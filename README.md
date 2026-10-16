@@ -66,11 +66,12 @@ standard library.
 
 Pick one way.
 
-**1. From the tæma repository** (quickest, and the one that updates itself). Add the
-repository once, then install like any other package:
+**1. From the GitHub repository** (quickest, and the one that updates itself). The
+packages live in this repository's `gh-pages` branch. Add it as an XBPS repository once,
+then install like any other package:
 
 ```sh
-echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+echo 'repository=https://raw.githubusercontent.com/Bongbetic/taema/gh-pages' | sudo tee /etc/xbps.d/20-taema.conf
 sudo xbps-install -S taema
 ```
 
@@ -266,7 +267,7 @@ git tag taema-v0.3.0 && git push origin taema-v0.3.0
 ```
 
 The `release` workflow runs the tests, builds the `.xbps`, publishes the GitHub release,
-signs and publishes the package to the repository at `https://bongbetic.github.io/taema`
+signs and publishes the package to the repository at `https://raw.githubusercontent.com/Bongbetic/taema/gh-pages`
 (branch `gh-pages`), and opens a pull request that bumps `version` and `checksum` in the
 void-packages template. Anyone who added the repository gets the new version with
 `sudo xbps-install -Su`. The package's install script changes nothing on an upgrade.
@@ -275,7 +276,7 @@ Once the template is merged into void-packages, `srcpkgs/taema/update` lets
 `./xbps-src update-check taema` and Void's update bot find each new release by its tag.
 
 Maintainer setup, once: the repository is signed with an RSA key. Store the private key as
-the Actions secret `XBPS_PRIVKEY` and turn on GitHub Pages for the `gh-pages` branch. If the
+the Actions secret `XBPS_PRIVKEY` and nothing else: the `gh-pages` branch is created by the workflow. If the
 key ever changes, every user has to accept the new fingerprint.
 
 ## Layout

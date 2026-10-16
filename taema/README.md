@@ -128,10 +128,12 @@ tæma uses only the Python standard library.
 
 ## Install
 
-### From the repository
+### From the GitHub repository
+
+The packages live in this repository's `gh-pages` branch.
 
 ```sh
-echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+echo 'repository=https://raw.githubusercontent.com/Bongbetic/taema/gh-pages' | sudo tee /etc/xbps.d/20-taema.conf
 sudo xbps-install -S taema
 ```
 

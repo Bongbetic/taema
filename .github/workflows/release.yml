@@ -1,6 +1,6 @@
 # Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
 # The workflow tests, builds the .xbps, publishes the GitHub release and a signed XBPS repository
-# (branch gh-pages, served by GitHub Pages), then opens a pull request that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
+# (branch gh-pages, served as raw files), then opens a pull request that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
 name: release
 
 on:
@@ -40,7 +40,7 @@ jobs:
           Add the repository once, then install and update like any other package:
 
           \`\`\`sh
-          echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+          echo 'repository=https://raw.githubusercontent.com/Bongbetic/taema/gh-pages' | sudo tee /etc/xbps.d/20-taema.conf
           sudo xbps-install -S taema
           \`\`\`
 
@@ -72,13 +72,6 @@ jobs:
           done
           xbps-rindex --privkey "$key" -S "taema-${VERSION}_1.noarch.xbps"
           rm -f "$key"
-          cat > index.html <<'HTML'
-          <!doctype html><meta charset="utf-8"><title>taema XBPS repository</title>
-          <p>XBPS repository for <a href="https://github.com/Bongbetic/taema">taema</a>.</p>
-          <pre>echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
-          sudo xbps-install -S taema</pre>
-          HTML
-          touch .nojekyll
           git init -q -b gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

@@ -49,10 +49,13 @@ tæma fixes that:
 - **Self-managing.** A daemon adopts running apps into scopes, stops a scope when its
   owner exits (`BindsTo`), garbage-collects unused helpers (`StopWhenUnneeded`) and
   cleans up at logout.
-- **Learns.** It remembers which programs turned out to be shared and how long they take
-  to exit, and `taema explain` shows why it decided what it did.
+- **Learns on its own.** It works out which program started which (owner and leftover),
+  which helpers are shared, and how long each takes to exit. When you close a terminal
+  job that leaves processes behind, it asks one short question in your shell. GUI apps
+  are learned silently. `taema explain` shows why it decided what it did.
+- **Zero setup.** Install the package and carry on. No commands to learn or run.
 - **Safe.** It touches only your own processes and never session infrastructure
-  (compositor, audio, D-Bus). For its first week it only adopts and learns; it stops a
+  (compositor, audio, D-Bus). It adopts and learns from the first minute, but it stops a
   leftover only after you answered a question about it, or after strong evidence.
 
 ## Install
@@ -103,9 +106,8 @@ taema status
 
 Upgrades change none of this. Only a first install does it.
 
-The default mode is `auto`: tæma adopts running apps and learns from day one, and stops
-a leftover only after you said so in the prompt (or after a week and strong evidence). Run
-the commands you always run. When something is left behind, tæma asks once:
+Run the commands you always run. When you close a terminal job and something is left
+behind, tæma asks once in your shell (bash, zsh or fish):
 
 ```
 tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
@@ -117,8 +119,9 @@ tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
 
 ### What auto mode does
 
-`auto` is the default. From the first minute it **adopts** running apps into scopes and
-**learns**. It does not stop anything at first. It stops a leftover only in two cases:
+`auto` is the default. From the first minute it **adopts** running apps into their own
+scopes and **learns** which leftover belongs to which owner. A leftover is stopped only in
+two cases:
 
 - **You answered.** In the prompt you said "stop them when it closes" for that pair
   (owner, leftover). The next close of that owner stops that leftover: SIGTERM, a grace
@@ -126,6 +129,15 @@ tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
 - **Strong evidence, after a burn-in.** Seen stopped by you at least 5 times on at least 3
   different days, never kept in 30 days, and a 7-day burn-in (or 20 closes) has passed.
   Evidence alone only sends SIGTERM.
+
+Other things it handles for you:
+
+- **Closing a GUI app.** Leftovers are moved to a `leftover/` scope and learned silently,
+  with no pop-up. They stop only when the pair is already decided and they are idle.
+- **Logging out.** Scopes survive logout (tmux and `nohup` jobs keep running) unless every
+  member is confidently stoppable.
+- **Closing an app by hand** (`kill`, `pkill`, `killall`): tæma matches the vanished
+  processes to the command and asks whether the app belonged to its recorded parent.
 
 Safety rules that auto mode never bends:
 

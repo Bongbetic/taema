@@ -13,8 +13,8 @@
 </p>
 
 <p align="center">
-  <em>Made by</em><br>
-  <a href="https://bongbetic.com"><img src="https://bongbetic.com/branding/bongbetic-logo-lockup.png" width="200" alt="Bongbetic"></a>
+  <em>Made by</em> <a href="https://bongbetic.com"><strong>Bongbetic</strong></a><br>
+  <a href="https://bongbetic.com"><img src="https://bongbetic.com/branding/bongbetic-logo-lockup.png" width="360" alt="Bongbetic logo"></a>
 </p>
 
 ---

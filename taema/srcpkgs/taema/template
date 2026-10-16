@@ -12,7 +12,7 @@ maintainer="soubarnak <soubarna@live.in>"
 license="MIT"
 homepage="https://github.com/Bongbetic/taema"
 distfiles="https://github.com/Bongbetic/taema/archive/refs/tags/taema-v${version}.tar.gz"
-checksum=2825914ddb331dd338ef426cceeebc74edf5e559fcfee1f1253be78e925db1d0
+checksum=9fde00d504793f445cd5b4e8856d12bcee18dc54a058bb840ffca386e67ded02
 system_groups="taema"
 conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 

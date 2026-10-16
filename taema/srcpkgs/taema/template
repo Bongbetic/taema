@@ -12,7 +12,7 @@ maintainer="soubarnak <soubarna@live.in>"
 license="MIT"
 homepage="https://github.com/Bongbetic/void-mods"
 distfiles="https://github.com/Bongbetic/void-mods/archive/refs/tags/taema-v${version}.tar.gz"
-checksum=@CHECKSUM@
+checksum=62aaaf8181efd001021adaf11c48d1e6adacdba24961b139e4ada39d381ab576
 system_groups="taema"
 conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 

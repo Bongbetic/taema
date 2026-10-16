@@ -10,7 +10,7 @@ from . import cgroup, engine, inspect, knowledge, policy
 
 def _load():
     cfg = policy.load_config()
-    store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"))
+    store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"), read_only=True)
     return cfg, store, policy.load_units(cfg)
 
 
@@ -49,6 +49,17 @@ def ask(cfg, msg, timeout=3.0):
     return None
 
 
+def feedback(cfg, store, op, key):
+    """Send an explicit answer to the daemon (single writer); append to feedback.jsonl when it is down."""
+    reply = ask(cfg, {"cmd": "feedback", "op": op, "key": key})
+    if reply and reply.get("ok"):
+        return "daemon"
+    fd = os.open(store.feedback_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(json.dumps({"op": op, "key": key}) + "\n")
+    return "queued"
+
+
 def die(msg, code=1):
     print("taema: " + msg, file=sys.stderr)
     return code
@@ -67,7 +78,18 @@ def cmd_run(a):
     leaf = "%s/scope-%s" % (base, name)
     if os.path.isdir(leaf) and cgroup.tree_procs(leaf) and not a.join:
         return die("scope %s already has processes (use --join to add)" % name)
+    owner = os.getpid() if a.bind else a.owner
+    if owner and inspect.uid_of(owner) == -1:
+        return die("owner pid %d is gone; not starting scope-%s" % (owner, name))
     os.makedirs(leaf, exist_ok=True)
+    # register before attaching: the daemon must be watching when this process enters the scope
+    reply = ask(cfg, {"cmd": "register", "scope": "scope-" + name, "owner": owner}) if owner else None
+    if reply is not None and "error" in reply:
+        try:
+            os.rmdir(leaf)
+        except OSError:
+            pass
+        return die("register failed: %s" % reply["error"])
     try:
         engine.helper_attach(cfg, os.getpid(), name)
     except engine.Refused as e:
@@ -76,8 +98,6 @@ def cmd_run(a):
         except OSError:
             pass
         return die("attach failed: %s" % e)
-    owner = os.getpid() if a.bind else a.owner
-    reply = ask(cfg, {"cmd": "register", "scope": "scope-" + name, "owner": owner}) if owner else None
     if owner and reply is None:
         print("taema: daemon not running; no owner watch for scope-%s" % name, file=sys.stderr)
     elif reply is None:
@@ -93,7 +113,7 @@ def cmd_kill(a):
     if not path:
         return die("no scope %s" % a.name)
     leaf_name = os.path.basename(path)
-    unit = policy.unit_for_scope(units, leaf_name)
+    unit = engine.unit_for_leaf(units, leaf_name)
     try:
         rep = engine.stop(path, cfg, store, unit, timeout=a.timeout, force=a.force, hard=a.hard,
                           keep=[x for x in (a.keep or "").split(",") if x], dry_run=a.dry_run,
@@ -103,10 +123,8 @@ def cmd_kill(a):
     for d in rep["decisions"]:
         print("%-5s %7d %-18s %s" % (d["action"], d["pid"], d["comm"][:18], d["why"][:110]))
     if a.force:
-        for d in rep["decisions"]:
-            if d["action"] == "kill":
-                store.bump(d["key"], "user_kill")
-        store.save()
+        for key in {d["key"] for d in rep["decisions"] if d["action"] == "kill"}:
+            feedback(cfg, store, "kill", key)
     if a.dry_run:
         print("dry run: nothing changed")
         return 0
@@ -161,7 +179,7 @@ def cmd_explain(a):
         return 0
     path = cgroup.resolve(a.target)
     if path:
-        unit = policy.unit_for_scope(units, os.path.basename(path))
+        unit = engine.unit_for_leaf(units, os.path.basename(path))
         for d in engine.plan_stop(path, cfg, store, unit):
             print("%-5s %7d %-18s %s" % (d["action"], d["pid"], d["comm"][:18], d["why"][:140]))
         return 0
@@ -171,18 +189,17 @@ def cmd_explain(a):
 
 def cmd_keep(a):
     cfg, store, units = _load()
-    store.bump(a.exe, "user_keep", 3.0)
-    store.log(event="keep", exe=a.exe)
-    store.save()
-    print("%s: %s" % (a.exe, store.default_action(a.exe)[0]))
+    how = feedback(cfg, store, "keep", a.exe)
+    store.bump(a.exe, "user_keep", 3.0)   # local view only: read-only store, never saved
+    print("%s: %s (%s)" % (a.exe, store.default_action(a.exe)[0], how))
     return 0
 
 
 def cmd_forget(a):
     cfg, store, units = _load()
-    print("forgot %s" % a.exe if store.forget(a.exe) else "nothing learned for %s" % a.exe)
-    store.log(event="forget", exe=a.exe)
-    store.save()
+    known = store.forget(a.exe)
+    feedback(cfg, store, "forget", a.exe)
+    print("forgot %s" % a.exe if known else "nothing learned for %s" % a.exe)
     return 0
 
 

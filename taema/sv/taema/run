@@ -6,7 +6,16 @@ exec 2>&1
 set -u
 PATH=/usr/bin:/usr/sbin:/bin:/sbin
 umask 022
-[ -r ./conf ] && . ./conf
+# ./conf is sourced as root: only trust a regular file owned by root, not group/world writable.
+if [ -e ./conf ] || [ -L ./conf ]; then
+    if [ -f ./conf ] && [ ! -L ./conf ] &&
+       [ "$(stat -c %u ./conf)" = 0 ] &&
+       [ $(( 0$(stat -c %a ./conf) & 022 )) -eq 0 ]; then
+        . ./conf
+    else
+        printf '%s\n' "taema: ignoring ./conf: must be a regular file owned by root, not group/world writable" >&2
+    fi
+fi
 
 GROUP=${TAEMA_GROUP:-taema}
 CONTROLLERS=${TAEMA_CONTROLLERS:-cpu cpuset io memory pids}
@@ -23,11 +32,13 @@ log() {
 enable_controllers() {
     offered=$(cat "$1/cgroup.controllers") || return 1
     enabled=$(cat "$1/cgroup.subtree_control") || return 1
+    set -f
     for ctrl in $CONTROLLERS; do
         case " $offered " in *" $ctrl "*) ;; *) continue ;; esac
         case " $enabled " in *" $ctrl "*) continue ;; esac
         printf '+%s\n' "$ctrl" > "$1/cgroup.subtree_control" || log "could not enable $ctrl in $1"
     done
+    set +f
     return 0
 }
 

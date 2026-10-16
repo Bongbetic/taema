@@ -64,10 +64,10 @@ class KnowledgeTests(unittest.TestCase):
     def test_graceful_default_with_few_samples(self):
         self.assertEqual(self.s.graceful_timeout("new", 10), (10.0, True))
 
-    def test_skip_sigterm_when_it_never_works(self):
+    def test_sigterm_never_skipped_when_it_never_works(self):
         r = self.s.rec("stubborn")
         r["killed"], r["sigkill_needed"] = 10, 9
-        self.assertEqual(self.s.graceful_timeout("stubborn", 10), (0.0, False))
+        self.assertEqual(self.s.graceful_timeout("stubborn", 10), (2.0, True))
 
     def test_idle_grace_doubles_after_respawn_and_shrinks_when_clean(self):
         self.assertEqual(self.s.idle_grace("x", 600), 600)

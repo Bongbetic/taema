@@ -4,9 +4,13 @@ import hashlib
 import os
 import signal
 import subprocess
+import sys
 import time
 
 from . import cgroup, inspect, policy
+
+
+HOOK_TIMEOUT = 30
 
 
 class Refused(Exception):
@@ -57,7 +61,11 @@ def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=()):
     pids = cgroup.tree_procs(path)
     pset = set(pids)
     pp = inspect.ppid_map()
-    edge_map = inspect.edges(pset, inspect.Snapshot())
+    snap = inspect.Snapshot()
+    edges_ok = getattr(snap, "ok", True)
+    edge_map = inspect.edges(pset, snap)
+    if not edges_ok:
+        store.log(event="edge_scan_failed", scope=cgroup.rel(path))
     keep_set = set(keep) | set((unit or {}).get("kill", {}).get("keep", []))
     out = {}
     for pid in pids:
@@ -69,6 +77,8 @@ def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=()):
         elif d["edges"] and not hard:
             d.update(action="share", why="outside users: " + "; ".join(
                 "%s %s" % (e["kind"], e["detail"]) for e in d["edges"]))
+        elif not edges_ok and not hard:
+            d.update(action="share", why="edge scan failed")
         elif key in keep_set:
             d.update(action="share", why="kept by unit or --keep")
         elif not force and store.default_action(key)[0] == "share":
@@ -84,13 +94,68 @@ def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=()):
     return list(out.values())
 
 
-def _wait_gone(path, kill_set, seconds):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if not (set(cgroup.tree_procs(path)) & kill_set):
-            return True
+def _signal_all(path, pids, sig, cfg):
+    """Signal pids that are still members of path and unprotected. Pins each pid with a pidfd
+    first so a recycled pid is never hit; falls back to os.kill without pidfd support."""
+    use_fd = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+    fds = {}
+    for p in pids:
+        fd = None
+        if use_fd:
+            try:
+                fd = os.pidfd_open(p)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                fd = None
+        fds[p] = fd
+    members = set(cgroup.tree_procs(path))   # after pinning: membership and protection re-checked
+    sent = []
+    for p, fd in fds.items():
+        try:
+            if p not in members or policy.protected_reason(p, cfg):
+                continue
+            if fd is not None:
+                signal.pidfd_send_signal(fd, sig)
+            else:
+                os.kill(p, sig)
+            sent.append(p)
+        except (ProcessLookupError, PermissionError):
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return sent
+
+
+def _wait_each(path, pids, seconds):
+    """Poll until pids leave path or seconds pass. Returns {pid: ms until it was gone}."""
+    t0 = time.monotonic()
+    deadline = t0 + seconds
+    left, gone = set(pids), {}
+    while True:
+        left &= set(cgroup.tree_procs(path))
+        for p in set(pids) - left - set(gone):
+            gone[p] = (time.monotonic() - t0) * 1000
+        if not left or time.monotonic() >= deadline:
+            return gone
         time.sleep(0.1)
-    return not (set(cgroup.tree_procs(path)) & kill_set)
+
+
+def _run_hook(hook):
+    """Run the stop hook in its own process group; kill the group on timeout."""
+    try:
+        p = subprocess.Popen([hook], start_new_session=True)
+    except OSError:
+        return
+    try:
+        p.wait(timeout=HOOK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.wait()
 
 
 def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, keep=(),
@@ -99,6 +164,7 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
     self_guard(path)
     report = {"scope": cgroup.rel(path), "decisions": [], "removed": False, "left": []}
     ran_hook = False
+    counted, killed_keys, sigkill_keys = set(), set(), set()
     for _ in range(passes):
         plan = plan_stop(path, cfg, store, unit, force, hard, keep)
         report["decisions"].extend(plan)
@@ -113,7 +179,7 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
             for e in d["edges"]:
                 store.bump(d["key"], "shared_hits", 1.0)
         for r in roots:
-            dest = cgroup.mkleaf("shared/%s-%d" % (_slug(r["comm"]), r["pid"]))
+            dest = cgroup.mkleaf("shared/" + leaf_slug(r["comm"], r["pid"]))
             moving = [p for p in inspect.descendants([r["pid"]], pp) if p in shared_pids]
             dest_cg = "/user/%d/%s" % (os.getuid(), cgroup.rel(dest))
             for _i in range(3):
@@ -129,36 +195,33 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
             if hook:
                 hook = policy.expand(hook)
                 if os.access(hook, os.X_OK):
-                    subprocess.run([hook], timeout=30)
+                    _run_hook(hook)
         if not kill:
             break
         kill_set = {d["pid"] for d in kill}
         keys = {d["key"] for d in kill}
         grace = max([store.graceful_timeout(k, (unit or {}).get("kill", {}).get("graceful",
                      policy.timer(cfg, "graceful_timeout", 10)))[0] for k in keys] or [0])
+        for k in keys - counted:
+            store.bump(k, "stops")
+            counted.add(k)
         if timeout is not None:
             grace = float(timeout)
-        t0 = time.monotonic()
-        for pid in kill_set:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        gone = _wait_gone(path, kill_set, grace)
-        ms = (time.monotonic() - t0) * 1000
+        _signal_all(path, kill_set, signal.SIGTERM, cfg)
+        exited = _wait_each(path, kill_set, grace)
+        survivors = kill_set - set(exited)
         for d in kill:
-            store.bump(d["key"], "killed")
-            store.add_term_ms(d["key"], ms if gone else grace * 1000)
-        if not gone:
-            for pid in set(cgroup.tree_procs(path)) & kill_set:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            store.add_term_ms(d["key"], exited.get(d["pid"], grace * 1000))
+            if d["key"] not in killed_keys:
+                killed_keys.add(d["key"])
+                store.bump(d["key"], "killed")
+        if survivors:
+            _signal_all(path, survivors, signal.SIGKILL, cfg)
             for d in kill:
-                if d["pid"] in set(cgroup.tree_procs(path)) | kill_set:
+                if d["pid"] in survivors and d["key"] not in sigkill_keys:
+                    sigkill_keys.add(d["key"])
                     store.bump(d["key"], "sigkill_needed")
-            _wait_gone(path, kill_set, 5)
+            _wait_each(path, survivors, 5)
     if not dry_run:
         try:
             cgroup.rmdir_tree(path)
@@ -169,18 +232,40 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
     store.log(event="stop", scope=report["scope"], dry_run=dry_run, removed=report["removed"],
               decisions=[{k: v for k, v in d.items() if k != "edges"} | {"edges": len(d["edges"])}
                          for d in report["decisions"]])
-    store.save()
+    store.save_if_dirty()
     return report
 
 
 def _slug(s):
-    out = "".join(c if c.isalnum() else "-" for c in s.lower()).strip("-")
+    out = "".join(c if c.isalnum() and c.isascii() else "-" for c in s.lower()).strip("-")
     return out[:24] or "proc"
+
+
+def leaf_slug(name, pid=None):
+    """Leaf name that always passes cgroup.valid_rel: '<slug>[-<hash>][-<pid>]'. A short hash
+    is added when slugging changed anything (Xwayland, g++, 'my app') so names stay distinct."""
+    slug = _slug(name)
+    if slug != name:
+        slug += "-" + hashlib.sha1(name.encode(errors="replace")).hexdigest()[:6]
+    if pid is not None:
+        slug += "-%d" % pid
+    return slug if cgroup.valid_rel(slug) else "proc-%d" % (pid or 0)
 
 
 # ---- adopt --------------------------------------------------------------------------------
 
+_MATCH_KEYS = ("exe", "comm", "cmdline_contains")
+_warned = set()
+
+
 def _matches(m, pid, env=None):
+    if not any(k in m for k in _MATCH_KEYS):   # an empty [match] would match every process
+        w = repr(sorted(m.items()))
+        if w not in _warned:
+            _warned.add(w)
+            print("taema: [match] needs one of %s; ignoring %s" % (", ".join(_MATCH_KEYS), w),
+                  file=sys.stderr)
+        return False
     if "exe" in m and inspect.exe(pid) != m["exe"]:
         return False
     if "comm" in m and inspect.comm(pid) != m["comm"]:
@@ -202,6 +287,8 @@ def adopt_plan(cfg, units, pp=None):
         if not m or u.get("unit", {}).get("kind") != "app":
             continue
         name = u["unit"]["name"]
+        if not cgroup.valid_rel(name) or "/" in name:
+            name = leaf_slug(name)
         matched = [p for p in in_session if _matches(m, p) and not policy.protected_reason(p, cfg)]
         roots = [p for p in matched if not any(a in matched for a in inspect.ancestors(p, pp))]
         groups = {}
@@ -276,14 +363,32 @@ def run_ops(cfg, store, ops, execute):
             op["done"] = True
         store.log(event="adopt" if execute else "adopt_would", op=op["op"], scope=op["scope"],
                   count=len(op["pids"]), skipped_protected=op["skipped_protected"])
-    store.save()
+    store.save_if_dirty()
     return ops
 
 
 # ---- gc -----------------------------------------------------------------------------------
 
-def gc_candidates(cfg, units, store, idle_since, now=time.time):
-    """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}."""
+def _cpu_usage(path):
+    """usage_usec from the leaf's cpu.stat, or None when unavailable."""
+    try:
+        with open(path + "/cpu.stat") as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip=None, noted=None):
+    """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}.
+
+    usage {rel: usage_usec at idle start}: CPU that moves during the idle window means busy.
+    skip: leaves never retried (protected member). noted: leaves already logged once."""
+    usage = {} if usage is None else usage
+    skip = set() if skip is None else skip
+    noted = set() if noted is None else noted
     base = cgroup.base()
     leaves = [d for d in cgroup.subdirs(base + "/shared")]
     unit_by_prefix = {u["unit"]["name"]: u for u in units if u.get("unit", {}).get("kind") == "app"}
@@ -292,14 +397,34 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time):
         for un, u in unit_by_prefix.items():
             if (n == un or n.startswith(un + "-")) and u["unit"].get("stop_when_unneeded"):
                 leaves.append(d)
+    live = {cgroup.rel(d) for d in leaves}
+    for table in (usage, skip, noted):
+        for k in [k for k in table if k not in live]:
+            table.discard(k) if isinstance(table, set) else table.pop(k)
     out = []
     snap = inspect.Snapshot()
+    pp = None
+    seeds = cfg.get("seeds", {})
+    protect = set(seeds.get("share", [])) | set(seeds.get("persist", []))
     for d in leaves:
         rel = cgroup.rel(d)
+        if rel in skip:
+            continue
         pids = cgroup.tree_procs(d)
         if not pids:
             out.append((d, "empty"))
             continue
+        if rel.startswith("shared/"):
+            pp = pp or inspect.ppid_map()
+            roots = [p for p in pids if not any(a in pids for a in inspect.ancestors(p, pp))]
+            held = next((k for k in map(policy.exe_key, roots)
+                         if k in protect or store.peek(k)["user_keep"] > 0), None)
+            if held:
+                if rel not in noted:
+                    noted.add(rel)
+                    store.log(event="gc_skip", scope=rel, why="share/persist seed or user keep: " + held)
+                idle_since.pop(rel, None)
+                continue
         u = next((v for k, v in unit_by_prefix.items() if os.path.basename(d).startswith(k)), None)
         gc = (u or {}).get("gc", {})
         # detector: pause process whose runtime directory is gone
@@ -311,14 +436,20 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time):
                 out.append((d, "%s gone: %s" % (var, sorted(dirs)[0])))
                 continue
         edge_map = inspect.edges(set(pids), snap)
-        busy = bool(edge_map)
+        busy = bool(edge_map) or not getattr(snap, "ok", True)
         if gc.get("keep_while_children") and u:
             root_comm = (u.get("match") or {}).get("comm")
             busy = busy or any(inspect.comm(p) != root_comm for p in pids)
         if busy:
             idle_since.pop(rel, None)
+            usage.pop(rel, None)
             continue
+        cpu = _cpu_usage(d)
+        if rel in idle_since and cpu is not None and usage.get(rel) is not None and cpu != usage[rel]:
+            idle_since[rel] = now()   # CPU moved: not idle, restart the window
         first = idle_since.setdefault(rel, now())
+        if cpu is not None:
+            usage[rel] = cpu
         key = policy.exe_key(pids[0])
         grace = store.idle_grace(key, policy.timer(cfg, "idle_grace", 600))
         if now() - first >= grace:

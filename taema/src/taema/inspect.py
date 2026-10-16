@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 
+PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
 _USERS = re.compile(r'\("([^"]*)",pid=(\d+)')
 _UNIX = re.compile(r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(users:\(.*\))?\s*$")
 _TCP = re.compile(r"^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s*(users:\(.*\))?\s*$")
@@ -15,12 +16,12 @@ _TCP = re.compile(r"^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s*(users:\(.*\))?\s*$")
 # ---- /proc ----------------------------------------------------------------------------
 
 def all_pids():
-    return [int(x) for x in os.listdir("/proc") if x.isdigit()]
+    return [int(x) for x in os.listdir(PROC) if x.isdigit()]
 
 
 def read(pid, name):
     try:
-        with open("/proc/%d/%s" % (pid, name), "rb") as f:
+        with open("%s/%d/%s" % (PROC, pid, name), "rb") as f:
             return f.read()
     except OSError:
         return b""
@@ -32,7 +33,7 @@ def comm(pid):
 
 def exe(pid):
     try:
-        return os.readlink("/proc/%d/exe" % pid).replace(" (deleted)", "")
+        return os.readlink("%s/%d/exe" % (PROC, pid)).replace(" (deleted)", "")
     except OSError:
         return ""
 
@@ -52,13 +53,23 @@ def environ(pid):
 
 def uid_of(pid):
     try:
-        return os.stat("/proc/%d" % pid).st_uid
+        return os.stat("%s/%d" % (PROC, pid)).st_uid
     except OSError:
         return -1
 
 
 def is_kernel_thread(pid):
     return not exe(pid) and not cmdline(pid)
+
+
+def starttime(pid):
+    """Field 22 of /proc/PID/stat (clock ticks since boot), or None when the pid is gone."""
+    data = read(pid, "stat")
+    rest = data.rsplit(b")", 1)[-1].split()
+    try:
+        return int(rest[19])
+    except (IndexError, ValueError):
+        return None
 
 
 def ppid_map():
@@ -148,21 +159,29 @@ def _host(addr):
 
 
 def _ss(*args):
+    """ss output, or None when ss failed (unknown: callers must not read it as "no sockets")."""
     try:
-        return subprocess.run(["ss", "-H"] + list(args), capture_output=True, text=True,
-                              timeout=10).stdout
+        r = subprocess.run(["ss", "-H"] + list(args), capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return None
+    return r.stdout if r.returncode == 0 else None
 
 
 class Snapshot:
     """One consistent view of sockets, taken once per decision pass."""
 
     def __init__(self, unix_text=None, tcp_text=None, tcp_listen_text=None):
-        self.unix = parse_ss_unix(unix_text if unix_text is not None else _ss("-xpn"))
-        self.tcp = parse_ss_tcp(tcp_text if tcp_text is not None else _ss("-tnp"))
-        self.tcp_listen = parse_ss_tcp(
-            tcp_listen_text if tcp_listen_text is not None else _ss("-tlnp"))
+        self.ok = True      # False when any ss call failed: edges are unknown, not absent
+        texts = []
+        for given, args in ((unix_text, "-xpn"), (tcp_text, "-tnp"), (tcp_listen_text, "-tlnp")):
+            t = given if given is not None else _ss(args)
+            if t is None:
+                self.ok = False
+                t = ""
+            texts.append(t)
+        self.unix = parse_ss_unix(texts[0])
+        self.tcp = parse_ss_tcp(texts[1])
+        self.tcp_listen = parse_ss_tcp(texts[2])
         self.by_inode = {r["inode"]: r for r in self.unix}
 
 

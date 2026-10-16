@@ -56,5 +56,7 @@ cgroup_prefix = []
 # Day-one defaults for the learning store, by exe basename. Learned counters can move an
 # exe between "share" and "kill" over time; `taema explain NAME` shows why.
 [seeds]
-share = ["catatonit", "conmon", "adb", "herdr", "tmux", "GradleDaemon", "kotlin-daemon", "ssh-agent", "gpg-agent"]
+share = ["catatonit", "conmon", "adb", "herdr", "GradleDaemon", "kotlin-daemon"]
+# Long-lived by design: never garbage-collected as idle, only stopped by an explicit answer.
+persist = ["tmux", "screen", "zellij", "abduco", "dtach", "mosh-server", "ssh-agent", "gpg-agent", "keyboxd", "dirmngr"]
 kill = ["qemu-system-x86_64", "qemu-system-x86_64-headless", "emulator", "node", "python3", "java"]

@@ -6,7 +6,7 @@
 exec 2>&1
 set -eu
 PATH=/usr/bin:/usr/sbin:/bin:/sbin
-umask 022
+umask 077
 
 user=${1:-$(basename "$(pwd -P)")}
 if ! ent=$(getent passwd "$user"); then

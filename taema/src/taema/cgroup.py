@@ -107,7 +107,7 @@ def rmdir_tree(path):
 def proc_cgroup(pid):
     """The cgroup v2 path of a pid ('/2', '/user/1000/scope-x'), or None."""
     try:
-        with open("/proc/%d/cgroup" % pid) as f:
+        with open("%s/%d/cgroup" % (os.environ.get("TAEMA_PROCROOT", "/proc"), pid)) as f:
             for line in f:
                 if line.startswith("0::"):
                     return line[3:].strip()

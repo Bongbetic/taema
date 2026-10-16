@@ -128,7 +128,17 @@ tæma uses only the Python standard library.
 
 ## Install
 
-### From a release
+### From the repository
+
+```sh
+echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+sudo xbps-install -S taema
+```
+
+The first sync asks whether to import the repository key. The fingerprint is
+`fa:d1:00:32:ce:b1:b9:fd:73:05:05:76:75:54:37:25`. Later updates come with `sudo xbps-install -Su`.
+
+### From a release file
 
 Download `taema-<version>_1.noarch.xbps` from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty
@@ -139,7 +149,7 @@ xbps-rindex -a taema-*.noarch.xbps
 sudo xbps-install --repository="$PWD" taema
 ```
 
-The package is unsigned, so this works only from a local directory repository.
+A file you download this way is unsigned, so it works only from a local directory repository.
 
 ### Build a package from source
 

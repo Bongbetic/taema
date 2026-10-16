@@ -1,6 +1,6 @@
 # Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
-# The workflow tests, builds the .xbps, publishes the GitHub release, then opens a pull request
-# that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
+# The workflow tests, builds the .xbps, publishes the GitHub release and a signed XBPS repository
+# (branch gh-pages, served by GitHub Pages), then opens a pull request that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
 name: release
 
 on:
@@ -36,9 +36,55 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > "$RUNNER_TEMP/notes.md" <<NOTES
+          Add the repository once, then install and update like any other package:
+
+          \`\`\`sh
+          echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+          sudo xbps-install -S taema
+          \`\`\`
+
+          Later updates arrive with \`sudo xbps-install -Su\`. The first sync asks you to accept the
+          repository key. Check that the fingerprint matches the README before you accept.
+          NOTES
           gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --title "tæma ${VERSION}" --generate-notes \
+            --repo "$GITHUB_REPOSITORY" --title "tæma ${VERSION}" \
+            --notes-file "$RUNNER_TEMP/notes.md" --generate-notes \
             "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps"
+      - name: Publish signed repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
+        run: |
+          [ -n "$XBPS_PRIVKEY" ] || { echo "secret XBPS_PRIVKEY is not set; skipping repository" >&2; exit 0; }
+          pages="$RUNNER_TEMP/pages"
+          key="$RUNNER_TEMP/privkey.pem"
+          umask 077
+          printf '%s\n' "$XBPS_PRIVKEY" > "$key"
+          umask 022
+          mkdir -p "$pages"
+          cp "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps" "$pages/"
+          cd "$pages"
+          # The package is noarch: index it for every architecture Void supports.
+          for arch in x86_64 x86_64-musl i686 aarch64 aarch64-musl armv7l armv7l-musl armv6l armv6l-musl; do
+            XBPS_ARCH=$arch xbps-rindex -a "taema-${VERSION}_1.noarch.xbps"
+            XBPS_ARCH=$arch xbps-rindex --privkey "$key" --signedby "Bongbetic <soubarna@live.in>" -s .
+          done
+          xbps-rindex --privkey "$key" -S "taema-${VERSION}_1.noarch.xbps"
+          rm -f "$key"
+          cat > index.html <<'HTML'
+          <!doctype html><meta charset="utf-8"><title>taema XBPS repository</title>
+          <p>XBPS repository for <a href="https://github.com/Bongbetic/taema">taema</a>.</p>
+          <pre>echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+          sudo xbps-install -S taema</pre>
+          HTML
+          touch .nojekyll
+          git init -q -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -qm "Repository for taema ${VERSION}"
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
 
   template:
     needs: release

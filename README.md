@@ -66,7 +66,24 @@ standard library.
 
 Pick one way.
 
-**1. From a release** (quickest). Download `taema-0.2.0_1.noarch.xbps` from the
+**1. From the tæma repository** (quickest, and the one that updates itself). Add the
+repository once, then install like any other package:
+
+```sh
+echo 'repository=https://bongbetic.github.io/taema' | sudo tee /etc/xbps.d/20-taema.conf
+sudo xbps-install -S taema
+```
+
+The first sync asks whether to import the repository key. Check that the fingerprint is
+
+```
+fa:d1:00:32:ce:b1:b9:fd:73:05:05:76:75:54:37:25
+```
+
+and answer `y`. Updates arrive with the rest of your system: `sudo xbps-install -Su`. The
+repository serves glibc and musl builds for x86_64, i686, aarch64, armv7l and armv6l.
+
+**2. From a release file.** Download `taema-0.2.0_1.noarch.xbps` from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty directory:
 
 ```sh
@@ -74,7 +91,7 @@ xbps-rindex -a taema-*.noarch.xbps
 sudo xbps-install --repository="$PWD" taema
 ```
 
-**2. Build from source.**
+**3. Build from source.**
 
 ```sh
 git clone https://github.com/Bongbetic/taema
@@ -83,14 +100,15 @@ tools/build-xbps.sh                       # runs the tests, writes build/repo/
 sudo xbps-install --repository="$PWD/build/repo" taema
 ```
 
-**3. With void-packages.** Copy `taema/srcpkgs/taema` into your `void-packages` checkout:
+**4. With void-packages.** Copy `taema/srcpkgs/taema` into your `void-packages` checkout:
 
 ```sh
 ./xbps-src pkg taema
 sudo xbps-install --repository=hostdir/binpkgs taema
 ```
 
-The package is unsigned, so it installs only from a local directory repository.
+Packages you build or download yourself are unsigned, so they install only from a local
+directory repository.
 
 ## Set up
 
@@ -247,12 +265,18 @@ then push a tag named `taema-vX.Y.Z`:
 git tag taema-v0.3.0 && git push origin taema-v0.3.0
 ```
 
-The `release` workflow runs the tests, builds the `.xbps`, publishes the GitHub release, and
-opens a pull request that bumps `version` and `checksum` in the void-packages template. Once
-the template is merged into void-packages, `srcpkgs/taema/update` lets
+The `release` workflow runs the tests, builds the `.xbps`, publishes the GitHub release,
+signs and publishes the package to the repository at `https://bongbetic.github.io/taema`
+(branch `gh-pages`), and opens a pull request that bumps `version` and `checksum` in the
+void-packages template. Anyone who added the repository gets the new version with
+`sudo xbps-install -Su`. The package's install script changes nothing on an upgrade.
+
+Once the template is merged into void-packages, `srcpkgs/taema/update` lets
 `./xbps-src update-check taema` and Void's update bot find each new release by its tag.
-After that, `xbps-install -Su` upgrades tæma like any other package. The package's install
-script changes nothing on an upgrade.
+
+Maintainer setup, once: the repository is signed with an RSA key. Store the private key as
+the Actions secret `XBPS_PRIVKEY` and turn on GitHub Pages for the `gh-pages` branch. If the
+key ever changes, every user has to accept the new fingerprint.
 
 ## Layout
 

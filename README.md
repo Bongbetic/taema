@@ -117,51 +117,70 @@ tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
   [Enter] ask me later
 ```
 
-### What auto mode does
+### How auto mode decides
 
-`auto` is the default. From the first minute it **adopts** running apps into their own
-scopes and **learns** which leftover belongs to which owner. A leftover is stopped only in
-two cases:
+Closing an app is not always clean. `npm run dev` exits and `esbuild` keeps running. You
+close your editor and its language server stays behind. tæma watches for this. When a
+program leaves something behind, tæma remembers "this leftover came from that program".
+That match is called a **pair**. Later, it can clean up the leftover for you.
 
-- **You answered.** In the prompt you said "stop them when it closes" for that pair
-  (owner, leftover). The next close of that owner stops that leftover: SIGTERM, a grace
-  period learned from past exits (5 to 30 s), then SIGKILL.
-- **Strong evidence, after a burn-in.** Seen stopped by you at least 5 times on at least 3
-  different days, never kept in 30 days, and a 7-day burn-in (or 20 closes) has passed.
-  Evidence alone only sends SIGTERM.
+It never guesses about stopping. Each pair moves through three steps:
 
-Other things it handles for you:
+1. **Watch.** From the first minute, every app you run gets its own scope. tæma notes
+   what survives when it closes. It stops nothing yet.
+2. **Ask.** If you close a terminal job and something survives, your shell asks one
+   question (see above). Answer `1` and tæma stops that leftover every time that program
+   closes. Answer `3` and it never touches it.
+3. **Learn from habit.** If you keep killing the same leftover yourself, tæma notices. It
+   takes over after all of these are true: you did it at least 5 times on at least 3
+   different days, you never kept it in the last 30 days, and tæma has been watching for 7
+   days (or 20 closes). It then stops it politely (SIGTERM only, never a hard kill).
 
-- **Closing a GUI app.** Leftovers are moved to a `leftover/` scope and learned silently,
-  with no pop-up. They stop only when the pair is already decided and they are idle.
-- **Logging out.** Scopes survive logout (tmux and `nohup` jobs keep running) unless every
-  member is confidently stoppable.
-- **Closing an app by hand** (`kill`, `pkill`, `killall`): tæma matches the vanished
-  processes to the command and asks whether the app belonged to its recorded parent.
+When tæma stops something because you answered `1`, it sends SIGTERM first, waits as long
+as that program usually needs to exit (5 to 30 seconds, learned from past exits), and only
+then sends SIGKILL.
 
-Safety rules that auto mode never bends:
+What happens in other situations:
 
-- **Regret.** If you relaunch the same program within 30 minutes of an automatic stop,
-  tæma counts that as a "keep", pauses the pair for 7 days and asks you again. A wrong
-  answer fixes itself with no command.
-- **Never stopped:** protected session infrastructure, anything another process still
-  uses (an edge), terminal hosts (anything holding `/dev/ptmx`: terminals, tmux, screen,
-  zellij, editors), anything above 1 % CPU over 60 s, and anything whose origin tæma
-  cannot tell.
-- **Persist seeds** (tmux, screen, zellij, abduco, dtach, mosh-server, ssh-agent,
-  gpg-agent, keyboxd, dirmngr) are never garbage-collected as idle.
-- Unknown is never "no": unreadable `/proc` data, a failed `ss` run or a zombie means
-  keep and learn.
+| You do this | tæma does this |
+|---|---|
+| Close a GUI app | Moves what it left behind into a `leftover/` scope and learns from it, silently. No pop-up. It stops them only when the pair is already decided and they are idle. |
+| Log out | Leaves scopes running, so tmux and `nohup` jobs survive. A scope stops only if every process in it is one tæma is sure about. |
+| Close an app with `kill`, `pkill` or `killall` | Matches the vanished processes to your command and asks whether that app belonged to its usual parent. |
 
-### Turn it down
+**It never stops these**, even if you said yes to something nearby:
+
+- Your desktop's own infrastructure (compositor, audio, D-Bus).
+- A process that something else still uses, such as a database a second program talks to.
+- Terminals, tmux, screen and zellij, and editors that run terminals.
+- Long-lived helpers: tmux, screen, zellij, abduco, dtach, mosh-server, ssh-agent,
+  gpg-agent, keyboxd, dirmngr.
+- Anything busy (above 1 % CPU over the last minute).
+- Anything tæma cannot identify, or cannot read. When in doubt, it keeps the process and
+  keeps learning.
+
+**If tæma gets it wrong,** just start the program again. If you relaunch something within
+30 minutes of an automatic stop, tæma treats the stop as a mistake. It pauses that pair
+for 7 days and asks you again. You never need a command to undo it.
+
+### Dial it down
+
+`auto` is the default. To make tæma quieter, set a different mode:
+
+| Mode | What happens |
+|---|---|
+| `auto` | Adopts, learns and cleans up as described above. |
+| `adopt` | Gives apps their own scopes. Never stops anything. |
+| `observe` | Only writes what it *would* do to the log. Changes nothing. |
 
 ```toml
 # ~/.config/taema/taema.toml
-mode = "observe"      # log what would happen, change nothing; or "adopt" (move, never kill)
+mode = "adopt"
 ```
 
-Then `sudo sv restart taema`. `TAEMA_NO_PROMPT=1` in your shell environment turns the
-question off. `taema forget NAME` resets what was learned about one program.
+Then run `sudo sv restart taema`. To switch the shell question off, put
+`TAEMA_NO_PROMPT=1` in your shell environment. `taema forget NAME` makes tæma unlearn one
+program.
 
 ## Use
 

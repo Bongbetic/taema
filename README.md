@@ -272,7 +272,7 @@ git tag taema-v0.3.0 && git push origin taema-v0.3.0
 The `release` workflow runs the tests, builds the `.xbps`, signs an XBPS repository, and
 attaches it with the package to the GitHub release. xbps reads it from
 `https://github.com/Bongbetic/taema/releases/latest/download`, so the newest release is
-always the repository. The workflow then opens a pull request that bumps `version` and
+always the repository. The workflow then commits a bump of `version` and
 `checksum` in the void-packages template. Anyone who added the repository gets the new version with
 `sudo xbps-install -Su`. The package's install script changes nothing on an upgrade.
 

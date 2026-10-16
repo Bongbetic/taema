@@ -1,6 +1,6 @@
 # Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
 # The workflow tests, builds the .xbps, signs an XBPS repository and attaches it, with the package,
-# to the GitHub release (xbps reads it from releases/latest/download), then opens a pull request that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
+# to the GitHub release (xbps reads it from releases/latest/download), then commits a bump of version and checksum in taema/srcpkgs/taema/template and in the README.
 name: release
 
 on:
@@ -94,12 +94,7 @@ jobs:
           fi
           sed -i "s/^version=.*/version=${version}/; s/^revision=.*/revision=1/; s/^checksum=.*/checksum=${sum}/" "$t"
           sed -i "s/taema-[0-9][0-9.]*_1\.noarch/taema-${version}_1.noarch/" README.md
-          branch="template-${version}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
           git commit -am "Template and README: taema ${version}"
-          git push origin "$branch"
-          gh pr create --base main --head "$branch" \
-            --title "Template and README: taema ${version}" \
-            --body "Automatic bump after release ${GITHUB_REF_NAME}. Updates version, checksum and the download name in the README."
+          git push origin HEAD:main

@@ -83,7 +83,7 @@ tæma uses only the Python standard library.
 ### From a release
 
 Download `taema-<version>_1.noarch.xbps` from the
-[releases page](https://github.com/Bongbetic/void-mods/releases) into an empty
+[releases page](https://github.com/Bongbetic/taema/releases) into an empty
 directory, index it, and install it:
 
 ```sh
@@ -96,8 +96,8 @@ The package is unsigned, so this works only from a local directory repository.
 ### Build a package from source
 
 ```sh
-git clone https://github.com/Bongbetic/void-mods
-cd void-mods/taema
+git clone https://github.com/Bongbetic/taema
+cd taema/taema
 tools/build-xbps.sh                       # runs the tests, writes build/repo/
 sudo xbps-install --repository="$PWD/build/repo" taema
 ```

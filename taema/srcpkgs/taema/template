@@ -10,9 +10,9 @@ checkdepends="python3 iproute2"
 short_desc="Dependency-aware, self-managing cgroup v2 process scopes"
 maintainer="soubarnak <soubarna@live.in>"
 license="MIT"
-homepage="https://github.com/Bongbetic/void-mods"
-distfiles="https://github.com/Bongbetic/void-mods/archive/refs/tags/taema-v${version}.tar.gz"
-checksum=62aaaf8181efd001021adaf11c48d1e6adacdba24961b139e4ada39d381ab576
+homepage="https://github.com/Bongbetic/taema"
+distfiles="https://github.com/Bongbetic/taema/archive/refs/tags/taema-v${version}.tar.gz"
+checksum=2825914ddb331dd338ef426cceeebc74edf5e559fcfee1f1253be78e925db1d0
 system_groups="taema"
 conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 

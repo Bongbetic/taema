@@ -22,7 +22,7 @@ rm -f "$repo/$pkg.noarch.xbps"
 (cd "$repo" && xbps-create -A noarch -n "$pkg" \
     -s "Dependency-aware, self-managing cgroup v2 process scopes" \
     -D "python3>=3.11_1 iproute2>=0 util-linux>=0 sudo>=0 runit>=0 shadow>=0" \
-    -l MIT -H https://github.com/Bongbetic/void-mods \
+    -l MIT -H https://github.com/Bongbetic/taema \
     -m "soubarnak <soubarna@live.in>" \
     --config-files "/etc/taema/taema.toml /etc/taema/units/podman.toml" \
     "$stage")

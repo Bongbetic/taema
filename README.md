@@ -63,7 +63,7 @@ standard library.
 
 Pick one way.
 
-**1. From a release** (quickest). Download `taema-0.1.0_1.noarch.xbps` from the
+**1. From a release** (quickest). Download `taema-0.2.0_1.noarch.xbps` from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty directory:
 
 ```sh

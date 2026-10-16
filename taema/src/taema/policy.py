@@ -16,6 +16,7 @@ from . import cgroup, inspect
 
 SYSTEM_CONFIG = os.environ.get("TAEMA_SYSTEM_CONFIG", "/etc/taema/taema.toml")
 SYSTEM_UNITS = "/etc/taema/units"
+USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
 MODES = ("observe", "adopt", "enforce")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
@@ -136,18 +137,34 @@ def hook_for(cfg, leaf_name):
     return h if os.path.exists(h) else None
 
 
-def session_cgroups(cfg, uid=None):
-    """Login session cgroups that hold this user's processes. 'auto' means every top-level
-    numeric cgroup (elogind names them after the session id) with at least one process of uid."""
-    uid = os.getuid() if uid is None else uid
+def session_dirs(cfg):
+    """Candidate login session cgroups, without looking inside: the pinned path, or every
+    top-level numeric cgroup (elogind names them after the session id)."""
     sc = cfg["paths"].get("session_cgroup", "auto")
     if sc != "auto":
         return [sc] if os.path.isdir(sc) else []
-    out = []
-    for d in cgroup.subdirs(cgroup.CG):
-        if os.path.basename(d).isdigit() and any(inspect.uid_of(p) == uid for p in cgroup.procs(d)):
-            out.append(d)
-    return out
+    return [d for d in cgroup.subdirs(cgroup.CG) if os.path.basename(d).isdigit()]
+
+
+def session_cgroups(cfg, uid=None):
+    """Login session cgroups that hold this user's processes. 'auto' means every top-level
+    numeric cgroup with at least one process of uid."""
+    uid = os.getuid() if uid is None else uid
+    if cfg["paths"].get("session_cgroup", "auto") != "auto":
+        return session_dirs(cfg)
+    return [d for d in session_dirs(cfg) if any(inspect.uid_of(p) == uid for p in cgroup.procs(d))]
+
+
+def session_state(uid=None):
+    """(STATE, [session ids]) from elogind's /run/systemd/users/<uid>, or None when unreadable."""
+    uid = os.getuid() if uid is None else uid
+    try:
+        with open("%s/%d" % (USERS_DIR, uid)) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    kv = dict(l.split("=", 1) for l in lines if "=" in l)
+    return kv.get("STATE", ""), kv.get("SESSIONS", "").split()
 
 
 def comm_protected(c, patterns):

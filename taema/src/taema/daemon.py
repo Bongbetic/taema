@@ -4,6 +4,7 @@ Single threaded. Mode gates every action: observe logs only, adopt moves, enforc
 """
 import json
 import os
+import select
 import selectors
 import signal
 import socket
@@ -12,6 +13,11 @@ import struct
 import time
 
 from . import cgroup, engine, inspect, knowledge, policy
+
+MAX_OWNERS = 256        # pidfd owner watches
+MAX_LEAF_WATCH = 256    # cgroup.events watches (EPOLLPRI)
+MAX_SLEEP = 60.0        # longest select() sleep
+MAX_GATE_SKIPS = 4      # fork gate: at most 4 skipped adopt passes, so every 5th one runs
 
 
 class Daemon:
@@ -29,6 +35,14 @@ class Daemon:
         self.srv = None
         self.sock_path = None
         self.last = {"adopt": 0.0, "gc": 0.0}
+        self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
+        self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.gate_sig = None    # fork gate: (last pid, session pid sets) of the last adopt pass
+        self.gate_skips = 0
+        self.leaf_ep = None     # epoll on leaf cgroup.events (EPOLLPRI), itself in self.sel
+        self.leaf_watch = {}    # fd -> (leaf rel, open cgroup.events file)
+        self.leaf_nowatch = set()   # leaves that could not be watched: the GC pass checks them
+        self.empty_seen = set()     # leaves seen empty by the previous GC pass
         self.last_result = {"adopt": None, "gc": None}
         self.started = time.time()
         self.stopping = False
@@ -49,6 +63,9 @@ class Daemon:
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
             return True     # already watched (first owner wins)
+        if len(self.owners) >= MAX_OWNERS:
+            self.store.log(event="owner_watch_full", scope=leaf, owner=pid)
+            return False
         st = inspect.starttime(pid)
         try:
             fd = os.pidfd_open(pid)
@@ -87,8 +104,26 @@ class Daemon:
             self.store.log(event="stop_error", scope=leaf, error="%s: %s" % (type(e).__name__, e))
 
     # ---- loops ----
+    def _fork_sig(self):
+        """Cheap change signature: /proc/loadavg last pid plus the session cgroup pid sets."""
+        try:
+            with open(inspect.PROC + "/loadavg") as f:
+                last_pid = f.read().split()[4]
+        except (OSError, IndexError):
+            return None
+        return (last_pid, tuple((d, frozenset(cgroup.procs(d))) for d in policy.session_dirs(self.cfg)))
+
     def adopt_pass(self):
-        ops = engine.adopt_plan(self.cfg, self.units) + engine.carve_plan(self.cfg, self.units)
+        sig = self._fork_sig()
+        if sig is not None and sig == self.gate_sig and self.gate_skips < MAX_GATE_SKIPS:
+            self.gate_skips += 1        # nothing forked and nobody joined a session: skip the walk
+            return
+        self.gate_sig, self.gate_skips = sig, 0
+        if not self.units:
+            self.last_result["adopt"] = []
+            return
+        pt = inspect.ProcTable.scan()
+        ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
         done = engine.run_ops(self.cfg, self.store, ops, self.may_move())
         for op in done:
             if op["op"] == "carve" and op["done"] and op.get("binds_to") == "root":
@@ -96,13 +131,101 @@ class Daemon:
         self.last_result["adopt"] = [{"op": o["op"], "scope": o["scope"], "pids": len(o["pids"]),
                                       "done": o["done"]} for o in done]
 
+    # ---- empty leaves ----
+    def _empty_leaf_dirs(self):
+        base = cgroup.base()
+        return cgroup.subdirs(base + "/shared") + [
+            d for d in cgroup.subdirs(base)
+            if os.path.basename(d).startswith(engine.EMPTY_PREFIXES) and os.path.basename(d) != "manager"]
+
+    def _drop_leaf_watch(self, fd):
+        _rel, f = self.leaf_watch.pop(fd)
+        try:
+            self.leaf_ep.unregister(fd)
+        except (OSError, ValueError):
+            pass
+        f.close()
+
+    def sync_leaf_watches(self):
+        """Watch cgroup.events of each removable leaf (cap MAX_LEAF_WATCH); leaves that cannot be
+        watched stay on the GC-pass check."""
+        dirs = {cgroup.rel(d): d for d in self._empty_leaf_dirs()}
+        for fd in [fd for fd, (rel, _f) in self.leaf_watch.items() if rel not in dirs]:
+            self._drop_leaf_watch(fd)
+        self.leaf_nowatch &= set(dirs)
+        watched = {rel for rel, _f in self.leaf_watch.values()}
+        for rel, d in dirs.items():
+            if rel in watched or rel in self.leaf_nowatch or len(self.leaf_watch) >= MAX_LEAF_WATCH:
+                continue
+            try:
+                if self.leaf_ep is None:
+                    self.leaf_ep = select.epoll()
+                    self.sel.register(self.leaf_ep.fileno(), selectors.EVENT_READ, "leaves")
+                f = open(d + "/cgroup.events")
+                f.read()    # arm: EPOLLPRI fires on the next change after a read
+                try:
+                    self.leaf_ep.register(f.fileno(), select.EPOLLPRI | select.EPOLLERR)
+                except OSError:
+                    f.close()
+                    raise
+                self.leaf_watch[f.fileno()] = (rel, f)
+            except OSError:
+                self.leaf_nowatch.add(rel)
+
+    def on_leaf_events(self):
+        """A watched leaf changed: remove it when cgroup.events says 'populated 0'."""
+        for fd, _ev in self.leaf_ep.poll(0):
+            if fd not in self.leaf_watch:
+                continue
+            rel, f = self.leaf_watch[fd]
+            try:
+                f.seek(0)
+                text = f.read()
+            except OSError:
+                text = ""
+            if "populated 0" in text:
+                self._drop_leaf_watch(fd)
+                self.remove_leaf(cgroup.base() + "/" + rel, "populated 0")
+            elif not text:
+                self._drop_leaf_watch(fd)
+
+    def remove_leaf(self, path, why):
+        leaf = cgroup.rel(path)
+        if engine.remove_empty(path):
+            self.empty_seen.discard(leaf)
+            self.store.log(event="gc_removed_empty", scope=leaf, why=why)
+            return True
+        return False
+
+    def _gc_empty(self, path, leaf, dry_run, res, now_empty):
+        """Empty leaf: removed on the second consecutive GC pass that sees it empty (a scope that
+        was just created is empty until its first process arrives)."""
+        if dry_run or not self.may_move():
+            res.append([leaf, "empty", "would"])
+            if not dry_run and self.store.changed("gc_empty:" + leaf, True):
+                self.store.log(event="gc_would_remove_empty", scope=leaf, mode=self.mode)
+            return
+        res.append([leaf, "empty", "remove"])
+        if leaf in self.empty_seen:
+            self.remove_leaf(path, "empty")
+        else:
+            now_empty.add(leaf)
+
     def gc_pass(self, dry_run=False):
-        self.store.apply_feedback()
+        if self.store.apply_feedback():
+            self.store.save_if_dirty()
+        self.store.decay()
+        self.store.enforce_caps()
         cands = engine.gc_candidates(self.cfg, self.units, self.store, self.idle_since,
                                      usage=self.gc_usage, skip=self.gc_skip, noted=self.gc_noted)
-        res = []
+        res, now_empty = [], set()
+        if not dry_run and self.may_move():
+            self.sync_leaf_watches()
         for path, why in cands:
             leaf = cgroup.rel(path)
+            if why == "empty":
+                self._gc_empty(path, leaf, dry_run, res, now_empty)
+                continue
             res.append([leaf, why, "would" if (dry_run or not self.may_kill()) else "stop"])
             if dry_run:
                 continue
@@ -123,11 +246,20 @@ class Daemon:
                     self.store.log(event="gc_incomplete", scope=leaf, why=rep.get("error", "busy"))
             else:
                 self.store.log(event="gc_would_stop", scope=leaf, why=why, mode=self.mode)
+        if not dry_run:
+            self.empty_seen = now_empty
+            self.store.forget_sigs("gc_empty:", {"gc_empty:" + r[0] for r in res if r[1] == "empty"})
         self.last_result["gc"] = res
         return res
 
     def session_ended(self):
         """True once every login session of this user has gone (after at least one was seen)."""
+        st = policy.session_state()
+        if st is not None:     # elogind's per-user state file: no cgroup scan
+            if st[1]:
+                self.session_seen = True
+                return False
+            return self.session_seen
         try:
             if policy.session_cgroups(self.cfg):
                 self.session_seen = True
@@ -270,31 +402,54 @@ class Daemon:
     def _on_signal(self, signum, _frame):
         self.stopping = True
 
+    def next_timeout(self, now=None):
+        """Seconds until the next timer is due (adopt, gc), capped at MAX_SLEEP."""
+        now = time.time() if now is None else now
+        due = min(self.last["adopt"] + self.iv_adopt, self.last["gc"] + self.iv_gc, now + MAX_SLEEP)
+        return max(0.0, min(MAX_SLEEP, due - now))
+
+    def tick(self):
+        """Run what is due: socket check, adopt (+ session end), GC, routine save."""
+        self.guarded(self.check_socket)
+        now = time.time()
+        if now - self.last["adopt"] >= self.iv_adopt:
+            self.last["adopt"] = now
+            self.guarded(self.adopt_pass)
+            if self.session_ended():
+                self.guarded(self.end_session)
+        if now - self.last["gc"] >= self.iv_gc:
+            self.last["gc"] = now
+            self.guarded(self.gc_pass)
+        self.guarded(lambda: self.store.save_if_dirty(knowledge.SAVE_INTERVAL))
+
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
+        wake_r, wake_w = socket.socketpair()    # a signal wakes select() at once
+        wake_r.setblocking(False)
+        wake_w.setblocking(False)
+        self.sel.register(wake_r, selectors.EVENT_READ, "wake")
+        try:
+            signal.set_wakeup_fd(wake_w.fileno(), warn_on_full_buffer=False)
+        except ValueError:      # not the main thread
+            pass
         self.guarded(self.check_socket)
         self.store.log(event="daemon_start", mode=self.mode, units=[u["_file"] for u in self.units])
-        iv_adopt = policy.timer(self.cfg, "adopt_interval", 15)
-        iv_gc = policy.timer(self.cfg, "gc_interval", 60)
         while not self.stopping:
-            for key, _ in self.sel.select(timeout=1.0):
+            for key, _ in self.sel.select(timeout=self.next_timeout()):
                 if key.data == "srv":
                     self.guarded(lambda: self.serve(self.srv))
+                elif key.data == "wake":
+                    try:
+                        wake_r.recv(4096)
+                    except OSError:
+                        pass
+                elif key.data == "leaves":
+                    self.guarded(self.on_leaf_events)
                 else:
                     fd = key.fd
                     self.guarded(lambda: self.on_owner_exit(fd))
-            self.guarded(self.check_socket)
-            now = time.time()
-            if now - self.last["adopt"] >= iv_adopt:
-                self.last["adopt"] = now
-                self.guarded(self.adopt_pass)
-            if now - self.last["gc"] >= iv_gc:
-                self.last["gc"] = now
-                self.guarded(self.gc_pass)
-            if self.session_ended():
-                self.guarded(self.end_session)
-            self.guarded(self.store.save_if_dirty)
+            self.tick()
         self.store.log(event="daemon_stop")
         self.store.save()
         return 0

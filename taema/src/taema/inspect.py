@@ -3,6 +3,7 @@
 An edge means an OUTSIDE process depends on a MEMBER (member is the server side).
 Clients of things outside the set, shared stdio, ptys and pipes are never edges.
 """
+from collections import namedtuple
 import os
 import re
 import subprocess
@@ -72,44 +73,91 @@ def starttime(pid):
         return None
 
 
+class Proc(namedtuple("Proc", "ppid pgrp sid tty start state")):
+    __slots__ = ()
+
+
+def _parse_stat(data):
+    """Proc from /proc/PID/stat bytes, or None. comm may hold spaces/parens: split after the last ')'."""
+    rest = data.rsplit(b")", 1)[-1].split()
+    if len(rest) < 2:
+        return None
+    try:
+        ints = [int(x) for x in rest[1:5]]
+        ints += [0] * (4 - len(ints))
+        start = int(rest[19]) if len(rest) > 19 else 0
+        return Proc(ints[0], ints[1], ints[2], ints[3], start, rest[0].decode(errors="replace"))
+    except ValueError:
+        return None
+
+
+class ProcTable:
+    """One snapshot of /proc/*/stat (zombies skipped), built once per pass and shared."""
+
+    def __init__(self, rows=None):
+        self.rows = rows if rows is not None else {}
+        self.ppid = {p: r.ppid for p, r in self.rows.items()}
+        self._kids = None
+
+    @classmethod
+    def scan(cls):
+        rows = {}
+        for pid in all_pids():
+            r = _parse_stat(read(pid, "stat"))
+            if r is not None and r.state != "Z":
+                rows[pid] = r
+        return cls(rows)
+
+    @classmethod
+    def from_ppid(cls, pp):
+        """Table from a bare {pid: ppid} map (tests, compatibility)."""
+        return cls({p: Proc(pa, p, p, 0, 0, "S") for p, pa in pp.items()})
+
+    def kids(self):
+        if self._kids is None:
+            self._kids = {}
+            for p, pa in self.ppid.items():
+                self._kids.setdefault(pa, []).append(p)
+        return self._kids
+
+    def descendants(self, roots):
+        out, stack, seen = [], list(roots), set()
+        kids = self.kids()
+        while stack:
+            p = stack.pop()
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+            stack.extend(kids.get(p, []))
+        return out
+
+    def ancestors(self, pid):
+        out, pp = [], self.ppid
+        while pid in pp and pp[pid] > 0 and len(out) < 64:
+            pid = pp[pid]
+            out.append(pid)
+        return out
+
+
+def _table(pp):
+    if isinstance(pp, ProcTable):
+        return pp
+    return ProcTable.from_ppid(pp) if pp is not None else ProcTable.scan()
+
+
 def ppid_map():
-    """{pid: ppid} from /proc/*/stat. comm may contain spaces/parens: split after the last ')'."""
-    m = {}
-    for pid in all_pids():
-        data = read(pid, "stat")
-        if not data:
-            continue
-        rest = data.rsplit(b")", 1)[-1].split()
-        if len(rest) > 1:
-            m[pid] = int(rest[1])
-    return m
+    """{pid: ppid} from /proc/*/stat (thin wrapper over ProcTable)."""
+    return dict(ProcTable.scan().ppid)
 
 
 def descendants(roots, pp=None):
-    """roots plus every descendant, using the ppid map."""
-    pp = pp if pp is not None else ppid_map()
-    kids = {}
-    for p, pa in pp.items():
-        kids.setdefault(pa, []).append(p)
-    out, stack = [], list(roots)
-    seen = set()
-    while stack:
-        p = stack.pop()
-        if p in seen:
-            continue
-        seen.add(p)
-        out.append(p)
-        stack.extend(kids.get(p, []))
-    return out
+    """roots plus every descendant. pp: a ProcTable, a {pid: ppid} map, or None (scan now)."""
+    return _table(pp).descendants(roots)
 
 
 def ancestors(pid, pp=None):
-    pp = pp if pp is not None else ppid_map()
-    out = []
-    while pid in pp and pp[pid] > 0 and len(out) < 64:
-        pid = pp[pid]
-        out.append(pid)
-    return out
+    return _table(pp).ancestors(pid)
 
 
 def tracer(pid):
@@ -168,21 +216,44 @@ def _ss(*args):
 
 
 class Snapshot:
-    """One consistent view of sockets, taken once per decision pass."""
+    """One consistent view of sockets, taken once per decision pass: two ss runs
+    (`-xapn`, `-tanp`); listening tcp rows are split out by state."""
 
     def __init__(self, unix_text=None, tcp_text=None, tcp_listen_text=None):
         self.ok = True      # False when any ss call failed: edges are unknown, not absent
-        texts = []
-        for given, args in ((unix_text, "-xpn"), (tcp_text, "-tnp"), (tcp_listen_text, "-tlnp")):
-            t = given if given is not None else _ss(args)
+
+        def get(given, args):
+            t = given if given is not None else _ss(*args)
             if t is None:
                 self.ok = False
-                t = ""
-            texts.append(t)
-        self.unix = parse_ss_unix(texts[0])
-        self.tcp = parse_ss_tcp(texts[1])
-        self.tcp_listen = parse_ss_tcp(texts[2])
+                return ""
+            return t
+
+        self.unix = parse_ss_unix(get(unix_text, ("-xapn",)))
+        if tcp_text is None and tcp_listen_text is None:
+            rows = parse_ss_tcp(get(None, ("-tanp",)))
+            self.tcp = [r for r in rows if r["state"] != "LISTEN"]
+            self.tcp_listen = [r for r in rows if r["state"] == "LISTEN"]
+        else:
+            self.tcp = parse_ss_tcp(get(tcp_text, ("-tnp",)))
+            self.tcp_listen = parse_ss_tcp(get(tcp_listen_text, ("-tlnp",)))
         self.by_inode = {r["inode"]: r for r in self.unix}
+
+
+class LazySnapshot:
+    """Builds the Snapshot on first use; one instance is shared by every pass of a decision."""
+
+    def __init__(self):
+        self._snap = None
+
+    def get(self):
+        if self._snap is None:
+            self._snap = Snapshot()
+        return self._snap
+
+    @property
+    def built(self):
+        return self._snap is not None
 
 
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}

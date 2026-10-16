@@ -12,7 +12,8 @@ def decide(members, edges, protected=(), seed_share=(), comms=None, ppids=None, 
     store = knowledge.Store(tempfile.mkdtemp(), {"share": list(seed_share), "kill": []})
     pp = ppids or {p: 1 for p in members}
     with mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)), \
-         mock.patch.object(engine.inspect, "ppid_map", return_value=pp), \
+         mock.patch.object(engine.inspect.ProcTable, "scan",
+                           return_value=engine.inspect.ProcTable.from_ppid(pp)), \
          mock.patch.object(engine.inspect, "Snapshot", return_value=None), \
          mock.patch.object(engine.inspect, "edges", return_value=edges), \
          mock.patch.object(engine.inspect, "comm", side_effect=lambda p: comms[p]), \

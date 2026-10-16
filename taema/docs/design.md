@@ -31,8 +31,11 @@
     shared/<comm>-<pid>/     members kept alive because something outside uses them
 ```
 
-No controllers are enabled below `user/<uid>`, so processes may sit in a parent and in its
-children at the same time. `cgroup.kill` on a parent kills the whole subtree.
+`sv/taema/run` enables the controllers `cpuset cpu io memory pids` in
+`user/<uid>/cgroup.subtree_control`, so each scope is a CPU and IO weight peer of its
+siblings. tæma sets no limits. With controllers enabled, a cgroup that has children
+cannot hold processes itself (no-internal-process rule): put processes in leaves.
+`cgroup.kill` on a parent kills the whole subtree.
 
 Moving a task needs write access to `cgroup.procs` of the lowest common ancestor of the
 source and destination. From a session cgroup into `user/<uid>`, that ancestor is the
@@ -100,11 +103,39 @@ Descendants of a shared process move with it.
   the edges. A leaf with no edges, and no children when `keep_while_children` is set,
   starts an idle timer. It is stopped after `idle_grace`. A podman scope whose
   `XDG_RUNTIME_DIR` is gone is a candidate at once.
+- **Empty leaves:** GC removes `app-*`, `scope-*` and `shared/*` leaves that hold no
+  process, never `manager`. Each leaf's `cgroup.events` is watched with `epoll`
+  (`EPOLLPRI`, at most 256 fds): `populated 0` removes the leaf at once. A leaf that
+  cannot be watched is removed by the GC pass when two passes in a row find it empty.
+  Only in `adopt` and `enforce` modes.
 - **Session end:** once at least one session of the user has been seen and none is left,
   every scope except `manager` and `survive_logout` units is stopped. This fires once
   per login.
 
 Mode gates every action. `observe` only logs. `adopt` also moves. `enforce` also stops.
+
+## Resource budget
+
+Targets for an idle daemon (no app starting or stopping): RSS at most 25 MB, CPU at most
+0.1 % of one core. How the loops stay inside them:
+
+- The daemon sleeps until the next timer (adopt, GC, at most 60 s), not at 1 Hz. A signal
+  wakes it at once through `signal.set_wakeup_fd`.
+- One `/proc/*/stat` snapshot (`inspect.ProcTable`) per adopt, GC or stop pass.
+- Fork gate: an adopt pass is skipped when the last pid in `/proc/loadavg` and the pid
+  sets of the session cgroups are unchanged. At least every fifth pass runs anyway.
+- `ss` runs only when a decision needs edges, as two calls (`-xapn`, `-tanp`) shared by
+  all passes of a stop.
+- Session end is checked at the adopt interval, from `/run/systemd/users/<uid>`
+  (`STATE=`, `SESSIONS=`) when readable, else by scanning session cgroups.
+- State is bounded: 512 exes, 256 owner watches, 256 leaf watches, `idle_since` pruned to
+  existing leaves, `knowledge.json` written compact and at most every 300 s (at once after
+  an explicit answer and on exit), `decisions.log` logs state changes only and rotates at
+  1 MiB to `decisions.log.1`.
+
+`tests/test_budget.py` checks that repeated passes on a fake tree do not grow these
+structures and that the idle loop sleeps more than 1 s. RSS and CPU are measured on a
+live machine with `ps -o rss,time -p $(pgrep -f taema)`.
 
 ## Learning
 

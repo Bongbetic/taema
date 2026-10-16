@@ -14,6 +14,10 @@ DECAY_DAYS = 7
 DECAY_FACTOR = 0.9
 COUNTERS = ("seen", "shared_hits", "killed", "sigkill_needed", "respawned", "user_keep", "user_kill")
 SEED_SHARE_PRIOR = 3.0
+SAVE_INTERVAL = 300         # seconds between routine saves; answers and exit save at once
+LOG_MAX = 1 << 20           # decisions.log rotates to decisions.log.1 at 1 MiB
+MAX_EXES = 512
+STALE_DAYS = 90
 
 
 class Store:
@@ -27,6 +31,7 @@ class Store:
         self.read_only = read_only      # CLI: the daemon is the single writer
         self.dirty = False
         self.last_save = 0.0
+        self.sigs = {}          # change-detection signatures for log lines (see changed())
         self.data = {"last_decay": self.now(), "exes": {}}
         self._load()
         self._decay()
@@ -74,7 +79,7 @@ class Store:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             os.fchmod(f.fileno(), 0o600)
-            json.dump(self.data, f, indent=1, sort_keys=True)
+            json.dump(self.data, f, separators=(",", ":"), sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.path)
@@ -91,10 +96,27 @@ class Store:
     def log(self, **fields):
         fields["ts"] = round(self.now(), 3)
         self._mkdir()
+        try:
+            if os.stat(self.log_path).st_size >= LOG_MAX:
+                os.replace(self.log_path, self.log_path + ".1")
+        except OSError:
+            pass
         fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as f:
             os.fchmod(f.fileno(), 0o600)
             f.write(json.dumps(fields, sort_keys=True) + "\n")
+
+    def changed(self, key, sig):
+        """True when sig differs from the last one seen for key (and remembers it)."""
+        if self.sigs.get(key) == sig:
+            return False
+        self.sigs[key] = sig
+        return True
+
+    def forget_sigs(self, prefix, keep):
+        """Drop remembered signatures under prefix that are not in keep (bounds the table)."""
+        for k in [k for k in self.sigs if k.startswith(prefix) and k not in keep]:
+            del self.sigs[k]
 
     # ---- feedback ----
     def apply_op(self, op, key):
@@ -176,7 +198,7 @@ class Store:
         """True for [seeds] persist keys (tmux, gpg-agent ...): never a GC candidate."""
         return key in self.seeds.get("persist", [])
 
-    def _decay(self):
+    def decay(self):
         days = (self.now() - self.data.get("last_decay", self.now())) / 86400.0
         steps = int(days // DECAY_DAYS)
         if steps <= 0:
@@ -188,6 +210,30 @@ class Store:
                 v = r.get(c, 0.0) * f
                 r[c] = 0.0 if v < 0.01 else v
         self.data["last_decay"] += steps * DECAY_DAYS * 86400
+
+    _decay = decay
+
+    @staticmethod
+    def _empty(r):
+        return (all(r.get(c, 0.0) == 0 for c in COUNTERS) and not r.get("term_exit_ms")
+                and not r.get("stops") and r.get("idle_grace_scale", 1.0) == 1.0)
+
+    def enforce_caps(self):
+        """Drop all-zero records; above MAX_EXES evict stale (last_seen > 90 days) records first,
+        then the lowest decayed weight."""
+        exes = self.data["exes"]
+        for k in [k for k, r in exes.items() if self._empty(r)]:
+            del exes[k]
+            self.dirty = True
+        over = len(exes) - MAX_EXES
+        if over > 0:
+            cutoff = self.now() - STALE_DAYS * 86400
+            order = sorted(exes, key=lambda k: (exes[k].get("last_seen", 0) >= cutoff,
+                                                sum(exes[k].get(c, 0.0) for c in COUNTERS),
+                                                exes[k].get("last_seen", 0)))
+            for k in order[:over]:
+                del exes[k]
+            self.dirty = True
 
     # ---- derived defaults ----
     def default_action(self, key):

@@ -7,10 +7,12 @@ import subprocess
 import sys
 import time
 
-from . import cgroup, inspect, policy
+from . import cgroup, inspect, knowledge, policy
 
 
 HOOK_TIMEOUT = 30
+EMPTY_PREFIXES = ("app-", "scope-")
+POLL_STEP = 0.05
 
 
 class Refused(Exception):
@@ -56,22 +58,29 @@ def unit_for_leaf(units, leaf):
 
 # ---- stop ---------------------------------------------------------------------------------
 
-def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=()):
-    """Decide per member: kill | share | skip. Never touches anything."""
+def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=(), pt=None, snap=None):
+    """Decide per member: kill | share | skip. Never touches anything.
+
+    pt: the pass's ProcTable. snap: an inspect.LazySnapshot shared across passes; ss runs only
+    when at least one member is unprotected (a candidate for kill)."""
     pids = cgroup.tree_procs(path)
     pset = set(pids)
-    pp = inspect.ppid_map()
-    snap = inspect.Snapshot()
-    edges_ok = getattr(snap, "ok", True)
-    edge_map = inspect.edges(pset, snap)
-    if not edges_ok:
-        store.log(event="edge_scan_failed", scope=cgroup.rel(path))
+    pt = pt or inspect.ProcTable.scan()
+    reasons = {pid: policy.protected_reason(pid, cfg) for pid in pids}
+    edge_map, edges_ok = {}, True
+    if any(r is None for r in reasons.values()):
+        snap = snap or inspect.LazySnapshot()
+        s = snap.get()
+        edges_ok = getattr(s, "ok", True)
+        edge_map = inspect.edges(pset, s)
+        if not edges_ok:
+            store.log(event="edge_scan_failed", scope=cgroup.rel(path))
     keep_set = set(keep) | set((unit or {}).get("kill", {}).get("keep", []))
     out = {}
     for pid in pids:
         key = policy.exe_key(pid)
         d = {"pid": pid, "comm": inspect.comm(pid), "key": key, "edges": edge_map.get(pid, [])}
-        reason = policy.protected_reason(pid, cfg)
+        reason = reasons[pid]
         if reason:
             d.update(action="skip", why=reason)
         elif d["edges"] and not hard:
@@ -89,7 +98,7 @@ def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=()):
     # a descendant of a shared pid moves with it
     shared = {p for p, d in out.items() if d["action"] == "share"}
     for pid, d in out.items():
-        if d["action"] == "kill" and any(a in shared for a in inspect.ancestors(pid, pp)):
+        if d["action"] == "kill" and any(a in shared for a in pt.ancestors(pid)):
             d.update(action="share", why="descendant of a shared process")
     return list(out.values())
 
@@ -139,7 +148,7 @@ def _wait_each(path, pids, seconds):
             gone[p] = (time.monotonic() - t0) * 1000
         if not left or time.monotonic() >= deadline:
             return gone
-        time.sleep(0.1)
+        time.sleep(POLL_STEP)
 
 
 def _run_hook(hook):
@@ -165,27 +174,28 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
     report = {"scope": cgroup.rel(path), "decisions": [], "removed": False, "left": []}
     ran_hook = False
     counted, killed_keys, sigkill_keys = set(), set(), set()
+    snap = inspect.LazySnapshot()     # one ss snapshot for all passes, built only if needed
     for _ in range(passes):
-        plan = plan_stop(path, cfg, store, unit, force, hard, keep)
+        pt = inspect.ProcTable.scan()
+        plan = plan_stop(path, cfg, store, unit, force, hard, keep, pt=pt, snap=snap)
         report["decisions"].extend(plan)
         if dry_run or not plan:
             break
         shared = [d for d in plan if d["action"] == "share"]
         kill = [d for d in plan if d["action"] == "kill"]
-        pp = inspect.ppid_map()
         shared_pids = {d["pid"] for d in shared}
-        roots = [d for d in shared if not any(a in shared_pids for a in inspect.ancestors(d["pid"], pp))]
+        roots = [d for d in shared if not any(a in shared_pids for a in pt.ancestors(d["pid"]))]
         for d in shared:
             for e in d["edges"]:
                 store.bump(d["key"], "shared_hits", 1.0)
         for r in roots:
             dest = cgroup.mkleaf("shared/" + leaf_slug(r["comm"], r["pid"]))
-            moving = [p for p in inspect.descendants([r["pid"]], pp) if p in shared_pids]
+            moving = [p for p in pt.descendants([r["pid"]]) if p in shared_pids]
             dest_cg = "/user/%d/%s" % (os.getuid(), cgroup.rel(dest))
             for _i in range(3):
                 for p in moving:
                     cgroup.move(p, dest)
-                moving = [p for p in inspect.descendants([r["pid"]]) if p in shared_pids
+                moving = [p for p in inspect.ProcTable.scan().descendants([r["pid"]]) if p in shared_pids
                           and cgroup.proc_cgroup(p) != dest_cg]
                 if not moving:
                     break
@@ -232,7 +242,7 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
     store.log(event="stop", scope=report["scope"], dry_run=dry_run, removed=report["removed"],
               decisions=[{k: v for k, v in d.items() if k != "edges"} | {"edges": len(d["edges"])}
                          for d in report["decisions"]])
-    store.save_if_dirty()
+    store.save_if_dirty(knowledge.SAVE_INTERVAL)
     return report
 
 
@@ -276,11 +286,12 @@ def _matches(m, pid, env=None):
 
 
 def adopt_plan(cfg, units, pp=None):
-    """Operations that move matching processes out of the login session cgroup."""
+    """Operations that move matching processes out of the login session cgroup.
+    pp: the pass's ProcTable (scanned here when omitted)."""
     in_session = set()
     for session in policy.session_cgroups(cfg):
         in_session.update(cgroup.procs(session))
-    pp = pp or inspect.ppid_map()
+    pp = pp or inspect.ProcTable.scan()
     ops = []
     for u in units:
         m = u.get("match")
@@ -290,7 +301,7 @@ def adopt_plan(cfg, units, pp=None):
         if not cgroup.valid_rel(name) or "/" in name:
             name = leaf_slug(name)
         matched = [p for p in in_session if _matches(m, p) and not policy.protected_reason(p, cfg)]
-        roots = [p for p in matched if not any(a in matched for a in inspect.ancestors(p, pp))]
+        roots = [p for p in matched if not any(a in matched for a in pp.ancestors(p))]
         groups = {}
         for r in roots:
             env = inspect.environ(r)
@@ -309,14 +320,14 @@ def adopt_plan(cfg, units, pp=None):
                     extra += [p for p in in_session
                               if inspect.comm(p) == c.get("comm") and
                               inspect.environ(p).get(c["same_env"]) == val]
-            moved = [p for p in inspect.descendants(rs + extra, pp) if p in in_session]
+            moved = [p for p in pp.descendants(rs + extra) if p in in_session]
             ops.append({"op": "move", "scope": scope, "unit": name, "pids": moved})
     return ops
 
 
 def carve_plan(cfg, units, pp=None):
     """Child scopes (sessions, vm) for processes sitting directly in an app scope."""
-    pp = pp or inspect.ppid_map()
+    pp = pp or inspect.ProcTable.scan()
     ops = []
     for u in units:
         if u.get("unit", {}).get("kind") != "app" or not u.get("children"):
@@ -331,17 +342,27 @@ def carve_plan(cfg, units, pp=None):
                     continue
                 want = c.get("ancestor_comm") or c.get("comm")
                 roots = [p for p in direct if inspect.comm(p) == want]
-                roots = [p for p in roots if not any(a in roots for a in inspect.ancestors(p, pp))]
+                roots = [p for p in roots if not any(a in roots for a in pp.ancestors(p))]
                 for r in roots:
-                    members = [p for p in inspect.descendants([r], pp) if p in direct]
+                    members = [p for p in pp.descendants([r]) if p in direct]
                     ops.append({"op": "carve", "parent": os.path.basename(scope_dir),
                                 "scope": "%s/%s-%d" % (os.path.basename(scope_dir), c["name"], r),
                                 "root": r, "binds_to": c.get("binds_to"), "pids": members})
     return ops
 
 
+def _inside_user(pid):
+    """True when pid already sits in user/<uid> (a move from there needs no root helper)."""
+    cg = cgroup.proc_cgroup(pid) or ""
+    me = "/user/%d" % os.getuid()
+    return cg == me or cg.startswith(me + "/")
+
+
 def run_ops(cfg, store, ops, execute):
-    """Log every op; perform it when `execute`. Returns the ops with a 'done' flag."""
+    """Log every op; perform it when `execute`. Returns the ops with a 'done' flag.
+    Pids inside user/<uid> move directly; the sudo helper is used only for pids in a session
+    cgroup. A repeated adopt_would for an identical op is not logged again."""
+    seen = set()
     for op in ops:
         op["done"] = False
         pids = [p for p in op["pids"] if not policy.protected_reason(p, cfg)]
@@ -349,21 +370,34 @@ def run_ops(cfg, store, ops, execute):
         op["pids"] = pids
         if execute and pids:
             cgroup.mkleaf(op["scope"])
-            if op["op"] == "move":
-                helper_move(cfg, op["scope"], pids)
-            else:
-                dest = cgroup.base() + "/" + op["scope"]
+            dest = cgroup.base() + "/" + op["scope"]
+            outside = [p for p in pids if not _inside_user(p)]
+            if outside:
+                helper_move(cfg, op["scope"], outside)
+            inside = [p for p in pids if p not in set(outside)]
+            if op["op"] == "carve":
                 for _i in range(3):
-                    for p in pids:
+                    for p in inside:
                         cgroup.move(p, dest)
-                    pids = [p for p in inspect.descendants([op["root"]]) if p in set(op["pids"])
-                            and cgroup.proc_cgroup(p) != "/user/%d/%s" % (os.getuid(), op["scope"])]
-                    if not pids:
+                    inside = [p for p in inspect.descendants([op["root"]]) if p in set(op["pids"])
+                              and cgroup.proc_cgroup(p) != "/user/%d/%s" % (os.getuid(), op["scope"])]
+                    if not inside:
                         break
+            else:
+                for p in inside:
+                    cgroup.move(p, dest)
             op["done"] = True
-        store.log(event="adopt" if execute else "adopt_would", op=op["op"], scope=op["scope"],
-                  count=len(op["pids"]), skipped_protected=op["skipped_protected"])
-    store.save_if_dirty()
+        fields = dict(op=op["op"], scope=op["scope"], count=len(op["pids"]),
+                      skipped_protected=op["skipped_protected"])
+        if execute:
+            store.log(event="adopt", **fields)
+        else:
+            seen.add(op["scope"])
+            if store.changed("adopt_would:" + op["scope"], (op["op"], tuple(sorted(op["pids"])),
+                                                           op["skipped_protected"])):
+                store.log(event="adopt_would", **fields)
+    store.forget_sigs("adopt_would:", {"adopt_would:" + x for x in seen})
+    store.save_if_dirty(knowledge.SAVE_INTERVAL)
     return ops
 
 
@@ -381,42 +415,48 @@ def _cpu_usage(path):
     return None
 
 
-def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip=None, noted=None):
+def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip=None, noted=None, pt=None):
     """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}.
 
     usage {rel: usage_usec at idle start}: CPU that moves during the idle window means busy.
-    skip: leaves never retried (protected member). noted: leaves already logged once."""
+    skip: leaves never retried (protected member). noted: leaves already logged once.
+    pt: the pass's ProcTable, scanned lazily. Empty app-*/scope-*/shared/* leaves come back
+    with reason "empty" (never 'manager'). The ss snapshot is built only when a leaf needs it."""
     usage = {} if usage is None else usage
     skip = set() if skip is None else skip
     noted = set() if noted is None else noted
     base = cgroup.base()
     leaves = [d for d in cgroup.subdirs(base + "/shared")]
     unit_by_prefix = {u["unit"]["name"]: u for u in units if u.get("unit", {}).get("kind") == "app"}
-    for d in cgroup.subdirs(base):
+    top = cgroup.subdirs(base)
+    for d in top:
         n = os.path.basename(d)
         for un, u in unit_by_prefix.items():
             if (n == un or n.startswith(un + "-")) and u["unit"].get("stop_when_unneeded"):
                 leaves.append(d)
+    gc_set = set(leaves)
+    leaves += [d for d in top if d not in gc_set and os.path.basename(d).startswith(EMPTY_PREFIXES)]
     live = {cgroup.rel(d) for d in leaves}
-    for table in (usage, skip, noted):
+    for table in (idle_since, usage, skip, noted):
         for k in [k for k in table if k not in live]:
             table.discard(k) if isinstance(table, set) else table.pop(k)
     out = []
-    snap = inspect.Snapshot()
-    pp = None
+    snap = inspect.LazySnapshot()
     seeds = cfg.get("seeds", {})
     protect = set(seeds.get("share", [])) | set(seeds.get("persist", []))
     for d in leaves:
         rel = cgroup.rel(d)
-        if rel in skip:
+        if rel in skip or os.path.basename(d) == "manager":
             continue
         pids = cgroup.tree_procs(d)
         if not pids:
             out.append((d, "empty"))
             continue
+        if d not in gc_set:
+            continue
         if rel.startswith("shared/"):
-            pp = pp or inspect.ppid_map()
-            roots = [p for p in pids if not any(a in pids for a in inspect.ancestors(p, pp))]
+            pt = pt or inspect.ProcTable.scan()
+            roots = [p for p in pids if not any(a in pids for a in pt.ancestors(p))]
             held = next((k for k in map(policy.exe_key, roots)
                          if k in protect or store.peek(k)["user_keep"] > 0), None)
             if held:
@@ -435,8 +475,9 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
             if dirs and all(not os.path.isdir(x) for x in dirs):
                 out.append((d, "%s gone: %s" % (var, sorted(dirs)[0])))
                 continue
-        edge_map = inspect.edges(set(pids), snap)
-        busy = bool(edge_map) or not getattr(snap, "ok", True)
+        s = snap.get()
+        edge_map = inspect.edges(set(pids), s)
+        busy = bool(edge_map) or not getattr(s, "ok", True)
         if gc.get("keep_while_children") and u:
             root_comm = (u.get("match") or {}).get("comm")
             busy = busy or any(inspect.comm(p) != root_comm for p in pids)
@@ -455,3 +496,14 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
         if now() - first >= grace:
             out.append((d, "idle %ds >= grace %ds" % (now() - first, grace)))
     return out
+
+
+def remove_empty(path):
+    """rmdir an empty leaf tree. False when a process is (or became) present or rmdir fails."""
+    if os.path.basename(path) == "manager" or cgroup.tree_procs(path):
+        return False
+    try:
+        cgroup.rmdir_tree(path)
+        return True
+    except OSError:
+        return False

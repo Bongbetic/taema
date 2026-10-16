@@ -107,7 +107,8 @@ class ProcRoot(unittest.TestCase):
 def plan(snap, members=(10, 11), protected=(), hard=False):
     store = knowledge.Store(tmp(), {})
     with mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)), \
-         mock.patch.object(engine.inspect, "ppid_map", return_value={p: 1 for p in members}), \
+         mock.patch.object(engine.inspect.ProcTable, "scan",
+                           return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in members})), \
          mock.patch.object(engine.inspect, "Snapshot", return_value=snap), \
          mock.patch.object(engine.inspect, "edges", return_value={}), \
          mock.patch.object(engine.inspect, "comm", side_effect=lambda p: "p%d" % p), \
@@ -152,7 +153,8 @@ class StopAccounting(unittest.TestCase):
             with mock.patch.object(engine, "_signal_all", side_effect=fake_signal), \
                  mock.patch.object(engine, "self_guard"), \
                  mock.patch.object(engine, "_wait_each", wraps=engine._wait_each), \
-                 mock.patch.object(engine.inspect, "ppid_map", return_value={p: 1 for p in pids}), \
+                 mock.patch.object(engine.inspect.ProcTable, "scan",
+                           return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in pids})), \
                  mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()), \
                  mock.patch.object(engine.inspect, "edges", return_value={}), \
                  mock.patch.object(engine.inspect, "comm", side_effect=lambda p: keys[p]), \
@@ -396,7 +398,8 @@ class GcRules(unittest.TestCase):
 
     def run_gc(self, cfg=None, idle=None, usage=None, skip=None, noted=None, snap=None):
         cfg = cfg or make_cfg(tmp(), seeds={"share": ["adb"], "persist": ["tmux"]})
-        with mock.patch.object(engine.inspect, "ppid_map", return_value={}), \
+        with mock.patch.object(engine.inspect.ProcTable, "scan",
+                           return_value=engine.inspect.ProcTable.from_ppid({})), \
              mock.patch.object(engine.inspect, "Snapshot", return_value=snap or OkSnap()), \
              mock.patch.object(engine.inspect, "edges", return_value={}), \
              mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: self.keys.get(p, "x")):

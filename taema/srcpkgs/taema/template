@@ -1,0 +1,21 @@
+# Template file for 'taema'
+pkgname=taema
+version=0.1.0
+revision=1
+build_wrksrc=taema
+build_style=gnu-makefile
+make_check_target=test
+checkdepends="python3 iproute2"
+depends="python3>=3.11 iproute2 util-linux sudo runit"
+short_desc="Dependency-aware, self-managing cgroup v2 process scopes"
+maintainer="soubarnak <soubarna@live.in>"
+license="MIT"
+homepage="https://github.com/Bongbetic/void-mods"
+distfiles="https://github.com/Bongbetic/void-mods/archive/refs/tags/taema-v${version}.tar.gz"
+checksum=@CHECKSUM@
+system_groups="taema"
+conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
+
+post_install() {
+	vlicense ${wrksrc}/LICENSE
+}

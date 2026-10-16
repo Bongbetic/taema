@@ -1,0 +1,3 @@
+#!/bin/sh
+mkdir -p /var/log/taema/service
+exec svlogd -tt /var/log/taema/service

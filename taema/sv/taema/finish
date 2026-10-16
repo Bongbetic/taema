@@ -1,0 +1,3 @@
+#!/bin/sh
+# runsvdir exits on TERM without stopping the per-user daemons: stop them here.
+exec /usr/libexec/taema/taema-svstop

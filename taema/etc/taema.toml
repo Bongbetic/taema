@@ -1,0 +1,60 @@
+# /etc/taema/taema.toml: system defaults and hard rules for taema.
+#
+# Each user may override mode, timers and seeds in ~/.config/taema/taema.toml and may add
+# [protected] entries there. A user file can never remove a protected entry set here.
+# The root helper (taema-attach) reads only this file.
+#
+# Modes, in the order they should be enabled:
+#   observe  log every move and kill the daemon would make; change nothing
+#   adopt    move matching processes into scopes; never kill
+#   enforce  move and kill
+mode = "observe"
+
+[paths]
+# Login session cgroup. "auto" = every top-level numeric cgroup (elogind session) that holds
+# a process of the user. Set an absolute path to pin one.
+session_cgroup = "auto"
+# Defaults (uncomment to change):
+# state_dir = "~/.local/state/taema"
+# socket = "/run/user/<uid>/taema.sock"
+# hooks_dir = "~/.config/taema/hooks"
+
+[timers]
+adopt_interval = 15      # seconds between adopt passes
+gc_interval = 60         # seconds between GC passes
+idle_grace = 600         # seconds a shared scope must stay unused before GC stops it
+graceful_timeout = 10    # seconds between SIGTERM and SIGKILL
+respawn_window = 60      # seconds: a kill followed by the same exe reappearing counts as "needed"
+
+# Hard rules. Never learned, never overridden by unit files.
+[protected]
+# Session infrastructure by comm (the 15-character kernel name, see /proc/PID/comm).
+# Shell-style globs are allowed. Never adopted, never signalled.
+comm = [
+  # compositors and window managers
+  "niri", "sway", "Hyprland", "river", "labwc", "wayfire", "kwin_wayland", "kwin_x11",
+  "gnome-shell", "plasmashell", "Xwayland", "Xorg", "X", "xwayland-satell",
+  # desktop shells and bars
+  "waybar", "quickshell", "qs", "noctalia-shell", "dms-guard", "mako", "dunst", "swaync",
+  # audio, session bus, secrets, portals, accessibility
+  "pipewire", "pipewire-pulse", "wireplumber", "pulseaudio",
+  "dbus-daemon", "dbus-broker", "dbus-run-sessio", "gnome-keyring-d",
+  "xdg-desktop-por", "xdg-permission-", "xdg-document-po",
+  "at-spi2-registr", "at-spi-bus-laun", "gvfsd*", "polkit-*",
+  # login and supervision
+  "greetd", "elogind", "seatd", "runsv", "runsvdir", "ssh-agent", "gpg-agent",
+]
+# Absolute cgroup paths the manager never reads for decisions and never writes.
+# Example: cgroup_prefix = ["/sys/fs/cgroup/myproject"]
+cgroup_prefix = []
+
+# Processes whose environment variable starts with one of these prefixes are never moved
+# or signalled. Example: a tool that runs its own rootless podman under /run/mytool:
+# [protected.env_prefix]
+# XDG_RUNTIME_DIR = ["/run/mytool"]
+
+# Day-one defaults for the learning store, by exe basename. Learned counters can move an
+# exe between "share" and "kill" over time; `taema explain NAME` shows why.
+[seeds]
+share = ["catatonit", "conmon", "adb", "herdr", "tmux", "GradleDaemon", "kotlin-daemon", "ssh-agent", "gpg-agent"]
+kill = ["qemu-system-x86_64", "qemu-system-x86_64-headless", "emulator", "node", "python3", "java"]

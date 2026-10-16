@@ -1,0 +1,19 @@
+# herdr terminal workspace server. Shared by every herdr client; stopped only when unused.
+# Install: cp this file to ~/.config/taema/units/
+[unit]
+name = "app-herdr"
+kind = "app"
+stop_when_unneeded = true
+
+[match]
+comm = "herdr"
+cmdline_contains = "server"
+
+[kill]
+# Detached servers are designed to outlive the login session.
+survive_logout = true
+graceful = 10
+
+[gc]
+# Panes survive without a client (tmux-like): the scope is needed while it has children.
+keep_while_children = true

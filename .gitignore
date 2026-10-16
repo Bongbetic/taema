@@ -1,0 +1,8 @@
+# private working notes, never published
+notes/
+# build output
+taema/build/
+*.xbps
+*-repodata
+__pycache__/
+*.pyc

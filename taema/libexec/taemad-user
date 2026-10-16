@@ -1,0 +1,36 @@
+#!/bin/sh
+# taemad-user [USER]: run one user's taema daemon. The taema service creates
+# /run/taema/sv/USER/run as a symlink to this file (/run is mounted noexec), so USER
+# defaults to the name of the service directory. Places itself in the user's manager/
+# leaf (the move out of the root cgroup needs root), then drops to the user.
+exec 2>&1
+set -eu
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+umask 022
+
+user=${1:-$(basename "$(pwd -P)")}
+if ! ent=$(getent passwd "$user"); then
+    echo "taemad-user: no such user: $user" >&2
+    sleep 30
+    exit 1
+fi
+uid=$(printf '%s' "$ent" | cut -d: -f3)
+gid=$(printf '%s' "$ent" | cut -d: -f4)
+home=$(printf '%s' "$ent" | cut -d: -f6)
+cg=/sys/fs/cgroup/user/$uid
+
+if [ ! -d "$cg" ] || [ "$(stat -c %u "$cg")" != "$uid" ]; then
+    echo "taemad-user: $cg is not delegated to $user; retrying" >&2
+    sleep 5
+    exit 1
+fi
+
+mkdir -p "$cg/manager"
+chown "$uid:$gid" "$cg/manager" "$cg/manager/cgroup.procs"
+printf '%s\n' "$$" > "$cg/manager/cgroup.procs"
+
+exec setpriv --reuid="$uid" --regid="$gid" --init-groups --inh-caps=-all --reset-env \
+    env HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/$uid" \
+    XDG_CONFIG_HOME="$home/.config" XDG_STATE_HOME="$home/.local/state" \
+    PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+    /usr/bin/taema daemon

@@ -1,0 +1,13 @@
+#!/bin/sh
+# taema-svstop: stop every per-user runsv under /run/taema/sv. runsvdir exits on TERM
+# without stopping its children, so the taema service calls this from finish and before
+# it starts a new runsvdir.
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+for d in /run/taema/sv/*/; do
+    [ -p "${d}supervise/control" ] || continue
+    sv -w 15 force-stop "$d" >/dev/null 2>&1
+    [ -p "${d}log/supervise/control" ] && sv -w 5 force-stop "${d}log" >/dev/null 2>&1
+    sv exit "$d" >/dev/null 2>&1
+    [ -p "${d}log/supervise/control" ] && sv exit "${d}log" >/dev/null 2>&1
+done
+exit 0

@@ -1,0 +1,3 @@
+#!/bin/sh
+# scoperun: alias for `taema run`.
+exec "$(dirname "$(readlink -f "$0")")/taema" run "$@"

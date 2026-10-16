@@ -1,0 +1,3 @@
+# Members of the taema group may run the taema root helper. It moves only their own
+# processes, into their own delegated cgroup subtree (see taema-attach).
+%taema ALL=(root) NOPASSWD: /usr/libexec/taema/taema-attach

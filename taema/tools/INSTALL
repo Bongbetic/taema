@@ -1,0 +1,14 @@
+#!/bin/sh
+# xbps INSTALL script for local builds (tools/build-xbps.sh). void-packages builds use
+# system_groups in the template instead.
+# Arguments: ACTION PKGNAME VERSION UPDATE CONF_FILE ARCH
+case "$1" in
+post)
+    if ! getent group taema >/dev/null 2>&1; then
+        groupadd -r taema && echo "Created system group taema."
+    fi
+    echo "taema: add users with 'usermod -aG taema USER', then enable the service:"
+    echo "       ln -s /etc/sv/taema /var/service/"
+    ;;
+esac
+exit 0

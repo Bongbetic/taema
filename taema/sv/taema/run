@@ -1,0 +1,75 @@
+#!/bin/sh
+# taema: delegate a cgroup v2 subtree (/sys/fs/cgroup/user/<uid>) to each member of the
+# taema group and supervise one taema daemon per member. Runs as root under runsv.
+# Optional settings in ./conf: TAEMA_GROUP, TAEMA_CONTROLLERS.
+exec 2>&1
+set -u
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+umask 022
+[ -r ./conf ] && . ./conf
+
+GROUP=${TAEMA_GROUP:-taema}
+CONTROLLERS=${TAEMA_CONTROLLERS:-cpu cpuset io memory pids}
+CG=/sys/fs/cgroup
+SVDIR=/run/taema/sv
+LOGDIR=/var/log/taema/users
+
+log() {
+    printf '%s\n' "taema: $*" >&2
+}
+
+# enable_controllers DIR: write +CTRL for each wanted controller DIR offers and has not
+# enabled. One refusing controller is logged and skipped.
+enable_controllers() {
+    offered=$(cat "$1/cgroup.controllers") || return 1
+    enabled=$(cat "$1/cgroup.subtree_control") || return 1
+    for ctrl in $CONTROLLERS; do
+        case " $offered " in *" $ctrl "*) ;; *) continue ;; esac
+        case " $enabled " in *" $ctrl "*) continue ;; esac
+        printf '+%s\n' "$ctrl" > "$1/cgroup.subtree_control" || log "could not enable $ctrl in $1"
+    done
+    return 0
+}
+
+if [ ! -f "$CG/cgroup.controllers" ]; then
+    log "cgroup v2 is not mounted at $CG"
+    sleep 30
+    exit 1
+fi
+if ! gent=$(getent group "$GROUP"); then
+    log "group $GROUP does not exist"
+    sleep 30
+    exit 1
+fi
+gid=$(printf '%s' "$gent" | cut -d: -f3)
+members=$( { printf '%s' "$gent" | cut -d: -f4 | tr ',' '\n'
+             getent passwd | awk -F: -v g="$gid" '$4 == g { print $1 }'; } | sed '/^$/d' | sort -u)
+
+enable_controllers "$CG"
+mkdir -p "$CG/user"
+enable_controllers "$CG/user"
+
+/usr/libexec/taema/taema-svstop
+rm -rf "$SVDIR"
+mkdir -p "$SVDIR"
+
+for user in $members; do
+    ent=$(getent passwd "$user") || { log "no such user: $user"; continue; }
+    uid=$(printf '%s' "$ent" | cut -d: -f3)
+    ugid=$(printf '%s' "$ent" | cut -d: -f4)
+    [ "$uid" != 0 ] || { log "refusing root"; continue; }
+    d=$CG/user/$uid
+    mkdir -p "$d" || { log "mkdir $d failed"; continue; }
+    enable_controllers "$d"
+    chown "$uid:$ugid" "$d" "$d/cgroup.procs" "$d/cgroup.threads" "$d/cgroup.subtree_control" ||
+        { log "chown $d failed"; continue; }
+    mkdir -p "$SVDIR/$user/log" "$LOGDIR/$user"
+    # /run is mounted noexec: the run scripts are symlinks to executables in /usr/libexec,
+    # which derive the user name from the service directory.
+    ln -s /usr/libexec/taema/taemad-user "$SVDIR/$user/run"
+    ln -s /usr/libexec/taema/taemad-log "$SVDIR/$user/log/run"
+    log "delegated $d to $user"
+done
+[ -n "$members" ] || log "group $GROUP has no members; add one with: usermod -aG $GROUP USER; sv restart taema"
+
+exec runsvdir -P "$SVDIR"

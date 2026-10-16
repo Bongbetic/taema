@@ -1,0 +1,3 @@
+#!/bin/sh
+# scopekill: alias for `taema kill`.
+exec "$(dirname "$(readlink -f "$0")")/taema" kill "$@"

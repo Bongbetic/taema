@@ -1,0 +1,23 @@
+# Claude Desktop and everything it spawns.
+# Install: cp this file to ~/.config/taema/units/
+[unit]
+name = "app-claude-desktop"
+kind = "app"
+
+[match]
+exe = "/usr/lib/claude-desktop/claude-desktop"
+
+# Sub-scopes carved out of the adopted subtree. Each child scope is bound to its own root
+# process: when that process exits, the child scope is stopped.
+[[children]]
+name = "session"           # becomes session-<pid>
+ancestor_comm = "disclaimer"
+binds_to = "root"
+
+[[children]]
+name = "cowork-vm"
+comm = "cowork-linux-he"
+binds_to = "root"
+
+[kill]
+graceful = 10

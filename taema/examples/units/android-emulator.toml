@@ -1,0 +1,14 @@
+# Explicit project scope for an Android emulator, started with:
+#   taema run emulator emulator -avd MyAvd -no-window -no-audio
+# and stopped with `taema kill emulator`.
+# Install: cp this file to ~/.config/taema/units/ and android-emulator.stop to
+# ~/.config/taema/hooks/emulator.stop
+[unit]
+name = "scope-emulator"
+kind = "scope"
+
+[kill]
+graceful = 15
+# exe basenames that are moved to shared/ instead of killed, even without a detected edge:
+# the adb server is shared by every Android tool on the machine.
+keep = ["adb"]

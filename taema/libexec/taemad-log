@@ -1,0 +1,6 @@
+#!/bin/sh
+# taemad-log: log service for one user's taema daemon. /run/taema/sv/USER/log/run is a
+# symlink to this file; USER is the name of the parent service directory.
+user=$(basename "$(dirname "$(pwd -P)")")
+mkdir -p "/var/log/taema/users/$user"
+exec svlogd -tt "/var/log/taema/users/$user"

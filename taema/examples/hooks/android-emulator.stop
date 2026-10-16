@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stop hook for scope-emulator: ask the emulator to exit cleanly before SIGTERM/SIGKILL.
+# taema runs ~/.config/taema/hooks/<name>.stop for scope-<name> when it is executable.
+adb=${ANDROID_HOME:-$HOME/Android/Sdk}/platform-tools/adb
+[ -x "$adb" ] || adb=adb
+exec "$adb" emu kill

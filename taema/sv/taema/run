@@ -22,6 +22,7 @@ CONTROLLERS=${TAEMA_CONTROLLERS:-cpu cpuset io memory pids}
 CG=/sys/fs/cgroup
 SVDIR=/run/taema/sv
 LOGDIR=/var/log/taema/users
+PIDFILE=/run/taema/rescan.pid
 
 log() {
     printf '%s\n' "taema: $*" >&2
@@ -42,45 +43,84 @@ enable_controllers() {
     return 0
 }
 
+# member_list: one member of the group per line (supplementary and primary).
+member_list() {
+    gent=$(getent group "$GROUP") || return 1
+    gid=$(printf '%s' "$gent" | cut -d: -f3)
+    { printf '%s' "$gent" | cut -d: -f4 | tr ',' '\n'
+      getent passwd | awk -F: -v g="$gid" '$4 == g { print $1 }'; } | sed '/^$/d' | sort -u
+}
+
+# sync_members [start]: delegate a cgroup and create a service directory for each member that
+# has none yet. Safe to repeat. With "start", problems are logged; later passes stay quiet
+# about them so the log does not fill up once a minute.
+sync_members() {
+    members=$(member_list) || return 1
+    for user in $members; do
+        [ ! -e "$SVDIR/$user" ] || continue
+        ent=$(getent passwd "$user") || { [ "${1-}" != start ] || log "no such user: $user"; continue; }
+        uid=$(printf '%s' "$ent" | cut -d: -f3)
+        ugid=$(printf '%s' "$ent" | cut -d: -f4)
+        [ "$uid" != 0 ] || { [ "${1-}" != start ] || log "refusing root"; continue; }
+        d=$CG/user/$uid
+        mkdir -p "$d" || { [ "${1-}" != start ] || log "mkdir $d failed"; continue; }
+        enable_controllers "$d"
+        chown "$uid:$ugid" "$d" "$d/cgroup.procs" "$d/cgroup.threads" "$d/cgroup.subtree_control" ||
+            { [ "${1-}" != start ] || log "chown $d failed"; continue; }
+        mkdir -p "$SVDIR/$user/log" "$LOGDIR/$user"
+        # /run is mounted noexec: the run scripts are symlinks to executables in /usr/libexec,
+        # which derive the user name from the service directory.
+        ln -s /usr/libexec/taema/taemad-user "$SVDIR/$user/run"
+        ln -s /usr/libexec/taema/taemad-log "$SVDIR/$user/log/run"
+        log "delegated $d to $user"
+    done
+    return 0
+}
+
 if [ ! -f "$CG/cgroup.controllers" ]; then
     log "cgroup v2 is not mounted at $CG"
     sleep 30
     exit 1
 fi
-if ! gent=$(getent group "$GROUP"); then
+if ! getent group "$GROUP" >/dev/null; then
     log "group $GROUP does not exist"
     sleep 30
     exit 1
 fi
-gid=$(printf '%s' "$gent" | cut -d: -f3)
-members=$( { printf '%s' "$gent" | cut -d: -f4 | tr ',' '\n'
-             getent passwd | awk -F: -v g="$gid" '$4 == g { print $1 }'; } | sed '/^$/d' | sort -u)
 
 enable_controllers "$CG"
 mkdir -p "$CG/user"
 enable_controllers "$CG/user"
 
+# A rescan loop from a previous run of this service must not outlive it.
+if [ -r "$PIDFILE" ]; then
+    old=$(cat "$PIDFILE" 2>/dev/null) || old=
+    case $old in
+    ''|*[!0-9]*) ;;
+    *) case $(tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null) in
+       *run*) kill "$old" 2>/dev/null ;;
+       esac ;;
+    esac
+fi
+rm -f "$PIDFILE"
+
 /usr/libexec/taema/taema-svstop
 rm -rf "$SVDIR"
 mkdir -p "$SVDIR"
 
-for user in $members; do
-    ent=$(getent passwd "$user") || { log "no such user: $user"; continue; }
-    uid=$(printf '%s' "$ent" | cut -d: -f3)
-    ugid=$(printf '%s' "$ent" | cut -d: -f4)
-    [ "$uid" != 0 ] || { log "refusing root"; continue; }
-    d=$CG/user/$uid
-    mkdir -p "$d" || { log "mkdir $d failed"; continue; }
-    enable_controllers "$d"
-    chown "$uid:$ugid" "$d" "$d/cgroup.procs" "$d/cgroup.threads" "$d/cgroup.subtree_control" ||
-        { log "chown $d failed"; continue; }
-    mkdir -p "$SVDIR/$user/log" "$LOGDIR/$user"
-    # /run is mounted noexec: the run scripts are symlinks to executables in /usr/libexec,
-    # which derive the user name from the service directory.
-    ln -s /usr/libexec/taema/taemad-user "$SVDIR/$user/run"
-    ln -s /usr/libexec/taema/taemad-log "$SVDIR/$user/log/run"
-    log "delegated $d to $user"
-done
-[ -n "$members" ] || log "group $GROUP has no members; add one with: usermod -aG $GROUP USER; sv restart taema"
+sync_members start
+[ -n "$(member_list)" ] || log "group $GROUP has no members; add one with: usermod -aG $GROUP USER (picked up within a minute)"
+
+# runsv execs runsvdir below, so this shell keeps its pid. The loop exits when that pid is
+# gone, so no loop survives "sv restart taema".
+parent=$$
+(
+    while sleep 60; do
+        kill -0 "$parent" 2>/dev/null || exit 0
+        [ -d "$SVDIR" ] || exit 0
+        sync_members
+    done
+) &
+printf '%s\n' "$!" > "$PIDFILE"
 
 exec runsvdir -P "$SVDIR"

@@ -19,7 +19,7 @@ SYSTEM_CONFIG = os.environ.get("TAEMA_SYSTEM_CONFIG", "/etc/taema/taema.toml")
 SYSTEM_UNITS = "/etc/taema/units"
 USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
-MODES = ("observe", "adopt", "enforce")
+MODES = ("observe", "adopt", "enforce", "auto")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
 
 

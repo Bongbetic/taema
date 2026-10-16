@@ -52,7 +52,8 @@ tæma fixes that:
 - **Learns.** It remembers which programs turned out to be shared and how long they take
   to exit, and `taema explain` shows why it decided what it did.
 - **Safe.** It touches only your own processes and never session infrastructure
-  (compositor, audio, D-Bus). It starts in `observe` mode, which changes nothing.
+  (compositor, audio, D-Bus). For its first week it only adopts and learns; it stops a
+  leftover only after you answered a question about it, or after strong evidence.
 
 ## Install
 
@@ -90,30 +91,65 @@ The package is unsigned, so it installs only from a local directory repository.
 
 ## Set up
 
-The package creates the `taema` group and installs the service disabled, like every Void
-service. Only members of the `taema` group are managed.
+Nothing. The package does it when it is first installed: it adds every human user (uid
+1000 and up, with a real login shell) to the `taema` group, enables the service, and hooks
+the prompt into bash, fish and (if installed) zsh. No `usermod`, no `ln -s`, and no
+logout: `taema` finds your group through the service, which checks for new members every
+minute.
 
 ```sh
-sudo usermod -aG taema "$USER"      # log out and back in to pick up the group
-sudo ln -s /etc/sv/taema /var/service/
 taema status
 ```
 
-tæma starts in `observe` mode: it logs what it would do and changes nothing. Move up one
-mode at a time in `~/.config/taema/taema.toml`:
+Upgrades change none of this. Only a first install does it.
 
-| Mode | Behaviour |
-|---|---|
-| `observe` | Log every move and stop. Change nothing. |
-| `adopt` | Move matching processes into scopes. Never kill. |
-| `enforce` | Move, and stop scopes (GC, owner watch, session end). |
+The default mode is `auto`: tæma adopts running apps and learns from day one, and stops
+a leftover only after you said so in the prompt (or after a week and strong evidence). Run
+the commands you always run. When something is left behind, tæma asks once:
 
-```toml
-mode = "adopt"
+```
+tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
+  [1] part of npm run dev: stop them when it closes
+  [2] part of another app: code (seen 3x)
+  [3] standalone app: give them their own scope, never stop with a parent
+  [Enter] ask me later
 ```
 
-Then `sudo sv restart taema`. Watch `~/.local/state/taema/decisions.log` for a few days,
-check `taema gc --dry-run`, and switch to `enforce` once it lists only real leftovers.
+### What auto mode does
+
+`auto` is the default. From the first minute it **adopts** running apps into scopes and
+**learns**. It does not stop anything at first. It stops a leftover only in two cases:
+
+- **You answered.** In the prompt you said "stop them when it closes" for that pair
+  (owner, leftover). The next close of that owner stops that leftover: SIGTERM, a grace
+  period learned from past exits (5 to 30 s), then SIGKILL.
+- **Strong evidence, after a burn-in.** Seen stopped by you at least 5 times on at least 3
+  different days, never kept in 30 days, and a 7-day burn-in (or 20 closes) has passed.
+  Evidence alone only sends SIGTERM.
+
+Safety rules that auto mode never bends:
+
+- **Regret.** If you relaunch the same program within 30 minutes of an automatic stop,
+  tæma counts that as a "keep", pauses the pair for 7 days and asks you again. A wrong
+  answer fixes itself with no command.
+- **Never stopped:** protected session infrastructure, anything another process still
+  uses (an edge), terminal hosts (anything holding `/dev/ptmx`: terminals, tmux, screen,
+  zellij, editors), anything above 1 % CPU over 60 s, and anything whose origin tæma
+  cannot tell.
+- **Persist seeds** (tmux, screen, zellij, abduco, dtach, mosh-server, ssh-agent,
+  gpg-agent, keyboxd, dirmngr) are never garbage-collected as idle.
+- Unknown is never "no": unreadable `/proc` data, a failed `ss` run or a zombie means
+  keep and learn.
+
+### Turn it down
+
+```toml
+# ~/.config/taema/taema.toml
+mode = "observe"      # log what would happen, change nothing; or "adopt" (move, never kill)
+```
+
+Then `sudo sv restart taema`. `TAEMA_NO_PROMPT=1` in your shell environment turns the
+question off. `taema forget NAME` resets what was learned about one program.
 
 ## Use
 
@@ -155,12 +191,12 @@ configuration, safety rules and installed files are in
 ## Uninstall
 
 ```sh
-sudo rm /var/service/taema          # stop the service
-sudo xbps-remove taema              # remove the package
+sudo xbps-remove taema
 ```
 
-Running scopes stay until their processes exit. These are left on purpose, so delete
-them if you want a clean slate:
+The package's remove script stops the service, deletes the `/var/service/taema` link and
+removes the `# taema` line from `/etc/zsh/zshrc`. Running scopes stay until their
+processes exit. These are left on purpose, so delete them if you want a clean slate:
 
 ```sh
 rm -rf ~/.config/taema ~/.local/state/taema   # your config, learning data, audit log

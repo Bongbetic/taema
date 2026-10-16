@@ -1,7 +1,10 @@
 """taemad: owner watch (pidfd), adopt loop, GC loop, session-end watch, unix socket API.
 
-Single threaded. Mode gates every action: observe logs only, adopt moves, enforce also kills.
+Single threaded. Mode gates every action: observe logs only, adopt moves, enforce also kills,
+auto moves and gives every app root its own scope; it stops only what a learned or answered pair
+authorises (engine.auto_stop_ok).
 """
+import collections
 import hmac
 import json
 import os
@@ -67,6 +70,9 @@ class Daemon:
         self.next_kid = 1
         self.gone = []          # [(ts, vanished record)] from recent observes
         self.stopped = {}       # key -> ts of the last stop (respawn tracking)
+        self.auto_scopes = set()    # app-* scopes created by auto adoption (status)
+        self.auto_stops = collections.deque(maxlen=5)   # last auto stops, newest last (status)
+        self.auto_recent = {}   # leftover key -> (owner key, ts) of an auto stop, for regret
         self.started = time.time()
         self.stopping = False
         self.session_seen = False
@@ -76,10 +82,14 @@ class Daemon:
     def mode(self):
         return self.cfg["mode"]
 
+    def auto(self):
+        return self.mode == "auto"
+
     def may_move(self):
-        return self.mode in ("adopt", "enforce")
+        return self.mode in ("adopt", "enforce", "auto")
 
     def may_kill(self):
+        """Global kill switch: enforce only. Auto stops go through engine.auto_stop_ok per pair."""
         return self.mode == "enforce"
 
     # ---- owner watch ----
@@ -114,7 +124,7 @@ class Daemon:
         path = "%s/%s" % (cgroup.base(), leaf)
         if not os.path.isdir(path):
             return
-        if not self.may_kill():
+        if not (self.may_kill() or self.auto()):    # auto: owner-bound scopes are the user's own request
             self.store.log(event="would_stop", scope=leaf, why=why, mode=self.mode)
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
@@ -147,16 +157,31 @@ class Daemon:
         pt = inspect.ProcTable.scan()
         self.lineage.observe(pt)
         self.guarded(self.after_observe)
-        if not self.units:
-            self.last_result["adopt"] = []
-            return
-        ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
-        done = engine.run_ops(self.cfg, self.store, ops, self.may_move())
-        for op in done:
-            if op["op"] == "carve" and op["done"] and op.get("binds_to") == "root":
-                self.watch_owner(op["scope"], op["root"])
+        done = []
+        if self.units:
+            ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
+            done = engine.run_ops(self.cfg, self.store, ops, self.may_move())
+            for op in done:
+                if op["op"] == "carve" and op["done"] and op.get("binds_to") == "root":
+                    self.watch_owner(op["scope"], op["root"])
         self.last_result["adopt"] = [{"op": o["op"], "scope": o["scope"], "pids": len(o["pids"]),
                                       "done": o["done"]} for o in done]
+        if self.auto():
+            self.guarded(lambda: self.auto_adopt(pt))
+
+    def auto_adopt(self, pt):
+        """Give every app root its own scope (engine.auto_adopt_plan), at most 64 new ones per pass."""
+        ops = engine.auto_adopt_plan(self.cfg, self.units, pt, self.lineage, self.store)
+        if ops:
+            try:
+                for op in engine.run_ops(self.cfg, self.store, ops, True):
+                    if op["done"]:
+                        self.auto_scopes.add(op["scope"])
+            except engine.Refused as e:
+                if self.store.changed("auto_adopt_refused", str(e)):
+                    self.store.log(event="auto_adopt_refused", error=str(e))
+        base = cgroup.base()
+        self.auto_scopes = {s for s in self.auto_scopes if os.path.isdir(base + "/" + s)}
 
     # ---- learning hooks (log only: nothing here kills) ----
     def note_stop(self, rep):
@@ -193,13 +218,145 @@ class Daemon:
                 self.store.respawn(e["key"], False)
                 self.store.gc_outcome(e["key"], True)
             del self.stopped[e["key"]]
+        self.check_regret(lin, now)
         for rid in lin.closed:
             owner = lin.ghosts.get(rid, {}).get("key")
             if owner:
                 left = lin.leftovers_of(rid[0])
                 for key in dict.fromkeys(l["key"] for l in left):
-                    self.store.observe_close(owner, key)       # weight 0: only counts closes
+                    self.store.observe_close(owner, key, launcher=False)       # weight 0: only counts closes
                 self.attribute(owner, left, root=rid[0])
+                if self.auto() and left and not lin.ghosts.get(rid, {}).get("terminal"):
+                    self.guarded(lambda: self.gui_close(rid, owner, left))
+
+    # ---- auto mode: silent GUI closes, survivors of closed jobs, regret ----
+    def check_regret(self, lin, now):
+        """The same leftover key reappearing within 30 min of an auto stop, under any owner, undoes it."""
+        for k in [k for k, (_o, t) in self.auto_recent.items() if now - t > knowledge.REGRET_WINDOW]:
+            del self.auto_recent[k]
+        for eid in lin.born:
+            e = lin.entries.get(eid)
+            hit = self.auto_recent.get(e["key"]) if e else None
+            if hit and self.store.regret(hit[0], e["key"]):
+                self.store.log(event="regret", owner=hit[0], leftover=e["key"])
+                del self.auto_recent[e["key"]]
+
+    def note_auto_stop(self, scope, why, pairs):
+        """Remember an auto stop: knowledge (regret window), status ring, decisions.log."""
+        now = time.time()
+        for o, k in pairs:
+            self.store.auto_stopped(o, k)
+            self.auto_recent[k] = (o, now)
+        while len(self.auto_recent) > 256:
+            del self.auto_recent[min(self.auto_recent, key=lambda k: self.auto_recent[k][1])]
+        self.auto_stops.append({"ts": int(now), "scope": scope, "why": why,
+                                "pairs": ["%s > %s" % (lineage.clean(o, 24), lineage.clean(k, 24)) for o, k in pairs][:6]})
+        self.store.log(event="auto_stop", scope=scope, why=why, pairs=[list(p) for p in pairs][:8])
+
+    def adopt_standalone(self, items):
+        """Leftovers the user declared standalone get their own app scope and are never stopped."""
+        by_key = {}
+        for l in items:
+            by_key.setdefault(l["key"], []).append(l)
+        ops = [{"op": "move", "scope": engine.auto_scope_name(k, ls[0]["pid"], ls[0]["start"]), "unit": None,
+                "auto": True, "pids": [l["pid"] for l in ls]} for k, ls in by_key.items()]
+        try:
+            for op in engine.run_ops(self.cfg, self.store, ops, True):
+                if op["done"]:
+                    self.auto_scopes.add(op["scope"])
+        except engine.Refused as e:
+            self.store.log(event="standalone_adopt_refused", error=str(e))
+
+    def gui_close(self, rid, owner, left):
+        """A GUI root vanished (not a terminal job): standalone leftovers get their own scope, the rest
+        go to leftover/<owner>-<id>; the GC pass stops that leaf by pair decision or idleness."""
+        standalone = [l for l in left if self.store.standalone(l["key"])]
+        rest = [l for l in left if not self.store.standalone(l["key"])]
+        if standalone:
+            self.adopt_standalone(standalone)
+        if rest:
+            name = "%s/%s" % (engine.LEFTOVER, engine.leaf_slug(owner, rid[0]))
+            try:
+                engine.run_ops(self.cfg, self.store, [{"op": "move", "scope": name, "unit": None, "auto": True,
+                                                       "pids": [l["pid"] for l in rest]}], True)
+            except engine.Refused as e:
+                self.store.log(event="leftover_move_refused", scope=name, error=str(e))
+
+    def _infos(self, pids, origin=None):
+        """member_info for each pid from one ss snapshot ('edges unknown' when ss failed)."""
+        pids = list(pids)
+        s = inspect.LazySnapshot().get() if pids else None
+        ok = getattr(s, "ok", True)
+        edge_map = inspect.edges(set(pids), s) if pids else {}
+        return [engine.member_info(self.cfg, self.lineage, p, edge_map, ok, origin) for p in pids]
+
+    def auto_stop_path(self, path, why, require_pair):
+        """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
+        decided stop); otherwise only the idle checks (no edges, no pty host, not protected) apply.
+        SIGKILL only when every pair was answered explicitly. Returns True when the scope was removed."""
+        leaf = cgroup.rel(path)
+        infos = self._infos(cgroup.tree_procs(path))
+        if not infos:
+            return False
+        for i in infos:
+            ok, w = engine.auto_stop_ok(self.store, i["origin"], i["key"], i) if require_pair else \
+                (not (i["edges"] is None or i["edges"] or i["protected"] or i["ptmx"]), "idle member busy")
+            if not ok:
+                self.store.log(event="auto_stop_refused", scope=leaf, pid=i["pid"], key=i["key"], why=w)
+                return False
+        pairs = [(i["origin"], i["key"]) for i in infos if i["origin"]]
+        explicit = require_pair and all(self.store.pair_explicit(o, k) for o, k in pairs)
+        grace = engine.auto_grace(self.store, {i["key"] for i in infos})
+        try:
+            rep = engine.stop(path, self.cfg, self.store, None, timeout=grace, allow_sigkill=explicit)
+        except engine.Refused as e:
+            self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
+            return False
+        self.note_stop(rep)
+        self.note_auto_stop(leaf, why, list(dict.fromkeys(pairs)))
+        return rep["removed"]
+
+    def auto_stop_survivors(self, tag, owner, left, dec):
+        """Survivors of a closed terminal job whose pair is decided stop: those that pass auto_stop_ok
+        are carved into <host scope>/job-<id> (when the host scope is under user/<uid>, no sudo) and
+        stopped there, else signalled in place. Everyone else is left alone."""
+        want = [l for l in left if dec.get(l["key"], ("",))[0] == "stop"]
+        if not want:
+            return
+        infos = {i["pid"]: i for i in self._infos([l["pid"] for l in want], origin=owner)}
+        good = []
+        for l in want:
+            ok, w = engine.auto_stop_ok(self.store, owner, l["key"], infos[l["pid"]])
+            if ok:
+                good.append(l)
+            else:
+                self.store.log(event="auto_stop_refused", job=tag, pid=l["pid"], key=l["key"], why=w)
+        if not good:
+            return
+        pairs = list(dict.fromkeys((owner, l["key"]) for l in good))
+        explicit = all(self.store.pair_explicit(o, k) for o, k in pairs)
+        grace = engine.auto_grace(self.store, {k for _o, k in pairs})
+        me = "/user/%d/" % os.getuid()
+        slug = tag.replace(".", "-")
+        carved, loose = {}, []
+        for l in good:
+            cg = cgroup.proc_cgroup(l["pid"]) or ""
+            host = cg[len(me):].strip("/") if cg.startswith(me) else None
+            if host and cgroup.valid_rel(host + "/job-" + slug) and inspect.starttime(l["pid"]) == l["start"]:
+                carved.setdefault(host, []).append(l["pid"])
+            else:
+                loose.append(l)
+        for host, pids in carved.items():
+            dest = cgroup.mkleaf("%s/job-%s" % (host, slug))
+            for p in pids:
+                cgroup.move(p, dest)
+            try:
+                self.note_stop(engine.stop(dest, self.cfg, self.store, None, timeout=grace, allow_sigkill=explicit))
+            except engine.Refused as e:
+                self.store.log(event="auto_stop_refused", scope=cgroup.rel(dest), why=str(e))
+        if loose:
+            engine.signal_survivors(self.cfg, loose, grace, explicit)
+        self.note_auto_stop("job-" + slug, "closed job %s: %s" % (tag, self.store.pair_decision(*pairs[0])[2]), pairs)
 
     def attribute(self, owner, leftovers, root=None, job=None):
         """Log would_attribute / would_stop for each distinct leftover key. Returns {key: decision}."""
@@ -266,10 +423,16 @@ class Daemon:
         keys = list(dict.fromkeys(l["key"] for l in left))
         for k in keys:
             self.store.observe_close(owner, k, launcher=launcher)
+        if self.auto():
+            standalone = [l for l in left if self.store.standalone(l["key"])]
+            if standalone:
+                self.guarded(lambda: self.adopt_standalone(standalone))
         if launcher:
             self.store.log(event="launcher_learned", job=tag, owner=owner, leftovers=keys[:8])
             return
         dec = self.attribute(owner, left, job=tag)
+        if self.auto():
+            self.guarded(lambda: self.auto_stop_survivors(tag, owner, left, dec))
         ask = [k for k in keys if dec[k][0] == "ask" and self.store.can_ask((owner, k))]
         if ask:
             self.make_question(j, tag, owner, left, ask)
@@ -446,7 +609,7 @@ class Daemon:
     # ---- empty leaves ----
     def _empty_leaf_dirs(self):
         base = cgroup.base()
-        return cgroup.subdirs(base + "/shared") + [
+        return [d for parent in cgroup.LEAF_PARENTS for d in cgroup.subdirs(base + "/" + parent)] + [
             d for d in cgroup.subdirs(base)
             if os.path.basename(d).startswith(engine.EMPTY_PREFIXES) and os.path.basename(d) != "manager"]
 
@@ -529,7 +692,8 @@ class Daemon:
         self.store.decay()
         self.store.enforce_caps()
         cands = engine.gc_candidates(self.cfg, self.units, self.store, self.idle_since,
-                                     usage=self.gc_usage, skip=self.gc_skip, noted=self.gc_noted)
+                                     usage=self.gc_usage, skip=self.gc_skip, noted=self.gc_noted,
+                                     lin=self.lineage, auto=self.auto())
         res, now_empty = [], set()
         if not dry_run and self.may_move():
             self.sync_leaf_watches()
@@ -538,8 +702,12 @@ class Daemon:
             if why == "empty":
                 self._gc_empty(path, leaf, dry_run, res, now_empty)
                 continue
-            res.append([leaf, why, "would" if (dry_run or not self.may_kill()) else "stop"])
+            auto_leaf = self.auto() and leaf.startswith(engine.LEFTOVER + "/")
+            res.append([leaf, why, "would" if (dry_run or not (self.may_kill() or auto_leaf)) else "stop"])
             if dry_run:
+                continue
+            if auto_leaf:
+                self.guarded(lambda: self.auto_stop_path(path, why, why.startswith("pair stop")))
                 continue
             if self.may_kill():
                 try:
@@ -583,12 +751,20 @@ class Daemon:
 
     def end_session(self):
         self.store.log(event="session_end", mode=self.mode)
-        for d in cgroup.subdirs(cgroup.base()):
+        top = cgroup.subdirs(cgroup.base())
+        if self.auto():     # leftover/* leaves count as scopes of their own; shared/ is never stopped
+            top = [d for d in top if os.path.basename(d) != engine.LEFTOVER] + \
+                cgroup.subdirs(cgroup.base() + "/" + engine.LEFTOVER)
+        for d in top:
             if os.path.basename(d) == "manager":
                 continue
             unit = engine.unit_for_leaf(self.units, os.path.basename(d))
             if unit and unit.get("kill", {}).get("survive_logout"):
                 self.store.log(event="session_end_kept", scope=cgroup.rel(d))
+                continue
+            if self.auto():     # keep everything unless every member's pair is confidently "stop"
+                if os.path.basename(d) == "shared" or not self.auto_stop_path(d, "session ended", True):
+                    self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
             if self.may_kill():
                 try:
@@ -619,7 +795,8 @@ class Daemon:
                     "pairs": self.store.pairs_summary(), "standalone": sorted(self.store.data["standalone"])[:50],
                     "lineage": {"entries": len(self.lineage.entries), "ghosts": len(self.lineage.ghosts),
                                 "jobs": len(self.lineage.jobs)},
-                    "pending_questions": len(self.pending)}
+                    "pending_questions": len(self.pending),
+                    "auto": self.auto_status()}
         if c == "register":
             leaf, owner = msg.get("scope"), msg.get("owner")
             if not isinstance(leaf, str) or not cgroup.valid_rel(leaf) \
@@ -628,6 +805,8 @@ class Daemon:
             if owner <= 1 or inspect.uid_of(owner) != os.getuid():
                 return {"error": "owner gone or not yours"}
             return {"watching": self.watch_owner(leaf, owner)}
+        if c == "attach":
+            return self.attach(msg)
         if c == "job_done":
             return self.job_done(msg)
         if c == "kill_done":
@@ -644,6 +823,35 @@ class Daemon:
             self.store.save_if_dirty()
             return {"ok": True}
         return {"error": "unknown command"}
+
+    def auto_status(self):
+        base = cgroup.base()
+        return {"auto_adopted_scopes": len(self.auto_scopes),
+                "leftover_leaves": len(cgroup.subdirs(base + "/" + engine.LEFTOVER)),
+                "auto_stops": list(self.auto_stops)}
+
+    def attach(self, msg):
+        """taema run from a shell that lacks the taema group: attach the caller's pids through the
+        helper, which this daemon (started with the group) may call. Only pids of this uid."""
+        scope, pids = msg.get("scope"), msg.get("pids")
+        if not isinstance(scope, str) or not isinstance(pids, list) or not 0 < len(pids) <= 64 \
+                or any(not isinstance(p, int) or isinstance(p, bool) or p <= 1 for p in pids):
+            return {"error": "bad request"}
+        name = scope[len("scope-"):] if scope.startswith("scope-") else scope
+        if not cgroup.valid_rel(name) or "/" in name or len(name) > 32 or not cgroup.valid_rel(scope):
+            return {"error": "bad request"}
+        me = os.getuid()
+        if any(inspect.uid_of(p) != me for p in pids):
+            return {"error": "pid gone or not yours"}
+        done = []
+        for p in dict.fromkeys(pids):
+            try:
+                engine.helper_attach(self.cfg, p, name)
+            except engine.Refused as e:
+                return {"error": "attach failed: %s" % e, "attached": done}
+            done.append(p)
+        self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
+        return {"ok": True, "attached": done}
 
     def _read_request(self, conn):
         """Bytes up to a newline (or EOF) within 0.5 s total and 64 KiB."""

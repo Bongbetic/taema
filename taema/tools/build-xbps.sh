@@ -15,7 +15,10 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 make -C "$here" DESTDIR="$stage" install
 install -Dm644 "$here/../LICENSE" "$stage/usr/share/licenses/taema/LICENSE"
-install -m755 "$here/tools/INSTALL" "$stage/INSTALL"
+# xbps-create picks up INSTALL and REMOVE from the root of the staged tree; these are the
+# same files xbps-src installs for srcpkgs/taema.
+install -m755 "$here/srcpkgs/taema/INSTALL" "$stage/INSTALL"
+install -m755 "$here/srcpkgs/taema/REMOVE" "$stage/REMOVE"
 
 pkg="taema-${version}_${revision}"
 rm -f "$repo/$pkg.noarch.xbps"

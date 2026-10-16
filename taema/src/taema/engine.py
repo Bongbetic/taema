@@ -13,6 +13,9 @@ from . import cgroup, inspect, knowledge, policy
 HOOK_TIMEOUT = 30
 EMPTY_PREFIXES = ("app-", "scope-")
 POLL_STEP = 0.05
+LEFTOVER = "leftover"
+AUTO_CAP = 64           # new app scopes per auto-adopt pass
+AUTO_MAX_CPU = 1.0      # percent over the last minute; busier members are never auto-stopped
 
 
 class Refused(Exception):
@@ -168,8 +171,9 @@ def _run_hook(hook):
 
 
 def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, keep=(),
-         dry_run=False, hook=None, passes=3):
-    """Stop a scope: move shared members aside, run the hook, SIGTERM, SIGKILL leftovers, rmdir."""
+         dry_run=False, hook=None, passes=3, allow_sigkill=True):
+    """Stop a scope: move shared members aside, run the hook, SIGTERM, SIGKILL leftovers, rmdir.
+    allow_sigkill=False (auto mode, pairs not explicitly answered): members that ignore SIGTERM live."""
     self_guard(path)
     report = {"scope": cgroup.rel(path), "decisions": [], "removed": False, "left": []}
     ran_hook = False
@@ -225,6 +229,9 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
             if d["key"] not in killed_keys:
                 killed_keys.add(d["key"])
                 store.bump(d["key"], "killed")
+        if survivors and not allow_sigkill:
+            report["unkilled"] = sorted(survivors)
+            break
         if survivors:
             _signal_all(path, survivors, signal.SIGKILL, cfg)
             for d in kill:
@@ -415,13 +422,17 @@ def _cpu_usage(path):
     return None
 
 
-def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip=None, noted=None, pt=None):
+def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip=None, noted=None, pt=None,
+                  lin=None, auto=False):
     """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}.
 
     usage {rel: usage_usec at idle start}: CPU that moves during the idle window means busy.
     skip: leaves never retried (protected member). noted: leaves already logged once.
     pt: the pass's ProcTable, scanned lazily. Empty app-*/scope-*/shared/* leaves come back
-    with reason "empty" (never 'manager'). The ss snapshot is built only when a leaf needs it."""
+    with reason "empty" (never 'manager'). The ss snapshot is built only when a leaf needs it.
+    auto (with lin, the Lineage): leftover/* leaves are candidates too, "pair stop ..." when every
+    member passes auto_stop_ok, else by the idle rule unless a member is held (protected, persist
+    seed, share seed with user_keep, pair decided keep, pty host)."""
     usage = {} if usage is None else usage
     skip = set() if skip is None else skip
     noted = set() if noted is None else noted
@@ -434,7 +445,12 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
         for un, u in unit_by_prefix.items():
             if (n == un or n.startswith(un + "-")) and u["unit"].get("stop_when_unneeded"):
                 leaves.append(d)
+    left_dirs = cgroup.subdirs(base + "/" + LEFTOVER)
+    if auto:
+        leaves += left_dirs
     gc_set = set(leaves)
+    if not auto:
+        leaves += left_dirs         # empty ones only
     leaves += [d for d in top if d not in gc_set and os.path.basename(d).startswith(EMPTY_PREFIXES)]
     live = {cgroup.rel(d) for d in leaves}
     for table in (idle_since, usage, skip, noted):
@@ -464,6 +480,17 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
                     noted.add(rel)
                     store.log(event="gc_skip", scope=rel, why="share/persist seed or user keep: " + held)
                 idle_since.pop(rel, None)
+                continue
+        if auto and rel.startswith(LEFTOVER + "/"):
+            verdict = _leftover_verdict(cfg, store, lin, pids, snap, protect)
+            if verdict[0] == "held":
+                if rel not in noted:
+                    noted.add(rel)
+                    store.log(event="gc_skip", scope=rel, why="leftover held: " + verdict[1])
+                idle_since.pop(rel, None)
+                continue
+            if verdict[0] == "stop":
+                out.append((d, "pair stop: " + verdict[1]))
                 continue
         u = next((v for k, v in unit_by_prefix.items() if os.path.basename(d).startswith(k)), None)
         gc = (u or {}).get("gc", {})
@@ -498,6 +525,28 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
     return out
 
 
+def _leftover_verdict(cfg, store, lin, pids, snap, protect):
+    """("stop", why) when every member passes auto_stop_ok, ("held", why) when a member must not be
+    stopped by the idle rule, else ("idle", "")."""
+    s = snap.get()
+    ok = getattr(s, "ok", True)
+    edge_map = inspect.edges(set(pids), s)
+    infos = [member_info(cfg, lin, p, edge_map, ok) for p in pids]
+    for i in infos:
+        if i["protected"]:
+            return "held", "protected: " + i["protected"]
+        if i["ptmx"]:
+            return "held", "pty host %s" % i["key"]
+        if i["key"] in protect and (store.is_persistent(i["key"]) or store.peek(i["key"])["user_keep"] > 0):
+            return "held", "persist/share seed " + i["key"]
+        if i["origin"] and store.pair_decision(i["origin"], i["key"])[0] == "keep":
+            return "held", "pair decided keep: %s>%s" % (i["origin"], i["key"])
+    res = [auto_stop_ok(store, i["origin"], i["key"], i) for i in infos]
+    if infos and all(r[0] for r in res):
+        return "stop", res[0][1]
+    return "idle", ""
+
+
 def remove_empty(path):
     """rmdir an empty leaf tree. False when a process is (or became) present or rmdir fails."""
     if os.path.basename(path) == "manager" or cgroup.tree_procs(path):
@@ -507,3 +556,110 @@ def remove_empty(path):
         return True
     except OSError:
         return False
+
+
+# ---- auto mode ------------------------------------------------------------------------------
+
+def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
+    """Facts auto_stop_ok needs about one process. edges None = unknown (ss failed)."""
+    e = lin.entry(pid) if lin is not None else None
+    return {"pid": pid, "key": e["key"] if e else policy.app_key(pid),
+            "origin": origin if origin is not None else (e["root_key"] if e else ""),
+            "edges": edge_map.get(pid, []) if edges_ok else None,
+            "protected": policy.protected_reason(pid, cfg),
+            "ptmx": bool(lin is not None and lin.ptmx_host(pid)),
+            "cpu": lin.cpu_pct(pid) if lin is not None else None}
+
+
+def auto_stop_ok(store, owner_key, leftover_key, mi):
+    """May auto mode stop this member? (ok, why). Only a pair decided "stop" (explicit answer, or
+    silent thresholds after burn-in) and a member that is plainly idle and known: no edges, not
+    protected / a pty host / a persist seed / a share seed the user keeps, <= 1 % CPU over the last
+    minute, origin known. Anything unknown keeps."""
+    action, _conf, why = store.pair_decision(owner_key, leftover_key) if owner_key else ("ask", 0, "")
+    if action != "stop":
+        return False, "pair decision is %s" % action
+    if not mi.get("origin"):
+        return False, "origin unknown"
+    if mi.get("edges") is None:
+        return False, "edges unknown"
+    if mi["edges"]:
+        return False, "has edges"
+    if mi.get("protected"):
+        return False, "protected: %s" % mi["protected"]
+    if mi.get("ptmx"):
+        return False, "pty host"
+    if store.is_persistent(leftover_key):
+        return False, "persist seed"
+    if leftover_key in store.seeds.get("share", []) and store.peek(leftover_key)["user_keep"] > 0:
+        return False, "share seed kept by user"
+    cpu = mi.get("cpu")
+    if cpu is None:
+        return False, "cpu unknown"
+    if cpu > AUTO_MAX_CPU:
+        return False, "cpu %.1f%% > %.0f%%" % (cpu, AUTO_MAX_CPU)
+    return True, why
+
+
+def auto_grace(store, keys):
+    """SIGTERM grace for an auto stop: max(5 s, p95 x 1.5) capped at 30 s."""
+    return min(30.0, max([5.0] + [store.graceful_timeout(k, 5)[0] for k in keys]))
+
+
+def auto_scope_name(key, pid, start):
+    return "app-%s-%s" % (leaf_slug(key), hashlib.sha1(("%d.%d" % (pid, start)).encode()).hexdigest()[:6])
+
+
+def auto_adopt_plan(cfg, units, table, lin, store, cap=AUTO_CAP):
+    """Move ops giving each app root its own scope app-<key>-<hash>, with every member of the
+    root that still sits in a session cgroup. Not adopted: session leaders, protected, pty hosts,
+    anything younger than 5 s (lin.root_for), terminal jobs (they stay in their host's scope),
+    roots already outside the session cgroups, and roots a unit with [match] claims."""
+    in_session = set()
+    for session in policy.session_cgroups(cfg):
+        in_session.update(cgroup.procs(session))
+    explicit = [u["match"] for u in units if u.get("match") and u.get("unit", {}).get("kind") == "app"]
+    by_root = {}
+    for e in lin.entries.values():
+        if e["root"] is not None and e["pid"] in in_session:
+            by_root.setdefault(e["root"], []).append(e["pid"])
+    ops = []
+    for rid in sorted(by_root, key=lambda r: (r[1], r[0])):
+        if len(ops) >= cap:
+            break
+        rpid = rid[0]
+        e = lin.entry(rpid)
+        if e is None or rpid not in in_session or lin.root_for(rpid) != rpid or e["sid"] == rpid:
+            continue
+        if lin.is_terminal_job(e) or policy.protected_reason(rpid, cfg) or lin.ptmx_host(rpid):
+            continue
+        if explicit and any(_matches(m, p) for m in explicit for p in [rpid] + [c[0] for c in e["chain_ids"]]):
+            continue
+        ops.append({"op": "move", "scope": auto_scope_name(e["key"], rpid, e["start"]), "unit": None,
+                    "auto": True, "pids": sorted(by_root[rid])})
+    return ops
+
+
+def signal_survivors(cfg, items, grace, allow_sigkill):
+    """Stop job survivors that cannot be carved (they live outside user/<uid>): SIGTERM through a
+    pidfd-pinned _signal_all, wait, SIGKILL only when allowed. items: [{"pid","start"}]. Returns the
+    pids signalled."""
+    groups = {}
+    for it in items:
+        if inspect.starttime(it["pid"]) != it["start"]:
+            continue
+        cg = cgroup.proc_cgroup(it["pid"])
+        if cg:
+            groups.setdefault(cgroup.CG + cg, []).append(it["pid"])
+    sent = []
+    for path, pids in groups.items():
+        try:
+            self_guard(path)
+        except Refused:
+            continue
+        sent += _signal_all(path, pids, signal.SIGTERM, cfg)
+        left = set(pids) - set(_wait_each(path, pids, grace))
+        if left and allow_sigkill:
+            _signal_all(path, left, signal.SIGKILL, cfg)
+            _wait_each(path, left, 5)
+    return sent

@@ -4,6 +4,7 @@ import os
 import re
 
 CG = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
+LEAF_PARENTS = ("shared", "leftover")   # top-level dirs holding removable leaves
 _REL = re.compile(r"[a-z0-9][a-z0-9_./-]{0,96}")
 
 

@@ -73,7 +73,7 @@ def starttime(pid):
         return None
 
 
-class Proc(namedtuple("Proc", "ppid pgrp sid tty start state")):
+class Proc(namedtuple("Proc", "ppid pgrp sid tty start state cpu", defaults=(0,))):
     __slots__ = ()
 
 
@@ -86,7 +86,8 @@ def _parse_stat(data):
         ints = [int(x) for x in rest[1:5]]
         ints += [0] * (4 - len(ints))
         start = int(rest[19]) if len(rest) > 19 else 0
-        return Proc(ints[0], ints[1], ints[2], ints[3], start, rest[0].decode(errors="replace"))
+        cpu = int(rest[11]) + int(rest[12]) if len(rest) > 12 else 0     # utime + stime, clock ticks
+        return Proc(ints[0], ints[1], ints[2], ints[3], start, rest[0].decode(errors="replace"), cpu)
     except ValueError:
         return None
 

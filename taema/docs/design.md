@@ -26,14 +26,16 @@
   user/<uid>/                delegated to the user by the taema service
     manager/                 the user's taema daemon
     app-<name>/              adopted apps, with child scopes such as session-<pid>
+                             and job-<id> (survivors of one terminal job)
     app-podman-<hash>/       one per rootless podman runtime dir: pause + conmon-<pid>/
     scope-<name>/            explicit project scopes (taema run NAME)
     shared/<comm>-<pid>/     members kept alive because something outside uses them
+    leftover/<owner>-<id>/   survivors of a closed app, until GC or an answer decides
 ```
 
 `sv/taema/run` enables the controllers `cpuset cpu io memory pids` in
-`user/<uid>/cgroup.subtree_control`, so each scope is a CPU and IO weight peer of its
-siblings. tæma sets no limits. With controllers enabled, a cgroup that has children
+`user/<uid>/cgroup.subtree_control` (and in each member's cgroup, re-scanned every 60 s),
+so each scope is a CPU and IO weight peer of its siblings. tæma sets no limits. With controllers enabled, a cgroup that has children
 cannot hold processes itself (no-internal-process rule): put processes in leaves.
 `cgroup.kill` on a parent kills the whole subtree.
 
@@ -46,7 +48,8 @@ root cgroup, so the move needs root: `taema-attach` does it. Moves between leave
 
 ```
 runsv taema (root)
-  run: delegate user/<uid> for each member of group taema
+  run: delegate user/<uid> for each member of group taema; a background loop repeats
+       it every 60 s for new members and ends with the service (pid in /run/taema/rescan.pid)
   runsvdir /run/taema/sv
     runsv <user>
       taemad-user <user> (root)  moves itself to user/<uid>/manager, then setpriv
@@ -113,6 +116,67 @@ Descendants of a shared process move with it.
   per login.
 
 Mode gates every action. `observe` only logs. `adopt` also moves. `enforce` also stops.
+`auto` moves and learns always, and stops only what "Auto mode" below allows.
+
+## Lineage
+
+Which app owns a process? Cgroup inheritance answers it: once a root is adopted, its
+children are born inside its scope. To keep the window before adoption short, the daemon
+diffs the session `cgroup.procs` every 2 s and looks only at new pids.
+
+- **Co-birth:** a newcomer with parent 1 within 2 s of a new root joins that root.
+- **Never adopted:** session leaders (`sid == pid`), processes whose parent is not the
+  user's (login shells from tty or ssh), and anything younger than 5 s.
+- **Re-rooting:** a root that exits within 5 s hands the scope to its oldest live member
+  (wrappers, AppImage, `code`). A leftover with the same key as the exiting root is a
+  self-update relaunch: re-root, never stop.
+- **Terminal jobs:** a job is identified by `pgrp`, `sid` and the shell tag
+  `TAEMA_JOB=<shellpid>.<n>` found in `/proc/PID/environ` (searched as bytes, only for pids
+  born in the job window, always checked with the start time). Nested shells keep a
+  `TAEMA_PARENT_JOB` link. Jobs stay in their host's scope. Only the survivors of a job
+  are carved into `<host>/job-<id>`, so typing commands creates no scopes.
+
+## Pairs and thresholds
+
+The learner keeps `pairs[(owner_key, leftover_key)] = {stop, keep, last_asked,
+last_auto_stop}` next to the per-exe counters, plus `standalone[key]`, at most 32 members
+per owner. Keys name interpreter programs by script (`node:vite`), not by interpreter.
+
+| Signal | Weight |
+|---|---|
+| explicit answer in the prompt | 3, no decay; only contrary evidence overturns it |
+| inferred user kill (pid vanished, `kill` args matched) | at most 0.25 |
+| leftover observed | 0 |
+| respawn | only under a different owner or when self-started; re-running a command is not one |
+
+Thresholds for a silent stop (all must hold): at least 5 shell-observed stops on at least
+3 distinct days, no keep in 30 days, ratio 0.9 or more, pair first seen more than 24 h ago,
+and a burn-in of 7 days or 20 closes passed. An answered pair needs none of these.
+Grace before SIGKILL is max(5 s, p95 x 1.5) capped at 30 s, and SIGKILL is only for
+answered pairs. Regret: a relaunch of the key within 30 minutes of an automatic stop adds
+keep +3, suspends the pair for 7 days and asks again.
+
+## Auto mode
+
+`mode = "auto"` is the default. Gate order per action:
+
+1. Adopt and learn always run.
+2. Hard rules: protected comm or cgroup, members with edges, ptmx hosts, persist seeds,
+   more than 1 % CPU over 60 s, unknown origin. These are never stopped.
+3. The pair is answered "stop with X", or its evidence thresholds pass: stop.
+4. Anything else: keep, and ask at most once per pair per week (3 per day).
+
+`observe`, `adopt` and `enforce` remain manual overrides. Auto-created scopes survive
+logout unless their pair is confidently "stop on close". Unknown is never "no": unreadable
+`/proc`, a failed `ss` or a zombie means keep and learn.
+
+## Leftover scopes
+
+When an app closes (a GUI close is silent, no prompt), its survivors move to
+`leftover/<owner>-<id>`. GC stops such a scope when it is idle (no edges, flat CPU in
+`cpu.stat`, no ptmx) after the learned grace, and only when the pair allows it. Pairs
+answered in a terminal apply to GUI closes too. Persist seeds and share seeds are never
+drained. The scope is removed when empty (`cgroup.events` shows `populated 0`).
 
 ## Resource budget
 

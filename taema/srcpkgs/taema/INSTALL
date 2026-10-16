@@ -1,0 +1,56 @@
+#!/bin/sh
+# taema xbps INSTALL script. Arguments: ACTION PKGNAME VERSION UPDATE CONF_FILE ARCH
+# First install only (UPDATE=no), after the files are unpacked: make taema work with no
+# manual setup. Every step is best effort and must never fail the install.
+ACTION="$1"
+UPDATE="$4"
+ROOTDIR="${ROOTDIR:-}"
+
+case "${ACTION}" in
+post)
+    if [ "${UPDATE}" = no ]; then
+        # (a) Group membership: human users only (uid 1000..59999, real login shell).
+        # On the running system the name service answers; for another root (xbps-install
+        # -r DIR) read DIR/etc/passwd and DIR/etc/group and let usermod edit that root.
+        case "${ROOTDIR}" in
+        ""|/)
+            _taema_R=""
+            _taema_passwd="getent passwd"
+            _taema_group="getent group taema"
+            ;;
+        *)
+            _taema_R="-R ${ROOTDIR}"
+            _taema_passwd="cat ${ROOTDIR}/etc/passwd"
+            _taema_group="grep -q ^taema: ${ROOTDIR}/etc/group"
+            ;;
+        esac
+        if ! ${_taema_group} >/dev/null 2>&1 && [ -z "${_taema_R}" ]; then
+            groupadd -r taema >/dev/null 2>&1 || true
+        fi
+        if ${_taema_group} >/dev/null 2>&1; then
+            ${_taema_passwd} 2>/dev/null | awk -F: '
+                $3 >= 1000 && $3 <= 59999 && $7 != "" && $7 !~ /(nologin|false)$/ { print $1 }' |
+            while read -r _taema_user; do
+                usermod ${_taema_R} -aG taema "${_taema_user}" >/dev/null 2>&1 ||
+                    echo "taema: could not add ${_taema_user} to group taema" >&2
+            done
+        fi
+
+        # (b) Enable the service.
+        if [ -d "${ROOTDIR}/var/service" ] && [ ! -e "${ROOTDIR}/var/service/taema" ] &&
+           [ ! -L "${ROOTDIR}/var/service/taema" ]; then
+            ln -s /etc/sv/taema "${ROOTDIR}/var/service/taema" 2>/dev/null || true
+        fi
+
+        # (c) zsh: Void's zsh reads /etc/zsh/zshrc but ships no file there.
+        if [ -d "${ROOTDIR}/etc/zsh" ] || [ -x "${ROOTDIR}/usr/bin/zsh" ]; then
+            if ! grep -qF '# taema' "${ROOTDIR}/etc/zsh/zshrc" 2>/dev/null; then
+                mkdir -p "${ROOTDIR}/etc/zsh" 2>/dev/null || true
+                printf '%s\n' '[ -r /usr/share/taema/shell/taema.zsh ] && . /usr/share/taema/shell/taema.zsh # taema' \
+                    >> "${ROOTDIR}/etc/zsh/zshrc" 2>/dev/null || true
+            fi
+        fi
+    fi
+    ;;
+esac
+true

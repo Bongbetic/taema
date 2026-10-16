@@ -25,6 +25,9 @@ JOB_WINDOW = 120.0      # environ is searched for the job tag only for processes
 MAX_ENTRIES = 4096
 MAX_JOBS = 64
 MAX_GHOSTS = 256
+CPU_KEEP = 12          # cpu samples kept per entry
+CPU_WINDOW = 60.0       # cpu_pct looks at the last minute
+CPU_MIN_SPAN = 30.0     # less history than this means unknown
 GHOST_TTL = 3600.0
 CHAIN = 8
 ENV_LIMIT = 1 << 18
@@ -117,6 +120,7 @@ class Lineage:
             r = rows[eid[0]]
             e.update(ppid=r.ppid, pgrp=r.pgrp, sid=r.sid, tty=r.tty, state=r.state, last_seen=self.now)
             e["seen"] += 1
+            e["cpu"] = (e["cpu"] + [(self.now, r.cpu)])[-CPU_KEEP:]
             if e["start"] and self.age(e) < KEY_SETTLE:
                 e["key"] = policy.app_key(eid[0])
         for e in self.entries.values():     # a root's key may have settled after its members were added
@@ -147,7 +151,7 @@ class Lineage:
     def _add(self, pid, r):
         key = policy.app_key(pid)
         e = {"pid": pid, "start": r.start, "ppid": r.ppid, "pgrp": r.pgrp, "sid": r.sid, "tty": r.tty,
-             "state": r.state, "key": key, "exe": os.path.basename(inspect.exe(pid)),
+             "state": r.state, "cpu": [(self.now, r.cpu)], "key": key, "exe": os.path.basename(inspect.exe(pid)),
              "first_seen": self.now, "last_seen": self.now, "seen": 1, "job": None, "host": None, "root": None, "root_key": "",
              "parent_key": "", "chain": [], "chain_ids": []}
         eid = (pid, r.start)
@@ -218,7 +222,8 @@ class Lineage:
                 self._join(m, nid, new["key"])
             self.reroots.append((rid, nid))
             return
-        self.ghosts[rid] = {"key": e["key"], "pid": rid[0], "ppid": e["ppid"], "exited": self.now}
+        self.ghosts[rid] = {"key": e["key"], "pid": rid[0], "ppid": e["ppid"], "exited": self.now,
+                            "terminal": self.is_terminal_job(e)}
         self.closed.append(rid)
 
     def _prune_ghosts(self):
@@ -271,6 +276,30 @@ class Lineage:
         if root is not None and self.age(root) < MIN_AGE:
             return None
         return e["root"][0]
+
+    def is_terminal_job(self, e):
+        """True for a process that belongs to a shell job: tagged, on a tty, or below an
+        interactive shell (session leader with a tty). GUI apps have none of these."""
+        if e["job"] or e["tty"]:
+            return True
+        for cid in e["chain_ids"]:
+            a = self.entries.get(cid)
+            if a is not None and a["tty"] and a["sid"] == a["pid"]:
+                return True
+        return False
+
+    def cpu_pct(self, pid, window=CPU_WINDOW, min_span=CPU_MIN_SPAN):
+        """Average CPU percent of pid over the last `window` seconds from per-pass /proc stat
+        samples; None (unknown) when less than `min_span` seconds of history exist."""
+        e = self.entry(pid)
+        cs = e.get("cpu") if e else None
+        if not cs or len(cs) < 2:
+            return None
+        t1, c1 = cs[-1]
+        t0, c0 = next(((t, c) for t, c in cs if t1 - t <= window + 2.0), (t1, c1))   # 2 s slack for pass jitter
+        if t1 - t0 < min_span:
+            return None
+        return 100.0 * max(0, c1 - c0) / HZ / (t1 - t0)
 
     # ---- hosts ----
     def _scan_ptmx(self, pid):

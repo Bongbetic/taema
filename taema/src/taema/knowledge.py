@@ -450,6 +450,12 @@ class Store:
         d = self.data
         return decide(p, self.now(), d["created"], d["closes"])
 
+    def pair_explicit(self, owner, leftover):
+        """True when the pair decision is "stop" because the user answered it (SIGKILL is allowed
+        only then)."""
+        action, _conf, why = self.pair_decision(owner, leftover)
+        return action == "stop" and why.startswith("answered stop")
+
     def can_ask(self, pair, now=None):
         """pair = (owner, leftover). At most 3 questions per day, each pair once per 7 days."""
         now = self.now() if now is None else now

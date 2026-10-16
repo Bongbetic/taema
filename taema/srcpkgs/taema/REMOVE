@@ -1,0 +1,28 @@
+#!/bin/sh
+# taema xbps REMOVE script. Arguments: ACTION PKGNAME VERSION UPDATE CONF_FILE ARCH
+# Real removal only (UPDATE=no): an upgrade must not stop or unlink anything.
+# Every step is best effort and must never fail the removal.
+ACTION="$1"
+UPDATE="$4"
+ROOTDIR="${ROOTDIR:-}"
+
+case "${ACTION}" in
+pre)
+    if [ "${UPDATE}" = no ]; then
+        case "${ROOTDIR}" in
+        ""|/)
+            if command -v sv >/dev/null 2>&1; then
+                sv down taema >/dev/null 2>&1 || true
+            fi
+            ;;
+        esac
+        if [ -L "${ROOTDIR}/var/service/taema" ]; then
+            rm -f "${ROOTDIR}/var/service/taema" 2>/dev/null || true
+        fi
+        if [ -f "${ROOTDIR}/etc/zsh/zshrc" ]; then
+            sed -i '/# taema$/d' "${ROOTDIR}/etc/zsh/zshrc" 2>/dev/null || true
+        fi
+    fi
+    ;;
+esac
+true

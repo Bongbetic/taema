@@ -67,8 +67,8 @@ Everything is gone except `adb`, because another program is still talking to it.
 checked first (sockets, shared podman state, ptrace), kept `adb`, and told you why.
 
 Or skip the typing. Run the daemon and it adopts running apps into scopes, stops a scope
-when its owner exits, and garbage-collects helpers nobody uses. It starts in `observe`
-mode, so it only tells you what it would do until you say otherwise.
+when its owner exits, and garbage-collects helpers nobody uses. It needs no setup: in
+`auto` mode it learns first and stops only what you told it to (see "Set up").
 
 ## The problem
 
@@ -161,37 +161,70 @@ sudo xbps-install --repository=hostdir/binpkgs taema
 
 ## Set up
 
-The package creates the `taema` group and installs the service disabled, like every Void
-service. Only members of the `taema` group are managed.
+Nothing to do. On first install the package adds every human user (uid 1000 to 59999
+with a real login shell) to the `taema` group, links `/etc/sv/taema` into `/var/service`,
+and, if zsh is installed, appends one guarded `# taema` line to `/etc/zsh/zshrc`. The
+service re-scans the group every minute, so you need no `usermod`, no `ln -s`, and no
+logout. Upgrades do none of this. Check with:
 
 ```sh
-sudo usermod -aG taema "$USER"      # log out and back in for your shell to see the group
-sudo ln -s /etc/sv/taema /var/service/
 taema status
 ```
 
 The service delegates `/sys/fs/cgroup/user/<uid>` to each group member and runs one
-daemon per member. After you change group membership, run `sudo sv restart taema`.
+daemon per member. A user you add later with `usermod -aG taema USER` is picked up within
+a minute.
 
-### Choose a mode
+### Auto mode
 
-tæma starts in `observe` mode, where it changes nothing. Move up one mode at a time:
+
+`auto` is the default. From the first minute it **adopts** running apps into scopes and
+**learns**. It does not stop anything at first. It stops a leftover only in two cases:
+
+- **You answered.** In the prompt you said "stop them when it closes" for that pair
+  (owner, leftover). The next close of that owner stops that leftover: SIGTERM, a grace
+  period learned from past exits (5 to 30 s), then SIGKILL.
+- **Strong evidence, after a burn-in.** Seen stopped by you at least 5 times on at least 3
+  different days, never kept in 30 days, and a 7-day burn-in (or 20 closes) has passed.
+  Evidence alone only sends SIGTERM.
+
+Safety rules that auto mode never bends:
+
+- **Regret.** If you relaunch the same program within 30 minutes of an automatic stop,
+  tæma counts that as a "keep", pauses the pair for 7 days and asks you again. A wrong
+  answer fixes itself with no command.
+- **Never stopped:** protected session infrastructure, anything another process still
+  uses (an edge), terminal hosts (anything holding `/dev/ptmx`: terminals, tmux, screen,
+  zellij, editors), anything above 1 % CPU over 60 s, and anything whose origin tæma
+  cannot tell.
+- **Persist seeds** (tmux, screen, zellij, abduco, dtach, mosh-server, ssh-agent,
+  gpg-agent, keyboxd, dirmngr) are never garbage-collected as idle.
+- Unknown is never "no": unreadable `/proc` data, a failed `ss` run or a zombie means
+  keep and learn.
+
+### Modes
+
+`auto` is the default. The others are manual overrides:
 
 | Mode | Behaviour |
 |---|---|
+| `auto` | Adopt and learn always. Stop only answered pairs, or pairs with strong evidence after the burn-in. |
 | `observe` | Log every move and stop the daemon would make. Change nothing. |
 | `adopt` | Move matching processes into scopes. Never kill. |
 | `enforce` | Move, and stop scopes (GC, owner watch, session end). |
 
-Set the mode for yourself in `~/.config/taema/taema.toml`:
+### Turn it down
 
 ```toml
-mode = "adopt"
+# ~/.config/taema/taema.toml
+mode = "observe"      # log what would happen, change nothing; or "adopt" (move, never kill)
 ```
 
-Restart your daemon with `sudo sv restart taema`. Watch
-`~/.local/state/taema/decisions.log` for a few days. Check `taema gc --dry-run`, then
-switch to `enforce` once the candidates it lists are only real leftovers.
+Then `sudo sv restart taema`. `TAEMA_NO_PROMPT=1` in your shell environment turns the
+question off. `taema forget NAME` resets what was learned about one program.
+
+Watch `~/.local/state/taema/decisions.log` and run `taema gc --dry-run` any time to see
+what tæma would do.
 
 ## Usage
 
@@ -252,13 +285,14 @@ tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
   [Enter] ask me later
 ```
 
-Press one key. Your answer is remembered. It asks at most 3 times a day, and each pair only
+Press one key. Your answer is remembered and applies to that pair (owner, leftover) from
+the next close on, also for GUI closes. It asks at most 3 times a day, and each pair only
 once a week. It stays silent when you have typed ahead and gives up after 15 s. It also asks
 after `kill`, `pkill` and `killall` when the app you closed belonged to another app.
 
 The hook is `shell/taema.bash` (installed to `/etc/bash/bashrc.d/taema.sh`), `taema.fish`
-(fish picks it up by itself) or `taema.zsh` (add `source /usr/share/taema/shell/taema.zsh`
-to `~/.zshrc`). A normal prompt runs no process and uses no `DEBUG` trap. Under bash the
+(fish picks it up by itself) or `taema.zsh` (the package hooks it into `/etc/zsh/zshrc`
+when zsh is installed). A normal prompt runs no process and uses no `DEBUG` trap. Under bash the
 hook sees `kill` only when ble.sh is loaded. Set `TAEMA_NO_PROMPT=1` to turn it off.
 
 ## Units
@@ -352,7 +386,8 @@ These rules are fixed. Learning and unit files cannot change them:
 | `/usr/libexec/taema/taema-hook` | prompt client, called by the shell hooks |
 | `/usr/share/taema/shell/` | shell hooks for bash, zsh and fish |
 | `/etc/sudoers.d/taema` | lets `%taema` run the helper without a password |
-| `/etc/sv/taema/` | runit service: delegation plus one daemon per member |
+| `/etc/sv/taema/` | runit service: delegation plus one daemon per member, re-scanned every minute |
+| `/var/service/taema` | link to the service, made and removed by the package scripts |
 | `/etc/taema/` | system configuration and units |
 | `~/.config/taema/` | your configuration, units and hooks |
 | `~/.local/state/taema/` | `knowledge.json` (learning) and `decisions.log` (audit) |
@@ -361,12 +396,20 @@ These rules are fixed. Learning and unit files cannot change them:
 ## Uninstall
 
 ```sh
-sudo rm /var/service/taema
 sudo xbps-remove taema
 ```
 
-Scopes that still exist stay where they are until their processes exit. Your files in
-`~/.config/taema` and `~/.local/state/taema` are not removed.
+The remove script stops the service, deletes the `/var/service/taema` link and removes the
+`# taema` line from `/etc/zsh/zshrc`. An upgrade does none of this. Scopes that still exist
+stay until their processes exit. Left on purpose: `~/.config/taema`, `~/.local/state/taema`,
+`/var/log/taema` and the `taema` group. Delete them for a clean slate:
+
+```sh
+rm -rf ~/.config/taema ~/.local/state/taema
+sudo gpasswd -d "$USER" taema      # repeat per user
+sudo groupdel taema
+sudo rm -rf /var/log/taema
+```
 
 ## Design
 

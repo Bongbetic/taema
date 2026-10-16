@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import sys
+import time
 
 from . import cgroup, engine, inspect, knowledge, lineage, policy
 
@@ -67,6 +68,11 @@ def die(msg, code=1):
 
 # ---- run ----------------------------------------------------------------------------------
 
+def _sudo_denied(msg):
+    """True when the helper call failed because sudo refused (no taema group), not the helper itself."""
+    m = msg.lower()
+    return "sudo" in m or "permission denied" in m or "password is required" in m or "not allowed" in m
+
 def cmd_run(a):
     cfg, store, units = _load()
     name = a.name
@@ -91,7 +97,15 @@ def cmd_run(a):
             pass
         return die("register failed: %s" % reply["error"])
     try:
-        engine.helper_attach(cfg, os.getpid(), name)
+        try:
+            engine.helper_attach(cfg, os.getpid(), name)
+        except engine.Refused as e:
+            if not _sudo_denied(str(e)):
+                raise
+            # no taema group in this shell yet: the daemon has it and attaches us
+            r = ask(cfg, {"cmd": "attach", "scope": "scope-" + name, "pids": [os.getpid()]})
+            if not (r and r.get("ok")):
+                raise engine.Refused("%s (daemon: %s)" % (e, (r or {}).get("error", "not running")))
     except engine.Refused as e:
         try:
             os.rmdir(leaf)
@@ -219,6 +233,19 @@ def print_pairs(pairs):
             r["stop"], r["keep"], r["closes"], lineage.clean(r["why"], 60)))
 
 
+def print_auto(auto):
+    """Auto mode: scopes it created, leftover leaves, and the last auto stops with their reason."""
+    print("auto: %d auto-adopted scopes, %d leftover leaves" % (auto.get("auto_adopted_scopes", 0),
+                                                              auto.get("leftover_leaves", 0)))
+    stops = auto.get("auto_stops", [])
+    if not stops:
+        print("auto stops: none yet")
+    for s in stops[-5:]:
+        print("auto stop %s %-24s %s  [%s]" % (time.strftime("%m-%d %H:%M", time.localtime(s.get("ts", 0))),
+                                              lineage.clean(s.get("scope", ""), 24), lineage.clean(s.get("why", ""), 70),
+                                              lineage.clean(", ".join(s.get("pairs", [])), 60)))
+
+
 def cmd_status(a):
     cfg, store, units = _load()
     reply = ask(cfg, {"cmd": "status"})
@@ -227,8 +254,11 @@ def cmd_status(a):
         return 1
     reply["config"] = cfg["_sources"]
     pairs = reply.pop("pairs", [])
+    auto = reply.pop("auto", None)
     print(json.dumps(reply, indent=1))
     print_pairs(pairs)
+    if reply.get("mode") == "auto" and auto:
+        print_auto(auto)
     return 0
 
 
@@ -245,7 +275,7 @@ def cmd_gc(a):
 def cmd_adopt(a):
     cfg, store, units = _load()
     ops = engine.adopt_plan(cfg, units) + engine.carve_plan(cfg, units)
-    execute = (not a.dry_run) and cfg["mode"] in ("adopt", "enforce")
+    execute = (not a.dry_run) and cfg["mode"] in ("adopt", "enforce", "auto")
     ops = engine.run_ops(cfg, store, ops, execute)
     for op in ops:
         print("%-6s %-34s pids=%d%s" % (op["op"], op["scope"], len(op["pids"]), " done" if op["done"] else ""))

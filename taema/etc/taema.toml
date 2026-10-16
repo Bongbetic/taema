@@ -4,11 +4,15 @@
 # [protected] entries there. A user file can never remove a protected entry set here.
 # The root helper (taema-attach) reads only this file.
 #
-# Modes, in the order they should be enabled:
+# Modes:
+#   auto     the default. Adopts and learns from day one. It stops something only for a pair
+#            (owner, leftover) you answered in the prompt, or for strong evidence (many
+#            observed stops over several days, no keeps) after a 7-day burn-in.
 #   observe  log every move and kill the daemon would make; change nothing
 #   adopt    move matching processes into scopes; never kill
 #   enforce  move and kill
-mode = "observe"
+# observe, adopt and enforce are manual overrides, for example in ~/.config/taema/taema.toml.
+mode = "auto"
 
 [paths]
 # Login session cgroup. "auto" = every top-level numeric cgroup (elogind session) that holds

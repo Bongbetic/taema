@@ -1,6 +1,6 @@
 # Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
-# The workflow tests, builds the .xbps, publishes the GitHub release and a signed XBPS repository
-# (branch gh-pages, served as raw files), then opens a pull request that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
+# The workflow tests, builds the .xbps, signs an XBPS repository and attaches it, with the package,
+# to the GitHub release (xbps reads it from releases/latest/download), then opens a pull request that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
 name: release
 
 on:
@@ -32,6 +32,26 @@ jobs:
         run: |
           cd taema
           tools/build-xbps.sh "$RUNNER_TEMP/repo"
+      - name: Sign repository
+        env:
+          XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
+        run: |
+          out="$RUNNER_TEMP/assets"
+          mkdir -p "$out"
+          cp "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps" "$out/"
+          [ -n "$XBPS_PRIVKEY" ] || { echo "secret XBPS_PRIVKEY is not set; publishing the package only" >&2; exit 0; }
+          key="$RUNNER_TEMP/privkey.pem"
+          umask 077
+          printf '%s\n' "$XBPS_PRIVKEY" > "$key"
+          umask 022
+          cd "$out"
+          # The package is noarch: index it for every architecture Void supports.
+          for arch in x86_64 x86_64-musl i686 aarch64 aarch64-musl armv7l armv7l-musl armv6l armv6l-musl; do
+            XBPS_ARCH=$arch xbps-rindex -a "taema-${VERSION}_1.noarch.xbps"
+            XBPS_ARCH=$arch xbps-rindex --privkey "$key" --signedby "Bongbetic <soubarna@live.in>" -s .
+          done
+          xbps-rindex --privkey "$key" -S "taema-${VERSION}_1.noarch.xbps"
+          rm -f "$key"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,7 +60,7 @@ jobs:
           Add the repository once, then install and update like any other package:
 
           \`\`\`sh
-          echo 'repository=https://raw.githubusercontent.com/Bongbetic/taema/gh-pages' | sudo tee /etc/xbps.d/20-taema.conf
+          echo 'repository=https://github.com/${GITHUB_REPOSITORY}/releases/latest/download' | sudo tee /etc/xbps.d/20-taema.conf
           sudo xbps-install -S taema
           \`\`\`
 
@@ -50,34 +70,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" --title "tæma ${VERSION}" \
             --notes-file "$RUNNER_TEMP/notes.md" --generate-notes \
-            "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps"
-      - name: Publish signed repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-          XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
-        run: |
-          [ -n "$XBPS_PRIVKEY" ] || { echo "secret XBPS_PRIVKEY is not set; skipping repository" >&2; exit 0; }
-          pages="$RUNNER_TEMP/pages"
-          key="$RUNNER_TEMP/privkey.pem"
-          umask 077
-          printf '%s\n' "$XBPS_PRIVKEY" > "$key"
-          umask 022
-          mkdir -p "$pages"
-          cp "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps" "$pages/"
-          cd "$pages"
-          # The package is noarch: index it for every architecture Void supports.
-          for arch in x86_64 x86_64-musl i686 aarch64 aarch64-musl armv7l armv7l-musl armv6l armv6l-musl; do
-            XBPS_ARCH=$arch xbps-rindex -a "taema-${VERSION}_1.noarch.xbps"
-            XBPS_ARCH=$arch xbps-rindex --privkey "$key" --signedby "Bongbetic <soubarna@live.in>" -s .
-          done
-          xbps-rindex --privkey "$key" -S "taema-${VERSION}_1.noarch.xbps"
-          rm -f "$key"
-          git init -q -b gh-pages
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -qm "Repository for taema ${VERSION}"
-          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+            "$RUNNER_TEMP"/assets/*
 
   template:
     needs: release

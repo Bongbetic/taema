@@ -1,45 +1,57 @@
 <p align="center">
-  <img src="https://bongbetic.com/branding/bongbetic-logo-lockup.png" width="360" alt="Bongbetic">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="taema/docs/assets/taema-logo-dark.svg">
+    <img src="taema/docs/assets/taema-logo-light.svg" width="160" alt="tæma logo">
+  </picture>
 </p>
 
-<h1 align="center">void-mods</h1>
+<h1 align="center">taema</h1>
 
 <p align="center">
-  <strong>System modifications for Void Linux, packaged as installable XBPS packages</strong>
+  <strong>Close an app. Actually close it.</strong><br>
+  Dependency-aware, self-managing process scopes for Void Linux, packaged as an XBPS package
+</p>
+
+<p align="center">
+  <em>Made by</em><br>
+  <a href="https://bongbetic.com"><img src="https://bongbetic.com/branding/bongbetic-logo-lockup.png" width="200" alt="Bongbetic"></a>
 </p>
 
 ---
 
 Void Linux keeps things small: runit instead of systemd, and no hidden machinery. That is
-a good base, but some conveniences that systemd distributions take for granted are
-missing. void-mods adds them back one at a time. Each mod is a self-contained directory
-with its own package template, tests and documentation. Install only what you need.
+a good base, but systemd-style app scopes are missing. A program you close can leave
+detached children running forever. **tæma** (Icelandic for "to empty") gives every app its
+own cgroup v2 scope and empties it when the app stops, while keeping any helper that
+another program still uses.
 
-## Mods
+This repository holds the tæma package. Everything lives in the [`taema/`](taema/)
+directory, so `taema/taema` is the package inside the `taema` repository.
 
-| Mod | What it does |
-|---|---|
-| [tæma](taema/) | Dependency-aware, self-managing cgroup v2 process scopes. Stops what a program left running in the background, keeps helpers that others still use, adopts running apps into scopes, and learns from past stops. systemd-style app scopes, `BindsTo` and `StopWhenUnneeded` for runit. |
+**Start here: [taema/README.md](taema/README.md)** for what it does, how to install it and
+how to use it.
 
 ## Layout
 
-Each mod directory contains:
-
-- `srcpkgs/<name>/template`: a void-packages template
-- `tools/build-xbps.sh`: builds a local `.xbps` without a void-packages checkout
-- `Makefile`: `make test` and `make install DESTDIR=...`
-- `README.md`: use case, install and usage
-- `docs/`: design notes
+```
+taema/                  this repository
+  taema/                the package
+    srcpkgs/taema/      void-packages template
+    tools/build-xbps.sh builds a local .xbps without a void-packages checkout
+    Makefile            make test, make install DESTDIR=...
+    README.md           use case, install and usage
+    docs/               design notes and logo
+```
 
 ## Principles
 
-- Packaged, never hand-copied: every file a mod installs belongs to an XBPS package and
-  goes away with `xbps-remove`.
-- Off until enabled: services install disabled, as Void expects, and start in the safest
-  mode.
-- Small privileged surface: the parts that run as root are short, self-contained and
-  validate their input on their own.
-- Standard library and base-system tools only, unless a mod's README says otherwise.
+- Packaged, never hand-copied: every file installed belongs to an XBPS package and goes
+  away with `xbps-remove`.
+- Off until enabled: the service installs disabled, as Void expects, and starts in the
+  safest mode.
+- Small privileged surface: the part that runs as root is short, self-contained and
+  validates its input on its own.
+- Standard library and base-system tools only.
 
 ## License
 

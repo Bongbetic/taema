@@ -1,12 +1,16 @@
 <p align="center">
-  <img src="https://bongbetic.com/branding/bongbetic-logo-lockup.png" width="360" alt="Bongbetic">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/taema-logo-dark.svg">
+    <img src="docs/assets/taema-logo-light.svg" width="200" alt="tæma logo: a b-shaped glyph with a draining spiral inside a scope ring, one red dot slipping out">
+  </picture>
 </p>
 
 <h1 align="center">tæma</h1>
 
 <p align="center">
-  <strong>Dependency-aware, self-managing process scopes for Void Linux</strong><br>
-  systemd-style app scopes, <code>BindsTo</code> and <code>StopWhenUnneeded</code> for runit systems, built on cgroup v2
+  <strong>Close an app. Actually close it.</strong><br>
+  Process scopes for Void Linux that stop what a program left behind and spare what someone still needs.<br>
+  <sub>systemd-style app scopes, <code>BindsTo</code> and <code>StopWhenUnneeded</code> for runit, built on cgroup v2</sub>
 </p>
 
 <p align="center">
@@ -16,11 +20,55 @@
   <img src="https://img.shields.io/badge/license-MIT-e8333a" alt="MIT">
 </p>
 
+<p align="center">
+  <em>Made by</em><br>
+  <a href="https://bongbetic.com"><img src="https://bongbetic.com/branding/bongbetic-logo-lockup.png" width="200" alt="Bongbetic"></a>
+</p>
+
 ---
 
-*tæma* is Icelandic for "to empty". When you stop something, tæma empties it: the program
-and everything it left running in the background. A helper that another program still
-uses is kept alive.
+## Why "tæma"?
+
+*tæma* (say "TY-ma") is Icelandic for **"to empty"**: to pour a vessel out until nothing
+is left. That is the whole job. You stop a program, and tæma empties its scope: the
+program, its children, and the children that double-forked and hoped you would not
+notice.
+
+The logo says the same thing. The **b** is a bowl with a spiral draining out of it. The
+ring around it is the **scope**, a cgroup that nothing can sneak out of. The one **red
+dot** is the helper that is still in use by someone else. tæma sees it, leaves it alive,
+and moves it out of the way. A good emptying never pours out what a neighbour is still
+drinking.
+
+## In one minute
+
+You close your IDE. The Android emulator it started keeps eating 3 GB of RAM. Your dev
+server is still there, and so is a rootless podman pause process whose runtime directory
+is long gone. On systemd every app lives in its own scope and the system cleans up. On
+Void with runit, everything shares one login-session cgroup, and a process that detaches
+(`setsid`, double fork, `nohup`) outlives its parent.
+
+tæma gives every app its own scope and cleans up properly:
+
+```sh
+taema run emulator emulator -avd Pixel_8 -no-window   # start it inside a scope
+taema ls                                              # see what lives where
+taema kill emulator                                   # empty the scope
+```
+
+```
+kill    41210 qemu-system-x86    no outside users
+kill    41188 emulator           no outside users
+share   41302 adb                outside users: tcp_server 127.0.0.1:5037 <- 127.0.0.1:51734
+scope scope-emulator stopped
+```
+
+Everything is gone except `adb`, because another program is still talking to it. tæma
+checked first (sockets, shared podman state, ptrace), kept `adb`, and told you why.
+
+Or skip the typing. Run the daemon and it adopts running apps into scopes, stops a scope
+when its owner exits, and garbage-collects helpers nobody uses. It starts in `observe`
+mode, so it only tells you what it would do until you say otherwise.
 
 ## The problem
 

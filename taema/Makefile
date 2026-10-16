@@ -11,6 +11,9 @@ CONFDIR   = $(DESTDIR)/etc/taema
 SUDOERS   = $(DESTDIR)/etc/sudoers.d
 DOCDIR    = $(DESTDIR)/usr/share/doc/taema
 EXAMPLES  = $(DESTDIR)/usr/share/examples/taema
+SHELLDIR  = $(DESTDIR)/usr/share/taema/shell
+BASHRCD   = $(DESTDIR)/etc/bash/bashrc.d
+FISHCONF  = $(DESTDIR)/usr/share/fish/vendor_conf.d
 
 .PHONY: all test check install
 
@@ -22,10 +25,10 @@ test check:
 
 install:
 	install -d $(LIBDIR) $(BINDIR) $(LIBEXEC) $(SVDIR)/log $(CONFDIR)/units $(SUDOERS) \
-		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks
+		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(SHELLDIR) $(BASHRCD) $(FISHCONF)
 	install -m644 $(PY_FILES) $(LIBDIR)/
 	install -m755 bin/taema bin/scoperun bin/scopekill bin/scopels $(BINDIR)/
-	install -m755 libexec/taema-attach libexec/taemad-user libexec/taemad-log libexec/taema-svstop $(LIBEXEC)/
+	install -m755 libexec/taema-attach libexec/taemad-user libexec/taemad-log libexec/taema-svstop libexec/taema-hook $(LIBEXEC)/
 	install -m755 sv/taema/run sv/taema/finish $(SVDIR)/
 	install -m755 sv/taema/log/run $(SVDIR)/log/
 	install -m644 etc/taema.toml $(CONFDIR)/
@@ -34,3 +37,6 @@ install:
 	install -m644 examples/units/*.toml $(EXAMPLES)/units/
 	install -m755 examples/hooks/* $(EXAMPLES)/hooks/
 	install -m644 README.md docs/design.md $(DOCDIR)/
+	install -m644 shell/taema.bash shell/taema.zsh shell/taema.fish $(SHELLDIR)/
+	install -m644 shell/taema.bash $(BASHRCD)/taema.sh
+	install -m644 shell/taema.fish $(FISHCONF)/taema.fish

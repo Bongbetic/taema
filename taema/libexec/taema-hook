@@ -1,0 +1,264 @@
+#!/usr/bin/python3 -IS
+"""taema-hook: the prompt client. Called by the shell hooks (shell/taema.*), never by hand.
+
+    taema-hook done SHELLPID TAG STATUS WORD   a command line ended (the shell runs this in the background)
+    taema-hook kill SHELLPID WORD              a kill/pkill/killall/taema line ended
+    taema-hook ask SHELLPID                    show the pending question and read one key
+
+It imports nothing outside the standard library (lazily) and not the taema package, so it starts
+fast and works while the package is being upgraded. It never fails loudly: any error exits 0.
+"""
+import os
+import re
+import sys
+
+BUDGET = 0.3            # seconds for done/kill: connect, send, and a short look at the reply
+ASK_BUDGET = 1.5
+KEY_TIMEOUT = 15.0
+COLS = 80
+KILL_WORDS = ("kill", "pkill", "killall", "taema")
+_CTRL = re.compile("[\x00-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
+
+
+def clean(s, n=64):
+    """Printable text: control and bidi characters stripped, length capped."""
+    return _CTRL.sub("", str(s))[:n]
+
+
+def sock_paths():
+    """Same order as the daemon: $TAEMA_SOCKET, /run/user/<uid>/taema.sock, then the state dir."""
+    env = os.environ.get("TAEMA_SOCKET")
+    out = [env] if env else []
+    out.append("/run/user/%d/taema.sock" % os.getuid())
+    out.append(os.path.expanduser("~/.local/state/taema/taema.sock"))
+    return out
+
+
+def request(msg, budget, paths=None):
+    """One JSON line to the daemon; the reply dict, or None on any failure. Total time stays near budget."""
+    import json
+    import socket
+    import time
+    end = time.monotonic() + budget
+    for path in paths or sock_paths():
+        left = end - time.monotonic()
+        if left <= 0:
+            break
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(left)
+            s.connect(path)
+            s.sendall((json.dumps(msg) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                s.settimeout(max(0.01, end - time.monotonic()))
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            return json.loads(buf) if buf else {}
+        except (OSError, ValueError):
+            continue
+        finally:
+            s.close()
+    return None
+
+
+# ---- the question ---------------------------------------------------------------------------------
+
+def wrap(text, indent="    "):
+    import textwrap
+    return textwrap.fill(text, width=COLS - 2, subsequent_indent=indent, break_long_words=True)
+
+
+def others(q):
+    return q.get("candidates", [])[1:]
+
+
+def format_question(q):
+    """The question as text lines (already control-stripped and wrapped)."""
+    cands = q.get("candidates", [])
+    left = q.get("leftovers", [])
+    first = clean(cands[0]["label"], 48) if cands else ""
+    lines = []
+    if q.get("kind") == "closed":
+        comm = clean(left[0].get("comm", "?"), 48) if left else "?"
+        lines.append("tæma: `%s` was closed. Was it part of %s?" % (comm, first or "another app"))
+        lines.append("  [1] yes: stop it when %s closes" % first)
+    else:
+        n = sum(int(l.get("count", 1)) for l in left if isinstance(l.get("count", 1), int)) or len(left)
+        names = [clean(l.get("key", "?"), 32) for l in left[:4]]
+        more = ", ..." if len(left) > 4 else ""
+        lines.append("tæma: `%s` left %d process%s running (%s%s)." % (
+            clean(q.get("job", "?"), 32), n, "" if n == 1 else "es", ", ".join(names), more))
+        lines.append("  [1] part of %s: stop them when it closes" % first)
+    rest = others(q)
+    if rest:
+        desc = ", ".join(clean(c["label"], 32) + (" (seen %dx)" % c["seen"] if isinstance(c.get("seen"), int) else "")
+                         for c in rest[:3])
+        lines.append("  [2] part of another app: " + desc)
+    lines.append("  [3] standalone app: give them their own scope, never stop with a parent")
+    lines.append("  [Enter] ask me later")
+    return [wrap(l, "      ") if i else wrap(l, "  ") for i, l in enumerate(lines)]
+
+
+def map_key(key, q):
+    """('answer', choice, owner) | ('menu',) | ('later',) for one key press."""
+    cands = q.get("candidates", [])
+    if key == "1" and cands:
+        return ("answer", "stop", cands[0]["key"])
+    if key == "2" and len(cands) > 1:
+        return ("menu",) if len(cands) > 2 else ("answer", "stop", cands[1]["key"])
+    if key == "3":
+        return ("answer", "standalone", None)
+    return ("later",)
+
+
+def menu_choice(key, q):
+    """Owner key for a key press in the second menu, or None."""
+    rest = others(q)
+    if key.isdigit() and 1 <= int(key) <= len(rest[:9]):
+        return rest[int(key) - 1]["key"]
+    return None
+
+
+def pending_input(fd):
+    """Bytes already waiting on the tty (type-ahead). Unknown counts as waiting. A cooked tty
+    reports only complete lines, so the count is taken briefly in non-canonical mode."""
+    import fcntl
+    import struct
+    import termios
+    old = None
+    try:
+        old = termios.tcgetattr(fd)
+        new = list(old)
+        new[3] &= ~termios.ICANON
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0] > 0
+    except (OSError, ValueError, termios.error):
+        return True
+    finally:
+        if old is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old)
+            except termios.error:
+                pass
+
+
+def read_key(fd, timeout=KEY_TIMEOUT):
+    """One key from the tty in raw mode (signals stay on). '' on timeout, Esc, or error."""
+    import select
+    import termios
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        return ""
+    new = list(old)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6] = list(old[6])
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
+        if not select.select([fd], [], [], timeout)[0]:
+            return ""
+        ch = os.read(fd, 1)
+        termios.tcflush(fd, termios.TCIFLUSH)   # drop the rest of an escape sequence
+        return ch.decode("latin-1") if ch and ch != b"\x1b" else ""
+    except OSError:
+        return ""
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except termios.error:
+            pass
+
+
+def say(fd, text):
+    os.write(fd, (text + "\n").encode("utf-8", "replace"))
+
+
+def drop_pending(shell):
+    rd = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    try:
+        os.unlink("%s/taema/q.%d" % (rd, shell))
+    except OSError:
+        pass
+
+
+def confirmation(q, choice, owner, reply):
+    keys = ", ".join(clean(l.get("key", "?"), 32) for l in q.get("leftovers", [])[:3]) or "them"
+    if choice == "standalone":
+        return "tæma: noted, %s will have their own scope." % keys
+    name = clean(owner, 48)
+    return "tæma: noted, %s will stop when %s closes." % (keys, name)
+
+
+def ask(shell, fd=None, paths=None):
+    """The ask flow. Returns a short status string (used by tests); prints to the tty."""
+    own = fd is None
+    if own:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    try:
+        if pending_input(fd):
+            return "typeahead"
+        r = request({"cmd": "ask", "shell_pid": shell}, ASK_BUDGET, paths)
+        if r is None:
+            return "down"
+        q = r.get("question")
+        if not isinstance(q, dict):
+            drop_pending(shell)
+            return "none"
+        say(fd, "\n".join(format_question(q)))
+        act = map_key(read_key(fd), q)
+        owner = None
+        if act[0] == "menu":
+            say(fd, "  which app?  " + "  ".join(
+                "[%d] %s" % (i + 1, clean(c["label"], 32)) for i, c in enumerate(others(q)[:9])))
+            owner = menu_choice(read_key(fd), q)
+            act = ("answer", "stop", owner) if owner else ("later",)
+        if act[0] != "answer":
+            drop_pending(shell)
+            say(fd, "tæma: ok, I will ask later.")
+            return "later"
+        _a, choice, owner = act
+        msg = {"cmd": "answer", "nonce": q.get("nonce"), "choice": choice}
+        if owner is not None:
+            msg["owner"] = owner
+        reply = request(msg, ASK_BUDGET, paths)
+        if reply and reply.get("ok"):
+            say(fd, confirmation(q, choice, reply.get("owner", owner), reply))
+            return "answered"
+        say(fd, "tæma: could not save the answer.")
+        return "failed"
+    finally:
+        if own:
+            os.close(fd)
+
+
+# ---- entry ----------------------------------------------------------------------------------------
+
+def main(argv):
+    if len(argv) < 3:
+        return 0
+    cmd = argv[1]
+    shell = int(argv[2])
+    if shell <= 1:
+        return 0
+    if cmd == "done" and len(argv) >= 5:
+        tag, status = argv[3], int(argv[4])
+        word = clean(argv[5], 32) if len(argv) > 5 else ""
+        request({"cmd": "job_done", "shell_pid": shell, "tag": tag, "status": status, "word": word}, BUDGET)
+    elif cmd == "kill":
+        word = argv[3] if len(argv) > 3 else ""
+        if word in KILL_WORDS:
+            request({"cmd": "kill_done", "shell_pid": shell, "word": word}, BUDGET)
+    elif cmd == "ask":
+        ask(shell)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except BaseException:       # never break a prompt
+        sys.exit(0)

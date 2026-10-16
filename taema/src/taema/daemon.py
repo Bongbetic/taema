@@ -26,6 +26,10 @@ STOPPED_JOB = (148, 149, 150)   # 128 + SIGTSTP/SIGTTIN/SIGTTOU: Ctrl-Z is not a
 MAX_PENDING = 64
 PENDING_TTL = 60.0
 MAX_CANDIDATES = 8
+KILL_WORDS = ("kill", "pkill", "killall", "taema")
+GONE_WINDOW = 120.0     # how long a vanished process is remembered for a kill_done
+MAX_GONE = 256
+KILL_LOOKBACK = 30.0    # a kill line counts processes that vanished up to this long before its report
 SHELL_KEYS = ("sh", "bash", "dash", "zsh", "fish")
 MAX_GATE_SKIPS = 4      # fork gate: at most 4 skipped adopt passes, so every 5th one runs
 
@@ -59,6 +63,9 @@ class Daemon:
         self.jobs = {}          # tag -> {"shell", "status", "word", "t"} awaiting its settle deadline
         self.pending = {}       # question id -> question record
         self.next_qid = 1
+        self.kills = {}         # kill id -> {"shell", "word", "t"} awaiting its settle deadline
+        self.next_kid = 1
+        self.gone = []          # [(ts, vanished record)] from recent observes
         self.stopped = {}       # key -> ts of the last stop (respawn tracking)
         self.started = time.time()
         self.stopping = False
@@ -171,6 +178,8 @@ class Daemon:
 
     def after_observe(self):
         lin, now = self.lineage, time.time()
+        self.gone = [g for g in self.gone if now - g[0] <= GONE_WINDOW] + [(now, r) for r in lin.vanished()]
+        del self.gone[:-MAX_GONE]
         w = policy.timer(self.cfg, "respawn_window", 60)
         for eid in lin.born:
             e = lin.entries.get(eid)
@@ -215,6 +224,8 @@ class Daemon:
         for _t, kind, arg in due:
             if kind == "job":
                 self.guarded(lambda: self.decide_job(arg))
+            elif kind == "kill":
+                self.guarded(lambda: self.decide_kill(arg))
             elif kind == "expire":
                 self.guarded(lambda: self.expire_question(arg))
 
@@ -285,7 +296,54 @@ class Daemon:
                 add("historic", o)
         return out
 
-    def make_question(self, j, tag, owner, left, ask_keys):
+    def kill_done(self, msg):
+        shell, word = msg.get("shell_pid"), msg.get("word")
+        if not isinstance(shell, int) or isinstance(shell, bool) or word not in KILL_WORDS:
+            return {"error": "bad request"}
+        if shell <= 1 or inspect.uid_of(shell) != os.getuid():
+            return {"error": "shell gone or not yours"}
+        if len(self.kills) >= MAX_PENDING:
+            del self.kills[min(self.kills)]
+        kid, self.next_kid = self.next_kid, self.next_kid + 1
+        self.kills[kid] = {"shell": shell, "word": word, "t": time.time()}
+        self.add_deadline(time.time() + JOB_SETTLE, "kill", kid)
+        return {"ok": True}
+
+    def decide_kill(self, kid):
+        """After the settle: tracked processes that vanished around the kill line. Each is weak
+        evidence for its recorded owner; one may become a "was it part of X?" question."""
+        k = self.kills.pop(kid, None)
+        if k is None:
+            return
+        self.lineage.observe(inspect.ProcTable.scan())
+        self.guarded(self.after_observe)
+        prot = self.cfg["protected"].get("comm", [])
+        asks, used = [], []
+        for ts, r in self.gone:
+            if ts < k["t"] - KILL_LOOKBACK or r["root"] is None:
+                continue
+            used.append(r)
+            key = r["key"]
+            if not key or key in SHELL_KEYS or policy.comm_protected(key, prot) or self.store.is_persistent(key):
+                continue
+            # the recorded owner: the app root it was a member of, else the nearest real ancestor
+            owner = next((c for c in [r["root_key"], r["parent_key"]] + list(r["chain"])
+                          if c and c != key and c not in SHELL_KEYS and not policy.comm_protected(c, prot)
+                          and not self.store.is_persistent(c)), None)
+            if owner is None:
+                continue
+            owner = owner.replace(knowledge.SEP, "")[:256]
+            self.store.observe_kill_inferred(owner, key)
+            if self.store.pair_decision(owner, key)[0] == "ask" and self.store.can_ask((owner, key)):
+                asks.append((owner, key, r))
+        self.gone = [g for g in self.gone if not any(g[1] is u for u in used)]
+        if asks:
+            owner, key, r = asks[0]
+            left = [{"key": key, "comm": key.split(":")[-1], "chain": list(r["chain"]),
+                     "chain_ids": [None] * len(r["chain"])}]
+            self.make_question({"shell": k["shell"], "word": k["word"]}, None, owner, left, [key], kind="closed")
+
+    def make_question(self, j, tag, owner, left, ask_keys, kind="job"):
         shell = j["shell"]
         for qid in [i for i, q in self.pending.items() if q["shell_pid"] == shell]:
             self.drop_question(qid)
@@ -296,7 +354,7 @@ class Daemon:
         for l in left:
             if l["key"] in ask_keys:
                 cnt.setdefault(l["key"], {"key": l["key"], "comm": l["comm"], "count": 0})["count"] += 1
-        q = {"id": qid, "nonce": secrets.token_hex(8), "shell_pid": shell, "tag": tag, "word": j["word"],
+        q = {"id": qid, "kind": kind, "nonce": secrets.token_hex(8), "shell_pid": shell, "tag": tag, "word": j["word"],
              "owner": owner, "ask_keys": list(ask_keys), "candidates": self.candidates(owner, left),
              "leftovers": list(cnt.values()), "created": time.time(), "shown": False}
         self.pending[qid] = q
@@ -358,7 +416,7 @@ class Daemon:
                 return {"question": None, "reason": "rate_limited"}
             q["shown"] = True
             self.store.mark_asked(ok)
-        return {"question": {"id": q["id"], "nonce": q["nonce"], "shell_pid": shell, "job": q["word"],
+        return {"question": {"id": q["id"], "kind": q["kind"], "nonce": q["nonce"], "shell_pid": shell, "job": q["word"],
                              "candidates": q["candidates"], "leftovers": q["leftovers"],
                              "choices": list(knowledge.CHOICES),
                              "expires_in": max(0, int(PENDING_TTL - (time.time() - q["created"])))}}
@@ -572,6 +630,8 @@ class Daemon:
             return {"watching": self.watch_owner(leaf, owner)}
         if c == "job_done":
             return self.job_done(msg)
+        if c == "kill_done":
+            return self.kill_done(msg)
         if c == "ask":
             return self.ask_question(msg)
         if c == "answer":

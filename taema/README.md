@@ -239,6 +239,28 @@ taema keep adb             # prefer keeping adb alive (feedback for the learner)
 taema forget adb           # reset everything learned about adb
 ```
 
+### The prompt
+
+After a command that ran for 2 s or more, tæma looks for processes it left running. If
+it cannot tell whose they are, it asks once, at your next prompt:
+
+```
+tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
+  [1] part of npm run dev: stop them when it closes
+  [2] part of another app: code (seen 3x)
+  [3] standalone app: give them their own scope, never stop with a parent
+  [Enter] ask me later
+```
+
+Press one key. Your answer is remembered. It asks at most 3 times a day, and each pair only
+once a week. It stays silent when you have typed ahead and gives up after 15 s. It also asks
+after `kill`, `pkill` and `killall` when the app you closed belonged to another app.
+
+The hook is `shell/taema.bash` (installed to `/etc/bash/bashrc.d/taema.sh`), `taema.fish`
+(fish picks it up by itself) or `taema.zsh` (add `source /usr/share/taema/shell/taema.zsh`
+to `~/.zshrc`). A normal prompt runs no process and uses no `DEBUG` trap. Under bash the
+hook sees `kill` only when ble.sh is loaded. Set `TAEMA_NO_PROMPT=1` to turn it off.
+
 ## Units
 
 A unit describes how to recognise an app and how to manage its scope. System units live
@@ -327,6 +349,8 @@ These rules are fixed. Learning and unit files cannot change them:
 | `/usr/bin/taema` | command line and daemon |
 | `/usr/lib/taema/` | Python package |
 | `/usr/libexec/taema/taema-attach` | root helper, run through sudo |
+| `/usr/libexec/taema/taema-hook` | prompt client, called by the shell hooks |
+| `/usr/share/taema/shell/` | shell hooks for bash, zsh and fish |
 | `/etc/sudoers.d/taema` | lets `%taema` run the helper without a password |
 | `/etc/sv/taema/` | runit service: delegation plus one daemon per member |
 | `/etc/taema/` | system configuration and units |

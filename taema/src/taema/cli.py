@@ -5,7 +5,7 @@ import os
 import socket
 import sys
 
-from . import cgroup, engine, inspect, knowledge, policy
+from . import cgroup, engine, inspect, knowledge, lineage, policy
 
 
 def _load():
@@ -171,11 +171,13 @@ def cmd_explain(a):
         pp = inspect.ppid_map()
         members = set(inspect.descendants([pid], pp))
         edges = inspect.edges(members, inspect.Snapshot()).get(pid, [])
-        print("pid %d comm=%s key=%s" % (pid, inspect.comm(pid), policy.exe_key(pid)))
+        print("pid %d comm=%s key=%s app_key=%s" % (pid, inspect.comm(pid), policy.exe_key(pid), policy.app_key(pid)))
         print("cgroup: %s" % cgroup.proc_cgroup(pid))
         print("protected: %s" % (policy.protected_reason(pid, cfg) or "no"))
         print("edges (outside users of this pid and its descendants): %s" % (json.dumps(edges) if edges else "none"))
-        print(json.dumps(store.explain(policy.exe_key(pid)), indent=1))
+        info = store.explain(policy.exe_key(pid))
+        info["pairs"] = store.explain(policy.app_key(pid))["pairs"]
+        print(json.dumps(info, indent=1))
         return 0
     path = cgroup.resolve(a.target)
     if path:
@@ -205,6 +207,18 @@ def cmd_forget(a):
 
 # ---- status / gc / adopt / daemon ---------------------------------------------------------
 
+def print_pairs(pairs):
+    """Pair table: what each (owner, leftover) pair would do and how sure taema is."""
+    if not pairs:
+        print("pairs: none learned yet")
+        return
+    print("%-22s %-22s %-10s %5s %5s %5s %6s  %s" % ("owner", "leftover", "action", "conf", "stop", "keep", "closes", "why"))
+    for r in pairs:
+        print("%-22s %-22s %-10s %5.2f %5.2f %5.2f %6d  %s" % (
+            lineage.clean(r["owner"], 22), lineage.clean(r["leftover"], 22), r["action"], r["confidence"],
+            r["stop"], r["keep"], r["closes"], lineage.clean(r["why"], 60)))
+
+
 def cmd_status(a):
     cfg, store, units = _load()
     reply = ask(cfg, {"cmd": "status"})
@@ -212,7 +226,9 @@ def cmd_status(a):
         print("daemon: not running (config mode=%s, from %s)" % (cfg["mode"], ", ".join(cfg["_sources"]) or "built-in defaults"))
         return 1
     reply["config"] = cfg["_sources"]
+    pairs = reply.pop("pairs", [])
     print(json.dumps(reply, indent=1))
+    print_pairs(pairs)
     return 0
 
 

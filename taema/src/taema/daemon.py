@@ -2,8 +2,11 @@
 
 Single threaded. Mode gates every action: observe logs only, adopt moves, enforce also kills.
 """
+import hmac
 import json
 import os
+import re
+import secrets
 import select
 import selectors
 import signal
@@ -12,11 +15,18 @@ import stat
 import struct
 import time
 
-from . import cgroup, engine, inspect, knowledge, policy
+from . import cgroup, engine, inspect, knowledge, lineage, policy
 
 MAX_OWNERS = 256        # pidfd owner watches
 MAX_LEAF_WATCH = 256    # cgroup.events watches (EPOLLPRI)
 MAX_SLEEP = 60.0        # longest select() sleep
+JOB_SETTLE = 1.5        # seconds between job_done and the decision (survivors must outlive it)
+JOB_LAUNCHER = 2.0      # a job shorter than this is a launcher: survivors are learned silently
+STOPPED_JOB = (148, 149, 150)   # 128 + SIGTSTP/SIGTTIN/SIGTTOU: Ctrl-Z is not a close
+MAX_PENDING = 64
+PENDING_TTL = 60.0
+MAX_CANDIDATES = 8
+SHELL_KEYS = ("sh", "bash", "dash", "zsh", "fish")
 MAX_GATE_SKIPS = 4      # fork gate: at most 4 skipped adopt passes, so every 5th one runs
 
 
@@ -44,6 +54,12 @@ class Daemon:
         self.leaf_nowatch = set()   # leaves that could not be watched: the GC pass checks them
         self.empty_seen = set()     # leaves seen empty by the previous GC pass
         self.last_result = {"adopt": None, "gc": None}
+        self.lineage = lineage.Lineage(cfg)
+        self.deadlines = []     # [(due ts, kind, arg)]: job settle and question expiry, run by tick()
+        self.jobs = {}          # tag -> {"shell", "status", "word", "t"} awaiting its settle deadline
+        self.pending = {}       # question id -> question record
+        self.next_qid = 1
+        self.stopped = {}       # key -> ts of the last stop (respawn tracking)
         self.started = time.time()
         self.stopping = False
         self.session_seen = False
@@ -96,7 +112,8 @@ class Daemon:
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
         try:
-            engine.stop(path, self.cfg, self.store, unit, hook=policy.hook_for(self.cfg, leaf))
+            rep = engine.stop(path, self.cfg, self.store, unit, hook=policy.hook_for(self.cfg, leaf))
+            self.note_stop(rep)
             self.store.log(event="stopped", scope=leaf, why=why)
         except engine.Refused as e:
             self.store.log(event="stop_refused", scope=leaf, why=str(e))
@@ -114,15 +131,18 @@ class Daemon:
         return (last_pid, tuple((d, frozenset(cgroup.procs(d))) for d in policy.session_dirs(self.cfg)))
 
     def adopt_pass(self):
+        self.expire_respawns()
         sig = self._fork_sig()
         if sig is not None and sig == self.gate_sig and self.gate_skips < MAX_GATE_SKIPS:
             self.gate_skips += 1        # nothing forked and nobody joined a session: skip the walk
             return
         self.gate_sig, self.gate_skips = sig, 0
+        pt = inspect.ProcTable.scan()
+        self.lineage.observe(pt)
+        self.guarded(self.after_observe)
         if not self.units:
             self.last_result["adopt"] = []
             return
-        pt = inspect.ProcTable.scan()
         ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
         done = engine.run_ops(self.cfg, self.store, ops, self.may_move())
         for op in done:
@@ -130,6 +150,240 @@ class Daemon:
                 self.watch_owner(op["scope"], op["root"])
         self.last_result["adopt"] = [{"op": o["op"], "scope": o["scope"], "pids": len(o["pids"]),
                                       "done": o["done"]} for o in done]
+
+    # ---- learning hooks (log only: nothing here kills) ----
+    def note_stop(self, rep):
+        """Remember the keys a stop killed, to see whether they come back (respawn / GC outcome)."""
+        now = time.time()
+        for d in (rep or {}).get("decisions", []):
+            if d.get("action") == "kill":
+                self.stopped[d["key"]] = now
+        while len(self.stopped) > 256:
+            del self.stopped[min(self.stopped, key=self.stopped.get)]
+
+    def expire_respawns(self):
+        """A stopped key that did not reappear within timers.respawn_window was a good stop."""
+        w = policy.timer(self.cfg, "respawn_window", 60)
+        now = time.time()
+        for k in [k for k, t in self.stopped.items() if now - t > w]:
+            del self.stopped[k]
+            self.store.gc_outcome(k, False)
+
+    def after_observe(self):
+        lin, now = self.lineage, time.time()
+        w = policy.timer(self.cfg, "respawn_window", 60)
+        for eid in lin.born:
+            e = lin.entries.get(eid)
+            t = self.stopped.get(e["key"]) if e else None
+            if t is None or now - t > w:
+                continue
+            pe = lin.entry(e["ppid"])
+            # re-running the same command from a shell is not a respawn; a supervisor or another app is
+            same = pe is not None and pe["sid"] == pe["pid"] and pe["tty"] != 0
+            if not same:        # a shell re-run is neither a respawn nor evidence about the stop
+                self.store.respawn(e["key"], False)
+                self.store.gc_outcome(e["key"], True)
+            del self.stopped[e["key"]]
+        for rid in lin.closed:
+            owner = lin.ghosts.get(rid, {}).get("key")
+            if owner:
+                left = lin.leftovers_of(rid[0])
+                for key in dict.fromkeys(l["key"] for l in left):
+                    self.store.observe_close(owner, key)       # weight 0: only counts closes
+                self.attribute(owner, left, root=rid[0])
+
+    def attribute(self, owner, leftovers, root=None, job=None):
+        """Log would_attribute / would_stop for each distinct leftover key. Returns {key: decision}."""
+        out = {}
+        for key in dict.fromkeys(l["key"] for l in leftovers):
+            pids = [l["pid"] for l in leftovers if l["key"] == key]
+            out[key] = self.store.pair_decision(owner, key)
+            self.store.log(event="would_attribute", owner=owner, leftover=key, pids=pids[:8], root=root, job=job)
+            if out[key][0] == "stop":
+                self.store.log(event="would_stop", owner=owner, leftover=key, confidence=round(out[key][1], 2),
+                               why=out[key][2], mode=self.mode)
+        return out
+
+    # ---- terminal jobs and questions ----
+    def add_deadline(self, due, kind, arg):
+        self.deadlines.append((due, kind, arg))
+
+    def run_deadlines(self):
+        now = time.time()
+        due = [d for d in self.deadlines if d[0] <= now]
+        self.deadlines = [d for d in self.deadlines if d[0] > now]
+        for _t, kind, arg in due:
+            if kind == "job":
+                self.guarded(lambda: self.decide_job(arg))
+            elif kind == "expire":
+                self.guarded(lambda: self.expire_question(arg))
+
+    def job_done(self, msg):
+        shell, tag, status, word = msg.get("shell_pid"), msg.get("tag"), msg.get("status"), msg.get("word")
+        if not isinstance(shell, int) or isinstance(shell, bool) or not isinstance(status, int) \
+                or isinstance(status, bool) or not isinstance(tag, str) or not isinstance(word, str) \
+                or len(word) > 32 or not 0 <= status <= 255:
+            return {"error": "bad request"}
+        if shell <= 1 or inspect.uid_of(shell) != os.getuid():
+            return {"error": "shell gone or not yours"}
+        if not tag.startswith("%d." % shell) or not lineage._TAG.fullmatch(tag):
+            return {"error": "bad request"}
+        if status in STOPPED_JOB:
+            return {"ok": True, "ignored": "stopped, not closed"}
+        if len(self.jobs) >= MAX_PENDING and tag not in self.jobs:
+            del self.jobs[min(self.jobs, key=lambda t: self.jobs[t]["t"])]
+        self.jobs[tag] = {"shell": shell, "status": status, "word": lineage.clean(word, 32), "t": time.time()}
+        self.add_deadline(time.time() + JOB_SETTLE, "job", tag)
+        return {"ok": True}
+
+    def decide_job(self, tag):
+        """After the settle: who survived the job, whose are they, and is a question due."""
+        j = self.jobs.pop(tag, None)
+        if j is None:
+            return
+        self.lineage.observe(inspect.ProcTable.scan())
+        self.guarded(self.after_observe)        # observe resets closed/born: consume them here too
+        left = self.lineage.leftovers_of(tag)
+        if not left:
+            return
+        info = self.lineage.job_info(tag) or {}
+        owner = info.get("root_key") or next((l["root_key"] for l in left if l["root_key"]), "") or j["word"]
+        owner = owner.replace(knowledge.SEP, "")[:256]
+        if not owner:
+            return
+        launcher = not info or j["t"] - info["first"] < JOB_LAUNCHER
+        keys = list(dict.fromkeys(l["key"] for l in left))
+        for k in keys:
+            self.store.observe_close(owner, k, launcher=launcher)
+        if launcher:
+            self.store.log(event="launcher_learned", job=tag, owner=owner, leftovers=keys[:8])
+            return
+        dec = self.attribute(owner, left, job=tag)
+        ask = [k for k in keys if dec[k][0] == "ask" and self.store.can_ask((owner, k))]
+        if ask:
+            self.make_question(j, tag, owner, left, ask)
+
+    def candidates(self, owner, left):
+        """Owners to offer, job root first, then recorded ancestors, then historical owners."""
+        prot = self.cfg["protected"].get("comm", [])
+        out, seen = [], set()
+
+        def add(kind, key):
+            if key and key not in seen and len(out) < MAX_CANDIDATES:
+                seen.add(key)
+                out.append({"id": len(out) + 1, "kind": kind, "key": key, "label": lineage.clean(key, 48)})
+        add("job", owner)
+        for l in left:
+            for k, cid in zip(l["chain"], l["chain_ids"]):
+                e = self.lineage.entries.get(cid)
+                if k in SHELL_KEYS or policy.comm_protected(k, prot) or self.store.is_persistent(k) \
+                        or (e is not None and (e["sid"] == e["pid"] or self.lineage.ptmx_host(e["pid"]))):
+                    continue
+                add("ancestor", k)
+        for l in left:
+            for o in self.store.owners_of(l["key"]):
+                add("historic", o)
+        return out
+
+    def make_question(self, j, tag, owner, left, ask_keys):
+        shell = j["shell"]
+        for qid in [i for i, q in self.pending.items() if q["shell_pid"] == shell]:
+            self.drop_question(qid)
+        while len(self.pending) >= MAX_PENDING:
+            self.drop_question(min(self.pending, key=lambda i: self.pending[i]["created"]))
+        qid, self.next_qid = self.next_qid, self.next_qid + 1
+        cnt = {}
+        for l in left:
+            if l["key"] in ask_keys:
+                cnt.setdefault(l["key"], {"key": l["key"], "comm": l["comm"], "count": 0})["count"] += 1
+        q = {"id": qid, "nonce": secrets.token_hex(8), "shell_pid": shell, "tag": tag, "word": j["word"],
+             "owner": owner, "ask_keys": list(ask_keys), "candidates": self.candidates(owner, left),
+             "leftovers": list(cnt.values()), "created": time.time(), "shown": False}
+        self.pending[qid] = q
+        self.add_deadline(q["created"] + PENDING_TTL, "expire", qid)
+        self.write_q(q)
+        self.store.log(event="question_ready", id=qid, shell=shell, owner=owner, leftovers=list(cnt))
+
+    # per-shell pending file: the prompt hook only tests that it exists
+    @staticmethod
+    def qdir():
+        rd = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+        return rd + "/taema"
+
+    def write_q(self, q):
+        d = self.qdir()
+        try:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            os.chmod(d, 0o700)
+            fd = os.open("%s/q.%d" % (d, q["shell_pid"]), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({"id": q["id"]}) + "\n")
+        except OSError as e:
+            self.store.log(event="question_file_failed", error=str(e))
+
+    def drop_question(self, qid):
+        q = self.pending.pop(qid, None)
+        if q and not any(o["shell_pid"] == q["shell_pid"] for o in self.pending.values()):
+            try:
+                os.unlink("%s/q.%d" % (self.qdir(), q["shell_pid"]))
+            except OSError:
+                pass
+        return q
+
+    def expire_question(self, qid):
+        q = self.pending.get(qid)
+        if q is not None and time.time() - q["created"] >= PENDING_TTL - 0.001:
+            self.drop_question(qid)
+
+    def _live_question(self, shell):
+        for qid, q in list(self.pending.items()):
+            if time.time() - q["created"] >= PENDING_TTL:
+                self.drop_question(qid)
+        return next((q for q in self.pending.values() if q["shell_pid"] == shell), None)
+
+    def ask_question(self, msg):
+        shell = msg.get("shell_pid")
+        if not isinstance(shell, int) or isinstance(shell, bool) or shell <= 1:
+            return {"error": "bad request"}
+        if inspect.uid_of(shell) != os.getuid():
+            return {"error": "shell gone or not yours"}
+        q = self._live_question(shell)
+        if q is None:
+            return {"question": None, "reason": "none"}
+        pairs = [(q["owner"], k) for k in q["ask_keys"]]
+        if not q["shown"]:
+            ok = [p for p in pairs if self.store.can_ask(p)]
+            if not ok:
+                self.drop_question(q["id"])
+                return {"question": None, "reason": "rate_limited"}
+            q["shown"] = True
+            self.store.mark_asked(ok)
+        return {"question": {"id": q["id"], "nonce": q["nonce"], "shell_pid": shell, "job": q["word"],
+                             "candidates": q["candidates"], "leftovers": q["leftovers"],
+                             "choices": list(knowledge.CHOICES),
+                             "expires_in": max(0, int(PENDING_TTL - (time.time() - q["created"])))}}
+
+    def answer_question(self, msg):
+        nonce, choice, owner = msg.get("nonce"), msg.get("choice"), msg.get("owner")
+        if not isinstance(nonce, str) or not 0 < len(nonce) < 65 or choice not in knowledge.CHOICES \
+                or (owner is not None and not isinstance(owner, str)):
+            return {"error": "bad request"}
+        q = next((x for x in self.pending.values() if hmac.compare_digest(x["nonce"], nonce)), None)
+        if q is None or time.time() - q["created"] >= PENDING_TTL:
+            if q is not None:
+                self.drop_question(q["id"])
+            return {"error": "unknown or expired nonce"}
+        keys = [c["key"] for c in q["candidates"]]
+        if owner is None:
+            owner = q["owner"]
+        elif owner not in keys:
+            return {"error": "owner is not a candidate"}
+        for k in q["ask_keys"]:
+            self.store.answer(owner, k, choice)
+        self.drop_question(q["id"])
+        self.store.log(event="answer", choice=choice, owner=owner, leftovers=q["ask_keys"][:8])
+        self.store.save()
+        return {"ok": True, "choice": choice, "owner": owner, "leftovers": q["ask_keys"]}
 
     # ---- empty leaves ----
     def _empty_leaf_dirs(self):
@@ -237,6 +491,7 @@ class Daemon:
                 except engine.Refused as e:
                     self.store.log(event="gc_refused", scope=leaf, why=str(e))
                     continue
+                self.note_stop(rep)
                 if rep["removed"]:
                     self.store.log(event="gc_stopped", scope=leaf, why=why)
                 elif any(d["action"] == "skip" for d in rep["decisions"]):
@@ -279,8 +534,8 @@ class Daemon:
                 continue
             if self.may_kill():
                 try:
-                    engine.stop(d, self.cfg, self.store, unit,
-                                hook=policy.hook_for(self.cfg, os.path.basename(d)))
+                    self.note_stop(engine.stop(d, self.cfg, self.store, unit,
+                                               hook=policy.hook_for(self.cfg, os.path.basename(d))))
                 except engine.Refused:
                     pass
             else:
@@ -302,7 +557,11 @@ class Daemon:
             return {"mode": self.mode, "uptime_s": int(time.time() - self.started),
                     "owners": [{"scope": l, "owner": p} for l, p, _s in self.owners.values()],
                     "idle_tracked": {k: int(time.time() - v) for k, v in self.idle_since.items()},
-                    "last_adopt": self.last_result["adopt"], "last_gc": self.last_result["gc"]}
+                    "last_adopt": self.last_result["adopt"], "last_gc": self.last_result["gc"],
+                    "pairs": self.store.pairs_summary(), "standalone": sorted(self.store.data["standalone"])[:50],
+                    "lineage": {"entries": len(self.lineage.entries), "ghosts": len(self.lineage.ghosts),
+                                "jobs": len(self.lineage.jobs)},
+                    "pending_questions": len(self.pending)}
         if c == "register":
             leaf, owner = msg.get("scope"), msg.get("owner")
             if not isinstance(leaf, str) or not cgroup.valid_rel(leaf) \
@@ -311,6 +570,12 @@ class Daemon:
             if owner <= 1 or inspect.uid_of(owner) != os.getuid():
                 return {"error": "owner gone or not yours"}
             return {"watching": self.watch_owner(leaf, owner)}
+        if c == "job_done":
+            return self.job_done(msg)
+        if c == "ask":
+            return self.ask_question(msg)
+        if c == "answer":
+            return self.answer_question(msg)
         if c == "gc":
             return {"candidates": self.gc_pass(dry_run=msg.get("dry_run") is True)}
         if c == "feedback":
@@ -405,12 +670,14 @@ class Daemon:
     def next_timeout(self, now=None):
         """Seconds until the next timer is due (adopt, gc), capped at MAX_SLEEP."""
         now = time.time() if now is None else now
-        due = min(self.last["adopt"] + self.iv_adopt, self.last["gc"] + self.iv_gc, now + MAX_SLEEP)
+        due = min([self.last["adopt"] + self.iv_adopt, self.last["gc"] + self.iv_gc, now + MAX_SLEEP]
+                  + [d[0] for d in self.deadlines])
         return max(0.0, min(MAX_SLEEP, due - now))
 
     def tick(self):
         """Run what is due: socket check, adopt (+ session end), GC, routine save."""
         self.guarded(self.check_socket)
+        self.run_deadlines()
         now = time.time()
         if now - self.last["adopt"] >= self.iv_adopt:
             self.last["adopt"] = now
@@ -450,6 +717,8 @@ class Daemon:
                     fd = key.fd
                     self.guarded(lambda: self.on_owner_exit(fd))
             self.tick()
+        for qid in list(self.pending):
+            self.drop_question(qid)
         self.store.log(event="daemon_stop")
         self.store.save()
         return 0

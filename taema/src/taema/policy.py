@@ -10,6 +10,7 @@ that replaces both layers (used by tests and isolated runs).
 import copy
 import fnmatch
 import os
+import re
 import tomllib
 
 from . import cgroup, inspect
@@ -207,6 +208,79 @@ def exe_key(pid):
     """Learning key: exe basename, else comm."""
     e = inspect.exe(pid)
     return os.path.basename(e) if e else inspect.comm(pid)
+
+
+INTERPRETERS = ("node", "nodejs", "bun", "deno", "java", "ruby", "perl", "sh", "bash", "dash", "zsh", "fish")
+INTERP_PREFIXES = ("python", "lua", "php")
+_VERSIONED = re.compile(r"^(python3?|lua|php|nodejs)[0-9.]*$")
+_JAVA_VALUE_OPTS = ("-cp", "-classpath", "--class-path", "-p", "--module-path")
+
+
+def interp_name(base):
+    """Canonical interpreter name for an exe basename (python3.12 -> python3, lua5.4 -> lua,
+    nodejs -> node), or None when base is not an interpreter."""
+    if base in INTERPRETERS:
+        return "node" if base == "nodejs" else base
+    if base.startswith(INTERP_PREFIXES):
+        m = _VERSIONED.match(base)
+        if m:
+            return {"nodejs": "node"}.get(m.group(1), m.group(1))
+    return None
+
+
+def _script_of(interp, args):
+    """First non-option argument (python -m MOD -> MOD, java -jar X -> X); '' when the
+    interpreter runs inline code (-c, -e) or has no script."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "-e", "--eval", "-p", "--print") and interp != "java":
+            return ""
+        if a == "-m" and interp.startswith("python"):
+            return args[i + 1] if i + 1 < len(args) else ""
+        if a.startswith("-m") and interp.startswith("python") and len(a) > 2 and not a.startswith("--"):
+            return a[2:]
+        if a == "-jar" and interp == "java":
+            return args[i + 1] if i + 1 < len(args) else ""
+        if interp == "java" and a in _JAVA_VALUE_OPTS:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return ""
+
+
+def app_key(pid, table=None):
+    """Learning key v2. Interpreters key on '<interp>:<script>' (node vite.js -> node:vite.js,
+    python -m http.server -> python3:http.server); a process that set its own title (comm differs
+    from the exe and is not the interpreter) keys on comm. Everything else keys like exe_key().
+    table: an optional ProcTable, accepted for call-site symmetry; the key needs only this pid."""
+    return _clean(_app_key(pid))
+
+
+def _clean(k):
+    return "".join(c for c in k if c.isprintable())[:64]
+
+
+def _app_key(pid):
+    e = inspect.exe(pid)
+    base = os.path.basename(e) if e else ""
+    if not base:
+        return inspect.comm(pid)
+    interp = interp_name(base)
+    if interp is None:
+        return base
+    c = inspect.comm(pid)
+    if c and c != base[:15] and interp_name(c) != interp:
+        return c
+    argv = [a.decode(errors="replace") for a in inspect.read(pid, "cmdline").split(b"\0")[1:] if a]
+    script = os.path.basename(_script_of(interp, argv).rstrip("/"))[:64]
+    return "%s:%s" % (interp, script) if script else interp
+
+
+leaf_key = app_key      # name used by knowledge pairs
 
 
 def env_excluded(env, rules):

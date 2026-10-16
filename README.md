@@ -108,6 +108,9 @@ sudo xbps-install --repository="$PWD/build/repo" taema
 sudo xbps-install --repository=hostdir/binpkgs taema
 ```
 
+The license is noncommercial, so void-packages' main repository (free software only) would
+not accept this template. Use it from your own `void-packages` checkout.
+
 Packages you build or download yourself are unsigned, so they install only from a local
 directory repository.
 
@@ -294,4 +297,9 @@ taema/                  this repository
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[PolyForm Noncommercial 1.0.0](LICENSE). Use, modify and share it for any noncommercial
+purpose. Commercial use and commercial distribution are not allowed. Whenever you share it,
+keep the license text and the `Required Notice:` line (credit to Bongbetic) with it.
+
+Releases 0.1.0 and 0.2.0 were published under the MIT license and stay under it. This
+license applies to everything after them.

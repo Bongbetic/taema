@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/platform-Void%20Linux-478061" alt="Void Linux">
   <img src="https://img.shields.io/badge/init-runit-black" alt="runit">
   <img src="https://img.shields.io/badge/python-3.11%2B-black" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/license-MIT-e8333a" alt="MIT">
+  <img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-e8333a" alt="PolyForm Noncommercial 1.0.0">
 </p>
 
 <p align="center">
@@ -448,4 +448,9 @@ learning rules and the systemd concepts that tæma mirrors.
 
 ## License
 
-MIT. See [LICENSE](../LICENSE).
+[PolyForm Noncommercial 1.0.0](../LICENSE). Use, modify and share it for any noncommercial
+purpose. Commercial use and commercial distribution are not allowed. Whenever you share it,
+keep the license text and the `Required Notice:` line (credit to Bongbetic) with it.
+
+Versions 0.1.0 and 0.2.0 were released under the MIT license and stay under it. This license
+applies to everything after them.

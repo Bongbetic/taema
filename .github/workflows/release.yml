@@ -32,7 +32,8 @@ jobs:
         run: |
           # The tests assume a normal user, so run them as one.
           useradd -m builder
-          chown -R builder "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          mkdir -p "$RUNNER_TEMP/repo"
+          chown -R builder "$GITHUB_WORKSPACE" "$RUNNER_TEMP/repo"
           su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && tools/build-xbps.sh '$RUNNER_TEMP/repo'"
       - name: Sign repository
         env:

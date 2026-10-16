@@ -452,5 +452,4 @@ learning rules and the systemd concepts that tæma mirrors.
 purpose. Commercial use and commercial distribution are not allowed. Whenever you share it,
 keep the license text and the `Required Notice:` line (credit to Bongbetic) with it.
 
-Versions 0.1.0 and 0.2.0 were released under the MIT license and stay under it. This license
-applies to everything after them.
+This license covers every version of tæma, including the earlier releases.

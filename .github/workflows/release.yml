@@ -1,0 +1,70 @@
+# Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
+# The workflow tests, builds the .xbps, publishes the GitHub release, then opens a pull request
+# that bumps version and checksum in taema/srcpkgs/taema/template and in the README.
+name: release
+
+on:
+  push:
+    tags: ["taema-v*"]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: ghcr.io/void-linux/void-glibc:latest
+    steps:
+      - name: Install build tools
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -Sy python3 iproute2 util-linux sudo make git shadow github-cli
+      - uses: actions/checkout@v4
+      - name: Check tag against version
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' taema/src/taema/__init__.py)
+          [ "${GITHUB_REF_NAME}" = "taema-v${version}" ] || {
+            echo "tag ${GITHUB_REF_NAME} does not match __version__ ${version}" >&2; exit 1; }
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+      - name: Test and build
+        run: |
+          cd taema
+          tools/build-xbps.sh "$RUNNER_TEMP/repo"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --title "tæma ${VERSION}" --generate-notes \
+            "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps"
+
+  template:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Bump template and README
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#taema-v}
+          sum=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | sha256sum | cut -d' ' -f1)
+          t=taema/srcpkgs/taema/template
+          if grep -q "^version=${version}\$" "$t" && grep -q "^checksum=${sum}\$" "$t"; then
+            echo "template already current"; exit 0
+          fi
+          sed -i "s/^version=.*/version=${version}/; s/^revision=.*/revision=1/; s/^checksum=.*/checksum=${sum}/" "$t"
+          sed -i "s/taema-[0-9][0-9.]*_1\.noarch/taema-${version}_1.noarch/" README.md
+          branch="template-${version}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "Template and README: taema ${version}"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Template and README: taema ${version}" \
+            --body "Automatic bump after release ${GITHUB_REF_NAME}. Updates version, checksum and the download name in the README."

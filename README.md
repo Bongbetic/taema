@@ -238,12 +238,28 @@ sudo rm -rf /var/log/taema                    # service and helper logs
 
 Installed from a local build? Also delete the downloaded `.xbps` or `build/repo/`.
 
+## Releases and updates
+
+A release needs no manual work. Bump `__version__` in `taema/src/taema/__init__.py`, commit,
+then push a tag named `taema-vX.Y.Z`:
+
+```sh
+git tag taema-v0.3.0 && git push origin taema-v0.3.0
+```
+
+The `release` workflow runs the tests, builds the `.xbps`, publishes the GitHub release, and
+opens a pull request that bumps `version` and `checksum` in the void-packages template. Once
+the template is merged into void-packages, `srcpkgs/taema/update` lets
+`./xbps-src update-check taema` and Void's update bot find each new release by its tag.
+After that, `xbps-install -Su` upgrades tæma like any other package. The package's install
+script changes nothing on an upgrade.
+
 ## Layout
 
 ```
 taema/                  this repository
   taema/                the package
-    srcpkgs/taema/      void-packages template
+    srcpkgs/taema/      void-packages template and update-check rule
     tools/build-xbps.sh builds a local .xbps without a void-packages checkout
     Makefile            make test, make install DESTDIR=...
     README.md           full reference: units, configuration, safety rules

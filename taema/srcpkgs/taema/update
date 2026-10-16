@@ -1,0 +1,2 @@
+site="https://github.com/Bongbetic/taema/releases/latest"
+pattern="(?<=releases/tag/taema-v)[\d.]+"

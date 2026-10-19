@@ -717,6 +717,7 @@ class LeftoverGc(AutoCase):
         self.assertEqual(result[0][2], "review")
         (review,) = self.d.store.open_reviews()
         self.assertEqual((review["kind"], review["scope"]), ("scope", "leftover/x"))
+        self.assertTrue(self.d.store.review_holds_scope("leftover/x"))
         self.age_review("leftover/x", 30)
         self.d.cfg.setdefault("timers", {})["leftover_expire_days"] = 20
 
@@ -797,28 +798,47 @@ class LeftoverGc(AutoCase):
         restarted = knowledge.Store(self.d.store.dir, seeds=self.d.store.seeds)
         self.assertEqual({r["scope"] for r in restarted.open_reviews()},
                          {"shared/helper-301", "app-podman-deadbeef"})
-        self.assertTrue(restarted.review_holds_scope("shared/helper-301"))
-        self.assertTrue(restarted.review_holds_scope("app-podman-deadbeef"))
-        for review in restarted.data["reviews"]:
-            review["created"] = time.time() - 45 * knowledge.DAY
-            review["expires"] = time.time() - 31 * knowledge.DAY
-        restarted.save()
-        expired = knowledge.Store(self.d.store.dir, seeds=self.d.store.seeds)
-        self.assertEqual(expired.open_reviews(), [])
-        self.assertTrue(expired.review_holds_scope("shared/helper-301"))
-        self.assertTrue(expired.review_holds_scope("app-podman-deadbeef"))
         out = io.StringIO()
         with mock.patch.object(cli, "_load", return_value=(self.d.cfg, self.d.store, self.d.units)), \
                 redirect_stdout(out):
             cli.cmd_review(argparse.Namespace())
         self.assertIn("scope=shared/helper-301", out.getvalue())
         self.assertIn("scope=app-podman-deadbeef", out.getvalue())
-        self.d.store = expired
-        self.d.cfg["mode"] = "auto"
-        self.assertEqual(self.d.gc_pass(), [])  # unanswered review timeout remains a persisted keep
-        self.assertTrue(self.d.store.review_holds_scope("shared/helper-301"))
-        self.assertTrue(self.d.store.review_holds_scope("app-podman-deadbeef"))
         self.stopm.assert_not_called()
+
+    def test_pending_adopt_scope_reviews_do_not_block_auto_gc(self):
+        self.d.cfg["mode"] = "adopt"
+        for pid, comm in ((301, "helper"), (302, "catatonit"), (303, "helper"), (304, "niri")):
+            self.fp.add(pid, 1, comm=comm, born=self.fp.up - 100)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(301, 302, 303, 304)
+        scopes = {301: "shared/helper-301", 302: "app-podman-deadbeef",
+                  303: "shared/helper-303", 304: "shared/niri-304"}
+        for pid, scope in scopes.items():
+            self.cg.leaf(scope, [pid], cpu=100)
+            self.d.idle_since[scope] = time.time() - 601
+            self.d.gc_usage[scope] = 100
+        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
+                         "match": {"comm": "catatonit"}}]
+
+        self.d.gc_pass()
+
+        self.assertEqual({r["scope"] for r in self.d.store.open_reviews()}, set(scopes.values()))
+        self.assertFalse(self.d.store.review_holds_scope(scopes[301]))
+        self.stopm.assert_not_called()
+        self.d.store.add_veto("scope", scopes[303])
+        self.d.cfg["mode"] = "auto"
+
+        self.d.gc_pass()
+
+        stopped_scopes = {os.path.relpath(call.args[0], self.cg.base)
+                          for call in self.stopm.call_args_list}
+        self.assertEqual(stopped_scopes, {scopes[301], scopes[302]})
+        self.assertEqual({r["scope"] for r in self.d.store.open_reviews()}, set(scopes.values()))
+        self.assertTrue(any(e.get("event") == "vetoed" and e.get("scope") == scopes[303]
+                            for e in self.log()))
+        self.assertTrue(any(e.get("event") == "auto_stop_refused" and e.get("scope") == scopes[304]
+                            and "protected" in e.get("why", "") for e in self.log()))
 
     def test_missing_runtime_dir_does_not_override_live_unit_children(self):
         gone = self.rt + "/gone"

@@ -642,9 +642,11 @@ class Store:
         return len(self.open_reviews())
 
     def review_holds_scope(self, scope):
-        """Open or unanswered expired reviews keep their scope out of automatic GC."""
+        """Pair and leftover scope reviews hold; adopt reviews for shared/unit scopes are informational."""
         return any(isinstance(r, dict) and r.get("scope") == scope
-                   and r.get("state") in ("open", "expired") for r in self.data.get("reviews", []))
+                   and r.get("state") in ("open", "expired")
+                   and (r.get("kind") != "scope" or scope.startswith("leftover/"))
+                   for r in self.data.get("reviews", []))
 
     def _resolve_review(self, review, now, reason):
         review["state"] = "expired"
@@ -665,7 +667,7 @@ class Store:
         self.dirty = True
 
     def expire_reviews(self):
-        """Resolve expired or over-cap reviews to keep, then prune closed records after 30 days."""
+        """Resolve expired reviews, then prune closed pair and non-leftover scope records."""
         now = self.now()
         reviews = self.data.setdefault("reviews", [])
         expired = 0
@@ -676,7 +678,8 @@ class Store:
                 expired += 1
                 self.log(event="review_expired", id=review.get("id"), owner=review.get("owner"))
         closed = [r for r in reviews if isinstance(r, dict) and r.get("state") != "open"
-                  and r.get("kind") != "scope"
+                  and not (r.get("kind") == "scope"
+                           and str(r.get("scope", "")).startswith("leftover/"))
                   and r.get("closed", now) <= now - REVIEW_RETENTION]
         if closed:
             self.data["reviews"] = [r for r in reviews if r not in closed]
@@ -799,7 +802,7 @@ class Store:
             self.dirty = True
 
     def prune_scope_reviews(self, live_scopes):
-        """Drop GC review holds only after their scopes no longer exist."""
+        """Drop GC scope reviews after their scopes no longer exist."""
         reviews = self.data.get("reviews", [])
         kept = [r for r in reviews if not (isinstance(r, dict) and r.get("kind") == "scope"
                                            and r.get("scope") not in live_scopes)]

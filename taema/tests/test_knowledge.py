@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-from taema.knowledge import Store
+from taema.knowledge import MAX_OPEN_REVIEWS, Store
 
 DAY = 86400.0
 
@@ -88,6 +88,19 @@ class KnowledgeTests(unittest.TestCase):
         self.s.log(event="t", a=1)
         with open(self.s.log_path) as f:
             self.assertIn('"event": "t"', f.read())
+
+    def test_review_queue_cap_resolves_oldest_to_keep(self):
+        for i in range(MAX_OPEN_REVIEWS + 1):
+            self.s.add_review("owner%d" % i, [{"key": "helper", "pid": 1000 + i}],
+                              "leftover/owner-%d" % i)
+        self.assertEqual(self.s.review_count, MAX_OPEN_REVIEWS)
+        old = next(r for r in self.s.data["reviews"] if r["id"] == 1)
+        self.assertEqual(old["state"], "expired")
+        self.assertEqual(self.s.pair_decision("owner0", "helper")[0], "keep")
+        self.s.save()
+        reloaded = Store(self.d, self.seeds, self.clock)
+        self.assertEqual(reloaded.review_count, MAX_OPEN_REVIEWS)
+        self.assertEqual(reloaded.data["review_seq"], MAX_OPEN_REVIEWS + 1)
 
 
 if __name__ == "__main__":

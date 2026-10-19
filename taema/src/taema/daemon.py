@@ -44,6 +44,8 @@ class Daemon:
         self.deny = policy.owner_deny(cfg)
         self.store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"), deny=self.deny)
         self.store.apply_feedback()
+        self.store.expire_reviews()
+        self.store.save_if_dirty()
         self.units = policy.load_units(cfg)
         self.sel = selectors.DefaultSelector()
         self.owners = {}        # pidfd -> (scope leaf name, owner pid, owner starttime)
@@ -160,6 +162,8 @@ class Daemon:
         return (last_pid, tuple((d, frozenset(cgroup.procs(d))) for d in policy.session_dirs(self.cfg)))
 
     def adopt_pass(self):
+        self.store.expire_reviews()
+        self.store.save_if_dirty()
         self.expire_respawns()
         sig = self._fork_sig()
         if sig is not None and sig == self.gate_sig and self.gate_skips < MAX_GATE_SKIPS:
@@ -250,9 +254,12 @@ class Daemon:
                 for key in dict.fromkeys(l["key"] for l in left):
                     self.store.observe_close(owner, key, launcher=False)       # weight 0: only counts closes
                 self.attribute(owner, left, root=rid[0])
-                if self.authorize(authorization.GUI_CLOSE).verdict == authorization.ACT \
-                        and left and not lin.ghosts.get(rid, {}).get("terminal"):
-                    self.guarded(lambda: self.gui_close(rid, owner, left))
+                if left and not lin.ghosts.get(rid, {}).get("terminal"):
+                    dec = self.authorize(authorization.GUI_CLOSE)
+                    if dec.verdict == authorization.ACT:
+                        self.guarded(lambda: self.gui_close(rid, owner, left))
+                    elif dec.verdict == authorization.WOULD_ACT:
+                        self.guarded(lambda: self.would_contain_gui_close(rid, owner, left))
 
     # ---- auto mode: silent GUI closes, survivors of closed jobs, regret ----
     def check_regret(self, lin, now):
@@ -294,7 +301,7 @@ class Daemon:
 
     def gui_close(self, rid, owner, left):
         """A GUI root vanished (not a terminal job): standalone leftovers get their own scope, the rest
-        go to leftover/<owner>-<id>; the GC pass stops that leaf by pair decision or idleness."""
+        go to leftover/<owner>-<id> with a pending review that holds the scope until answered or expiry."""
         standalone = [l for l in left if self.store.standalone(l["key"])]
         rest = [l for l in left if not self.store.standalone(l["key"])]
         if standalone:
@@ -302,10 +309,28 @@ class Daemon:
         if rest:
             name = "%s/%s" % (engine.LEFTOVER, engine.leaf_slug(owner, rid[0]))
             try:
-                engine.run_ops(self.cfg, self.store, [{"op": "move", "scope": name, "unit": None, "auto": True,
-                                                       "pids": [l["pid"] for l in rest]}], True)
+                ops = engine.run_ops(self.cfg, self.store, [{"op": "move", "scope": name, "unit": None,
+                                                             "auto": True, "pids": [l["pid"] for l in rest]}], True)
+                op = next((x for x in ops if x.get("done")), None)
+                if op:
+                    moved = set(op["pids"])
+                    contained = [l for l in rest if l["pid"] in moved]
+                    review = self.store.add_review(owner, contained, name)
+                    if review:
+                        self.store.log(event="review_created", id=review["id"], owner=owner,
+                                       scope=name, survivors=review["survivors"], pids=review["pids"])
+                        self.store.save_if_dirty()
             except engine.Refused as e:
                 self.store.log(event="leftover_move_refused", scope=name, error=str(e))
+
+    def would_contain_gui_close(self, rid, owner, left):
+        """Record one observe-mode would-action for the survivors of a closed GUI root."""
+        pids = sorted({l["pid"] for l in left})
+        keys = sorted({l["key"] for l in left})
+        signature = (owner, tuple(keys), tuple(pids))
+        key = "would_contain:%d.%d" % rid
+        if self.store.changed(key, signature):
+            self.store.log(event="would_contain", owner=owner, root=rid[0], survivors=keys, pids=pids)
 
     def _infos(self, pids, origin=None):
         """member_info for each pid from one ss snapshot ('edges unknown' when ss failed)."""
@@ -731,6 +756,8 @@ class Daemon:
             now_empty.add(leaf)
 
     def gc_pass(self, dry_run=False):
+        self.store.expire_reviews()
+        self.store.save_if_dirty()
         if self.store.apply_feedback():
             self.store.save_if_dirty()
         self.store.decay()
@@ -845,6 +872,8 @@ class Daemon:
             return {"error": "bad request"}
         c = msg.get("cmd")
         if c == "status":
+            self.store.expire_reviews()
+            self.store.save_if_dirty()
             return {"mode": self.mode, "uptime_s": int(time.time() - self.started),
                     "owners": [{"scope": l, "owner": p} for l, p, _s in self.owners.values()],
                     "idle_tracked": {k: int(time.time() - v) for k, v in self.idle_since.items()},
@@ -853,7 +882,12 @@ class Daemon:
                     "lineage": {"entries": len(self.lineage.entries), "ghosts": len(self.lineage.ghosts),
                                 "jobs": len(self.lineage.jobs)},
                     "pending_questions": len(self.pending),
+                    "reviews": self.store.review_count,
                     "auto": self.auto_status()}
+        if c == "review":
+            self.store.expire_reviews()
+            self.store.save_if_dirty()
+            return {"reviews": self.store.open_reviews()}
         if c == "register":
             leaf, owner = msg.get("scope"), msg.get("owner")
             if not isinstance(leaf, str) or not cgroup.valid_rel(leaf) \

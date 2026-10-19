@@ -1,4 +1,5 @@
 """Packaging scripts: syntax of every shell script, and INSTALL/REMOVE run in a temp root."""
+
 import os
 import shutil
 import subprocess
@@ -24,10 +25,19 @@ nobody:x:65534:65534::/:/bin/bash
 
 class SyntaxTest(unittest.TestCase):
     def test_sh_n(self):
-        for rel in ("srcpkgs/taema/INSTALL", "srcpkgs/taema/REMOVE", "sv/taema/run",
-                    "sv/taema/finish", "tools/build-xbps.sh"):
+        for rel in (
+            "srcpkgs/taema/INSTALL",
+            "srcpkgs/taema/REMOVE",
+            "sv/taema/run",
+            "sv/taema/finish",
+            "tools/build-xbps.sh",
+        ):
             with self.subTest(script=rel):
-                r = subprocess.run(["sh", "-n", os.path.join(ROOT, rel)], capture_output=True, text=True)
+                r = subprocess.run(
+                    ["sh", "-n", os.path.join(ROOT, rel)],
+                    capture_output=True,
+                    text=True,
+                )
                 self.assertEqual(r.returncode, 0, r.stderr)
 
 
@@ -58,9 +68,19 @@ class ScriptTest(unittest.TestCase):
         os.chmod(path, 0o755)
 
     def run_script(self, script, action, update):
-        env = {"PATH": self.stubs + ":/usr/bin:/bin", "ROOTDIR": self.root, "STUBLOG": self.log, "LC_ALL": "C"}
-        r = subprocess.run(["sh", script, action, "taema", "0.1.0_1", update, "", "noarch"],
-                           env=env, capture_output=True, text=True, timeout=30)
+        env = {
+            "PATH": self.stubs + ":/usr/bin:/bin",
+            "ROOTDIR": self.root,
+            "STUBLOG": self.log,
+            "LC_ALL": "C",
+        }
+        r = subprocess.run(
+            ["sh", script, action, "taema", "0.1.0_1", update, "", "noarch"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         return r
 

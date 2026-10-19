@@ -4,6 +4,7 @@ Learned: whether an exe tends to be shared (default action), how long it takes t
 gracefully, and how long an idle shared leaf should live. Not learned: protected list,
 uid rules, configured cgroup and environment exclusions (see policy.py). No model, no network.
 """
+
 import glob
 import json
 import math
@@ -15,10 +16,18 @@ from . import policy
 
 DECAY_DAYS = 7
 DECAY_FACTOR = 0.9
-COUNTERS = ("seen", "shared_hits", "killed", "sigkill_needed", "respawned", "user_keep", "user_kill")
+COUNTERS = (
+    "seen",
+    "shared_hits",
+    "killed",
+    "sigkill_needed",
+    "respawned",
+    "user_keep",
+    "user_kill",
+)
 SEED_SHARE_PRIOR = 3.0
-SAVE_INTERVAL = 300         # seconds between routine saves; answers and exit save at once
-LOG_MAX = 1 << 20           # decisions.log rotates to decisions.log.1 at 1 MiB
+SAVE_INTERVAL = 300  # seconds between routine saves; answers and exit save at once
+LOG_MAX = 1 << 20  # decisions.log rotates to decisions.log.1 at 1 MiB
 MAX_EXES = 512
 STALE_DAYS = 90
 SCHEMA = 2
@@ -30,16 +39,16 @@ REVIEW_TTL = 14 * DAY
 REVIEW_RETENTION = 30 * DAY
 MAX_PAIRS = 256
 MAX_PER_OWNER = 32
-W_ANSWER = 3.0              # explicit answer weight; never decayed
-W_INFERRED = 0.25           # user kill inferred from a vanished pid
-W_REGRET = 3.0              # keep evidence added when an auto-stopped app comes back
-SILENT_KILLS = 5            # shell-observed kills ...
-SILENT_DAYS = 3             # ... on this many distinct days
+W_ANSWER = 3.0  # explicit answer weight; never decayed
+W_INFERRED = 0.25  # user kill inferred from a vanished pid
+W_REGRET = 3.0  # keep evidence added when an auto-stopped app comes back
+SILENT_KILLS = 5  # shell-observed kills ...
+SILENT_DAYS = 3  # ... on this many distinct days
 SILENT_RATIO = 0.9
 SILENT_KEEP_FREE_DAYS = 30  # no keep evidence this long
-SILENT_MIN_AGE = DAY        # pair first seen more than 24 h ago
-BURN_IN_DAYS = 7            # store age ... 
-BURN_IN_CLOSES = 20         # ... or closes seen since creation
+SILENT_MIN_AGE = DAY  # pair first seen more than 24 h ago
+BURN_IN_DAYS = 7  # store age ...
+BURN_IN_CLOSES = 20  # ... or closes seen since creation
 REGRET_WINDOW = 30 * 60.0
 REGRET_SUSPEND = 7 * DAY
 ASK_PER_DAY = 3
@@ -54,15 +63,30 @@ def decide(p, now, created, closes_total):
     if not p:
         return "ask", 0.0, "no evidence"
     if p.get("suspended_until", 0) > now:
-        return "ask", 0.0, "suspended after regret until day +%d" % int((p["suspended_until"] - now) // DAY + 1)
+        return (
+            "ask",
+            0.0,
+            "suspended after regret until day +%d"
+            % int((p["suspended_until"] - now) // DAY + 1),
+        )
     ex_s, ex_k = p.get("ex_stop", 0), p.get("ex_keep", 0)
     stop, keep = p.get("stop", 0), p.get("keep", 0)
-    if ex_s or ex_k:    # explicit: the last answer holds until contrary evidence outweighs it
+    if (
+        ex_s or ex_k
+    ):  # explicit: the last answer holds until contrary evidence outweighs it
         last = p.get("ex_last") or ("stop" if ex_s >= ex_k else "keep")
         if last == "stop" and keep < ex_s:
-            return "stop", 1.0, "answered stop (weight %.0f), contrary %.2f" % (ex_s, keep)
+            return (
+                "stop",
+                1.0,
+                "answered stop (weight %.0f), contrary %.2f" % (ex_s, keep),
+            )
         if last == "keep" and stop < ex_k:
-            return "keep", 1.0, "answered keep (weight %.0f), contrary %.2f" % (ex_k, stop)
+            return (
+                "keep",
+                1.0,
+                "answered keep (weight %.0f), contrary %.2f" % (ex_k, stop),
+            )
         return "ask", 0.0, "answer overturned by contrary evidence"
     if p.get("launches") and not p.get("kills"):
         return "keep", 0.5, "launcher pattern: survivors are what the job started"
@@ -72,12 +96,27 @@ def decide(p, now, created, closes_total):
     burn = now - created >= BURN_IN_DAYS * DAY or closes_total >= BURN_IN_CLOSES
     quiet = not keep and now - p.get("last_keep", 0) > SILENT_KEEP_FREE_DAYS * DAY
     old = now - p.get("first_seen", now) > SILENT_MIN_AGE
-    if kills >= SILENT_KILLS and days >= SILENT_DAYS and ratio >= SILENT_RATIO and quiet and old and burn:
-        return "stop", ratio, "silent: %d kills on %d days, ratio %.2f" % (kills, days, ratio)
+    if (
+        kills >= SILENT_KILLS
+        and days >= SILENT_DAYS
+        and ratio >= SILENT_RATIO
+        and quiet
+        and old
+        and burn
+    ):
+        return (
+            "stop",
+            ratio,
+            "silent: %d kills on %d days, ratio %.2f" % (kills, days, ratio),
+        )
     if keep > stop and keep >= 1:
         return "keep", keep / tot, "keep evidence %.2f vs stop %.2f" % (keep, stop)
-    return "ask", ratio, "kills %d/%d, days %d/%d, ratio %.2f, quiet %s, old %s, burn-in %s" % (
-        kills, SILENT_KILLS, days, SILENT_DAYS, ratio, quiet, old, burn)
+    return (
+        "ask",
+        ratio,
+        "kills %d/%d, days %d/%d, ratio %.2f, quiet %s, old %s, burn-in %s"
+        % (kills, SILENT_KILLS, days, SILENT_DAYS, ratio, quiet, old, burn),
+    )
 
 
 class Store:
@@ -88,20 +127,33 @@ class Store:
         self.feedback_path = os.path.join(state_dir, "feedback.jsonl")
         self.now = now
         self.seeds = seeds or {}
-        self.read_only = read_only      # CLI: the daemon is the single writer
-        self.deny = tuple(deny)         # configured owner-deny entries (extend the defaults)
+        self.read_only = read_only  # CLI: the daemon is the single writer
+        self.deny = tuple(deny)  # configured owner-deny entries (extend the defaults)
         self.dirty = False
         self.last_save = 0.0
-        self.sigs = {}          # change-detection signatures for log lines (see changed())
+        self.sigs = {}  # change-detection signatures for log lines (see changed())
         self.data = self._fresh()
         self._load()
         self._decay()
 
     def _fresh(self):
-        return {"version": SCHEMA, "last_decay": self.now(), "created": self.now(), "closes": 0,
-                "exes": {}, "pairs": {}, "standalone": {}, "noise": {},
-                "asked": {"day": 0, "n": 0}, "reviews": [], "review_seq": 0,
-                "vetoes": [], "auto_actions": [], "feedback_ids": [], "leftover_expiries": {}}
+        return {
+            "version": SCHEMA,
+            "last_decay": self.now(),
+            "created": self.now(),
+            "closes": 0,
+            "exes": {},
+            "pairs": {},
+            "standalone": {},
+            "noise": {},
+            "asked": {"day": 0, "n": 0},
+            "reviews": [],
+            "review_seq": 0,
+            "vetoes": [],
+            "auto_actions": [],
+            "feedback_ids": [],
+            "leftover_expiries": {},
+        }
 
     def _migrate(self, data):
         """v1 (exes only) -> v2: add pairs, standalone, asked, noise; keep every exe record."""
@@ -123,13 +175,23 @@ class Store:
             self.dirty = True
         seq = data.get("review_seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
-            seq = max((r.get("id", 0) for r in data["reviews"] if isinstance(r, dict)
-                       and isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool)), default=0)
+            seq = max(
+                (
+                    r.get("id", 0)
+                    for r in data["reviews"]
+                    if isinstance(r, dict)
+                    and isinstance(r.get("id"), int)
+                    and not isinstance(r.get("id"), bool)
+                ),
+                default=0,
+            )
             data["review_seq"] = seq
             self.dirty = True
         if not isinstance(data.get("closes"), int) or isinstance(data["closes"], bool):
             data["closes"] = 0
-        if not isinstance(data.get("created"), (int, float)) or isinstance(data["created"], bool):
+        if not isinstance(data.get("created"), (int, float)) or isinstance(
+            data["created"], bool
+        ):
             data["created"] = self.now()
         data["version"] = SCHEMA
         return data
@@ -219,7 +281,11 @@ class Store:
     # ---- vetoes and automatic-stop correction -----------------------------------------------
     @staticmethod
     def _valid_veto_target(target):
-        if not isinstance(target, dict) or target.get("kind") not in ("scope", "app", "pid"):
+        if not isinstance(target, dict) or target.get("kind") not in (
+            "scope",
+            "app",
+            "pid",
+        ):
             return False
         value = target.get("value")
         if not isinstance(value, (str, int)) or isinstance(value, bool):
@@ -233,12 +299,21 @@ class Store:
             except ValueError:
                 return False
             start = target.get("start")
-            return pid > 1 and isinstance(start, int) and not isinstance(start, bool) and start > 0
+            return (
+                pid > 1
+                and isinstance(start, int)
+                and not isinstance(start, bool)
+                and start > 0
+            )
         return isinstance(target.get("start"), type(None))
 
     @staticmethod
     def _target(veto):
-        return {"kind": veto["kind"], "value": veto["value"], "start": veto.get("start")}
+        return {
+            "kind": veto["kind"],
+            "value": veto["value"],
+            "start": veto.get("start"),
+        }
 
     @staticmethod
     def describe_veto(veto):
@@ -253,11 +328,19 @@ class Store:
         if not self._valid_veto_target(target):
             return None
         target["value"] = str(target["value"])
-        if identifier is not None and (not isinstance(identifier, str) or not identifier or len(identifier) > 128):
+        if identifier is not None and (
+            not isinstance(identifier, str) or not identifier or len(identifier) > 128
+        ):
             return None
         identifier = identifier or uuid.uuid4().hex
-        existing = next((v for v in self.data["vetoes"] if isinstance(v, dict)
-                         and v.get("id") == identifier), None)
+        existing = next(
+            (
+                v
+                for v in self.data["vetoes"]
+                if isinstance(v, dict) and v.get("id") == identifier
+            ),
+            None,
+        )
         if existing:
             return dict(existing)
         veto = {"id": identifier, **target, "created": self.now()}
@@ -270,30 +353,46 @@ class Store:
 
     def remove_veto(self, target):
         """Remove only a matching veto. PID removal may omit start to clear that pid's instances."""
-        if not isinstance(target, dict) or target.get("kind") not in ("scope", "app", "pid"):
+        if not isinstance(target, dict) or target.get("kind") not in (
+            "scope",
+            "app",
+            "pid",
+        ):
             return []
         value = target.get("value")
         if not isinstance(value, (str, int)) or isinstance(value, bool):
             return []
         value = str(value)
         start = target.get("start")
-        if start is not None and (not isinstance(start, int) or isinstance(start, bool)):
+        if start is not None and (
+            not isinstance(start, int) or isinstance(start, bool)
+        ):
             return []
         removed = []
         keep = []
         for veto in self.data["vetoes"]:
-            same = isinstance(veto, dict) and veto.get("kind") == target["kind"] \
-                and veto.get("value") == value and (start is None or veto.get("start") == start)
+            same = (
+                isinstance(veto, dict)
+                and veto.get("kind") == target["kind"]
+                and veto.get("value") == value
+                and (start is None or veto.get("start") == start)
+            )
             (removed if same else keep).append(veto)
         if removed:
             self.data["vetoes"] = keep
             self.dirty = True
-            self.log(event="veto_removed", target={"kind": target["kind"], "value": value, "start": start})
+            self.log(
+                event="veto_removed",
+                target={"kind": target["kind"], "value": value, "start": start},
+            )
         return [dict(v) for v in removed]
 
     def _active_vetoes(self, include_pending=True):
-        vetoes = [dict(v) for v in self.data["vetoes"] if isinstance(v, dict)
-                  and self._valid_veto_target(v)]
+        vetoes = [
+            dict(v)
+            for v in self.data["vetoes"]
+            if isinstance(v, dict) and self._valid_veto_target(v)
+        ]
         if not include_pending:
             return vetoes
         known_ids = set(self.data.get("feedback_ids", []))
@@ -309,7 +408,11 @@ class Store:
                     op = json.loads(line)
                 except ValueError:
                     continue
-                if not isinstance(op, dict) or op.get("v") != 1 or op.get("id") in known_ids:
+                if (
+                    not isinstance(op, dict)
+                    or op.get("v") != 1
+                    or op.get("id") in known_ids
+                ):
                     continue
                 op_id = op.get("id")
                 if not isinstance(op_id, str) or not op_id or len(op_id) > 128:
@@ -322,38 +425,61 @@ class Store:
                     target = op.get("target")
                     if isinstance(target, dict):
                         start = target.get("start")
-                        vetoes = [v for v in vetoes if not (
-                            v.get("kind") == target.get("kind") and v.get("value") == str(target.get("value"))
-                            and (start is None or v.get("start") == start))]
+                        vetoes = [
+                            v
+                            for v in vetoes
+                            if not (
+                                v.get("kind") == target.get("kind")
+                                and v.get("value") == str(target.get("value"))
+                                and (start is None or v.get("start") == start)
+                            )
+                        ]
                 elif op.get("op") == "undo":
                     action = self.auto_action(op.get("action_id"))
                     if action:
-                        apps = action.get("apps") or [pair[1] for pair in action.get("pairs", [])
-                                                       if isinstance(pair, list) and len(pair) == 2]
+                        apps = action.get("apps") or [
+                            pair[1]
+                            for pair in action.get("pairs", [])
+                            if isinstance(pair, list) and len(pair) == 2
+                        ]
                         targets = [("app", app) for app in dict.fromkeys(apps)]
                         if not targets and action.get("scope"):
                             targets = [("scope", action["scope"])]
                         for index, (kind, value) in enumerate(targets):
                             target = {"kind": kind, "value": value, "start": None}
                             if self._valid_veto_target(target):
-                                vetoes.append({"id": "%s:%d" % (op_id, index), **target,
-                                               "created": self.now()})
+                                vetoes.append(
+                                    {
+                                        "id": "%s:%d" % (op_id, index),
+                                        **target,
+                                        "created": self.now(),
+                                    }
+                                )
         return vetoes
 
     def match_veto(self, scope=None, members=(), include_pending=True):
         """Return the first veto matching a scope or observed member identities."""
         for veto in self._active_vetoes(include_pending):
             kind, value = veto.get("kind"), veto.get("value")
-            if kind == "scope" and isinstance(scope, str) \
-                    and (scope == value or scope.startswith(value.rstrip("/") + "/")):
+            if (
+                kind == "scope"
+                and isinstance(scope, str)
+                and (scope == value or scope.startswith(value.rstrip("/") + "/"))
+            ):
                 return dict(veto)
             for member in members or ():
                 if not isinstance(member, dict):
                     continue
                 if kind == "app" and value in member.get("apps", ()):
                     return dict(veto)
-                if kind == "pid" and str(member.get("pid")) == value \
-                        and (member.get("start") is None or member.get("start") == veto.get("start")):
+                if (
+                    kind == "pid"
+                    and str(member.get("pid")) == value
+                    and (
+                        member.get("start") is None
+                        or member.get("start") == veto.get("start")
+                    )
+                ):
                     return dict(veto)
         return None
 
@@ -361,15 +487,26 @@ class Store:
         """Keep enough durable context to target the latest automatic stop after restart."""
         normalized_pairs = []
         for pair in pairs:
-            if isinstance(pair, (tuple, list)) and len(pair) == 2 and all(
-                    isinstance(x, str) and x and len(x) <= 256 for x in pair):
+            if (
+                isinstance(pair, (tuple, list))
+                and len(pair) == 2
+                and all(isinstance(x, str) and x and len(x) <= 256 for x in pair)
+            ):
                 normalized_pairs.append([pair[0], pair[1]])
-        normalized_apps = list(dict.fromkeys(x for x in apps if isinstance(x, str) and x and len(x) <= 256))
+        normalized_apps = list(
+            dict.fromkeys(x for x in apps if isinstance(x, str) and x and len(x) <= 256)
+        )
         for _owner, app in normalized_pairs:
             if app not in normalized_apps:
                 normalized_apps.append(app)
-        action = {"id": uuid.uuid4().hex, "scope": str(scope)[:256], "why": str(why)[:512],
-                  "pairs": normalized_pairs[:32], "apps": normalized_apps[:64], "ts": self.now()}
+        action = {
+            "id": uuid.uuid4().hex,
+            "scope": str(scope)[:256],
+            "why": str(why)[:512],
+            "pairs": normalized_pairs[:32],
+            "apps": normalized_apps[:64],
+            "ts": self.now(),
+        }
         actions = self.data.setdefault("auto_actions", [])
         actions.append(action)
         del actions[:-50]
@@ -388,30 +525,46 @@ class Store:
         action = self.auto_action(identifier)
         if not action:
             return None
-        apps = action.get("apps") or [pair[1] for pair in action.get("pairs", [])
-                                       if isinstance(pair, list) and len(pair) == 2]
+        apps = action.get("apps") or [
+            pair[1]
+            for pair in action.get("pairs", [])
+            if isinstance(pair, list) and len(pair) == 2
+        ]
         targets = [("app", app) for app in dict.fromkeys(apps)]
         if not targets and action.get("scope"):
             targets = [("scope", action["scope"])]
         vetoes = []
         for index, (kind, value) in enumerate(targets):
-            veto = self.add_veto(kind, value,
-                                 identifier=("%s:%d" % (feedback_id, index)) if feedback_id else None,
-                                 reason="undo automatic stop")
+            veto = self.add_veto(
+                kind,
+                value,
+                identifier=("%s:%d" % (feedback_id, index)) if feedback_id else None,
+                reason="undo automatic stop",
+            )
             if veto:
                 vetoes.append(veto)
         for pair in action.get("pairs", []):
             if isinstance(pair, list) and len(pair) == 2:
                 self.answer(pair[0], pair[1], "keep")
-        self.log(event="undo", action_id=action.get("id"), scope=action.get("scope"),
-                 vetoes=[self._target(v) for v in vetoes], pairs=action.get("pairs", [])[:8])
+        self.log(
+            event="undo",
+            action_id=action.get("id"),
+            scope=action.get("scope"),
+            vetoes=[self._target(v) for v in vetoes],
+            pairs=action.get("pairs", [])[:8],
+        )
         self.dirty = True
         return {"action": action, "vetoes": vetoes}
 
     # ---- feedback ----
     def apply_op(self, op, key):
         """One explicit user answer: keep | forget | kill. Returns False for a bad op or key."""
-        if op not in ("keep", "forget", "kill") or not isinstance(key, str) or not key or len(key) > 256:
+        if (
+            op not in ("keep", "forget", "kill")
+            or not isinstance(key, str)
+            or not key
+            or len(key) > 256
+        ):
             return False
         if op == "keep":
             self.bump(key, "user_keep", 3.0)
@@ -436,8 +589,13 @@ class Store:
             target = msg.get("target")
             if not self._valid_veto_target(target):
                 return None
-            veto = self.add_veto(target["kind"], target["value"], target.get("start"),
-                                 identifier=op_id, reason=msg.get("reason", ""))
+            veto = self.add_veto(
+                target["kind"],
+                target["value"],
+                target.get("start"),
+                identifier=op_id,
+                reason=msg.get("reason", ""),
+            )
             result = {"target": self._target(veto)}
         elif op == "unveto":
             target = msg.get("target")
@@ -452,9 +610,11 @@ class Store:
             undone = self.undo_auto_action(action_id, feedback_id=op_id)
             if not undone:
                 return None
-            result = {"action_id": action_id,
-                      "targets": [self._target(v) for v in undone["vetoes"]],
-                      "pairs": undone["action"].get("pairs", [])}
+            result = {
+                "action_id": action_id,
+                "targets": [self._target(v) for v in undone["vetoes"]],
+                "pairs": undone["action"].get("pairs", []),
+            }
         elif op == "vetoed":
             target, trigger = msg.get("target"), msg.get("trigger")
             if not isinstance(target, dict) or not isinstance(trigger, str):
@@ -474,7 +634,9 @@ class Store:
         work = path + ".replay"
         if os.path.exists(path):
             try:
-                if os.path.exists(work):    # leftover of a crash: keep it, append the new lines
+                if os.path.exists(
+                    work
+                ):  # leftover of a crash: keep it, append the new lines
                     with open(path, "rb") as src, open(work, "ab") as dst:
                         dst.write(src.read())
                     os.unlink(path)
@@ -546,13 +708,16 @@ class Store:
         if steps <= 0:
             return
         self.dirty = True
-        f = DECAY_FACTOR ** steps
+        f = DECAY_FACTOR**steps
         for r in self.data["exes"].values():
             for c in COUNTERS:
                 v = r.get(c, 0.0) * f
                 r[c] = 0.0 if v < 0.01 else v
         for p in self.data["pairs"].values():
-            for c in ("stop", "keep"):      # inferred evidence only; ex_* counters never decay
+            for c in (
+                "stop",
+                "keep",
+            ):  # inferred evidence only; ex_* counters never decay
                 v = p.get(c, 0.0) * f
                 p[c] = 0.0 if v < 0.01 else v
         self.data["last_decay"] += steps * DECAY_DAYS * 86400
@@ -561,8 +726,12 @@ class Store:
 
     @staticmethod
     def _empty(r):
-        return (all(r.get(c, 0.0) == 0 for c in COUNTERS) and not r.get("term_exit_ms")
-                and not r.get("stops") and r.get("idle_grace_scale", 1.0) == 1.0)
+        return (
+            all(r.get(c, 0.0) == 0 for c in COUNTERS)
+            and not r.get("term_exit_ms")
+            and not r.get("stops")
+            and r.get("idle_grace_scale", 1.0) == 1.0
+        )
 
     def enforce_caps(self):
         """Drop all-zero records; above MAX_EXES evict stale (last_seen > 90 days) records first,
@@ -572,8 +741,14 @@ class Store:
             del exes[k]
             self.dirty = True
         pairs = self.data["pairs"]
-        for k in [k for k, p in pairs.items() if self._pweight(p) == 0 and not p.get("closes")
-                  and not p.get("launches") and not p.get("kills")]:
+        for k in [
+            k
+            for k, p in pairs.items()
+            if self._pweight(p) == 0
+            and not p.get("closes")
+            and not p.get("launches")
+            and not p.get("kills")
+        ]:
             del pairs[k]
             self.dirty = True
         if len(pairs) > MAX_PAIRS:
@@ -581,9 +756,14 @@ class Store:
         over = len(exes) - MAX_EXES
         if over > 0:
             cutoff = self.now() - STALE_DAYS * 86400
-            order = sorted(exes, key=lambda k: (exes[k].get("last_seen", 0) >= cutoff,
-                                                sum(exes[k].get(c, 0.0) for c in COUNTERS),
-                                                exes[k].get("last_seen", 0)))
+            order = sorted(
+                exes,
+                key=lambda k: (
+                    exes[k].get("last_seen", 0) >= cutoff,
+                    sum(exes[k].get(c, 0.0) for c in COUNTERS),
+                    exes[k].get("last_seen", 0),
+                ),
+            )
             for k in order[:over]:
                 del exes[k]
             self.dirty = True
@@ -595,7 +775,9 @@ class Store:
 
     @staticmethod
     def _ok(*keys):
-        return all(isinstance(k, str) and 0 < len(k) <= 256 and SEP not in k for k in keys)
+        return all(
+            isinstance(k, str) and 0 < len(k) <= 256 and SEP not in k for k in keys
+        )
 
     def _pair(self, owner, leftover, create=True):
         k = self.pkey(owner, leftover)
@@ -605,8 +787,19 @@ class Store:
                 return None
             p = self.data["pairs"][k] = {"first_seen": self.now()}
             self._cap_pairs(owner, keep=k)
-        for f in ("stop", "keep", "ex_stop", "ex_keep", "closes", "kills", "launches", "last_asked",
-                  "last_auto_stop", "last_keep", "suspended_until"):
+        for f in (
+            "stop",
+            "keep",
+            "ex_stop",
+            "ex_keep",
+            "closes",
+            "kills",
+            "launches",
+            "last_asked",
+            "last_auto_stop",
+            "last_keep",
+            "suspended_until",
+        ):
             p.setdefault(f, 0 if f in ("closes", "kills", "launches") else 0.0)
         p.setdefault("days", [])
         p["last_seen"] = self.now()
@@ -615,15 +808,24 @@ class Store:
 
     @staticmethod
     def _pweight(p):
-        return p.get("stop", 0) + p.get("keep", 0) + p.get("ex_stop", 0) + p.get("ex_keep", 0)
+        return (
+            p.get("stop", 0)
+            + p.get("keep", 0)
+            + p.get("ex_stop", 0)
+            + p.get("ex_keep", 0)
+        )
 
     def _cap_pairs(self, owner, keep=None):
         pairs = self.data["pairs"]
+
         def drop(cands, over):
-            order = sorted((k for k in cands if k != keep),
-                           key=lambda k: (self._pweight(pairs[k]), pairs[k].get("last_seen", 0)))
+            order = sorted(
+                (k for k in cands if k != keep),
+                key=lambda k: (self._pweight(pairs[k]), pairs[k].get("last_seen", 0)),
+            )
             for k in order[:over]:
                 del pairs[k]
+
         mine = [k for k in pairs if k.startswith(owner + SEP)]
         if len(mine) > MAX_PER_OWNER:
             drop(mine, len(mine) - MAX_PER_OWNER)
@@ -634,8 +836,13 @@ class Store:
     def open_reviews(self):
         """Pending reviews, in creation order, excluding reviews past their expiry."""
         now = self.now()
-        return [dict(r) for r in self.data.get("reviews", []) if isinstance(r, dict)
-                and r.get("state") == "open" and r.get("expires", now) > now]
+        return [
+            dict(r)
+            for r in self.data.get("reviews", [])
+            if isinstance(r, dict)
+            and r.get("state") == "open"
+            and r.get("expires", now) > now
+        ]
 
     @property
     def review_count(self):
@@ -643,10 +850,13 @@ class Store:
 
     def review_holds_scope(self, scope):
         """Pair and leftover scope reviews hold; adopt reviews for shared/unit scopes are informational."""
-        return any(isinstance(r, dict) and r.get("scope") == scope
-                   and r.get("state") in ("open", "expired")
-                   and (r.get("kind") != "scope" or scope.startswith("leftover/"))
-                   for r in self.data.get("reviews", []))
+        return any(
+            isinstance(r, dict)
+            and r.get("scope") == scope
+            and r.get("state") in ("open", "expired")
+            and (r.get("kind") != "scope" or scope.startswith("leftover/"))
+            for r in self.data.get("reviews", [])
+        )
 
     def _resolve_review(self, review, now, reason):
         review["state"] = "expired"
@@ -654,16 +864,24 @@ class Store:
         review["reason"] = reason
         for key in review.get("survivors", []):
             owner = review.get("owner")
-            pair = self.data.get("pairs", {}).get(self.pkey(owner, key)) if owner else None
+            pair = (
+                self.data.get("pairs", {}).get(self.pkey(owner, key)) if owner else None
+            )
             # A user's explicit keep stays authoritative; a fresh unanswered review can replace
             # an older stop answer with the safe default keep.
-            if pair and pair.get("ex_keep", 0) and pair.get("ex_last") == "keep" \
-                    and pair.get("ex_source") != "review_expiry":
+            if (
+                pair
+                and pair.get("ex_keep", 0)
+                and pair.get("ex_last") == "keep"
+                and pair.get("ex_source") != "review_expiry"
+            ):
                 continue
             if self.answer(owner, key, "keep", source="review_expiry"):
                 pair = self._pair(owner, key)
                 if review.get("scope"):
-                    pair.setdefault("review_expiries", {})[review["scope"]] = review.get("created", now)
+                    pair.setdefault("review_expiries", {})[review["scope"]] = (
+                        review.get("created", now)
+                    )
         self.dirty = True
 
     def expire_reviews(self):
@@ -672,15 +890,29 @@ class Store:
         reviews = self.data.setdefault("reviews", [])
         expired = 0
         for review in reviews:
-            if isinstance(review, dict) and review.get("state") == "open" \
-                    and review.get("expires", now + 1) <= now:
+            if (
+                isinstance(review, dict)
+                and review.get("state") == "open"
+                and review.get("expires", now + 1) <= now
+            ):
                 self._resolve_review(review, now, "expired")
                 expired += 1
-                self.log(event="review_expired", id=review.get("id"), owner=review.get("owner"))
-        closed = [r for r in reviews if isinstance(r, dict) and r.get("state") != "open"
-                  and not (r.get("kind") == "scope"
-                           and str(r.get("scope", "")).startswith("leftover/"))
-                  and r.get("closed", now) <= now - REVIEW_RETENTION]
+                self.log(
+                    event="review_expired",
+                    id=review.get("id"),
+                    owner=review.get("owner"),
+                )
+        closed = [
+            r
+            for r in reviews
+            if isinstance(r, dict)
+            and r.get("state") != "open"
+            and not (
+                r.get("kind") == "scope"
+                and str(r.get("scope", "")).startswith("leftover/")
+            )
+            and r.get("closed", now) <= now - REVIEW_RETENTION
+        ]
         if closed:
             self.data["reviews"] = [r for r in reviews if r not in closed]
             self.dirty = True
@@ -688,12 +920,22 @@ class Store:
 
     def add_review(self, owner, members, scope):
         """Record one durable review for members moved to a leftover scope."""
-        if not isinstance(owner, str) or not owner or len(owner) > 256 or not isinstance(scope, str) or not scope:
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or len(owner) > 256
+            or not isinstance(scope, str)
+            or not scope
+        ):
             return None
         by_key = {}
         for member in members:
-            if not isinstance(member, dict) or not isinstance(member.get("key"), str) \
-                    or not isinstance(member.get("pid"), int) or isinstance(member.get("pid"), bool):
+            if (
+                not isinstance(member, dict)
+                or not isinstance(member.get("key"), str)
+                or not isinstance(member.get("pid"), int)
+                or isinstance(member.get("pid"), bool)
+            ):
                 continue
             by_key.setdefault(member["key"], set()).add(member["pid"])
         if not by_key:
@@ -705,14 +947,26 @@ class Store:
             oldest = min(opens, key=lambda r: (r.get("created", 0), r.get("id", 0)))
             now = self.now()
             self._resolve_review(oldest, now, "queue cap")
-            self.log(event="review_expired", id=oldest.get("id"), owner=oldest.get("owner"),
-                     reason="queue cap")
+            self.log(
+                event="review_expired",
+                id=oldest.get("id"),
+                owner=oldest.get("owner"),
+                reason="queue cap",
+            )
             opens.remove(oldest)
         now = self.now()
         review_id = self.data.get("review_seq", 0) + 1
-        review = {"id": review_id, "kind": "close", "owner": owner, "survivors": sorted(by_key),
-                  "pids": sorted({p for pids in by_key.values() for p in pids}), "scope": scope,
-                  "created": now, "expires": now + REVIEW_TTL, "state": "open"}
+        review = {
+            "id": review_id,
+            "kind": "close",
+            "owner": owner,
+            "survivors": sorted(by_key),
+            "pids": sorted({p for pids in by_key.values() for p in pids}),
+            "scope": scope,
+            "created": now,
+            "expires": now + REVIEW_TTL,
+            "state": "open",
+        }
         reviews.append(review)
         self.data["review_seq"] = review_id
         self.dirty = True
@@ -720,13 +974,26 @@ class Store:
 
     def add_scope_review(self, scope, reason):
         """Queue a durable GC review without inventing an owner/member pair."""
-        if not isinstance(scope, str) or not scope or len(scope) > 512 \
-                or not isinstance(reason, str) or not reason:
+        if (
+            not isinstance(scope, str)
+            or not scope
+            or len(scope) > 512
+            or not isinstance(reason, str)
+            or not reason
+        ):
             return None
         self.expire_reviews()
-        existing = next((r for r in self.data.get("reviews", []) if isinstance(r, dict)
-                         and r.get("kind") == "scope" and r.get("scope") == scope
-                         and r.get("state") == "open"), None)
+        existing = next(
+            (
+                r
+                for r in self.data.get("reviews", [])
+                if isinstance(r, dict)
+                and r.get("kind") == "scope"
+                and r.get("scope") == scope
+                and r.get("state") == "open"
+            ),
+            None,
+        )
         if existing:
             return dict(existing)
         reviews = self.data.setdefault("reviews", [])
@@ -735,13 +1002,24 @@ class Store:
             oldest = min(opens, key=lambda r: (r.get("created", 0), r.get("id", 0)))
             now = self.now()
             self._resolve_review(oldest, now, "queue cap")
-            self.log(event="review_expired", id=oldest.get("id"), owner=oldest.get("owner"),
-                     reason="queue cap")
+            self.log(
+                event="review_expired",
+                id=oldest.get("id"),
+                owner=oldest.get("owner"),
+                reason="queue cap",
+            )
             opens.remove(oldest)
         now = self.now()
         review_id = self.data.get("review_seq", 0) + 1
-        review = {"id": review_id, "kind": "scope", "scope": scope, "reason": reason[:256],
-                  "created": now, "expires": now + REVIEW_TTL, "state": "open"}
+        review = {
+            "id": review_id,
+            "kind": "scope",
+            "scope": scope,
+            "reason": reason[:256],
+            "created": now,
+            "expires": now + REVIEW_TTL,
+            "state": "open",
+        }
         reviews.append(review)
         self.data["review_seq"] = review_id
         self.dirty = True
@@ -759,14 +1037,21 @@ class Store:
         expiries = self.data.setdefault("leftover_expiries", {})
         created = expiries.get(scope)
         if not isinstance(created, (int, float)) or isinstance(created, bool):
-            reviews = [r for r in self.data.get("reviews", []) if isinstance(r, dict)
-                       and r.get("scope") == scope
-                       and isinstance(r.get("created"), (int, float))]
+            reviews = [
+                r
+                for r in self.data.get("reviews", [])
+                if isinstance(r, dict)
+                and r.get("scope") == scope
+                and isinstance(r.get("created"), (int, float))
+            ]
             starts = [r["created"] for r in reviews]
-            starts.extend(p.get("review_expiries", {}).get(scope)
-                          for p in self.data.get("pairs", {}).values()
-                          if isinstance(p, dict) and isinstance(p.get("review_expiries"), dict)
-                          and isinstance(p["review_expiries"].get(scope), (int, float)))
+            starts.extend(
+                p.get("review_expiries", {}).get(scope)
+                for p in self.data.get("pairs", {}).values()
+                if isinstance(p, dict)
+                and isinstance(p.get("review_expiries"), dict)
+                and isinstance(p["review_expiries"].get(scope), (int, float))
+            )
             if not starts:
                 return False
             created = min(starts)
@@ -777,9 +1062,14 @@ class Store:
             self.dirty = True
             self.log(event="leftover_expiry_authorized", scope=scope, days=days)
         for review in self.data.get("reviews", []):
-            if isinstance(review, dict) and review.get("scope") == scope \
-                    and review.get("state") == "open":
-                review.update(state="leftover_expired", closed=now, reason="leftover_expire_days")
+            if (
+                isinstance(review, dict)
+                and review.get("scope") == scope
+                and review.get("state") == "open"
+            ):
+                review.update(
+                    state="leftover_expired", closed=now, reason="leftover_expire_days"
+                )
                 self.dirty = True
         return True
 
@@ -790,7 +1080,9 @@ class Store:
         pair = self.data.get("pairs", {}).get(self.pkey(owner, leftover))
         if not pair or pair.get("ex_source") != "review_expiry":
             return False
-        return pair.get("review_expiries", {}).get(scope) == self.data["leftover_expiries"].get(scope)
+        return pair.get("review_expiries", {}).get(scope) == self.data[
+            "leftover_expiries"
+        ].get(scope)
 
     def prune_leftover_expiries(self, live_scopes):
         """Bound persisted expiry markers once their leftover scope has disappeared."""
@@ -804,8 +1096,15 @@ class Store:
     def prune_scope_reviews(self, live_scopes):
         """Drop GC scope reviews after their scopes no longer exist."""
         reviews = self.data.get("reviews", [])
-        kept = [r for r in reviews if not (isinstance(r, dict) and r.get("kind") == "scope"
-                                           and r.get("scope") not in live_scopes)]
+        kept = [
+            r
+            for r in reviews
+            if not (
+                isinstance(r, dict)
+                and r.get("kind") == "scope"
+                and r.get("scope") not in live_scopes
+            )
+        ]
         if len(kept) != len(reviews):
             self.data["reviews"] = kept
             self.dirty = True
@@ -825,7 +1124,7 @@ class Store:
             self.dirty = True
             return True
         if policy.bad_owner(owner, self.deny):
-            return False        # an explicit answer never lands on a bad key
+            return False  # an explicit answer never lands on a bad key
         p = self._pair(owner, leftover)
         p["ex_" + choice] += W_ANSWER
         p["ex_last"] = choice
@@ -891,8 +1190,16 @@ class Store:
     def regret(self, owner, leftover):
         """The leftover came back within 30 min of an auto-stop: keep +3, suspended for 7 days
         (the pair asks again). True when it was a regret."""
-        p = self._pair(owner, leftover, create=False) if self._ok(owner, leftover) else None
-        if not p or not p["last_auto_stop"] or self.now() - p["last_auto_stop"] > REGRET_WINDOW:
+        p = (
+            self._pair(owner, leftover, create=False)
+            if self._ok(owner, leftover)
+            else None
+        )
+        if (
+            not p
+            or not p["last_auto_stop"]
+            or self.now() - p["last_auto_stop"] > REGRET_WINDOW
+        ):
             return False
         p["keep"] += W_REGRET
         p["last_keep"] = self.now()
@@ -907,8 +1214,11 @@ class Store:
     def owners_of(self, leftover, limit=3):
         """Owners that historically had this leftover key, strongest first."""
         suffix = SEP + leftover
-        rows = [(self._pweight(p) + p.get("closes", 0) * 0.01, k[:-len(suffix)])
-                for k, p in self.data["pairs"].items() if k.endswith(suffix)]
+        rows = [
+            (self._pweight(p) + p.get("closes", 0) * 0.01, k[: -len(suffix)])
+            for k, p in self.data["pairs"].items()
+            if k.endswith(suffix)
+        ]
         return [o for _w, o in sorted(rows, reverse=True)[:limit]]
 
     def _decide(self, owner, p):
@@ -961,11 +1271,27 @@ class Store:
         for k, p in self.data["pairs"].items():
             owner, _, leftover = k.partition(SEP)
             action, conf, why = self._decide(owner, p)
-            out.append({"owner": owner, "leftover": leftover, "action": action, "confidence": round(conf, 2),
-                        "stop": round(p.get("stop", 0) + p.get("ex_stop", 0), 2),
-                        "keep": round(p.get("keep", 0) + p.get("ex_keep", 0), 2),
-                        "closes": p.get("closes", 0), "kills": p.get("kills", 0), "why": why})
-        out.sort(key=lambda r: (-(r["stop"] + r["keep"]), -r["closes"], r["owner"], r["leftover"]))
+            out.append(
+                {
+                    "owner": owner,
+                    "leftover": leftover,
+                    "action": action,
+                    "confidence": round(conf, 2),
+                    "stop": round(p.get("stop", 0) + p.get("ex_stop", 0), 2),
+                    "keep": round(p.get("keep", 0) + p.get("ex_keep", 0), 2),
+                    "closes": p.get("closes", 0),
+                    "kills": p.get("kills", 0),
+                    "why": why,
+                }
+            )
+        out.sort(
+            key=lambda r: (
+                -(r["stop"] + r["keep"]),
+                -r["closes"],
+                r["owner"],
+                r["leftover"],
+            )
+        )
         return out[:limit]
 
     # ---- derived defaults ----
@@ -973,14 +1299,20 @@ class Store:
         """('share'|'kill', explanation). Learned 'share' defers a kill; it never overrides
         hard rules or detected edges."""
         r = self.peek(key)
-        prior = SEED_SHARE_PRIOR if (key in self.seeds.get("share", []) or self.is_persistent(key)) else 0.0
+        prior = (
+            SEED_SHARE_PRIOR
+            if (key in self.seeds.get("share", []) or self.is_persistent(key))
+            else 0.0
+        )
         score = prior + r["user_keep"] + r["shared_hits"] + 0.5 * r["respawned"]
         against = r["user_kill"] + 2
         action = "share" if score > against else "kill"
-        why = ("score %.2f (seed %.1f + keep %.1f + shared_hits %.1f + 0.5*respawned %.1f; "
-               "respawn is weighted half: supervisors restart things that were not needed) "
-               "vs user_kill+2 = %.1f" % (score, prior, r["user_keep"], r["shared_hits"],
-                                          r["respawned"], against))
+        why = (
+            "score %.2f (seed %.1f + keep %.1f + shared_hits %.1f + 0.5*respawned %.1f; "
+            "respawn is weighted half: supervisors restart things that were not needed) "
+            "vs user_kill+2 = %.1f"
+            % (score, prior, r["user_keep"], r["shared_hits"], r["respawned"], against)
+        )
         return action, why
 
     def graceful_timeout(self, key, default):
@@ -1004,14 +1336,30 @@ class Store:
     def gc_outcome(self, key, respawned):
         """Adjust the idle grace after a GC stop: double when it came back, shrink 10% otherwise."""
         r = self.rec(key)
-        r["idle_grace_scale"] = r["idle_grace_scale"] * 2 if respawned else max(0.2, r["idle_grace_scale"] * 0.9)
+        r["idle_grace_scale"] = (
+            r["idle_grace_scale"] * 2
+            if respawned
+            else max(0.2, r["idle_grace_scale"] * 0.9)
+        )
 
     def explain(self, key):
         r = self.peek(key)
         action, why = self.default_action(key)
         t, graceful = self.graceful_timeout(key, 10)
-        pairs = [x for x in self.pairs_summary(256) if x["leftover"] == key or x["owner"] == key][:20]
-        return {"key": key, "standalone": self.standalone(key), "pairs": pairs, "default_action": action, "why": why,
-                "graceful_timeout_s": round(t, 1), "graceful": graceful,
-                "counters": {c: round(r[c], 2) for c in COUNTERS},
-                "term_exit_ms": r["term_exit_ms"], "idle_grace_scale": round(r["idle_grace_scale"], 2)}
+        pairs = [
+            x
+            for x in self.pairs_summary(256)
+            if x["leftover"] == key or x["owner"] == key
+        ][:20]
+        return {
+            "key": key,
+            "standalone": self.standalone(key),
+            "pairs": pairs,
+            "default_action": action,
+            "why": why,
+            "graceful_timeout_s": round(t, 1),
+            "graceful": graceful,
+            "counters": {c: round(r[c], 2) for c in COUNTERS},
+            "term_exit_ms": r["term_exit_ms"],
+            "idle_grace_scale": round(r["idle_grace_scale"], 2),
+        }

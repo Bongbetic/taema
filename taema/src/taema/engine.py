@@ -1,5 +1,5 @@
 """Decision and action engine: plan_stop/stop, adopt_pass, gc_pass."""
-import fnmatch
+
 import hashlib
 import os
 import signal
@@ -14,8 +14,10 @@ HOOK_TIMEOUT = 30
 EMPTY_PREFIXES = ("app-", "scope-")
 POLL_STEP = 0.05
 LEFTOVER = "leftover"
-AUTO_CAP = 64           # new app scopes per auto-adopt pass
-AUTO_MAX_CPU = 1.0      # percent over the last minute; busier members are never auto-stopped
+AUTO_CAP = 64  # new app scopes per auto-adopt pass
+AUTO_MAX_CPU = (
+    1.0  # percent over the last minute; busier members are never auto-stopped
+)
 
 
 class Refused(Exception):
@@ -28,13 +30,18 @@ class Vetoed(Refused):
 
 # ---- helpers ------------------------------------------------------------------------------
 
+
 def helper_path(cfg):
     return policy.expand(cfg["paths"].get("helper", policy.HELPER))
 
 
 def helper_attach(cfg, pid, name):
     """Move one pid into scope-NAME through the root helper (needed from the login cgroup)."""
-    r = subprocess.run(["sudo", "-n", helper_path(cfg), "attach", str(pid), name], capture_output=True, text=True)
+    r = subprocess.run(
+        ["sudo", "-n", helper_path(cfg), "attach", str(pid), name],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         raise Refused(r.stderr.strip() or "attach failed")
 
@@ -42,8 +49,11 @@ def helper_attach(cfg, pid, name):
 def helper_move(cfg, relpath, pids):
     pids = [str(p) for p in pids]
     for i in range(0, len(pids), 64):
-        r = subprocess.run(["sudo", "-n", helper_path(cfg), "move", relpath] + pids[i:i + 64],
-                           capture_output=True, text=True)
+        r = subprocess.run(
+            ["sudo", "-n", helper_path(cfg), "move", relpath] + pids[i : i + 64],
+            capture_output=True,
+            text=True,
+        )
         if r.returncode != 0:
             raise Refused(r.stderr.strip() or "move failed")
 
@@ -58,14 +68,19 @@ def unit_for_leaf(units, leaf):
     """The unit for a top-level leaf: exact name, or '<unit name>-<suffix>' for app units."""
     for u in units:
         n = u.get("unit", {}).get("name")
-        if n and (leaf == n or (u["unit"].get("kind") == "app" and leaf.startswith(n + "-"))):
+        if n and (
+            leaf == n or (u["unit"].get("kind") == "app" and leaf.startswith(n + "-"))
+        ):
             return u
     return None
 
 
 # ---- stop ---------------------------------------------------------------------------------
 
-def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=(), pt=None, snap=None):
+
+def plan_stop(
+    path, cfg, store, unit=None, force=False, hard=False, keep=(), pt=None, snap=None
+):
     """Decide per member: kill | share | skip. Never touches anything.
 
     pt: the pass's ProcTable. snap: an inspect.LazySnapshot shared across passes; ss runs only
@@ -86,13 +101,21 @@ def plan_stop(path, cfg, store, unit=None, force=False, hard=False, keep=(), pt=
     out = {}
     for pid in pids:
         key = policy.exe_key(pid)
-        d = {"pid": pid, "comm": inspect.comm(pid), "key": key, "edges": edge_map.get(pid, [])}
+        d = {
+            "pid": pid,
+            "comm": inspect.comm(pid),
+            "key": key,
+            "edges": edge_map.get(pid, []),
+        }
         reason = reasons[pid]
         if reason:
             d.update(action="skip", why=reason)
         elif d["edges"] and not hard:
-            d.update(action="share", why="outside users: " + "; ".join(
-                "%s %s" % (e["kind"], e["detail"]) for e in d["edges"]))
+            d.update(
+                action="share",
+                why="outside users: "
+                + "; ".join("%s %s" % (e["kind"], e["detail"]) for e in d["edges"]),
+            )
         elif not edges_ok and not hard:
             d.update(action="share", why="edge scan failed")
         elif key in keep_set:
@@ -125,7 +148,9 @@ def _signal_all(path, pids, sig, cfg):
             except OSError:
                 fd = None
         fds[p] = fd
-    members = set(cgroup.tree_procs(path))   # after pinning: membership and protection re-checked
+    members = set(
+        cgroup.tree_procs(path)
+    )  # after pinning: membership and protection re-checked
     sent = []
     for p, fd in fds.items():
         try:
@@ -180,12 +205,26 @@ def veto_for_scope(store, path):
     for pid in cgroup.tree_procs(path):
         start = inspect.starttime(pid)
         apps = {policy.app_key(pid), policy.exe_key(pid)}
-        members.append({"pid": pid, "start": start, "apps": [key for key in apps if key]})
+        members.append(
+            {"pid": pid, "start": start, "apps": [key for key in apps if key]}
+        )
     return store.match_veto(scope=cgroup.rel(path), members=members)
 
 
-def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, keep=(),
-         dry_run=False, hook=None, passes=3, allow_sigkill=True):
+def stop(
+    path,
+    cfg,
+    store,
+    unit=None,
+    timeout=None,
+    force=False,
+    hard=False,
+    keep=(),
+    dry_run=False,
+    hook=None,
+    passes=3,
+    allow_sigkill=True,
+):
     """Stop a scope: move shared members aside, run the hook, SIGTERM, SIGKILL leftovers, rmdir.
     allow_sigkill=False (auto mode, pairs not explicitly answered): members that ignore SIGTERM live."""
     self_guard(path)
@@ -197,7 +236,9 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
     report = {"scope": cgroup.rel(path), "decisions": [], "removed": False, "left": []}
     ran_hook = False
     counted, killed_keys, sigkill_keys = set(), set(), set()
-    snap = inspect.LazySnapshot()     # one ss snapshot for all passes, built only if needed
+    snap = (
+        inspect.LazySnapshot()
+    )  # one ss snapshot for all passes, built only if needed
     for _ in range(passes):
         pt = inspect.ProcTable.scan()
         plan = plan_stop(path, cfg, store, unit, force, hard, keep, pt=pt, snap=snap)
@@ -207,7 +248,11 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
         shared = [d for d in plan if d["action"] == "share"]
         kill = [d for d in plan if d["action"] == "kill"]
         shared_pids = {d["pid"] for d in shared}
-        roots = [d for d in shared if not any(a in shared_pids for a in pt.ancestors(d["pid"]))]
+        roots = [
+            d
+            for d in shared
+            if not any(a in shared_pids for a in pt.ancestors(d["pid"]))
+        ]
         for d in shared:
             for e in d["edges"]:
                 store.bump(d["key"], "shared_hits", 1.0)
@@ -218,8 +263,11 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
             for _i in range(3):
                 for p in moving:
                     cgroup.move(p, dest)
-                moving = [p for p in inspect.ProcTable.scan().descendants([r["pid"]]) if p in shared_pids
-                          and cgroup.proc_cgroup(p) != dest_cg]
+                moving = [
+                    p
+                    for p in inspect.ProcTable.scan().descendants([r["pid"]])
+                    if p in shared_pids and cgroup.proc_cgroup(p) != dest_cg
+                ]
                 if not moving:
                     break
         if not ran_hook:
@@ -233,8 +281,18 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
             break
         kill_set = {d["pid"] for d in kill}
         keys = {d["key"] for d in kill}
-        grace = max([store.graceful_timeout(k, (unit or {}).get("kill", {}).get("graceful",
-                     policy.timer(cfg, "graceful_timeout", 10)))[0] for k in keys] or [0])
+        grace = max(
+            [
+                store.graceful_timeout(
+                    k,
+                    (unit or {})
+                    .get("kill", {})
+                    .get("graceful", policy.timer(cfg, "graceful_timeout", 10)),
+                )[0]
+                for k in keys
+            ]
+            or [0]
+        )
         for k in keys - counted:
             store.bump(k, "stops")
             counted.add(k)
@@ -265,15 +323,24 @@ def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, kee
         except OSError as e:
             report["left"] = cgroup.tree_procs(path)
             report["error"] = str(e)
-    store.log(event="stop", scope=report["scope"], dry_run=dry_run, removed=report["removed"],
-              decisions=[{k: v for k, v in d.items() if k != "edges"} | {"edges": len(d["edges"])}
-                         for d in report["decisions"]])
+    store.log(
+        event="stop",
+        scope=report["scope"],
+        dry_run=dry_run,
+        removed=report["removed"],
+        decisions=[
+            {k: v for k, v in d.items() if k != "edges"} | {"edges": len(d["edges"])}
+            for d in report["decisions"]
+        ],
+    )
     store.save_if_dirty(knowledge.SAVE_INTERVAL)
     return report
 
 
 def _slug(s):
-    out = "".join(c if c.isalnum() and c.isascii() else "-" for c in s.lower()).strip("-")
+    out = "".join(c if c.isalnum() and c.isascii() else "-" for c in s.lower()).strip(
+        "-"
+    )
     return out[:24] or "proc"
 
 
@@ -291,16 +358,21 @@ def leaf_slug(name, pid=None):
 # ---- adopt --------------------------------------------------------------------------------
 
 _MATCH_KEYS = ("exe", "comm", "cmdline_contains")
-_warned = set()
+_warned: set[str] = set()
 
 
 def _matches(m, pid, env=None):
-    if not any(k in m for k in _MATCH_KEYS):   # an empty [match] would match every process
+    if not any(
+        k in m for k in _MATCH_KEYS
+    ):  # an empty [match] would match every process
         w = repr(sorted(m.items()))
         if w not in _warned:
             _warned.add(w)
-            print("taema: [match] needs one of %s; ignoring %s" % (", ".join(_MATCH_KEYS), w),
-                  file=sys.stderr)
+            print(
+                "taema: [match] needs one of %s; ignoring %s"
+                % (", ".join(_MATCH_KEYS), w),
+                file=sys.stderr,
+            )
         return False
     if "exe" in m and inspect.exe(pid) != m["exe"]:
         return False
@@ -326,7 +398,11 @@ def adopt_plan(cfg, units, pp=None):
         name = u["unit"]["name"]
         if not cgroup.valid_rel(name) or "/" in name:
             name = leaf_slug(name)
-        matched = [p for p in in_session if _matches(m, p) and not policy.protected_reason(p, cfg)]
+        matched = [
+            p
+            for p in in_session
+            if _matches(m, p) and not policy.protected_reason(p, cfg)
+        ]
         roots = [p for p in matched if not any(a in matched for a in pp.ancestors(p))]
         groups = {}
         for r in roots:
@@ -336,16 +412,21 @@ def adopt_plan(cfg, units, pp=None):
                 val = env.get(gb)
                 if not val or policy.env_excluded(env, m.get("env_exclude")):
                     continue
-                groups.setdefault(name + "-" + hashlib.sha1(val.encode()).hexdigest()[:8], (val, []))[1].append(r)
+                groups.setdefault(
+                    name + "-" + hashlib.sha1(val.encode()).hexdigest()[:8], (val, [])
+                )[1].append(r)
             else:
                 groups.setdefault(name, (None, []))[1].append(r)
         for scope, (val, rs) in groups.items():
             extra = []
             for c in u.get("children", []):
                 if "same_env" in c and val is not None:
-                    extra += [p for p in in_session
-                              if inspect.comm(p) == c.get("comm") and
-                              inspect.environ(p).get(c["same_env"]) == val]
+                    extra += [
+                        p
+                        for p in in_session
+                        if inspect.comm(p) == c.get("comm")
+                        and inspect.environ(p).get(c["same_env"]) == val
+                    ]
             moved = [p for p in pp.descendants(rs + extra) if p in in_session]
             ops.append({"op": "move", "scope": scope, "unit": name, "pids": moved})
     return ops
@@ -359,21 +440,34 @@ def carve_plan(cfg, units, pp=None):
         if u.get("unit", {}).get("kind") != "app" or not u.get("children"):
             continue
         base = cgroup.base()
-        for scope_dir in [d for d in cgroup.subdirs(base)
-                          if os.path.basename(d) == u["unit"]["name"]
-                          or os.path.basename(d).startswith(u["unit"]["name"] + "-")]:
+        for scope_dir in [
+            d
+            for d in cgroup.subdirs(base)
+            if os.path.basename(d) == u["unit"]["name"]
+            or os.path.basename(d).startswith(u["unit"]["name"] + "-")
+        ]:
             direct = set(cgroup.procs(scope_dir))
             for c in u["children"]:
                 if "ancestor_comm" not in c and "comm" not in c:
                     continue
                 want = c.get("ancestor_comm") or c.get("comm")
                 roots = [p for p in direct if inspect.comm(p) == want]
-                roots = [p for p in roots if not any(a in roots for a in pp.ancestors(p))]
+                roots = [
+                    p for p in roots if not any(a in roots for a in pp.ancestors(p))
+                ]
                 for r in roots:
                     members = [p for p in pp.descendants([r]) if p in direct]
-                    ops.append({"op": "carve", "parent": os.path.basename(scope_dir),
-                                "scope": "%s/%s-%d" % (os.path.basename(scope_dir), c["name"], r),
-                                "root": r, "binds_to": c.get("binds_to"), "pids": members})
+                    ops.append(
+                        {
+                            "op": "carve",
+                            "parent": os.path.basename(scope_dir),
+                            "scope": "%s/%s-%d"
+                            % (os.path.basename(scope_dir), c["name"], r),
+                            "root": r,
+                            "binds_to": c.get("binds_to"),
+                            "pids": members,
+                        }
+                    )
     return ops
 
 
@@ -406,22 +500,33 @@ def run_ops(cfg, store, ops, execute, cleanup=True):
                 for _i in range(3):
                     for p in inside:
                         cgroup.move(p, dest)
-                    inside = [p for p in inspect.descendants([op["root"]]) if p in set(op["pids"])
-                              and cgroup.proc_cgroup(p) != "/user/%d/%s" % (os.getuid(), op["scope"])]
+                    inside = [
+                        p
+                        for p in inspect.descendants([op["root"]])
+                        if p in set(op["pids"])
+                        and cgroup.proc_cgroup(p)
+                        != "/user/%d/%s" % (os.getuid(), op["scope"])
+                    ]
                     if not inside:
                         break
             else:
                 for p in inside:
                     cgroup.move(p, dest)
             op["done"] = True
-        fields = dict(op=op["op"], scope=op["scope"], count=len(op["pids"]),
-                      skipped_protected=op["skipped_protected"])
+        fields = dict(
+            op=op["op"],
+            scope=op["scope"],
+            count=len(op["pids"]),
+            skipped_protected=op["skipped_protected"],
+        )
         if execute:
             store.log(event="adopt", **fields)
         else:
             seen.add(op["scope"])
-            if store.changed("adopt_would:" + op["scope"], (op["op"], tuple(sorted(op["pids"])),
-                                                           op["skipped_protected"])):
+            if store.changed(
+                "adopt_would:" + op["scope"],
+                (op["op"], tuple(sorted(op["pids"])), op["skipped_protected"]),
+            ):
                 store.log(event="adopt_would", **fields)
     if cleanup:
         store.forget_sigs("adopt_would:", {"adopt_would:" + x for x in seen})
@@ -430,6 +535,7 @@ def run_ops(cfg, store, ops, execute, cleanup=True):
 
 
 # ---- gc -----------------------------------------------------------------------------------
+
 
 def _cpu_usage(path):
     """usage_usec from the leaf's cpu.stat, or None when unavailable."""
@@ -443,8 +549,19 @@ def _cpu_usage(path):
     return None
 
 
-def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip=None, noted=None, pt=None,
-                  lin=None, auto=False):
+def gc_candidates(
+    cfg,
+    units,
+    store,
+    idle_since,
+    now=time.time,
+    usage=None,
+    skip=None,
+    noted=None,
+    pt=None,
+    lin=None,
+    auto=False,
+):
     """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}.
 
     usage {rel: usage_usec at idle start}: CPU that moves during the idle window means busy.
@@ -459,20 +576,28 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
     noted = set() if noted is None else noted
     base = cgroup.base()
     leaves = [d for d in cgroup.subdirs(base + "/shared")]
-    unit_by_prefix = {u["unit"]["name"]: u for u in units if u.get("unit", {}).get("kind") == "app"}
+    unit_by_prefix = {
+        u["unit"]["name"]: u for u in units if u.get("unit", {}).get("kind") == "app"
+    }
     top = cgroup.subdirs(base)
     for d in top:
         n = os.path.basename(d)
         for un, u in unit_by_prefix.items():
-            if (n == un or n.startswith(un + "-")) and u["unit"].get("stop_when_unneeded"):
+            if (n == un or n.startswith(un + "-")) and u["unit"].get(
+                "stop_when_unneeded"
+            ):
                 leaves.append(d)
     left_dirs = cgroup.subdirs(base + "/" + LEFTOVER)
     if auto:
         leaves += left_dirs
     gc_set = set(leaves)
     if not auto:
-        leaves += left_dirs         # empty ones only
-    leaves += [d for d in top if d not in gc_set and os.path.basename(d).startswith(EMPTY_PREFIXES)]
+        leaves += left_dirs  # empty ones only
+    leaves += [
+        d
+        for d in top
+        if d not in gc_set and os.path.basename(d).startswith(EMPTY_PREFIXES)
+    ]
     live = {cgroup.rel(d) for d in leaves}
     store.prune_leftover_expiries(live)
     store.prune_scope_reviews(live)
@@ -493,7 +618,9 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
             continue
         if d not in gc_set:
             continue
-        if not (auto and rel.startswith(LEFTOVER + "/")) and store.review_holds_scope(rel):
+        if not (auto and rel.startswith(LEFTOVER + "/")) and store.review_holds_scope(
+            rel
+        ):
             if rel not in noted:
                 noted.add(rel)
                 store.log(event="gc_skip", scope=rel, why="GC review pending")
@@ -502,12 +629,22 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
         if rel.startswith("shared/"):
             pt = pt or inspect.ProcTable.scan()
             roots = [p for p in pids if not any(a in pids for a in pt.ancestors(p))]
-            held = next((k for k in map(policy.exe_key, roots)
-                         if k in protect or store.peek(k)["user_keep"] > 0), None)
+            held = next(
+                (
+                    k
+                    for k in map(policy.exe_key, roots)
+                    if k in protect or store.peek(k)["user_keep"] > 0
+                ),
+                None,
+            )
             if held:
                 if rel not in noted:
                     noted.add(rel)
-                    store.log(event="gc_skip", scope=rel, why="share/persist seed or user keep: " + held)
+                    store.log(
+                        event="gc_skip",
+                        scope=rel,
+                        why="share/persist seed or user keep: " + held,
+                    )
                 idle_since.pop(rel, None)
                 continue
         if auto and rel.startswith(LEFTOVER + "/"):
@@ -519,18 +656,32 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
                     store.log(event="gc_skip", scope=rel, why="close review pending")
                 idle_since.pop(rel, None)
                 continue
-            verdict = _leftover_verdict(cfg, store, lin, pids, snap, protect,
-                                        scope=rel, expiry_days=expiry_days, at=now())
+            verdict = _leftover_verdict(
+                cfg,
+                store,
+                lin,
+                pids,
+                snap,
+                protect,
+                scope=rel,
+                expiry_days=expiry_days,
+                at=now(),
+            )
             if verdict[0] == "held":
                 if rel not in noted:
                     noted.add(rel)
-                    store.log(event="gc_skip", scope=rel, why="leftover held: " + verdict[1])
+                    store.log(
+                        event="gc_skip", scope=rel, why="leftover held: " + verdict[1]
+                    )
                 idle_since.pop(rel, None)
                 continue
             if verdict[0] == "stop":
                 out.append((d, "pair stop: " + verdict[1]))
                 continue
-        u = next((v for k, v in unit_by_prefix.items() if os.path.basename(d).startswith(k)), None)
+        u = next(
+            (v for k, v in unit_by_prefix.items() if os.path.basename(d).startswith(k)),
+            None,
+        )
         gc = (u or {}).get("gc", {})
         # detector: pause process whose runtime directory is gone
         env_reason = None
@@ -552,8 +703,13 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
             continue
         cpu = _cpu_usage(d)
         cpu_moved = False
-        if rel in idle_since and cpu is not None and usage.get(rel) is not None and cpu != usage[rel]:
-            idle_since[rel] = now()   # CPU moved: not idle, restart the window
+        if (
+            rel in idle_since
+            and cpu is not None
+            and usage.get(rel) is not None
+            and cpu != usage[rel]
+        ):
+            idle_since[rel] = now()  # CPU moved: not idle, restart the window
             cpu_moved = True
         first = idle_since.setdefault(rel, now())
         if cpu is not None:
@@ -572,7 +728,9 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
     return out
 
 
-def _leftover_verdict(cfg, store, lin, pids, snap, protect, scope="", expiry_days=0, at=None):
+def _leftover_verdict(
+    cfg, store, lin, pids, snap, protect, scope="", expiry_days=0, at=None
+):
     """("stop", why) when every member passes auto_stop_ok, ("held", why) when a member must not be
     stopped by the idle rule, else ("idle", "")."""
     s = snap.get()
@@ -584,11 +742,14 @@ def _leftover_verdict(cfg, store, lin, pids, snap, protect, scope="", expiry_day
             return "held", "protected: " + i["protected"]
         if i["ptmx"]:
             return "held", "pty host %s" % i["key"]
-        if i["key"] in protect and (store.is_persistent(i["key"]) or store.peek(i["key"])["user_keep"] > 0):
+        if i["key"] in protect and (
+            store.is_persistent(i["key"]) or store.peek(i["key"])["user_keep"] > 0
+        ):
             return "held", "persist/share seed " + i["key"]
         if i["origin"] and store.pair_decision(i["origin"], i["key"])[0] == "keep":
-            if not store.leftover_expiry_overrides_keep(i["origin"], i["key"], scope,
-                                                        expiry_days, now=at):
+            if not store.leftover_expiry_overrides_keep(
+                i["origin"], i["key"], scope, expiry_days, now=at
+            ):
                 return "held", "pair decided keep: %s>%s" % (i["origin"], i["key"])
     res = [auto_stop_ok(store, i["origin"], i["key"], i) for i in infos]
     if infos and all(r[0] for r in res):
@@ -609,15 +770,19 @@ def remove_empty(path):
 
 # ---- auto mode ------------------------------------------------------------------------------
 
+
 def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
     """Facts auto_stop_ok needs about one process. edges None = unknown (ss failed)."""
     e = lin.entry(pid) if lin is not None else None
-    return {"pid": pid, "key": e["key"] if e else policy.app_key(pid),
-            "origin": origin if origin is not None else (e["root_key"] if e else ""),
-            "edges": edge_map.get(pid, []) if edges_ok else None,
-            "protected": policy.protected_reason(pid, cfg),
-            "ptmx": bool(lin is not None and lin.ptmx_host(pid)),
-            "cpu": lin.cpu_pct(pid) if lin is not None else None}
+    return {
+        "pid": pid,
+        "key": e["key"] if e else policy.app_key(pid),
+        "origin": origin if origin is not None else (e["root_key"] if e else ""),
+        "edges": edge_map.get(pid, []) if edges_ok else None,
+        "protected": policy.protected_reason(pid, cfg),
+        "ptmx": bool(lin is not None and lin.ptmx_host(pid)),
+        "cpu": lin.cpu_pct(pid) if lin is not None else None,
+    }
 
 
 def auto_stop_ok(store, owner_key, leftover_key, mi):
@@ -625,7 +790,9 @@ def auto_stop_ok(store, owner_key, leftover_key, mi):
     silent thresholds after burn-in) and a member that is plainly idle and known: no edges, not
     protected / a pty host / a persist seed / a share seed the user keeps, <= 1 % CPU over the last
     minute, origin known. Anything unknown keeps."""
-    action, _conf, why = store.pair_decision(owner_key, leftover_key) if owner_key else ("ask", 0, "")
+    action, _conf, why = (
+        store.pair_decision(owner_key, leftover_key) if owner_key else ("ask", 0, "")
+    )
     if action != "stop":
         return False, "pair decision is %s" % action
     if not mi.get("origin"):
@@ -640,7 +807,10 @@ def auto_stop_ok(store, owner_key, leftover_key, mi):
         return False, "pty host"
     if store.is_persistent(leftover_key):
         return False, "persist seed"
-    if leftover_key in store.seeds.get("share", []) and store.peek(leftover_key)["user_keep"] > 0:
+    if (
+        leftover_key in store.seeds.get("share", [])
+        and store.peek(leftover_key)["user_keep"] > 0
+    ):
         return False, "share seed kept by user"
     cpu = mi.get("cpu")
     if cpu is None:
@@ -656,7 +826,10 @@ def auto_grace(store, keys):
 
 
 def auto_scope_name(key, pid, start):
-    return "app-%s-%s" % (leaf_slug(key), hashlib.sha1(("%d.%d" % (pid, start)).encode()).hexdigest()[:6])
+    return "app-%s-%s" % (
+        leaf_slug(key),
+        hashlib.sha1(("%d.%d" % (pid, start)).encode()).hexdigest()[:6],
+    )
 
 
 def auto_adopt_plan(cfg, units, table, lin, store, cap=AUTO_CAP):
@@ -667,7 +840,11 @@ def auto_adopt_plan(cfg, units, table, lin, store, cap=AUTO_CAP):
     in_session = set()
     for session in policy.session_cgroups(cfg):
         in_session.update(cgroup.procs(session))
-    explicit = [u["match"] for u in units if u.get("match") and u.get("unit", {}).get("kind") == "app"]
+    explicit = [
+        u["match"]
+        for u in units
+        if u.get("match") and u.get("unit", {}).get("kind") == "app"
+    ]
     by_root = {}
     for e in lin.entries.values():
         if e["root"] is not None and e["pid"] in in_session:
@@ -678,14 +855,34 @@ def auto_adopt_plan(cfg, units, table, lin, store, cap=AUTO_CAP):
             break
         rpid = rid[0]
         e = lin.entry(rpid)
-        if e is None or rpid not in in_session or lin.root_for(rpid) != rpid or e["sid"] == rpid:
+        if (
+            e is None
+            or rpid not in in_session
+            or lin.root_for(rpid) != rpid
+            or e["sid"] == rpid
+        ):
             continue
-        if lin.is_terminal_job(e) or policy.protected_reason(rpid, cfg) or lin.ptmx_host(rpid):
+        if (
+            lin.is_terminal_job(e)
+            or policy.protected_reason(rpid, cfg)
+            or lin.ptmx_host(rpid)
+        ):
             continue
-        if explicit and any(_matches(m, p) for m in explicit for p in [rpid] + [c[0] for c in e["chain_ids"]]):
+        if explicit and any(
+            _matches(m, p)
+            for m in explicit
+            for p in [rpid] + [c[0] for c in e["chain_ids"]]
+        ):
             continue
-        ops.append({"op": "move", "scope": auto_scope_name(e["key"], rpid, e["start"]), "unit": None,
-                    "auto": True, "pids": sorted(by_root[rid])})
+        ops.append(
+            {
+                "op": "move",
+                "scope": auto_scope_name(e["key"], rpid, e["start"]),
+                "unit": None,
+                "auto": True,
+                "pids": sorted(by_root[rid]),
+            }
+        )
     return ops
 
 

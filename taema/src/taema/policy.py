@@ -7,6 +7,7 @@ A user file may change the mode, timers and seeds, and may add protected entries
 never remove a protected entry set by the system file. TAEMA_CONFIG names a single file
 that replaces both layers (used by tests and isolated runs).
 """
+
 import copy
 import fnmatch
 import os
@@ -59,7 +60,9 @@ def merge(system, user):
                 elif pk == "env_prefix":
                     env = prot.setdefault("env_prefix", {})
                     for var, prefixes in pv.items():
-                        env[var] = list(dict.fromkeys(list(env.get(var, [])) + list(prefixes)))
+                        env[var] = list(
+                            dict.fromkeys(list(env.get(var, [])) + list(prefixes))
+                        )
             continue
         if k == "learner" and isinstance(v, dict):
             out_l = out.setdefault("learner", {})
@@ -144,7 +147,9 @@ def unit_for_scope(units, leaf_name):
 
 def hook_for(cfg, leaf_name):
     """$hooks_dir/<name>.stop for scope-<name>, if it exists."""
-    h = os.path.join(expand(cfg["paths"]["hooks_dir"]), leaf_name.replace("scope-", "", 1) + ".stop")
+    h = os.path.join(
+        expand(cfg["paths"]["hooks_dir"]), leaf_name.replace("scope-", "", 1) + ".stop"
+    )
     return h if os.path.exists(h) else None
 
 
@@ -163,7 +168,11 @@ def session_cgroups(cfg, uid=None):
     uid = os.getuid() if uid is None else uid
     if cfg["paths"].get("session_cgroup", "auto") != "auto":
         return session_dirs(cfg)
-    return [d for d in session_dirs(cfg) if any(inspect.uid_of(p) == uid for p in cgroup.procs(d))]
+    return [
+        d
+        for d in session_dirs(cfg)
+        if any(inspect.uid_of(p) == uid for p in cgroup.procs(d))
+    ]
 
 
 def session_state(uid=None):
@@ -220,7 +229,20 @@ def exe_key(pid):
     return os.path.basename(e) if e else inspect.comm(pid)
 
 
-INTERPRETERS = ("node", "nodejs", "bun", "deno", "java", "ruby", "perl", "sh", "bash", "dash", "zsh", "fish")
+INTERPRETERS = (
+    "node",
+    "nodejs",
+    "bun",
+    "deno",
+    "java",
+    "ruby",
+    "perl",
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "fish",
+)
 INTERP_PREFIXES = ("python", "lua", "php")
 _VERSIONED = re.compile(r"^(python3?|lua|php|nodejs)[0-9.]*$")
 _JAVA_VALUE_OPTS = ("-cp", "-classpath", "--class-path", "-p", "--module-path")
@@ -248,7 +270,12 @@ def _script_of(interp, args):
             return ""
         if a == "-m" and interp.startswith("python"):
             return args[i + 1] if i + 1 < len(args) else ""
-        if a.startswith("-m") and interp.startswith("python") and len(a) > 2 and not a.startswith("--"):
+        if (
+            a.startswith("-m")
+            and interp.startswith("python")
+            and len(a) > 2
+            and not a.startswith("--")
+        ):
             return a[2:]
         if a == "-jar" and interp == "java":
             return args[i + 1] if i + 1 < len(args) else ""
@@ -285,12 +312,16 @@ def _app_key(pid):
     c = inspect.comm(pid)
     if c and c != base[:15] and interp_name(c) != interp:
         return c
-    argv = [a.decode(errors="replace") for a in inspect.read(pid, "cmdline").split(b"\0")[1:] if a]
+    argv = [
+        a.decode(errors="replace")
+        for a in inspect.read(pid, "cmdline").split(b"\0")[1:]
+        if a
+    ]
     script = os.path.basename(_script_of(interp, argv).rstrip("/"))[:64]
     return "%s:%s" % (interp, script) if script else interp
 
 
-leaf_key = app_key      # name used by knowledge pairs
+leaf_key = app_key  # name used by knowledge pairs
 
 
 def env_excluded(env, rules):
@@ -301,7 +332,7 @@ def env_excluded(env, rules):
 
 
 # ---- learner hygiene: names that must never own a pair ----
-OWNER_NAMES = ("MainThread", "GC", "Finalizer")       # generic thread names
+OWNER_NAMES = ("MainThread", "GC", "Finalizer")  # generic thread names
 OWNER_GLOBS = ("Thread-*", "pool-*")
 OWNER_SHELLS = ("sh", "bash", "dash", "zsh", "fish")
 OWNER_TRIVIAL = ("sleep", "cat", "head", "sort", "grep", "true")
@@ -311,7 +342,9 @@ def owner_deny(cfg):
     """Configured extra owner-deny entries ([learner] deny_owners). They extend the built-in
     classes rejected by bad_owner(); a missing or malformed section is just no extras."""
     deny = ((cfg or {}).get("learner") or {}).get("deny_owners") or []
-    return [e for e in deny if isinstance(e, str) and e] if isinstance(deny, list) else []
+    return (
+        [e for e in deny if isinstance(e, str) and e] if isinstance(deny, list) else []
+    )
 
 
 def bad_owner(key, deny=()):

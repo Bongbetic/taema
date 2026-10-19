@@ -1,4 +1,5 @@
 """Phase 3 tests: taema-hook against a fake daemon, the shell hooks, and the kill_done flow."""
+
 import importlib.machinery
 import importlib.util
 import json
@@ -77,12 +78,23 @@ def run_hook(*args, sock, timeout=5):
     return subprocess.run([HOOK, *args], env=env, capture_output=True, timeout=timeout)
 
 
-QUESTION = {"id": 1, "kind": "job", "nonce": "abc123", "shell_pid": 20, "job": "npm run dev",
-            "candidates": [{"id": 1, "kind": "job", "key": "npm", "label": "npm run dev"},
-                           {"id": 2, "kind": "ancestor", "key": "code", "label": "code"}],
-            "leftovers": [{"key": "node:esbuild", "comm": "node", "count": 1},
-                          {"key": "node:vite", "comm": "node", "count": 1}],
-            "choices": ["stop", "keep", "standalone"], "expires_in": 60}
+QUESTION = {
+    "id": 1,
+    "kind": "job",
+    "nonce": "abc123",
+    "shell_pid": 20,
+    "job": "npm run dev",
+    "candidates": [
+        {"id": 1, "kind": "job", "key": "npm", "label": "npm run dev"},
+        {"id": 2, "kind": "ancestor", "key": "code", "label": "code"},
+    ],
+    "leftovers": [
+        {"key": "node:esbuild", "comm": "node", "count": 1},
+        {"key": "node:vite", "comm": "node", "count": 1},
+    ],
+    "choices": ["stop", "keep", "standalone"],
+    "expires_in": 60,
+}
 
 
 class TtyCase(unittest.TestCase):
@@ -108,12 +120,15 @@ class TtyCase(unittest.TestCase):
 
     def ask_in_thread(self, paths, shell=20):
         res = []
-        t = threading.Thread(target=lambda: res.append(hook.ask(shell, fd=self.slave, paths=paths)))
+        t = threading.Thread(
+            target=lambda: res.append(hook.ask(shell, fd=self.slave, paths=paths))
+        )
         t.start()
         return t, res
 
 
 # ---- 1. taema-hook: done / kill ----------------------------------------------------------------------
+
 
 class HookSend(unittest.TestCase):
     def setUp(self):
@@ -128,7 +143,18 @@ class HookSend(unittest.TestCase):
     def test_done(self):
         r = run_hook("done", "20", "20.3", "1", "npm", sock=self.d.path)
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
-        self.assertEqual(self.d.got, [{"cmd": "job_done", "shell_pid": 20, "tag": "20.3", "status": 1, "word": "npm"}])
+        self.assertEqual(
+            self.d.got,
+            [
+                {
+                    "cmd": "job_done",
+                    "shell_pid": 20,
+                    "tag": "20.3",
+                    "status": 1,
+                    "word": "npm",
+                }
+            ],
+        )
 
     def test_done_strips_and_caps_word(self):
         run_hook("done", "20", "20.3", "0", "a\x1b[2Jb" + "x" * 50, sock=self.d.path)
@@ -141,20 +167,32 @@ class HookSend(unittest.TestCase):
     def test_kill(self):
         r = run_hook("kill", "20", "pkill", sock=self.d.path)
         self.assertEqual((r.returncode, r.stdout), (0, b""))
-        self.assertEqual(self.d.got, [{"cmd": "kill_done", "shell_pid": 20, "word": "pkill"}])
+        self.assertEqual(
+            self.d.got, [{"cmd": "kill_done", "shell_pid": 20, "word": "pkill"}]
+        )
         run_hook("kill", "20", "rm", sock=self.d.path)
         self.assertEqual(len(self.d.got), 1)
 
     def test_daemon_down_is_silent_and_fast(self):
         t = time.monotonic()
-        for args in (("done", "20", "20.1", "0", "x"), ("kill", "20", "kill"), ("ask", "20")):
+        for args in (
+            ("done", "20", "20.1", "0", "x"),
+            ("kill", "20", "kill"),
+            ("ask", "20"),
+        ):
             r = run_hook(*args, sock="/nonexistent/none.sock")
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""), args)
         self.assertLess(time.monotonic() - t, 3.0)
 
     def test_garbage_arguments_exit_zero(self):
-        for args in ((), ("done",), ("done", "x", "y", "z"), ("ask", "notanumber"), ("bogus", "20"),
-                     ("done", "1", "1.1", "0", "x")):
+        for args in (
+            (),
+            ("done",),
+            ("done", "x", "y", "z"),
+            ("ask", "notanumber"),
+            ("bogus", "20"),
+            ("done", "1", "1.1", "0", "x"),
+        ):
             r = run_hook(*args, sock=self.d.path)
             self.assertEqual((r.returncode, r.stdout), (0, b""), args)
         self.assertEqual(self.d.got, [])
@@ -173,11 +211,17 @@ class HookSend(unittest.TestCase):
 
 # ---- 2. taema-hook: the question -----------------------------------------------------------------------
 
+
 class QuestionText(unittest.TestCase):
     def test_job_question_matches_the_plan(self):
         lines = hook.format_question(QUESTION)
-        self.assertEqual(lines[0], "tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).")
-        self.assertEqual(lines[1], "  [1] part of npm run dev: stop them when it closes")
+        self.assertEqual(
+            lines[0],
+            "tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).",
+        )
+        self.assertEqual(
+            lines[1], "  [1] part of npm run dev: stop them when it closes"
+        )
         self.assertEqual(lines[2], "  [2] part of another app: code")
         self.assertIn("[3] standalone app", lines[3])
         self.assertEqual(lines[4], "  [Enter] ask me later")
@@ -185,7 +229,9 @@ class QuestionText(unittest.TestCase):
     def test_seen_count_shown_when_given(self):
         q = json.loads(json.dumps(QUESTION))
         q["candidates"][1]["seen"] = 3
-        self.assertEqual(hook.format_question(q)[2], "  [2] part of another app: code (seen 3x)")
+        self.assertEqual(
+            hook.format_question(q)[2], "  [2] part of another app: code (seen 3x)"
+        )
 
     def test_no_other_candidates_no_option_two(self):
         q = dict(QUESTION, candidates=QUESTION["candidates"][:1])
@@ -194,9 +240,15 @@ class QuestionText(unittest.TestCase):
         self.assertEqual(hook.map_key("2", q), ("later",))
 
     def test_closed_question(self):
-        q = dict(QUESTION, kind="closed", leftovers=[{"key": "node:vite", "comm": "vite", "count": 1}])
+        q = dict(
+            QUESTION,
+            kind="closed",
+            leftovers=[{"key": "node:vite", "comm": "vite", "count": 1}],
+        )
         lines = hook.format_question(q)
-        self.assertEqual(lines[0], "tæma: `vite` was closed. Was it part of npm run dev?")
+        self.assertEqual(
+            lines[0], "tæma: `vite` was closed. Was it part of npm run dev?"
+        )
         self.assertIn("[1] yes", lines[1])
 
     def test_control_characters_stripped_and_width_kept(self):
@@ -211,7 +263,10 @@ class QuestionText(unittest.TestCase):
             self.assertLessEqual(len(line), 80)
 
     def test_many_leftovers_are_summarised(self):
-        q = dict(QUESTION, leftovers=[{"key": "k%d" % i, "comm": "c", "count": 2} for i in range(9)])
+        q = dict(
+            QUESTION,
+            leftovers=[{"key": "k%d" % i, "comm": "c", "count": 2} for i in range(9)],
+        )
         head = hook.format_question(q)[0]
         self.assertIn("left 18 processes", head)
         self.assertIn("...", head)
@@ -224,7 +279,9 @@ class QuestionText(unittest.TestCase):
         for k in ("", "\r", "\n", "x", "4", "0"):
             self.assertEqual(m(k, QUESTION), ("later",), k)
         three = json.loads(json.dumps(QUESTION))
-        three["candidates"].append({"id": 3, "kind": "historic", "key": "idea", "label": "idea"})
+        three["candidates"].append(
+            {"id": 3, "kind": "historic", "key": "idea", "label": "idea"}
+        )
         self.assertEqual(m("2", three), ("menu",))
         self.assertEqual(hook.menu_choice("1", three), "code")
         self.assertEqual(hook.menu_choice("2", three), "idea")
@@ -239,14 +296,21 @@ class QuestionText(unittest.TestCase):
         os.write(m, b"ls")
         time.sleep(0.1)
         self.assertTrue(hook.pending_input(s))
-        self.assertTrue(hook.pending_input(-1))        # unknown counts as waiting
+        self.assertTrue(hook.pending_input(-1))  # unknown counts as waiting
 
 
 class AskFlow(TtyCase):
     def setUp(self):
         super().setUp()
-        self.answer = {"ok": True, "choice": "stop", "owner": "npm", "leftovers": ["node:vite"]}
-        self.d = FakeDaemon(lambda m: {"question": QUESTION} if m["cmd"] == "ask" else self.answer)
+        self.answer = {
+            "ok": True,
+            "choice": "stop",
+            "owner": "npm",
+            "leftovers": ["node:vite"],
+        }
+        self.d = FakeDaemon(
+            lambda m: {"question": QUESTION} if m["cmd"] == "ask" else self.answer
+        )
         self.addCleanup(self.d.close)
 
     def play(self, keys, expect=b"ask me later"):
@@ -262,7 +326,10 @@ class AskFlow(TtyCase):
         res, out = self.play(["1"])
         self.assertEqual(res, "answered")
         self.assertIn("tæma: `npm run dev` left 2 processes".encode(), out)
-        self.assertEqual(self.d.got[1], {"cmd": "answer", "nonce": "abc123", "choice": "stop", "owner": "npm"})
+        self.assertEqual(
+            self.d.got[1],
+            {"cmd": "answer", "nonce": "abc123", "choice": "stop", "owner": "npm"},
+        )
         self.assertIn(b"noted", out)
         self.assertEqual(out.count(b"noted"), 1)
         self.assertNotIn(b"\x1b", out)
@@ -270,11 +337,15 @@ class AskFlow(TtyCase):
     def test_standalone_has_no_owner(self):
         res, _out = self.play(["3"])
         self.assertEqual(res, "answered")
-        self.assertEqual(self.d.got[1], {"cmd": "answer", "nonce": "abc123", "choice": "standalone"})
+        self.assertEqual(
+            self.d.got[1], {"cmd": "answer", "nonce": "abc123", "choice": "standalone"}
+        )
 
     def test_second_menu(self):
         q = json.loads(json.dumps(QUESTION))
-        q["candidates"].append({"id": 3, "kind": "historic", "key": "idea", "label": "idea"})
+        q["candidates"].append(
+            {"id": 3, "kind": "historic", "key": "idea", "label": "idea"}
+        )
         self.d.replies = lambda m: {"question": q} if m["cmd"] == "ask" else self.answer
         res, out = self.play(["2", "2"])
         self.assertEqual(res, "answered")
@@ -290,7 +361,9 @@ class AskFlow(TtyCase):
             self.assertIn(b"ask later", out)
 
     def test_timeout_asks_later(self):
-        with mock.patch.object(hook, "read_key", return_value=""):      # what read_key gives on timeout
+        with mock.patch.object(
+            hook, "read_key", return_value=""
+        ):  # what read_key gives on timeout
             self.assertEqual(hook.ask(20, fd=self.slave, paths=[self.d.path]), "later")
         self.assertEqual([m["cmd"] for m in self.d.got], ["ask"])
 
@@ -301,6 +374,7 @@ class AskFlow(TtyCase):
 
     def test_read_key_restores_terminal(self):
         import termios
+
         before = termios.tcgetattr(self.slave)
         os.write(self.master, b"3")
         self.assertEqual(hook.read_key(self.slave, 2.0), "3")
@@ -324,7 +398,9 @@ class AskFlow(TtyCase):
         self.assertIn(b"could not save", out)
 
     def test_daemon_down(self):
-        self.assertEqual(hook.ask(20, fd=self.slave, paths=["/nonexistent/x.sock"]), "down")
+        self.assertEqual(
+            hook.ask(20, fd=self.slave, paths=["/nonexistent/x.sock"]), "down"
+        )
         self.assertEqual(self.drain(), b"")
 
     def test_later_removes_the_pending_file(self):
@@ -355,15 +431,23 @@ class ShellFiles(unittest.TestCase):
         for path in (BASH, ZSH, FISH):
             with open(path) as f:
                 text = f.read()
-            code = "\n".join(l for l in text.split("\n") if not l.lstrip().startswith("#"))
+            code = "\n".join(
+                l for l in text.split("\n") if not l.lstrip().startswith("#")
+            )
             self.assertNotIn("trap ", code, path)
             self.assertNotIn("$(date", code, path)
 
     def test_files_are_installed(self):
         with open(os.path.join(ROOT, "Makefile")) as f:
             mk = f.read()
-        for needle in ("shell/taema.bash", "shell/taema.zsh", "shell/taema.fish", "libexec/taema-hook",
-                       "bashrc.d", "vendor_conf.d"):
+        for needle in (
+            "shell/taema.bash",
+            "shell/taema.zsh",
+            "shell/taema.fish",
+            "libexec/taema-hook",
+            "bashrc.d",
+            "vendor_conf.d",
+        ):
             self.assertIn(needle, mk)
 
 
@@ -372,8 +456,14 @@ def bash_script(body, env=None, interactive=True):
     master, slave = pty.openpty()
     e = dict(os.environ, PATH="/usr/bin:/bin")
     e.update(env or {})
-    p = subprocess.Popen(["bash", "--norc", "--noprofile"] + (["-i"] if interactive else ["-c", body]),
-                         stdin=slave, stdout=slave, stderr=slave, env=e, close_fds=True)
+    p = subprocess.Popen(
+        ["bash", "--norc", "--noprofile"] + (["-i"] if interactive else ["-c", body]),
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=e,
+        close_fds=True,
+    )
     os.close(slave)
     if interactive:
         os.write(master, (body + "\nexit\n").encode())
@@ -417,75 +507,136 @@ class BashHook(unittest.TestCase):
             return []
 
     def test_installs_exactly_one_hook(self):
-        _rc, out = bash_script(self.src() + self.src() + 'echo "PC=${#PROMPT_COMMAND[@]}:${PROMPT_COMMAND[0]}"; '
-                               'echo "JOB=$TAEMA_JOB"; echo "PID=$$"', self.env)
+        _rc, out = bash_script(
+            self.src()
+            + self.src()
+            + 'echo "PC=${#PROMPT_COMMAND[@]}:${PROMPT_COMMAND[0]}"; '
+            'echo "JOB=$TAEMA_JOB"; echo "PID=$$"',
+            self.env,
+        )
         self.assertIn("PC=1:_taema_precmd", out)
         job = [l for l in out.splitlines() if l.startswith("JOB=")][-1][4:]
         pid = [l for l in out.splitlines() if l.startswith("PID=")][-1][4:]
         self.assertRegex(job, r"^%s\.\d+\s*$" % pid.strip())
 
     def test_ps0_added_once(self):
-        _rc, out = bash_script(self.src() + self.src() + 'echo "PS0N=$(printf %s "$PS0" | grep -o _taema_t0 | wc -l)"',
-                               self.env)
+        _rc, out = bash_script(
+            self.src()
+            + self.src()
+            + 'echo "PS0N=$(printf %s "$PS0" | grep -o _taema_t0 | wc -l)"',
+            self.env,
+        )
         self.assertIn("PS0N=1", out)
 
     def test_off_when_not_interactive_or_disabled_or_hook_missing(self):
-        for env, interactive in (({}, False), ({"TAEMA_NO_PROMPT": "1"}, True), ({"TAEMA_HOOK": "/nonexistent"}, True)):
+        for env, interactive in (
+            ({}, False),
+            ({"TAEMA_NO_PROMPT": "1"}, True),
+            ({"TAEMA_HOOK": "/nonexistent"}, True),
+        ):
             e = dict(self.env, **env)
-            body = self.src() + 'echo "PC=${#PROMPT_COMMAND[@]}"; echo "J=${TAEMA_JOB-unset}"'
-            _rc, out = bash_script(body if interactive else "source %s; echo \"PC=${#PROMPT_COMMAND[@]}\"" % BASH,
-                                   e, interactive)
+            body = (
+                self.src()
+                + 'echo "PC=${#PROMPT_COMMAND[@]}"; echo "J=${TAEMA_JOB-unset}"'
+            )
+            _rc, out = bash_script(
+                body
+                if interactive
+                else 'source %s; echo "PC=${#PROMPT_COMMAND[@]}"' % BASH,
+                e,
+                interactive,
+            )
             self.assertIn("PC=0", out, env)
 
     def test_off_without_a_tty(self):
-        r = subprocess.run(["bash", "--norc", "-i", "-c", "source %s; echo PC=${#PROMPT_COMMAND[@]}" % BASH],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           env=dict(os.environ, **self.env))
+        r = subprocess.run(
+            [
+                "bash",
+                "--norc",
+                "-i",
+                "-c",
+                "source %s; echo PC=${#PROMPT_COMMAND[@]}" % BASH,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, **self.env),
+        )
         self.assertIn("PC=0", r.stdout)
 
     def test_precmd_idle_path_spawns_nothing(self):
-        body = (self.src() + 'PATH=; _taema_precmd; echo "RC=$?"; false; _taema_precmd; echo "RC2=$?"; '
-                'true || _taema_precmd; echo END')
+        body = (
+            self.src()
+            + 'PATH=; _taema_precmd; echo "RC=$?"; false; _taema_precmd; echo "RC2=$?"; '
+            "true || _taema_precmd; echo END"
+        )
         _rc, out = bash_script(body, self.env)
         self.assertIn("RC=0", out)
-        self.assertIn("RC2=1", out)         # the function returns the status it was entered with
+        self.assertIn(
+            "RC2=1", out
+        )  # the function returns the status it was entered with
         self.assertNotIn("command not found", out)
         self.assertEqual(self.called(), [])
 
     def test_precmd_preserves_status(self):
-        body = self.src() + 'false; _taema_precmd; echo "S=$?"; (exit 7); _taema_precmd; echo "S2=$?"'
+        body = (
+            self.src()
+            + 'false; _taema_precmd; echo "S=$?"; (exit 7); _taema_precmd; echo "S2=$?"'
+        )
         _rc, out = bash_script(body, self.env)
         self.assertIn("S=1", out)
         self.assertIn("S2=7", out)
 
     def test_pending_file_runs_ask_and_slow_job_runs_done(self):
         os.makedirs(self.dir + "/rt/taema")
-        body = (self.src() + 'sleep 2.2; echo X\n' + 'touch %s/rt/taema/q.$$\n' % self.dir
-                + 'true\n' + 'sleep 0.3\n' + 'echo DONE')
+        body = (
+            self.src()
+            + "sleep 2.2; echo X\n"
+            + "touch %s/rt/taema/q.$$\n" % self.dir
+            + "true\n"
+            + "sleep 0.3\n"
+            + "echo DONE"
+        )
         _rc, out = bash_script(body, self.env)
         time.sleep(0.5)
         calls = self.called()
-        self.assertTrue(any(c.split()[0] == "done" and c.split()[2].startswith(c.split()[1] + ".") and
-                            c.split()[3] == "0" for c in calls), calls)
+        self.assertTrue(
+            any(
+                c.split()[0] == "done"
+                and c.split()[2].startswith(c.split()[1] + ".")
+                and c.split()[3] == "0"
+                for c in calls
+            ),
+            calls,
+        )
         self.assertTrue(any(c.split()[0] == "ask" for c in calls), calls)
-        self.assertEqual(sum(c.split()[0] == "done" for c in calls), 1, calls)    # fast lines send nothing
-        self.assertNotRegex(out, r"\[\d+\]")          # no job-control noise
+        self.assertEqual(
+            sum(c.split()[0] == "done" for c in calls), 1, calls
+        )  # fast lines send nothing
+        self.assertNotRegex(out, r"\[\d+\]")  # no job-control noise
 
     def test_nested_shell_remembers_the_parent_job(self):
-        body = 'export TAEMA_JOB=999.7\n' + self.src() + 'echo "P=$TAEMA_PARENT_JOB J=$TAEMA_JOB"'
+        body = (
+            "export TAEMA_JOB=999.7\n"
+            + self.src()
+            + 'echo "P=$TAEMA_PARENT_JOB J=$TAEMA_JOB"'
+        )
         _rc, out = bash_script(body, self.env)
         self.assertIn("P=999.7 J=", out)
 
     def test_ble_registers_through_blehook(self):
-        body = ('blehook() { echo "BLE $*"; }\n' + self.src())
+        body = 'blehook() { echo "BLE $*"; }\n' + self.src()
         _rc, out = bash_script(body, self.env)
         self.assertIn("BLE PREEXEC+=_taema_preexec", out)
         self.assertIn("BLE PRECMD+=_taema_precmd", out)
 
     def test_preexec_word_and_kill_flag(self):
-        body = (self.src() + '_taema_preexec "  pkill -f vite"; echo "W=$_taema_word K=$_taema_kill"; '
-                '_taema_preexec "taema kill emu"; echo "K2=$_taema_kill"; _taema_preexec "taema ls"; echo "K3=$_taema_kill"; '
-                '_taema_preexec "ls -l"; echo "W4=$_taema_word K4=$_taema_kill"')
+        body = (
+            self.src()
+            + '_taema_preexec "  pkill -f vite"; echo "W=$_taema_word K=$_taema_kill"; '
+            '_taema_preexec "taema kill emu"; echo "K2=$_taema_kill"; _taema_preexec "taema ls"; echo "K3=$_taema_kill"; '
+            '_taema_preexec "ls -l"; echo "W4=$_taema_word K4=$_taema_kill"'
+        )
         _rc, out = bash_script(body, self.env)
         self.assertIn("W=pkill K=1", out)
         self.assertIn("K2=1", out)
@@ -494,6 +645,7 @@ class BashHook(unittest.TestCase):
 
 
 # ---- 4. daemon: kill_done ----------------------------------------------------------------------------------------
+
 
 class KillFlow(ProcCase):
     def setUp(self):
@@ -505,7 +657,11 @@ class KillFlow(ProcCase):
         p = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.rt})
         p.start()
         self.addCleanup(p.stop)
-        self.d = daemon.Daemon(make_cfg(tmp(), seeds={"persist": ["gpg-agent"]}, protected={"comm": ["niri*"]}))
+        self.d = daemon.Daemon(
+            make_cfg(
+                tmp(), seeds={"persist": ["gpg-agent"]}, protected={"comm": ["niri*"]}
+            )
+        )
         self.fp.add(20, 1, comm="bash", sid=20, tty=34816, born=1000.0)
         self.fp.add(21, 20, comm="npm", pgrp=21)
         self.fp.add(22, 21, comm="vite", pgrp=21)
@@ -521,8 +677,15 @@ class KillFlow(ProcCase):
     def test_validation(self):
         h = self.d.handle
         good = {"cmd": "kill_done", "shell_pid": 20, "word": "kill"}
-        for patch in ({"shell_pid": "20"}, {"shell_pid": True}, {"shell_pid": 1}, {"shell_pid": 999999},
-                      {"word": "rm"}, {"word": 3}, {"word": None}):
+        for patch in (
+            {"shell_pid": "20"},
+            {"shell_pid": True},
+            {"shell_pid": 1},
+            {"shell_pid": 999999},
+            {"word": "rm"},
+            {"word": 3},
+            {"word": None},
+        ):
             self.assertIn("error", h(dict(good, **patch)), patch)
         self.assertEqual(h(good), {"ok": True})
         self.assertEqual(self.d.deadlines[-1][1], "kill")
@@ -536,7 +699,9 @@ class KillFlow(ProcCase):
         self.assertEqual(q["candidates"][0]["key"], "npm")
         self.assertEqual([l["key"] for l in q["leftovers"]], ["vite"])
         self.assertTrue(os.path.exists(self.rt + "/taema/q.20"))
-        a = self.d.handle({"cmd": "answer", "nonce": q["nonce"], "choice": "stop", "owner": "npm"})
+        a = self.d.handle(
+            {"cmd": "answer", "nonce": q["nonce"], "choice": "stop", "owner": "npm"}
+        )
         self.assertEqual((a["ok"], a["owner"], a["leftovers"]), (True, "npm", ["vite"]))
         self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "stop")
         self.assertFalse(os.path.exists(self.rt + "/taema/q.20"))
@@ -549,12 +714,15 @@ class KillFlow(ProcCase):
     def test_rate_limit_and_pair_gap(self):
         self.kill()
         q = self.d.handle({"cmd": "ask", "shell_pid": 20})["question"]
-        self.assertIsNotNone(q)                         # shown: the pair is stamped
+        self.assertIsNotNone(q)  # shown: the pair is stamped
         self.d.handle({"cmd": "answer", "nonce": q["nonce"], "choice": "keep"})
         self.fp.add(22, 21, comm="vite", pgrp=21)
         self.d.lineage.observe(self.fp.table())
         self.kill()
-        self.assertEqual(self.d.handle({"cmd": "ask", "shell_pid": 20}), {"question": None, "reason": "none"})
+        self.assertEqual(
+            self.d.handle({"cmd": "ask", "shell_pid": 20}),
+            {"question": None, "reason": "none"},
+        )
 
     def test_daily_limit(self):
         for _ in range(3):
@@ -572,7 +740,9 @@ class KillFlow(ProcCase):
         self.assertEqual(self.d.pending, {})
 
     def test_root_without_a_real_owner_is_not_asked(self):
-        self.fp.add(40, 20, comm="solo", pgrp=40)       # its only recorded parent is the shell
+        self.fp.add(
+            40, 20, comm="solo", pgrp=40
+        )  # its only recorded parent is the shell
         self.d.lineage.observe(self.fp.table())
         self.kill(40)
         self.assertEqual(self.d.pending, {})

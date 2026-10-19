@@ -3,6 +3,7 @@
 An edge means an OUTSIDE process depends on a MEMBER (member is the server side).
 Clients of things outside the set, shared stdio, ptys and pipes are never edges.
 """
+
 from collections import namedtuple
 import os
 import re
@@ -10,11 +11,14 @@ import subprocess
 
 PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
 _USERS = re.compile(r'\("([^"]*)",pid=(\d+)')
-_UNIX = re.compile(r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(users:\(.*\))?\s*$")
+_UNIX = re.compile(
+    r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(users:\(.*\))?\s*$"
+)
 _TCP = re.compile(r"^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s*(users:\(.*\))?\s*$")
 
 
 # ---- /proc ----------------------------------------------------------------------------
+
 
 def all_pids():
     return [int(x) for x in os.listdir(PROC) if x.isdigit()]
@@ -86,8 +90,18 @@ def _parse_stat(data):
         ints = [int(x) for x in rest[1:5]]
         ints += [0] * (4 - len(ints))
         start = int(rest[19]) if len(rest) > 19 else 0
-        cpu = int(rest[11]) + int(rest[12]) if len(rest) > 12 else 0     # utime + stime, clock ticks
-        return Proc(ints[0], ints[1], ints[2], ints[3], start, rest[0].decode(errors="replace"), cpu)
+        cpu = (
+            int(rest[11]) + int(rest[12]) if len(rest) > 12 else 0
+        )  # utime + stime, clock ticks
+        return Proc(
+            ints[0],
+            ints[1],
+            ints[2],
+            ints[3],
+            start,
+            rest[0].decode(errors="replace"),
+            cpu,
+        )
     except ValueError:
         return None
 
@@ -170,6 +184,7 @@ def tracer(pid):
 
 # ---- ss parsing -------------------------------------------------------------------------
 
+
 def _pids(users):
     return {int(p) for _, p in _USERS.findall(users or "")}
 
@@ -182,8 +197,15 @@ def parse_ss_unix(text):
         if not m:
             continue
         _, state, lpath, linode, _ppath, pinode, users = m.groups()
-        rows.append({"state": state, "path": "" if lpath == "*" else lpath,
-                     "inode": int(linode), "peer_inode": int(pinode), "pids": _pids(users)})
+        rows.append(
+            {
+                "state": state,
+                "path": "" if lpath == "*" else lpath,
+                "inode": int(linode),
+                "peer_inode": int(pinode),
+                "pids": _pids(users),
+            }
+        )
     return rows
 
 
@@ -195,7 +217,9 @@ def parse_ss_tcp(text):
         if not m:
             continue
         state, local, peer, users = m.groups()
-        rows.append({"state": state, "local": local, "peer": peer, "pids": _pids(users)})
+        rows.append(
+            {"state": state, "local": local, "peer": peer, "pids": _pids(users)}
+        )
     return rows
 
 
@@ -210,7 +234,9 @@ def _host(addr):
 def _ss(*args):
     """ss output, or None when ss failed (unknown: callers must not read it as "no sockets")."""
     try:
-        r = subprocess.run(["ss", "-H"] + list(args), capture_output=True, text=True, timeout=10)
+        r = subprocess.run(
+            ["ss", "-H"] + list(args), capture_output=True, text=True, timeout=10
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -221,7 +247,7 @@ class Snapshot:
     (`-xapn`, `-tanp`); listening tcp rows are split out by state."""
 
     def __init__(self, unix_text=None, tcp_text=None, tcp_listen_text=None):
-        self.ok = True      # False when any ss call failed: edges are unknown, not absent
+        self.ok = True  # False when any ss call failed: edges are unknown, not absent
 
         def get(given, args):
             t = given if given is not None else _ss(*args)
@@ -275,7 +301,9 @@ def edges(members, snap=None, pids_info=None):
     out = {}
 
     def add(pid, kind, detail, peers):
-        out.setdefault(pid, []).append({"kind": kind, "detail": detail, "peers": sorted(peers)})
+        out.setdefault(pid, []).append(
+            {"kind": kind, "detail": detail, "peers": sorted(peers)}
+        )
 
     # unix: the member holds the server-side end (that end carries the bound path)
     for r in snap.unix:
@@ -300,8 +328,15 @@ def edges(members, snap=None, pids_info=None):
         for pid in r["pids"] & members:
             listen.setdefault(_port(r["local"]), set()).add(pid)
     if listen:
-        by_local = {(_host(r["local"]), _port(r["local"]), _host(r["peer"]), _port(r["peer"])): r
-                    for r in snap.tcp}
+        by_local = {
+            (
+                _host(r["local"]),
+                _port(r["local"]),
+                _host(r["peer"]),
+                _port(r["peer"]),
+            ): r
+            for r in snap.tcp
+        }
         for r in snap.tcp:
             port = _port(r["local"])
             if port not in listen or r["state"] != "ESTAB":
@@ -324,9 +359,13 @@ def edges(members, snap=None, pids_info=None):
         if not rd:
             continue
         candidates = info["comm"].keys() if "comm" in info else all_pids()
-        users = [p for p in candidates
-                 if p not in members and get_comm(p) == "conmon"
-                 and get_env(p).get("XDG_RUNTIME_DIR") == rd]
+        users = [
+            p
+            for p in candidates
+            if p not in members
+            and get_comm(p) == "conmon"
+            and get_env(p).get("XDG_RUNTIME_DIR") == rd
+        ]
         if users:
             add(pid, "podman_pause", rd, users)
 

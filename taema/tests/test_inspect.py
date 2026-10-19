@@ -2,15 +2,21 @@ import unittest
 
 from taema import inspect
 
-SERVER = 'u_str ESTAB 0 0 /run/user/1000/herdr.sock 100 * 101 users:(("herdr",pid=50,fd=9))'
+SERVER = (
+    'u_str ESTAB 0 0 /run/user/1000/herdr.sock 100 * 101 users:(("herdr",pid=50,fd=9))'
+)
 CLIENT_OUT = 'u_str ESTAB 0 0 * 101 * 100 users:(("fzf",pid=70,fd=3))'
-LISTEN = 'u_str LISTEN 0 128 /run/user/1000/herdr.sock 99 * 0 users:(("herdr",pid=50,fd=5))'
+LISTEN = (
+    'u_str LISTEN 0 128 /run/user/1000/herdr.sock 99 * 0 users:(("herdr",pid=50,fd=5))'
+)
 # member (pid 60) is a client of niri (outside); niri's end carries the path
 M_CLIENT = 'u_str ESTAB 0 0 * 200 * 201 users:(("foot",pid=60,fd=4))'
-NIRI_END = 'u_str ESTAB 0 0 /run/user/1000/wayland-1 201 * 200 users:(("niri",pid=1,fd=40))'
+NIRI_END = (
+    'u_str ESTAB 0 0 /run/user/1000/wayland-1 201 * 200 users:(("niri",pid=1,fd=40))'
+)
 # member server whose client is a root process (peer end has no visible pids)
 ROOT_SRV = 'u_str ESTAB 0 0 /run/foo.sock 300 * 301 users:(("srv",pid=80,fd=4))'
-ROOT_CLI = 'u_str ESTAB 0 0 * 301 * 300'
+ROOT_CLI = "u_str ESTAB 0 0 * 301 * 300"
 
 
 class UnixEdges(unittest.TestCase):
@@ -38,8 +44,10 @@ class UnixEdges(unittest.TestCase):
 
 TCP_LISTEN = 'LISTEN 0 128 127.0.0.1:5037 0.0.0.0:* users:(("adb",pid=90,fd=10))'
 TCP_SRV_SIDE = 'ESTAB 0 0 127.0.0.1:5037 127.0.0.1:40000 users:(("adb",pid=90,fd=11))'
-TCP_CLIENT_SIDE = 'ESTAB 0 0 127.0.0.1:40000 127.0.0.1:5037 users:(("studio",pid=91,fd=7))'
-TCP_REMOTE = 'ESTAB 0 0 127.0.0.1:5037 10.0.0.5:51000'
+TCP_CLIENT_SIDE = (
+    'ESTAB 0 0 127.0.0.1:40000 127.0.0.1:5037 users:(("studio",pid=91,fd=7))'
+)
+TCP_REMOTE = "ESTAB 0 0 127.0.0.1:5037 10.0.0.5:51000"
 
 
 class TcpEdges(unittest.TestCase):
@@ -52,7 +60,12 @@ class TcpEdges(unittest.TestCase):
         self.assertEqual(e[90][0]["peers"], [91])
 
     def test_loopback_client_inside_set_is_not(self):
-        self.assertEqual(inspect.edges({90, 91}, self.snap(TCP_LISTEN, TCP_SRV_SIDE, TCP_CLIENT_SIDE)), {})
+        self.assertEqual(
+            inspect.edges(
+                {90, 91}, self.snap(TCP_LISTEN, TCP_SRV_SIDE, TCP_CLIENT_SIDE)
+            ),
+            {},
+        )
 
     def test_remote_client_is_an_edge(self):
         e = inspect.edges({90}, self.snap(TCP_LISTEN, TCP_REMOTE))
@@ -64,17 +77,26 @@ class TcpEdges(unittest.TestCase):
 
 class OtherEdges(unittest.TestCase):
     def test_podman_pause_used_by_outside_conmon(self):
-        info = {"comm": {10: "catatonit", 11: "conmon", 12: "conmon"},
-                "environ": {10: {"XDG_RUNTIME_DIR": "/r"}, 11: {"XDG_RUNTIME_DIR": "/r"},
-                            12: {"XDG_RUNTIME_DIR": "/other"}}}
+        info = {
+            "comm": {10: "catatonit", 11: "conmon", 12: "conmon"},
+            "environ": {
+                10: {"XDG_RUNTIME_DIR": "/r"},
+                11: {"XDG_RUNTIME_DIR": "/r"},
+                12: {"XDG_RUNTIME_DIR": "/other"},
+            },
+        }
         e = inspect.edges({10}, inspect.Snapshot("", "", ""), info)
         self.assertEqual(e[10][0]["kind"], "podman_pause")
         self.assertEqual(e[10][0]["peers"], [11])
 
     def test_podman_conmon_inside_set_is_not_outside(self):
-        info = {"comm": {10: "catatonit", 11: "conmon"},
-                "environ": {10: {"XDG_RUNTIME_DIR": "/r"}, 11: {"XDG_RUNTIME_DIR": "/r"}}}
-        self.assertEqual(inspect.edges({10, 11}, inspect.Snapshot("", "", ""), info), {})
+        info = {
+            "comm": {10: "catatonit", 11: "conmon"},
+            "environ": {10: {"XDG_RUNTIME_DIR": "/r"}, 11: {"XDG_RUNTIME_DIR": "/r"}},
+        }
+        self.assertEqual(
+            inspect.edges({10, 11}, inspect.Snapshot("", "", ""), info), {}
+        )
 
     def test_ptrace_from_outside(self):
         info = {"comm": {5: "x"}, "tracer": {5: 99}, "environ": {}}
@@ -91,10 +113,15 @@ class Parse(unittest.TestCase):
     def test_parse_real_format(self):
         txt = 'u_str ESTAB 0      0                                                         * 2302403             * 2302404  users:(("herdr",pid=11549,fd=11),("herdr",pid=11549,fd=9))'
         r = inspect.parse_ss_unix(txt)[0]
-        self.assertEqual((r["inode"], r["peer_inode"], r["pids"], r["path"]), (2302403, 2302404, {11549}, ""))
+        self.assertEqual(
+            (r["inode"], r["peer_inode"], r["pids"], r["path"]),
+            (2302403, 2302404, {11549}, ""),
+        )
 
     def test_parse_tcp_no_users(self):
-        r = inspect.parse_ss_tcp("LISTEN 0      128          0.0.0.0:22         0.0.0.0:*")[0]
+        r = inspect.parse_ss_tcp(
+            "LISTEN 0      128          0.0.0.0:22         0.0.0.0:*"
+        )[0]
         self.assertEqual((r["local"], r["pids"]), ("0.0.0.0:22", set()))
 
 

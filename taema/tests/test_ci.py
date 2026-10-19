@@ -1,4 +1,5 @@
 """CI: the push/PR workflow runs the suites in Void glibc/musl containers and on Python 3.11."""
+
 import os
 import re
 import unittest
@@ -35,8 +36,9 @@ class VoidJobsTest(unittest.TestCase):
         text = read(CI)
         # Either two literal jobs or a libc matrix over the official Void images.
         literal = "void-glibc" in text and "void-musl" in text
-        matrix = ("void-${{ matrix.libc }}" in text
-                  and re.search(r"libc:\s*\[glibc,\s*musl\]", text))
+        matrix = "void-${{ matrix.libc }}" in text and re.search(
+            r"libc:\s*\[glibc,\s*musl\]", text
+        )
         self.assertTrue(literal or matrix, "no Void glibc and musl container jobs")
 
     def test_distribution_python(self):
@@ -59,6 +61,14 @@ class PythonFloorTest(unittest.TestCase):
         text = read(CI)
         self.assertRegex(text, r"python-version:\s*['\"]3\.11['\"]")
         self.assertRegex(text, r"make (-C taema )?test")
+
+    def test_quality_gates_run_on_python_311(self):
+        text = read(CI)
+        self.assertIn("ruff check src tests tools", text)
+        self.assertIn("ruff format --check src tests tools", text)
+        self.assertIn("mypy src/taema", text)
+        self.assertIn("coverage run -m unittest discover", text)
+        self.assertIn("tools/check_coverage.py", text)
 
 
 class FailureTest(unittest.TestCase):

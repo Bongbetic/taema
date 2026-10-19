@@ -31,15 +31,31 @@ Member-level pair authority (auto_stop_ok, the explicit-answer SIGKILL rule) sta
 today -- at actuation inside engine/daemon -- and is re-checked there after the ladder says ``act``;
 the authority slot is the trigger-level home for it as the M0 tickets land.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Final, Literal
 
 __all__ = [
-    "ACT", "WOULD_ACT", "KEEP", "SLOTS", "MODES", "Facts", "Decision", "authorize",
-    "OWNER_EXIT", "UNIT_ADOPT", "AUTO_ADOPT", "GUI_CLOSE", "JOB_SURVIVORS", "LEFTOVER_LEAVES",
-    "GC_STOP", "GC_REMOVE_EMPTY", "SESSION_END", "MANUAL_STOP",
+    "ACT",
+    "WOULD_ACT",
+    "KEEP",
+    "SLOTS",
+    "MODES",
+    "Facts",
+    "Decision",
+    "authorize",
+    "OWNER_EXIT",
+    "UNIT_ADOPT",
+    "AUTO_ADOPT",
+    "GUI_CLOSE",
+    "JOB_SURVIVORS",
+    "LEFTOVER_LEAVES",
+    "GC_STOP",
+    "GC_REMOVE_EMPTY",
+    "SESSION_END",
+    "MANUAL_STOP",
 ]
 
 Mode = Literal["observe", "adopt", "enforce", "auto"]
@@ -47,8 +63,18 @@ Verdict = Literal["act", "would", "keep"]
 Authority = Literal["", "mode", "unit", "pair", "manual"]
 Slot = Literal["hard_safety", "veto", "hold", "mode_capability", "authority"]
 Vote = Literal["pass", "deny"]
-Trigger = Literal["owner_exit", "unit_adopt", "auto_adopt", "gui_close", "job_survivors",
-                  "leftover_leaves", "gc_stop", "gc_remove_empty", "session_end", "manual_stop"]
+Trigger = Literal[
+    "owner_exit",
+    "unit_adopt",
+    "auto_adopt",
+    "gui_close",
+    "job_survivors",
+    "leftover_leaves",
+    "gc_stop",
+    "gc_remove_empty",
+    "session_end",
+    "manual_stop",
+]
 SlotFn = Callable[[str, str, "Facts"], tuple[Vote, str]]
 
 # verdicts
@@ -67,16 +93,22 @@ SLOTS: Final[tuple[Slot, ...]] = (HARD_SAFETY, VETO, HOLD, MODE_CAPABILITY, AUTH
 MODES: Final[tuple[Mode, ...]] = ("observe", "adopt", "enforce", "auto")
 
 # triggers: every lifecycle decision point, named after the daemon/CLI path that asks for them
-OWNER_EXIT: Final[Trigger] = "owner_exit"            # Daemon.stop_leaf (owner bound scope)
-UNIT_ADOPT: Final[Trigger] = "unit_adopt"            # Daemon.adopt_pass (unit/carve move ops)
-AUTO_ADOPT: Final[Trigger] = "auto_adopt"            # Daemon.adopt_pass -> auto_adopt
-GUI_CLOSE: Final[Trigger] = "gui_close"              # Daemon.after_observe -> gui_close
-JOB_SURVIVORS: Final[Trigger] = "job_survivors"      # Daemon.decide_job (standalone + survivors)
-LEFTOVER_LEAVES: Final[Trigger] = "leftover_leaves"  # gc_candidates(auto=) and end_session's list
-GC_STOP: Final[Trigger] = "gc_stop"                  # Daemon.gc_pass, per non-empty candidate
-GC_REMOVE_EMPTY: Final[Trigger] = "gc_remove_empty"  # Daemon._gc_empty / sync / remove_leaf
-SESSION_END: Final[Trigger] = "session_end"          # Daemon.end_session
-MANUAL_STOP: Final[Trigger] = "manual_stop"          # cli.cmd_kill (`taema kill`)
+OWNER_EXIT: Final[Trigger] = "owner_exit"  # Daemon.stop_leaf (owner bound scope)
+UNIT_ADOPT: Final[Trigger] = "unit_adopt"  # Daemon.adopt_pass (unit/carve move ops)
+AUTO_ADOPT: Final[Trigger] = "auto_adopt"  # Daemon.adopt_pass -> auto_adopt
+GUI_CLOSE: Final[Trigger] = "gui_close"  # Daemon.after_observe -> gui_close
+JOB_SURVIVORS: Final[Trigger] = (
+    "job_survivors"  # Daemon.decide_job (standalone + survivors)
+)
+LEFTOVER_LEAVES: Final[Trigger] = (
+    "leftover_leaves"  # gc_candidates(auto=) and end_session's list
+)
+GC_STOP: Final[Trigger] = "gc_stop"  # Daemon.gc_pass, per non-empty candidate
+GC_REMOVE_EMPTY: Final[Trigger] = (
+    "gc_remove_empty"  # Daemon._gc_empty / sync / remove_leaf
+)
+SESSION_END: Final[Trigger] = "session_end"  # Daemon.end_session
+MANUAL_STOP: Final[Trigger] = "manual_stop"  # cli.cmd_kill (`taema kill`)
 
 # authority values an `act` carries to its actuation
 AUTHORITY_MODE: Final[Authority] = "mode"
@@ -121,50 +153,132 @@ class Decision:
 _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
     OWNER_EXIT: {
         "observe": (WOULD_ACT, "", "owner exit: observe only logs would_stop"),
-        "adopt": (ACT, AUTHORITY_UNIT, "owner exit: adopt honors explicit owner binding"),
+        "adopt": (
+            ACT,
+            AUTHORITY_UNIT,
+            "owner exit: adopt honors explicit owner binding",
+        ),
         "enforce": (ACT, AUTHORITY_UNIT, "owner exit: enforce stops the bound scope"),
-        "auto": (ACT, AUTHORITY_UNIT, "owner exit: an owner-bound scope is the user's own request"),
+        "auto": (
+            ACT,
+            AUTHORITY_UNIT,
+            "owner exit: an owner-bound scope is the user's own request",
+        ),
     },
     UNIT_ADOPT: {
         "observe": (WOULD_ACT, "", "unit adopt: observe only logs adopt_would"),
-        "adopt": (ACT, AUTHORITY_MODE, "unit adopt: adopt moves unit-matched processes"),
-        "enforce": (ACT, AUTHORITY_MODE, "unit adopt: enforce moves unit-matched processes"),
+        "adopt": (
+            ACT,
+            AUTHORITY_MODE,
+            "unit adopt: adopt moves unit-matched processes",
+        ),
+        "enforce": (
+            ACT,
+            AUTHORITY_MODE,
+            "unit adopt: enforce moves unit-matched processes",
+        ),
         "auto": (ACT, AUTHORITY_MODE, "unit adopt: auto moves unit-matched processes"),
     },
     AUTO_ADOPT: {
         "observe": (WOULD_ACT, "", "app adopt: observe only logs adopt_would"),
-        "adopt": (ACT, AUTHORITY_MODE, "app adopt: adopt moves every eligible app root"),
-        "enforce": (ACT, AUTHORITY_MODE, "app adopt: enforce moves every eligible app root"),
-        "auto": (ACT, AUTHORITY_MODE, "auto adopt: every eligible app root gets its own scope"),
+        "adopt": (
+            ACT,
+            AUTHORITY_MODE,
+            "app adopt: adopt moves every eligible app root",
+        ),
+        "enforce": (
+            ACT,
+            AUTHORITY_MODE,
+            "app adopt: enforce moves every eligible app root",
+        ),
+        "auto": (
+            ACT,
+            AUTHORITY_MODE,
+            "auto adopt: every eligible app root gets its own scope",
+        ),
     },
     GUI_CLOSE: {
-        "observe": (WOULD_ACT, "", "gui close: observe logs survivors it would contain"),
-        "adopt": (ACT, AUTHORITY_MODE, "gui close: adopt contains survivors in leftover/<owner>-<id>"),
-        "enforce": (ACT, AUTHORITY_MODE, "gui close: enforce contains survivors in leftover/<owner>-<id>"),
-        "auto": (ACT, AUTHORITY_MODE, "gui close: auto contains survivors in leftover/<owner>-<id>"),
+        "observe": (
+            WOULD_ACT,
+            "",
+            "gui close: observe logs survivors it would contain",
+        ),
+        "adopt": (
+            ACT,
+            AUTHORITY_MODE,
+            "gui close: adopt contains survivors in leftover/<owner>-<id>",
+        ),
+        "enforce": (
+            ACT,
+            AUTHORITY_MODE,
+            "gui close: enforce contains survivors in leftover/<owner>-<id>",
+        ),
+        "auto": (
+            ACT,
+            AUTHORITY_MODE,
+            "gui close: auto contains survivors in leftover/<owner>-<id>",
+        ),
     },
     JOB_SURVIVORS: {
-        "observe": (KEEP, "", "job survivors: only auto acts on closed-job survivors (0.2.1)"),
-        "adopt": (KEEP, "", "job survivors: only auto acts on closed-job survivors (0.2.1)"),
-        "enforce": (KEEP, "", "job survivors: only auto acts on closed-job survivors (0.2.1)"),
-        "auto": (ACT, AUTHORITY_MODE,
-                 "job survivors: auto adopts standalone and stops decided survivors"),
+        "observe": (
+            KEEP,
+            "",
+            "job survivors: only auto acts on closed-job survivors (0.2.1)",
+        ),
+        "adopt": (
+            KEEP,
+            "",
+            "job survivors: only auto acts on closed-job survivors (0.2.1)",
+        ),
+        "enforce": (
+            KEEP,
+            "",
+            "job survivors: only auto acts on closed-job survivors (0.2.1)",
+        ),
+        "auto": (
+            ACT,
+            AUTHORITY_MODE,
+            "job survivors: auto adopts standalone and stops decided survivors",
+        ),
     },
     LEFTOVER_LEAVES: {
-        "observe": (KEEP, "", "leftover leaves: only auto treats leftover/* as scopes (0.2.1)"),
-        "adopt": (KEEP, "", "leftover leaves: only auto treats leftover/* as scopes (0.2.1)"),
-        "enforce": (KEEP, "", "leftover leaves: only auto treats leftover/* as scopes (0.2.1)"),
-        "auto": (ACT, AUTHORITY_MODE,
-                 "leftover leaves: auto GCs and session-ends leftover/* individually"),
+        "observe": (
+            KEEP,
+            "",
+            "leftover leaves: only auto treats leftover/* as scopes (0.2.1)",
+        ),
+        "adopt": (
+            KEEP,
+            "",
+            "leftover leaves: only auto treats leftover/* as scopes (0.2.1)",
+        ),
+        "enforce": (
+            KEEP,
+            "",
+            "leftover leaves: only auto treats leftover/* as scopes (0.2.1)",
+        ),
+        "auto": (
+            ACT,
+            AUTHORITY_MODE,
+            "leftover leaves: auto GCs and session-ends leftover/* individually",
+        ),
     },
     GC_STOP: {
         "observe": (WOULD_ACT, "", "gc stop: observe only logs gc_would_stop"),
         "adopt": (WOULD_ACT, "", "gc stop: adopt only logs gc_would_stop (0.2.1)"),
         "enforce": (ACT, AUTHORITY_UNIT, "gc stop: enforce stops idle candidates"),
-        "auto": (ACT, AUTHORITY_MODE, "gc stop: auto collects eligible idle shared/unit scopes"),
+        "auto": (
+            ACT,
+            AUTHORITY_MODE,
+            "gc stop: auto collects eligible idle shared/unit scopes",
+        ),
     },
     GC_REMOVE_EMPTY: {
-        "observe": (WOULD_ACT, "", "empty leaf: observe only logs gc_would_remove_empty"),
+        "observe": (
+            WOULD_ACT,
+            "",
+            "empty leaf: observe only logs gc_would_remove_empty",
+        ),
         "adopt": (ACT, AUTHORITY_MODE, "empty leaf: adopt removes unused scopes"),
         "enforce": (ACT, AUTHORITY_MODE, "empty leaf: enforce removes unused scopes"),
         "auto": (ACT, AUTHORITY_MODE, "empty leaf: auto removes unused scopes"),
@@ -173,23 +287,53 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
         "observe": (WOULD_ACT, "", "session end: observe only logs would_stop"),
         "adopt": (WOULD_ACT, "", "session end: adopt only logs would_stop (0.2.1)"),
         "enforce": (ACT, AUTHORITY_UNIT, "session end: enforce stops every scope"),
-        "auto": (ACT, AUTHORITY_PAIR, "session end: auto stops scopes each pair authorises"),
+        "auto": (
+            ACT,
+            AUTHORITY_PAIR,
+            "session end: auto stops scopes each pair authorises",
+        ),
     },
     MANUAL_STOP: {
-        "observe": (ACT, AUTHORITY_MANUAL, "explicit taema kill: a user request acts in every mode"),
-        "adopt": (ACT, AUTHORITY_MANUAL, "explicit taema kill: a user request acts in every mode"),
-        "enforce": (ACT, AUTHORITY_MANUAL, "explicit taema kill: a user request acts in every mode"),
-        "auto": (ACT, AUTHORITY_MANUAL, "explicit taema kill: a user request acts in every mode"),
+        "observe": (
+            ACT,
+            AUTHORITY_MANUAL,
+            "explicit taema kill: a user request acts in every mode",
+        ),
+        "adopt": (
+            ACT,
+            AUTHORITY_MANUAL,
+            "explicit taema kill: a user request acts in every mode",
+        ),
+        "enforce": (
+            ACT,
+            AUTHORITY_MANUAL,
+            "explicit taema kill: a user request acts in every mode",
+        ),
+        "auto": (
+            ACT,
+            AUTHORITY_MANUAL,
+            "explicit taema kill: a user request acts in every mode",
+        ),
     },
 }
 
 
-def _capability(trigger: str, mode: str, facts: Facts) -> tuple[Verdict, Authority, str]:
+def _capability(
+    trigger: str, mode: str, facts: Facts
+) -> tuple[Verdict, Authority, str]:
     """Slot 4: fact rules first, then the per-trigger, per-mode table above."""
     if trigger == GC_STOP and mode == "auto":
         if facts.leftover:
-            return ACT, AUTHORITY_PAIR, "gc stop: auto stops leftover/* under pair/idle authority"
-        return ACT, AUTHORITY_MODE, "gc stop: auto collects eligible idle shared/unit scopes"
+            return (
+                ACT,
+                AUTHORITY_PAIR,
+                "gc stop: auto stops leftover/* under pair/idle authority",
+            )
+        return (
+            ACT,
+            AUTHORITY_MODE,
+            "gc stop: auto collects eligible idle shared/unit scopes",
+        )
     if trigger == SESSION_END and mode == "auto" and facts.shared:
         return KEEP, "", "session end: shared/ is never stopped in auto"
     row = _CAPABILITY.get(trigger)
@@ -201,6 +345,7 @@ def _capability(trigger: str, mode: str, facts: Facts) -> tuple[Verdict, Authori
 
 # ---- slots 1-3: blocking, pass through in 0.2.1 -------------------------------------------------
 
+
 def _hard_safety(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
     """Slot 1: hard safety/dependencies (never root/other users/protected/self, revalidated at
     actuation by engine.stop/plan_stop). No trigger supplies hard-safety facts in 0.2.1."""
@@ -209,7 +354,10 @@ def _hard_safety(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
 
 def _veto(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
     """Slot 2: a user veto blocks every stop trigger before mode or learned authority."""
-    if trigger in (OWNER_EXIT, JOB_SURVIVORS, GC_STOP, SESSION_END, MANUAL_STOP) and facts.vetoed:
+    if (
+        trigger in (OWNER_EXIT, JOB_SURVIVORS, GC_STOP, SESSION_END, MANUAL_STOP)
+        and facts.vetoed
+    ):
         return "deny", "vetoed: " + facts.vetoed
     return "pass", ""
 
@@ -220,6 +368,7 @@ def _hold(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
 
 
 # ---- slot 5: pair/signature/unit authority ------------------------------------------------------
+
 
 def _authority(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
     """Slot 5: trigger-level authority. Only unit kill.survive_logout denies in 0.2.1 (session

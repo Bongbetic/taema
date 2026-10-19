@@ -768,6 +768,23 @@ class ScenarioApiTest(unittest.TestCase):
         t.join()
         self.assertEqual(rel, "user/1000/app-late")
 
+    def test_wait_for_scope_gone_uses_proc_relative_path_and_polls(self):
+        rel = "user/1000/scope-exit"
+        scope_path = os.path.join(self.cgroot, rel)
+        os.makedirs(scope_path)
+        self.assertFalse(scenario.wait_for_scope_gone(
+            rel, timeout=0.05, poll=0.01, cgroot=self.cgroot))
+
+        def remove_scope():
+            time.sleep(0.1)
+            shutil.rmtree(scope_path)
+
+        t = threading.Thread(target=remove_scope)
+        t.start()
+        self.assertTrue(scenario.wait_for_scope_gone(
+            rel, timeout=5, poll=0.01, cgroot=self.cgroot))
+        t.join()
+
     def test_wait_for_scope_timeout_raises(self):
         self._fake_proc(56, "/sys/fs/cgroup")
         with self.assertRaises(scenario.ScenarioError):

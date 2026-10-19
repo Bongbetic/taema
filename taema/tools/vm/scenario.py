@@ -311,6 +311,17 @@ def wait_for_scope(pid, prefixes, timeout=90, poll=0.5, cgroot=None, procroot=No
         time.sleep(poll)
 
 
+def wait_for_scope_gone(rel, timeout=20, poll=0.1, cgroot=None):
+    """Wait for a proc-relative scope directory under cgroot to disappear."""
+    path = os.path.join(cgroot or CGROOT, rel)
+    deadline = time.monotonic() + timeout
+    while os.path.isdir(path):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
 # ---- logs and privileged steps --------------------------------------------
 
 def capture_daemon_logs(dest_dir, state_dir=None, extra_dirs=()):
@@ -737,10 +748,12 @@ def scenario_m0(rec, args, tree_holder):
         bound_scope = wait_for_scope(bound["root"], ["scope-m0-bind"], timeout=30)
         open(bound["gate"], "w").close()
         bound["proc"].wait(timeout=20)
+        bound_child_dead = _wait_process_dead(bound["children"][0])
+        bound_scope_gone = wait_for_scope_gone(bound_scope, timeout=20, poll=0.05)
         record("adopt-bind-owner-exit-stops-scope",
-               _wait_process_dead(bound["children"][0])
-               and not os.path.isdir(os.path.join(CGROOT, "user", str(os.getuid()), bound_scope)),
-               "scope=%s child=%d" % (bound_scope, bound["children"][0]))
+               bound_child_dead and bound_scope_gone,
+               "scope=%s child=%d child_dead=%s scope_gone=%s"
+               % (bound_scope, bound["children"][0], bound_child_dead, bound_scope_gone))
 
         bound_veto = track(_spawn_bound_tree("m0-veto", os.path.join(args.artifacts, "m0-veto"),
                                               ["/bin/sleep", "3600"]))
@@ -817,11 +830,14 @@ def scenario_m0(rec, args, tree_holder):
                (scope_veto.stdout + scope_veto.stderr).strip()[:400])
         os.rmdir(eligible["runtime_dir"])
         eligible_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
+        eligible_process_dead = _wait_process_dead(eligible["root"])
+        eligible_scope_gone = wait_for_scope_gone(
+            eligible_scope, timeout=20, poll=0.05)
         record("auto-stops-idle-pause-after-runtime-disappears",
-               eligible_gc.returncode == 0 and _wait_process_dead(eligible["root"])
-               and not os.path.isdir(os.path.join(CGROOT, "user", str(os.getuid()),
-                                                  eligible_scope)),
-               "scope=%s gc=%s" % (eligible_scope, eligible_gc.stdout[-700:]))
+               eligible_gc.returncode == 0 and eligible_process_dead and eligible_scope_gone,
+               "scope=%s process_dead=%s scope_gone=%s gc=%s"
+               % (eligible_scope, eligible_process_dead, eligible_scope_gone,
+                  eligible_gc.stdout[-700:]))
         os.rmdir(vetoed["runtime_dir"])
         vetoed_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
         gc_veto_event = wait_for_audit_event(

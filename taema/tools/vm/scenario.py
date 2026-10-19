@@ -258,6 +258,14 @@ def scope_of(pid, cgroot=None, procroot=None):
     return rel
 
 
+def daemon_scope(rel):
+    """Drop the delegated user prefix used by /proc from daemon-relative scope paths."""
+    parts = rel.split("/", 2)
+    if len(parts) == 3 and parts[0] == "user" and parts[1].isdigit():
+        return parts[2]
+    return rel
+
+
 def scope_matches(rel, prefix):
     p = str(prefix).rstrip("/")
     return any(seg.startswith(p) for seg in rel.split("/"))
@@ -690,13 +698,15 @@ def scenario_m0(rec, args, tree_holder):
                "close_to_containment=%.3fs adopt_interval=%.3fs poll_tolerance=0.1s"
                % (containment_latency, adopt_interval))
         review = _run(["/usr/bin/taema", "review"], timeout=30)
-        review_events = _event_lines(log_path, "review_created", leftover)
+        leftover_leaf = daemon_scope(leftover)
+        review_events = _event_lines(log_path, "review_created", leftover_leaf)
         record("adopt-review-lists-contained-survivors",
                review.returncode == 0 and "open reviews:" in review.stdout
                and "owner=" in review.stdout and "survivors=sleep" in review.stdout
                and bool(review_events),
-               "review=%s event=%s" %
-               ((review.stdout + review.stderr)[:700], review_events[-1:] or "missing"))
+               "scope=%s review=%s event=%s" %
+               (leftover, (review.stdout + review.stderr)[:700],
+                review_events[-1:] or "missing"))
 
         veto = _run(["/usr/bin/taema", "do-not-kill", "app:sleep"], timeout=30)
         record("adopt-do-not-kill-app", veto.returncode == 0,
@@ -765,7 +775,8 @@ def scenario_m0(rec, args, tree_holder):
         auto_leftover = wait_for_scope(automatic["children"][0], ["leftover/"], timeout=30)
         gc_result = _run(["/usr/bin/taema", "gc"], timeout=30)
         review = _run(["/usr/bin/taema", "review"], timeout=30)
-        auto_review_events = _event_lines(log_path, "review_created", auto_leftover)
+        auto_leaf = daemon_scope(auto_leftover)
+        auto_review_events = _event_lines(log_path, "review_created", auto_leaf)
         record("auto-keeps-and-reviews-unlearned-leftover",
                gc_result.returncode == 0 and review.returncode == 0
                and _process_running(automatic["children"][0])

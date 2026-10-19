@@ -665,6 +665,11 @@ class ScenarioApiTest(unittest.TestCase):
         self.assertEqual(os.path.realpath("/proc/%d/exe" % self.tree["children"][0]),
                          os.path.realpath(tail))
 
+    def test_daemon_scope_strips_delegated_user_prefix(self):
+        self.assertEqual(scenario.daemon_scope("user/1001/leftover/firefox-123"),
+                         "leftover/firefox-123")
+        self.assertEqual(scenario.daemon_scope("shared/helper-123"), "shared/helper-123")
+
     def test_wait_for_event_returns_matching_line(self):
         log = os.path.join(self.tmp, "decisions.log")
         with open(log, "w") as f:

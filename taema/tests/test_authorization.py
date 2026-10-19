@@ -17,11 +17,12 @@ from tests.test_phase0 import make_cfg, tmp
 from tests.test_phase4 import AutoCase
 
 MODES = ("observe", "adopt", "enforce", "auto")
+REAL_STOP = engine.stop
 
 # (trigger, facts, expected) with expected = {mode: (verdict, authority)}.
 TRUTH = [
     (authorization.OWNER_EXIT, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("would", ""),
+        "observe": ("would", ""), "adopt": ("act", "unit"),
         "enforce": ("act", "unit"), "auto": ("act", "unit")}),
     (authorization.UNIT_ADOPT, authorization.Facts(), {
         "observe": ("would", ""), "adopt": ("act", "mode"),
@@ -113,6 +114,102 @@ class DaemonRouting(AutoCase):
         self.d.stop_leaf("scope-x", "owner 5 exited")
         self.assertIn(authorization.OWNER_EXIT, self.triggers(m))
         self.stopm.assert_called_once()                     # auto: acts
+
+    def test_owner_bound_scope_stops_in_mutating_modes_and_logs_once_in_observe(self):
+        for mode in MODES:
+            with self.subTest(mode=mode):
+                self.d.cfg["mode"] = mode
+                self.cg.leaf("scope-" + mode, [])
+                self.stopm.reset_mock()
+
+                self.d.stop_leaf("scope-" + mode, "owner 5 exited")
+
+                if mode == "observe":
+                    self.stopm.assert_not_called()
+                    events = [e for e in self.log() if e.get("event") == "would_stop"
+                              and e.get("scope") == "scope-observe"]
+                    self.assertEqual(len(events), 1)
+                else:
+                    self.stopm.assert_called_once()
+
+    def test_run_bind_and_owner_forms_stop_in_every_mode(self):
+        for mode in MODES:
+            for source in ("bind", "owner"):
+                with self.subTest(mode=mode, source=source):
+                    self.d.cfg["mode"] = mode
+                    self.stopm.reset_mock()
+                    name = "owner-" + mode + "-" + source
+                    args = argparse.Namespace(name=name, join=False, bind=source == "bind",
+                                              owner=os.getpid() if source == "owner" else None,
+                                              cmd=["true"])
+                    with mock.patch.object(cli, "_load", return_value=(self.d.cfg, self.d.store, [])), \
+                            mock.patch.object(cli, "ask", side_effect=lambda _cfg, msg: self.d.handle(msg)), \
+                            mock.patch.object(inspect, "uid_of", return_value=os.getuid()), \
+                            mock.patch.object(inspect, "starttime", return_value=123), \
+                            mock.patch.object(cli.engine, "helper_attach"), \
+                            mock.patch.object(cli.os, "execvp"):
+                        cli.cmd_run(args)
+
+                    fd = next(fd for fd, (leaf, _pid, _start) in self.d.owners.items()
+                              if leaf == "scope-" + name)
+                    self.d.on_owner_exit(fd)
+                    if mode == "observe":
+                        self.stopm.assert_not_called()
+                        events = [e for e in self.log() if e.get("event") == "would_stop"
+                                  and e.get("scope") == "scope-" + name]
+                        self.assertEqual(len(events), 1)
+                    else:
+                        self.stopm.assert_called_once()
+
+    def test_unit_root_binding_stops_or_logs_in_every_mode(self):
+        for i, mode in enumerate(MODES):
+            with self.subTest(mode=mode):
+                root = 7000 + i
+                self.d.cfg["mode"] = mode
+                app = "app-" + mode
+                self.fp.add(root, 1, comm="qemu", sid=root, born=self.fp.up - 100)
+                self.cg.leaf(app, [root])
+                self.d.units = [{"unit": {"name": app, "kind": "app"}, "children": [
+                    {"name": "vm", "ancestor_comm": "qemu", "binds_to": "root"},
+                ]}]
+                self.stopm.reset_mock()
+                with mock.patch.object(engine, "auto_adopt_plan", return_value=[]), \
+                        mock.patch.object(inspect, "uid_of", return_value=os.getuid()), \
+                        mock.patch.object(inspect, "starttime", return_value=123), \
+                        mock.patch.object(os, "pidfd_open",
+                                          side_effect=lambda _pid: os.open(os.devnull, os.O_RDONLY)), \
+                        mock.patch.object(self.d.sel, "register"), \
+                        mock.patch.object(self.d.sel, "unregister"):
+                    self.d.adopt_pass()
+
+                    self.assertEqual(len(self.d.owners), 1)
+                    fd = next(iter(self.d.owners))
+                    leaf = self.d.owners[fd][0]
+                    self.d.on_owner_exit(fd)
+                if mode == "observe":
+                    self.stopm.assert_not_called()
+                    events = [e for e in self.log() if e.get("event") == "would_stop"
+                              and e.get("scope") == leaf]
+                    self.assertEqual(len(events), 1)
+                else:
+                    self.stopm.assert_called_once()
+
+    def test_owner_bound_stop_keeps_shared_and_protected_members_safe(self):
+        self.d.cfg["mode"] = "adopt"
+        self.fp.add(4001, 1, comm="server")
+        self.fp.add(4002, 1, comm="niri")
+        self.cg.leaf("scope-bound", [4001, 4002])
+        self.edges[4001] = [{"kind": "tcp_client", "detail": "127.0.0.1:9", "peers": [90]}]
+        with mock.patch.object(inspect, "uid_of", return_value=os.getuid()), \
+                mock.patch.object(engine, "stop", wraps=REAL_STOP), \
+                mock.patch.object(engine, "_signal_all") as signal_all:
+            self.d.stop_leaf("scope-bound", "owner 5 exited")
+
+        signal_all.assert_not_called()
+        self.assertTrue(os.path.isdir(self.cg.base + "/shared/server-4001"))
+        stopped = [e for e in self.log() if e.get("event") == "stop"][-1]
+        self.assertEqual({d["pid"]: d["action"] for d in stopped["decisions"]},
+                         {4001: "share", 4002: "skip"})
 
     def test_adopt_pass_asks_unit_adopt_and_auto_adopt(self):
         m = self.asked()

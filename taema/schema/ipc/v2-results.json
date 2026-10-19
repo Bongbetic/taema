@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taema-ipc-v2-command-results",
+  "$defs": {
+    "status": {
+      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews"],
+      "properties": {
+        "mode": {"type": "string"}, "uptime_s": {"type": "integer", "minimum": 0},
+        "owners": {"type": "array", "items": {"type": "object", "required": ["scope", "owner"], "properties": {"scope": {"type": "string"}, "owner": {"type": "integer"}}}},
+        "pairs": {"type": "array", "items": {"type": "object"}},
+        "reviews": {"type": "integer", "minimum": 0}, "auto": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "review": {"type": "object", "required": ["reviews"], "properties": {"reviews": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": true},
+    "register": {"type": "object", "required": ["watching"], "properties": {"watching": {"type": "boolean"}}, "additionalProperties": true},
+    "attach": {"type": "object", "required": ["ok", "attached"], "properties": {"ok": {"const": true}, "attached": {"type": "array", "items": {"type": "integer"}}}, "additionalProperties": true},
+    "job_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}, "ignored": {"type": "string"}}, "additionalProperties": true},
+    "kill_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true},
+    "ask": {"type": "object", "required": ["question"], "properties": {"question": {"type": ["object", "null"]}, "reason": {"type": "string"}}, "additionalProperties": true},
+    "answer": {"type": "object", "required": ["ok", "choice", "owner", "leftovers"], "properties": {"ok": {"const": true}, "choice": {"enum": ["stop", "keep", "standalone"]}, "owner": {"type": "string"}, "leftovers": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true},
+    "gc": {"type": "object", "required": ["candidates"], "properties": {"candidates": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": true},
+    "feedback": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true}
+  }
+}

@@ -24,6 +24,7 @@ from ..core import cgroup, process as inspect, lineage
 from ..governor import engine
 from ..store import knowledge
 from ..config import policy
+from .. import protocol
 
 MAX_OWNERS = 256  # pidfd owner watches
 MAX_LEAF_WATCH = 256  # cgroup.events watches (EPOLLPRI)
@@ -1554,15 +1555,17 @@ class Daemon:
         """Bytes up to a newline (or EOF) within 0.5 s total and 64 KiB."""
         deadline = time.monotonic() + 0.5
         buf = b""
-        while b"\n" not in buf and len(buf) < 65536:
+        while b"\n" not in buf and len(buf) <= 65536:
             left = deadline - time.monotonic()
             if left <= 0:
                 raise TimeoutError("request too slow")
             conn.settimeout(left)
-            chunk = conn.recv(65536 - len(buf))
+            chunk = conn.recv(65537 - len(buf))
             if not chunk:
                 break
             buf += chunk
+        if len(buf) > 65536:
+            raise ValueError("request too large")
         return buf
 
     def serve(self, srv):
@@ -1581,11 +1584,31 @@ class Daemon:
                 reply = {"error": "forbidden"}
             else:
                 data = self._read_request(conn)
-                reply = (
-                    self.handle(json.loads(data))
-                    if data.strip()
-                    else {"error": "empty"}
-                )
+                if not data.strip():
+                    reply = {"error": "empty"}
+                else:
+                    message = json.loads(data.decode("utf-8"))
+                    if protocol.is_v2(message):
+                        identifier = protocol.request_id(message)
+                        try:
+                            command = protocol.decode_v2(message)
+                        except protocol.ProtocolError as error:
+                            reply = protocol.error_reply(identifier, error)
+                        else:
+                            reply = protocol.reply_v2(identifier, self.handle(command))
+                    elif protocol.is_legacy(message):
+                        reply = self.handle(message)
+                    elif isinstance(message, dict) and "v" in message:
+                        reply = protocol.error_reply(
+                            protocol.request_id(message),
+                            protocol.ProtocolError(
+                                "unsupported_version",
+                                "Unsupported protocol version.",
+                                "Use v=2.",
+                            ),
+                        )
+                    else:
+                        reply = {"error": "bad request"}
         except (
             Exception
         ) as e:  # bad input of any shape gets an error reply, never a crash

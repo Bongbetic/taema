@@ -6,7 +6,7 @@ import socket
 import sys
 import time
 
-from . import cgroup, engine, inspect, knowledge, lineage, policy
+from . import authorization, cgroup, engine, inspect, knowledge, lineage, policy
 
 
 def _load():
@@ -126,6 +126,9 @@ def cmd_kill(a):
     path = cgroup.resolve(a.name)
     if not path:
         return die("no scope %s" % a.name)
+    dec = authorization.authorize(authorization.MANUAL_STOP, cfg["mode"])
+    if dec.verdict != authorization.ACT:
+        return die("kill not allowed: %s" % dec.reason)
     leaf_name = os.path.basename(path)
     unit = engine.unit_for_leaf(units, leaf_name)
     try:

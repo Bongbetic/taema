@@ -133,13 +133,13 @@ class Daemon:
 
     def stop_leaf(self, leaf, why):
         path = "%s/%s" % (cgroup.base(), leaf)
-        if not os.path.isdir(path):
-            return
         dec = self.authorize(authorization.OWNER_EXIT)
         if dec.verdict == authorization.WOULD_ACT:
             self.store.log(event="would_stop", scope=leaf, why=why, mode=self.mode)
             return
-        if dec.verdict != authorization.ACT:   # keep: a future veto/hold blocks silently here
+        if dec.verdict != authorization.ACT or not os.path.isdir(path):
+            # keep: a future veto/hold blocks silently here. An absent leaf can still be
+            # observed in observe mode when a unit's binds_to=root is only a projected carve.
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
         try:
@@ -180,7 +180,9 @@ class Daemon:
             ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
             done = engine.run_ops(self.cfg, self.store, ops, execute, cleanup=False)
             for op in done:
-                if op["op"] == "carve" and op["done"] and op.get("binds_to") == "root":
+                owner_bound = (op["op"] == "carve" and op.get("binds_to") == "root"
+                               and op.get("root") in op.get("pids", []))
+                if owner_bound and (op["done"] or self.mode == "observe"):
                     self.watch_owner(op["scope"], op["root"])
         self.last_result["adopt"] = [{"op": o["op"], "scope": o["scope"], "pids": len(o["pids"]),
                                       "done": o["done"]} for o in done]

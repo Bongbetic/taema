@@ -120,10 +120,11 @@ class ConfigTest(VmTestCase):
     def test_default_config_valid(self):
         cfg = vmh.load_config()
         self.assertEqual(cfg["libcs"], ["glibc", "musl"])
-        self.assertEqual(cfg["scenarios"], ["smoke"])
+        self.assertEqual(cfg["scenarios"], ["smoke", "m0"])
         self.assertIn(cfg["accel"], ("auto", "kvm", "tcg"))
         self.assertGreaterEqual(cfg["memory_mb"], 512)
         self.assertGreater(cfg["boot_timeout_s"], 0)
+        self.assertGreaterEqual(cfg["scenario_timeout_s"], 3600)
 
     def test_default_images_pinned(self):
         cfg = vmh.load_config()
@@ -302,13 +303,14 @@ class PlanTest(VmTestCase):
 
     def test_plan_step_order(self):
         plan = vmh.build_plan(self.cfg, libcs=["glibc"],
-                              scenarios=["smoke", "upgrade", "remove"], kvm=False)
+                              scenarios=["smoke", "m0", "upgrade", "remove"], kvm=False)
         names = [s["name"] for s in plan["vms"][0]["steps"]]
         self.assertEqual(names[0], "wait-ssh")
         self.assertIn("scp-bootstrap", names)
         self.assertIn("provision", names)
         self.assertLess(names.index("provision"), names.index("scenario:smoke"))
-        self.assertLess(names.index("scenario:smoke"), names.index("scenario:upgrade"))
+        self.assertLess(names.index("scenario:smoke"), names.index("scenario:m0"))
+        self.assertLess(names.index("scenario:m0"), names.index("scenario:upgrade"))
         self.assertLess(names.index("scenario:upgrade"), names.index("scenario:remove"))
         self.assertEqual(names[-1], "teardown")
         self.assertIn("collect", names)
@@ -322,7 +324,7 @@ class PlanTest(VmTestCase):
 
 class DryRunTest(VmTestCase):
     def test_dry_run_prints_plan_without_side_effects(self):
-        path = self.write_config()
+        path = self.write_config(scenarios=["smoke", "m0"])
         code, out, err = self.run_main("run", "--dry-run", "--config", path,
                                        "--state-dir", self.state, "--tcg")
         self.assertEqual(code, 0, err)
@@ -331,6 +333,7 @@ class DryRunTest(VmTestCase):
         self.assertIn("glibc", out)
         self.assertIn("musl", out)
         self.assertIn("scenario:smoke", out)
+        self.assertIn("scenario:m0", out)
         self.assertFalse(os.path.exists(self.state), "dry run must not create the state dir")
 
 
@@ -522,7 +525,11 @@ class RunPipelineTest(VmTestCase):
 
 class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
-        self.assertEqual(vmh.parse_scenarios("all"), ["smoke", "upgrade", "remove"])
+        self.assertEqual(vmh.parse_scenarios("all"), ["smoke", "m0", "upgrade", "remove"])
+
+    def test_m0_acceptance_is_a_registered_guest_scenario(self):
+        self.assertIn("m0", vmh.SCENARIOS)
+        self.assertIn("m0", scenario.SCENARIOS)
 
     def test_parse_libcs(self):
         self.assertEqual(vmh.parse_libcs("glibc, musl"), ["glibc", "musl"])
@@ -539,6 +546,33 @@ class HarnessCliParsingTest(VmTestCase):
 
 class HarnessSurfacesTest(unittest.TestCase):
     """Docs, make targets and the opt-in KVM workflow: text contracts."""
+
+    def test_release_notes_document_adopt_change_and_version(self):
+        notes = read_text(os.path.join(REPO, "CHANGELOG.md"))
+        self.assertIn("## Behaviour changes", notes)
+        self.assertIn("### adopt now contains and asks", notes)
+        self.assertIn("leftover/", notes)
+        self.assertIn("review", notes)
+
+        workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
+        self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
+        self.assertEqual(vmh.read_version(ROOT), "0.3.0")
+
+    def test_release_workflow_combines_manual_and_generated_release_notes(self):
+        workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
+        self.assertIn('notes="$(cat "$RUNNER_TEMP/notes.md")"', workflow)
+        self.assertIn('--title "tæma ${VERSION}"', workflow)
+        self.assertIn('--notes "$notes" --generate-notes', workflow)
+        self.assertNotIn("--notes-file", workflow)
+
+    def test_readme_mode_table_describes_adopt_lifecycle(self):
+        readme = read_text(os.path.join(REPO, "README.md"))
+        self.assertIn(
+            "| `adopt` | Adopts eligible apps, contains GUI survivors under `leftover/` "
+            "for review, and honors `taema run --bind` by stopping that scope when "
+            "its command exits; idle shared and unit scopes are reviewed, not stopped. |",
+            readme,
+        )
 
     def test_docs_document_one_command_scenarios_and_safety(self):
         docs = read_text(os.path.join(ROOT, "docs", "vm-harness.md"))
@@ -566,6 +600,8 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn("workflow_dispatch", wf)
         self.assertNotIn("  push:", wf)  # never auto-runs without KVM
         self.assertIn("kvm", wf)
+        self.assertIn('default: "smoke,m0"', wf)
+        self.assertIn("timeout-minutes: 180", wf)
         self.assertIn("upload-artifact", wf)
         self.assertNotIn("continue-on-error", wf)
 
@@ -627,6 +663,20 @@ class ScenarioApiTest(unittest.TestCase):
         for pid in self.tree["children"]:
             self.assertTrue(process_alive(pid), "children must survive a root close")
 
+    def test_spawn_gui_tree_accepts_a_distinct_survivor_command(self):
+        tail = shutil.which("tail")
+        self.assertIsNotNone(tail)
+        work = os.path.join(self.tmp, "work-tail")
+        self.tree = scenario.spawn_gui_tree(
+            work, children=1, child_argv=[tail, "-f", "/dev/null"])
+        self.assertEqual(os.path.realpath("/proc/%d/exe" % self.tree["children"][0]),
+                         os.path.realpath(tail))
+
+    def test_daemon_scope_strips_delegated_user_prefix(self):
+        self.assertEqual(scenario.daemon_scope("user/1001/leftover/firefox-123"),
+                         "leftover/firefox-123")
+        self.assertEqual(scenario.daemon_scope("shared/helper-123"), "shared/helper-123")
+
     def test_wait_for_event_returns_matching_line(self):
         log = os.path.join(self.tmp, "decisions.log")
         with open(log, "w") as f:
@@ -648,6 +698,18 @@ class ScenarioApiTest(unittest.TestCase):
             f.write('{"event": "daemon_start"}\n')
         with self.assertRaises(scenario.ScenarioError):
             scenario.wait_for_event(log, "auto_stop", timeout=0.3, poll=0.05)
+
+    def test_wait_for_audit_event_matches_scope_and_trigger(self):
+        log = os.path.join(self.tmp, "decisions.log")
+        with open(log, "w") as f:
+            f.write('{"event":"vetoed","trigger":"manual_stop",'
+                    '"scope":"scope-x"}\n')
+            f.write('{"event":"vetoed","trigger":"owner_exit",'
+                    '"scope":"scope-x"}\n')
+        event = scenario.wait_for_audit_event(
+            log, "vetoed", "scope-x", trigger="owner_exit", timeout=5, poll=0.05)
+        self.assertEqual((event["event"], event["scope"], event["trigger"]),
+                         ("vetoed", "scope-x", "owner_exit"))
 
     def _fake_scope(self, rel, pids):
         d = os.path.join(self.cgroot, rel)
@@ -705,6 +767,23 @@ class ScenarioApiTest(unittest.TestCase):
                                       cgroot=self.cgroot, procroot=self.procroot)
         t.join()
         self.assertEqual(rel, "user/1000/app-late")
+
+    def test_wait_for_scope_gone_uses_proc_relative_path_and_polls(self):
+        rel = "user/1000/scope-exit"
+        scope_path = os.path.join(self.cgroot, rel)
+        os.makedirs(scope_path)
+        self.assertFalse(scenario.wait_for_scope_gone(
+            rel, timeout=0.05, poll=0.01, cgroot=self.cgroot))
+
+        def remove_scope():
+            time.sleep(0.1)
+            shutil.rmtree(scope_path)
+
+        t = threading.Thread(target=remove_scope)
+        t.start()
+        self.assertTrue(scenario.wait_for_scope_gone(
+            rel, timeout=5, poll=0.01, cgroot=self.cgroot))
+        t.join()
 
     def test_wait_for_scope_timeout_raises(self):
         self._fake_proc(56, "/sys/fs/cgroup")

@@ -5,12 +5,12 @@
 # --allow-network; runs with a populated cache work offline.
 
 libcs = ["glibc", "musl"]          # libcs to boot for `run`
-scenarios = ["smoke"]              # smoke | upgrade | remove (or "all")
+scenarios = ["smoke", "m0"]        # smoke + M0 acceptance | upgrade | remove (or "all")
 accel = "auto"                     # auto | kvm | tcg; auto uses KVM when /dev/kvm is usable
 memory_mb = 1536
 cpus = 2
 boot_timeout_s = 300               # ssh readiness after qemu starts
-scenario_timeout_s = 600           # per in-guest scenario
+scenario_timeout_s = 4500          # M0 includes a real one-hour idle GC window
 test_user = "taematest"            # login session the scenarios run as
 
 [paths]

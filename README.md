@@ -192,7 +192,7 @@ for 7 days and asks you again. You never need a command to undo it.
 | Mode | What happens |
 |---|---|
 | `auto` | Learns from app closes, reviews unlearned idle leftovers, and stops eligible idle shared or `stop_when_unneeded` scopes after safety and veto checks. |
-| `adopt` | Gives apps their own scopes and reviews idle shared or `stop_when_unneeded` scopes; it does not stop them. |
+| `adopt` | Adopts eligible apps, contains GUI survivors under `leftover/` for review, and honors `taema run --bind` by stopping that scope when its command exits; idle shared and unit scopes are reviewed, not stopped. |
 | `observe` | Logs what it *would* do and leaves scopes and processes in place. |
 | `enforce` | Applies unit and lifecycle rules, including GC for `stop_when_unneeded` scopes, with safety and veto checks. |
 

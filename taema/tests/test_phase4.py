@@ -1,4 +1,4 @@
-"""Phase 4 tests (auto mode): app-root adoption, pair authority, auto stops, leftover leaves, logout,
+"""Mode and lifecycle tests: app-root adoption, pair authority, auto stops, leftover leaves, logout,
 the attach socket command and status. Fake /proc and cgroup trees; no real signal is ever sent."""
 import argparse
 import io
@@ -225,6 +225,44 @@ class AutoAdopt(ProcCase):
         self.assertEqual(hm.call_args[0][2], [200, 201])
         self.assertEqual(len(d.auto_scopes), 1)
         self.assertEqual(d.auto_status()["auto_adopted_scopes"], 1)
+
+    def test_adopt_and_enforce_modes_scope_app_roots(self):
+        self.add(200, comm="firefox")
+        self.add(201, 200, comm="web")
+        with open(self.session + "/cgroup.procs", "w") as f:
+            f.write("200\n201\n")
+        for mode in ("adopt", "enforce"):
+            cfg = make_cfg(tmp(), mode=mode, protected={"comm": ["niri*"]})
+            cfg["paths"]["session_cgroup"] = self.session
+            d = daemon.Daemon(cfg)
+            with mock.patch.object(engine, "helper_move"), \
+                 mock.patch.object(cgroup, "proc_cgroup", return_value="/2"):
+                d.adopt_pass()
+            self.assertEqual(d.auto_status()["auto_adopted_scopes"], 1, mode)
+
+    def test_observe_logs_each_unchanged_would_adopt_once_without_moving(self):
+        self.cfg["mode"] = "observe"
+        self.add(200, comm="firefox")
+        self.add(201, 200, comm="web")
+        self.add(300, comm="unitapp")
+        with open(self.session + "/cgroup.procs", "w") as f:
+            f.write("200\n201\n300\n")
+        d = daemon.Daemon(self.cfg)
+        d.units = [{"unit": {"name": "known-app", "kind": "app"}, "match": {"comm": "unitapp"}}]
+        with mock.patch.object(engine, "helper_move") as hm, \
+             mock.patch.object(cgroup, "move") as mv:
+            d.adopt_pass()
+            d.adopt_pass()
+        hm.assert_not_called()
+        mv.assert_not_called()
+        self.assertEqual(d.auto_scopes, set())
+        self.assertFalse(any(os.path.basename(path).startswith("app-")
+                             for path in os.listdir(self.cg.base)))
+        events = []
+        if os.path.exists(d.store.log_path):
+            with open(d.store.log_path) as f:
+                events = [json.loads(line)["event"] for line in f]
+        self.assertEqual(events.count("adopt_would"), 2)
 
 
 # ---- 4. job survivors, GUI closes, regret, standalone -----------------------------------------
@@ -652,6 +690,46 @@ class CliRun(unittest.TestCase):
         self.assertFalse([m for m in asks if m["cmd"] == "attach"])
 
 
+class AdoptAll(ProcCase):
+    def setUp(self):
+        super().setUp()
+        self.cg = FakeCg()
+        self.cg.__enter__()
+        self.addCleanup(self.cg.__exit__)
+        self.session = self.cg.root + "/2"
+        os.makedirs(self.session)
+        self.cfg = make_cfg(tmp(), mode="adopt", protected={"comm": ["niri*"]})
+        self.cfg["paths"]["session_cgroup"] = self.session
+        self.fp.add(100, 1, comm="niri", sid=100, born=100.0)
+        self.fp.add(200, 100, comm="firefox", born=100.0)
+        self.fp.add(201, 200, comm="web", born=101.0)
+        with open(self.session + "/cgroup.procs", "w") as f:
+            f.write("200\n201\n")
+        self.store = knowledge.Store(tmp(), {}, read_only=True)
+
+    def test_adopt_all_includes_unknown_app_roots_and_honors_dry_run(self):
+        with mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])), \
+             mock.patch.object(engine, "helper_move") as hm, \
+             mock.patch.object(cgroup, "proc_cgroup", return_value="/2"):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli.main(["adopt", "--all", "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertIn("app-firefox-", out.getvalue())
+            self.assertIn("nothing moved", out.getvalue())
+            self.assertEqual([name for name in os.listdir(self.cg.base) if name.startswith("app-")], [])
+            hm.assert_not_called()
+
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli.main(["adopt", "--all"])
+        self.assertEqual(rc, 0)
+        self.assertIn("done", out.getvalue())
+        scopes = [name for name in os.listdir(self.cg.base) if name.startswith("app-")]
+        self.assertEqual(len(scopes), 1)
+        hm.assert_called_once()
+
+
 class StatusAndModes(ProcCase):
     def test_status_shows_auto_block_and_authority(self):
         d = daemon.Daemon(make_cfg(tmp(), mode="auto"))
@@ -670,6 +748,20 @@ class StatusAndModes(ProcCase):
         self.assertIn("0 auto-adopted scopes", out.getvalue())
         self.assertEqual(out.getvalue().count("auto stop "), 5)
         self.assertIn("why 6", out.getvalue())
+
+    def test_status_prints_auto_scope_count_in_every_mode(self):
+        for mode in ("observe", "adopt", "enforce", "auto"):
+            cfg = make_cfg(tmp(), mode=mode)
+            d = daemon.Daemon(cfg)
+            d.auto_scopes.add("app-firefox-deadbeef")
+            reply = d.handle({"cmd": "status"})
+            out = io.StringIO()
+            with mock.patch.object(cli, "_load", return_value=(cfg, d.store, [])), \
+                 mock.patch.object(cli, "ask", return_value=reply), \
+                 redirect_stdout(out):
+                rc = cli.cmd_status(argparse.Namespace())
+            self.assertEqual(rc, 0, mode)
+            self.assertIn("1 auto-adopted scopes", out.getvalue(), mode)
 
     def test_mode_gates(self):
         want = {"observe": (False, False), "adopt": (True, False), "enforce": (True, True), "auto": (True, False)}
@@ -705,12 +797,13 @@ class StatusAndModes(ProcCase):
         with self.assertRaises(ValueError):
             policy.load_config(p)
 
-    def test_non_auto_adopt_pass_never_auto_adopts(self):
-        d = daemon.Daemon(make_cfg(tmp(), mode="adopt"))
-        with mock.patch.object(d, "auto_adopt") as aa, \
-             mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable()):
-            d.adopt_pass()
-        aa.assert_not_called()
+    def test_adopt_pass_auto_adopts_in_adopt_enforce_and_auto_modes(self):
+        for mode in ("adopt", "enforce", "auto"):
+            d = daemon.Daemon(make_cfg(tmp(), mode=mode))
+            with mock.patch.object(d, "auto_adopt") as aa, \
+                 mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable()):
+                d.adopt_pass()
+            aa.assert_called_once()
 
     def test_cpu_pct_from_samples(self):
         lin = Lineage(make_cfg(tmp()))

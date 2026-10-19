@@ -282,7 +282,7 @@ def cmd_status(a):
     auto = reply.pop("auto", None)
     print(json.dumps(reply, indent=1))
     print_pairs(pairs)
-    if reply.get("mode") == "auto" and auto:
+    if auto:
         print_auto(auto)
     return 0
 
@@ -299,8 +299,17 @@ def cmd_gc(a):
 
 def cmd_adopt(a):
     cfg, store, units = _load()
-    ops = engine.adopt_plan(cfg, units) + engine.carve_plan(cfg, units)
-    execute = (not a.dry_run) and cfg["mode"] in ("adopt", "enforce", "auto")
+    if a.all:
+        pt = inspect.ProcTable.scan()
+        lin = lineage.Lineage(cfg)
+        lin.observe(pt)
+        ops = engine.adopt_plan(cfg, units, pt) + engine.carve_plan(cfg, units, pt)
+        ops += engine.auto_adopt_plan(cfg, units, pt, lin, store)
+        decision = authorization.authorize(authorization.AUTO_ADOPT, cfg["mode"])
+    else:
+        ops = engine.adopt_plan(cfg, units) + engine.carve_plan(cfg, units)
+        decision = authorization.authorize(authorization.UNIT_ADOPT, cfg["mode"])
+    execute = (not a.dry_run) and decision.verdict == authorization.ACT
     ops = engine.run_ops(cfg, store, ops, execute)
     for op in ops:
         print("%-6s %-34s pids=%d%s" % (op["op"], op["scope"], len(op["pids"]), " done" if op["done"] else ""))
@@ -340,7 +349,7 @@ def main(argv):
     s = sub.add_parser("forget"); s.add_argument("exe"); s.set_defaults(f=cmd_forget)
     s = sub.add_parser("status"); s.set_defaults(f=cmd_status)
     s = sub.add_parser("gc"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_gc)
-    s = sub.add_parser("adopt"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_adopt)
+    s = sub.add_parser("adopt"); s.add_argument("--all", action="store_true"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_adopt)
     s = sub.add_parser("daemon"); s.set_defaults(f=cmd_daemon)
     a = p.parse_args(argv)
     if a.c == "run":

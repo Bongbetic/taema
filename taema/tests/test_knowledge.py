@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 
+from taema.store import knowledge
 from taema.store.knowledge import MAX_OPEN_REVIEWS, Store
 
 DAY = 86400.0
@@ -175,6 +177,43 @@ class KnowledgeTests(unittest.TestCase):
             self.s.match_veto(members=[{"pid": 7, "start": 8, "apps": ["firefox"]}])
         )
         self.assertEqual(veto["value"], "firefox")
+
+    def test_veto_cap_refuses_new_protection_without_evicting_active_vetoes(self):
+        with mock.patch.object(knowledge, "MAX_VETOES", 2):
+            self.s.add_veto("app", "one")
+            self.s.add_veto("app", "two")
+            self.assertIsNone(self.s.add_veto("app", "three"))
+        self.assertEqual({v["value"] for v in self.s.data["vetoes"]}, {"one", "two"})
+
+    def test_zero_weight_pairs_remain_for_thirty_days(self):
+        self.s._pair("owner", "leftover")
+        self.s.enforce_caps()
+        key = self.s.pkey("owner", "leftover")
+        self.assertIn(key, self.s.data["pairs"])
+        self.clock.t += knowledge.PAIR_RETENTION + 1
+        self.s.enforce_caps()
+        self.assertNotIn(key, self.s.data["pairs"])
+
+    def test_pair_cap_does_not_evict_an_active_keep_answer(self):
+        with mock.patch.object(knowledge, "MAX_PAIRS", 1):
+            self.assertTrue(self.s.answer("owner-one", "helper", "keep"))
+            self.assertTrue(self.s.answer("owner-two", "helper", "keep"))
+        self.assertEqual(self.s.pair_decision("owner-one", "helper")[0], "keep")
+        self.assertEqual(self.s.pair_decision("owner-two", "helper")[0], "keep")
+
+    def test_closed_leftover_reviews_expire_after_thirty_days(self):
+        self.s.data["reviews"] = [
+            {
+                "id": 1,
+                "kind": "scope",
+                "scope": "leftover/old",
+                "state": "expired",
+                "created": self.clock.t - knowledge.REVIEW_RETENTION - 1,
+                "closed": self.clock.t - knowledge.REVIEW_RETENTION - 1,
+            }
+        ]
+        self.s.expire_reviews()
+        self.assertEqual(self.s.data["reviews"], [])
 
     def test_pending_offline_undo_vetoes_before_replay_and_keeps_after_replay(self):
         action = self.s.record_auto_action(

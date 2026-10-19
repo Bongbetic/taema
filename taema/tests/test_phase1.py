@@ -392,13 +392,15 @@ class StoreBounds(unittest.TestCase):
         self.t = [1e7]
         self.store = knowledge.Store(tmp(), {}, now=lambda: self.t[0])
 
-    def test_compact_json_and_save_interval(self):
+    def test_sqlite_state_and_save_interval(self):
         self.store.bump("a", "seen")
         self.assertTrue(self.store.save_if_dirty(300))
-        with open(self.store.path) as f:
-            raw = f.read()
-        self.assertNotIn("\n", raw)
-        self.assertNotIn(" ", raw)
+        self.assertEqual(
+            knowledge.Store(self.store.dir, {}, now=lambda: self.t[0]).peek("a")[
+                "seen"
+            ],
+            1,
+        )
         self.store.bump("a", "seen")
         self.t[0] += 100
         self.assertFalse(self.store.save_if_dirty(300))
@@ -406,14 +408,47 @@ class StoreBounds(unittest.TestCase):
         self.t[0] += 250
         self.assertTrue(self.store.save_if_dirty(300))
 
+    def test_daemon_commits_routine_state_once_at_end_of_tick(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.store.bump("a", "seen")
+        d.last = {"adopt": time.time(), "gc": time.time()}
+        with (
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "run_deadlines"),
+            mock.patch.object(
+                d.store.db, "save_state", wraps=d.store.db.save_state
+            ) as save,
+        ):
+            d.tick()
+        save.assert_called_once()
+
+    def test_gc_command_defers_pass_writes_then_commits_once(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.store.bump("a", "seen")
+        with (
+            mock.patch.object(d, "gc_pass", return_value=["candidate"]),
+            mock.patch.object(
+                d.store.db, "save_state", wraps=d.store.db.save_state
+            ) as save,
+        ):
+            self.assertEqual(
+                d.handle({"cmd": "gc", "dry_run": True}),
+                {"candidates": ["candidate"]},
+            )
+        save.assert_called_once()
+        self.assertFalse(d.store.defer_writes)
+
     def test_explicit_feedback_saves_at_once(self):
         d = daemon.Daemon(make_cfg(tmp()))
         d.store.save()
         d.store.last_save = time.time()
+        d.store.defer_writes = True
         self.assertEqual(
             d.handle({"cmd": "feedback", "op": "keep", "key": "k"}), {"ok": True}
         )
         self.assertFalse(d.store.dirty)
+        reopened = knowledge.Store(d.store.dir, {}, read_only=True)
+        self.assertEqual(reopened.peek("k")["user_keep"], 3.0)
 
     def test_all_zero_records_dropped(self):
         self.store.rec("zero")

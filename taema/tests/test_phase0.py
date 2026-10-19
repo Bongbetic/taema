@@ -323,36 +323,26 @@ class KnowledgeHardening(unittest.TestCase):
         for v in (0.0, 1.0, 3.0):
             self.assertGreater(s2.graceful_timeout("fresh", v)[0], 0)
 
-    def test_save_fsyncs_and_is_private(self):
+    def test_state_database_and_log_are_private(self):
         d = os.path.join(tmp(), "state")
         s = knowledge.Store(d, {})
         s.bump("x", "seen")
-        with mock.patch.object(knowledge.os, "fsync", wraps=os.fsync) as fs:
-            s.save()
-        fs.assert_called_once()
+        s.save()
+        self.assertEqual(knowledge.Store(d, {}).peek("x")["seen"], 1)
         self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(s.path).st_mode), 0o600)
         s.log(event="t")
         self.assertEqual(stat.S_IMODE(os.stat(s.log_path).st_mode), 0o600)
 
-    def test_corrupt_file_kept_once(self):
+    def test_legacy_json_is_left_untouched_for_the_importer(self):
         d = tmp()
         path = os.path.join(d, "knowledge.json")
         with open(path, "w") as f:
             f.write("{not json")
         s = knowledge.Store(d, {})
         self.assertEqual(s.data["exes"], {})
-        kept = [n for n in os.listdir(d) if n.startswith("knowledge.json.corrupt-")]
-        self.assertEqual(len(kept), 1)
-        with open(os.path.join(d, kept[0])) as f:
-            self.assertEqual(f.read(), "{not json")
-        with open(path, "w") as f:
-            f.write(
-                "[1]"
-            )  # wrong shape, but a .corrupt copy already exists: left alone
-        knowledge.Store(d, {})
-        self.assertEqual(len([n for n in os.listdir(d) if ".corrupt" in n]), 1)
-        with open(os.path.join(d, kept[0])) as f:
+        self.assertTrue(os.path.isfile(s.path))
+        with open(path) as f:
             self.assertEqual(f.read(), "{not json")
 
     def test_dirty_flag(self):

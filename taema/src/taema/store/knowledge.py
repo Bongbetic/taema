@@ -5,7 +5,6 @@ gracefully, and how long an idle shared leaf should live. Not learned: protected
 uid rules, configured cgroup and environment exclusions (see policy.py). No model, no network.
 """
 
-import glob
 import json
 import math
 import os
@@ -13,6 +12,7 @@ import time
 import uuid
 
 from ..config import policy
+from . import db
 
 DECAY_DAYS = 7
 DECAY_FACTOR = 0.9
@@ -26,18 +26,20 @@ COUNTERS = (
     "user_kill",
 )
 SEED_SHARE_PRIOR = 3.0
-SAVE_INTERVAL = 300  # seconds between routine saves; answers and exit save at once
 LOG_MAX = 1 << 20  # decisions.log rotates to decisions.log.1 at 1 MiB
 MAX_EXES = 512
 STALE_DAYS = 90
 SCHEMA = 2
+MAX_VETOES = 512
+MAX_AUTO_ACTIONS = 10_000  # durable undo context; status exposes only a recent view
 
 # ---- pair model (Phase 2/4 thresholds; pure, see decide()) ----
 DAY = 86400.0
+PAIR_RETENTION = 30 * DAY
 MAX_OPEN_REVIEWS = 128
 REVIEW_TTL = 14 * DAY
 REVIEW_RETENTION = 30 * DAY
-MAX_PAIRS = 256
+MAX_PAIRS = 1000
 MAX_PER_OWNER = 32
 W_ANSWER = 3.0  # explicit answer weight; never decayed
 W_INFERRED = 0.25  # user kill inferred from a vanished pid
@@ -122,7 +124,8 @@ def decide(p, now, created, closes_total):
 class Store:
     def __init__(self, state_dir, seeds=None, now=time.time, read_only=False, deny=()):
         self.dir = state_dir
-        self.path = os.path.join(state_dir, "knowledge.json")
+        self.path = os.path.join(state_dir, "state.db")
+        self.legacy_path = os.path.join(state_dir, "knowledge.json")
         self.log_path = os.path.join(state_dir, "decisions.log")
         self.feedback_path = os.path.join(state_dir, "feedback.jsonl")
         self.now = now
@@ -130,8 +133,10 @@ class Store:
         self.read_only = read_only  # CLI: the daemon is the single writer
         self.deny = tuple(deny)  # configured owner-deny entries (extend the defaults)
         self.dirty = False
+        self.defer_writes = False
         self.last_save = 0.0
         self.sigs = {}  # change-detection signatures for log lines (see changed())
+        self.db = db.StateDB(self.path, read_only=self.read_only)
         self.data = self._fresh()
         self._load()
         self._decay()
@@ -155,73 +160,8 @@ class Store:
             "leftover_expiries": {},
         }
 
-    def _migrate(self, data):
-        """v1 (exes only) -> v2: add pairs, standalone, asked, noise; keep every exe record."""
-        fresh = self._fresh()
-        if data.get("version") != SCHEMA:
-            self.dirty = True
-        for k in ("pairs", "standalone", "asked", "noise"):
-            if not isinstance(data.get(k), dict):
-                data[k] = fresh[k]
-        if "reviews" not in data or not isinstance(data.get("reviews"), list):
-            data["reviews"] = []
-            self.dirty = True
-        for field in ("vetoes", "auto_actions", "feedback_ids"):
-            if not isinstance(data.get(field), list):
-                data[field] = []
-                self.dirty = True
-        if not isinstance(data.get("leftover_expiries"), dict):
-            data["leftover_expiries"] = {}
-            self.dirty = True
-        seq = data.get("review_seq")
-        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
-            seq = max(
-                (
-                    r.get("id", 0)
-                    for r in data["reviews"]
-                    if isinstance(r, dict)
-                    and isinstance(r.get("id"), int)
-                    and not isinstance(r.get("id"), bool)
-                ),
-                default=0,
-            )
-            data["review_seq"] = seq
-            self.dirty = True
-        if not isinstance(data.get("closes"), int) or isinstance(data["closes"], bool):
-            data["closes"] = 0
-        if not isinstance(data.get("created"), (int, float)) or isinstance(
-            data["created"], bool
-        ):
-            data["created"] = self.now()
-        data["version"] = SCHEMA
-        return data
-
     def _load(self):
-        try:
-            with open(self.path) as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("exes"), dict):
-                raise ValueError("bad shape")
-        except FileNotFoundError:
-            return
-        except OSError:
-            return
-        except ValueError:
-            self._keep_corrupt()
-            return
-        data.setdefault("last_decay", self.now())
-        self.data = self._migrate(data)
-
-    def _keep_corrupt(self):
-        """Rename an unreadable knowledge.json once; never overwrite an earlier .corrupt copy."""
-        if self.read_only or glob.glob(self.path + ".corrupt*"):
-            return
-        dest = "%s.corrupt-%d" % (self.path, int(self.now()))
-        try:
-            os.replace(self.path, dest)
-        except OSError:
-            return
-        self.log(event="knowledge_corrupt", moved_to=dest)
+        self.data = self.db.load_state(self.data)
 
     # ---- persistence ----
     def _mkdir(self):
@@ -234,21 +174,19 @@ class Store:
     def save(self):
         if self.read_only:
             return
-        self._mkdir()
-        tmp = self.path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), 0o600)
-            json.dump(self.data, f, separators=(",", ":"), sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
+        self.enforce_caps()
+        self._prune_vetoes()
+        self.db.save_state(self.data, now=self.now())
         self.dirty = False
         self.last_save = self.now()
 
     def save_if_dirty(self, min_interval=0):
         """Save only when something changed and min_interval seconds passed. True when saved."""
-        if not self.dirty or self.now() - self.last_save < min_interval:
+        if (
+            self.defer_writes
+            or not self.dirty
+            or self.now() - self.last_save < min_interval
+        ):
             return False
         self.save()
         return True
@@ -343,6 +281,9 @@ class Store:
         )
         if existing:
             return dict(existing)
+        self._prune_vetoes()
+        if len(self.data["vetoes"]) >= MAX_VETOES:
+            return None
         veto = {"id": identifier, **target, "created": self.now()}
         if isinstance(reason, str) and reason:
             veto["reason"] = reason[:256]
@@ -388,10 +329,13 @@ class Store:
         return [dict(v) for v in removed]
 
     def _active_vetoes(self, include_pending=True):
+        now = self.now()
         vetoes = [
             dict(v)
             for v in self.data["vetoes"]
-            if isinstance(v, dict) and self._valid_veto_target(v)
+            if isinstance(v, dict)
+            and self._valid_veto_target(v)
+            and not self._veto_expired(v, now)
         ]
         if not include_pending:
             return vetoes
@@ -457,6 +401,27 @@ class Store:
                                 )
         return vetoes
 
+    @staticmethod
+    def _veto_expired(veto, now):
+        expires = veto.get("expires")
+        return (
+            isinstance(expires, (int, float))
+            and not isinstance(expires, bool)
+            and expires <= now
+        )
+
+    def _prune_vetoes(self):
+        now = self.now()
+        vetoes = self.data.get("vetoes", [])
+        kept = [
+            veto
+            for veto in vetoes
+            if not isinstance(veto, dict) or not self._veto_expired(veto, now)
+        ]
+        if len(kept) != len(vetoes):
+            self.data["vetoes"] = kept
+            self.dirty = True
+
     def match_veto(self, scope=None, members=(), include_pending=True):
         """Return the first veto matching a scope or observed member identities."""
         for veto in self._active_vetoes(include_pending):
@@ -509,7 +474,7 @@ class Store:
         }
         actions = self.data.setdefault("auto_actions", [])
         actions.append(action)
-        del actions[:-50]
+        del actions[:-MAX_AUTO_ACTIONS]
         self.dirty = True
         return dict(action)
 
@@ -533,6 +498,9 @@ class Store:
         targets = [("app", app) for app in dict.fromkeys(apps)]
         if not targets and action.get("scope"):
             targets = [("scope", action["scope"])]
+        self._prune_vetoes()
+        if len(self.data["vetoes"]) + len(targets) > MAX_VETOES:
+            return None
         vetoes = []
         for index, (kind, value) in enumerate(targets):
             veto = self.add_veto(
@@ -596,6 +564,8 @@ class Store:
                 identifier=op_id,
                 reason=msg.get("reason", ""),
             )
+            if veto is None:
+                return None
             result = {"target": self._target(veto)}
         elif op == "unveto":
             target = msg.get("target")
@@ -741,6 +711,7 @@ class Store:
             del exes[k]
             self.dirty = True
         pairs = self.data["pairs"]
+        now = self.now()
         for k in [
             k
             for k, p in pairs.items()
@@ -748,6 +719,7 @@ class Store:
             and not p.get("closes")
             and not p.get("launches")
             and not p.get("kills")
+            and now - p.get("first_seen", p.get("last_seen", now)) >= PAIR_RETENTION
         ]:
             del pairs[k]
             self.dirty = True
@@ -820,11 +792,21 @@ class Store:
 
         def drop(cands, over):
             order = sorted(
-                (k for k in cands if k != keep),
+                (
+                    k
+                    for k in cands
+                    if k != keep
+                    and not (
+                        pairs[k].get("ex_last") == "keep"
+                        and pairs[k].get("ex_keep", 0) > pairs[k].get("stop", 0)
+                    )
+                ),
                 key=lambda k: (self._pweight(pairs[k]), pairs[k].get("last_seen", 0)),
             )
             for k in order[:over]:
                 del pairs[k]
+            if order:
+                self.dirty = True
 
         mine = [k for k in pairs if k.startswith(owner + SEP)]
         if len(mine) > MAX_PER_OWNER:
@@ -907,10 +889,6 @@ class Store:
             for r in reviews
             if isinstance(r, dict)
             and r.get("state") != "open"
-            and not (
-                r.get("kind") == "scope"
-                and str(r.get("scope", "")).startswith("leftover/")
-            )
             and r.get("closed", now) <= now - REVIEW_RETENTION
         ]
         if closed:

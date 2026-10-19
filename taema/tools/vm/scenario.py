@@ -674,8 +674,7 @@ def scenario_m0(rec, args, tree_holder):
     if not os.path.isfile(tail):
         raise ScenarioError("tail is required by the VM survivor fixtures")
     tracked = []
-    simulated_cgroup = None
-    simulated_pid = None
+    idle_fixture = None
     ok = False
 
     def record(name, passed, detail=""):
@@ -832,39 +831,26 @@ def scenario_m0(rec, args, tree_holder):
                "scope=%s gc=%s event=%s" %
                (vetoed_scope, vetoed_gc.stdout[-700:], gc_veto_event))
 
+        # Create a genuine app scope in adopt mode, then restart in observe mode so the
+        # real-hour GC can only report its would-stop decision.
+        status = _m0_write_mode("adopt", idle_grace=3600, adopt_interval=2)
+        record("idle-gc-adopt-mode-ready", status.returncode == 0, status.stdout[:300])
+        idle_runtime = os.path.join(args.artifacts, "runtime-idle-hour")
+        idle_fixture = track(_spawn_pause_process(
+            os.path.join(args.artifacts, "m0-idle-hour"), idle_runtime))
+        idle_pid = idle_fixture["root"]
+        idle_scope = wait_for_scope(idle_pid, ["app-m0pause"], timeout=30)
+        idle_leaf = daemon_scope(idle_scope)
+        idle_scope_path = os.path.join(CGROOT, idle_scope)
+        record("idle-gc-process-in-daemon-scope",
+               assert_scope_member(idle_pid, "app-m0pause/") == idle_scope
+               and os.path.isdir(idle_runtime),
+               "pid=%d scope=%s runtime=%s" % (idle_pid, idle_scope, idle_runtime))
+
         status = _m0_write_mode("observe", idle_grace=3600, adopt_interval=2)
         record("simulated-gc-observe-mode-ready", status.returncode == 0, status.stdout[:300])
         sys.path.insert(0, "/usr/lib/taema")
         from taema import daemon as taema_daemon, engine as taema_engine, policy as taema_policy
-
-        simulated = subprocess.Popen(["/bin/sleep", "7200"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        simulated_pid = simulated.pid
-        rel = "shared/m0-gc-hour"
-        simulated_scope = os.path.join(CGROOT, "user", str(os.getuid()),
-                                       rel)
-        simulated_cgroup = simulated_scope
-        os.makedirs(simulated_scope, exist_ok=True)
-        with open(os.path.join(simulated_scope, "cgroup.procs"), "w") as f:
-            f.write("%d\n" % simulated_pid)
-        time.sleep(1)
-        initial_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
-        initial_events = _event_lines(log_path, "gc_would_stop", "shared/m0-gc-hour")
-        record("real-hour-idle-window-started",
-               initial_gc.returncode == 0 and not initial_events,
-               "gc=%s prior_would_stop_lines=%d" %
-               (initial_gc.stdout[-500:], len(initial_events)))
-        real_idle_started = time.monotonic()
-        time.sleep(3602)
-        real_passes = [_run(["/usr/bin/taema", "gc"], timeout=30) for _ in range(3)]
-        real_elapsed = time.monotonic() - real_idle_started
-        real_events = _event_lines(log_path, "gc_would_stop", "shared/m0-gc-hour")
-        record("one-hour-idle-would-stop-is-deduplicated",
-               real_elapsed >= 3600 and all(r.returncode == 0 for r in real_passes)
-               and len(real_events) == 1 and _process_running(simulated_pid)
-               and daemon_scope(scope_of(simulated_pid)) == rel,
-               "real_idle_seconds=%.1f gc_passes=3 would_stop_lines=%d last_gc=%s"
-               % (real_elapsed, len(real_events), real_passes[-1].stdout[-500:]))
 
         cfg = taema_policy.load_config()
         cfg["mode"] = "observe"
@@ -875,36 +861,48 @@ def scenario_m0(rec, args, tree_holder):
         simulated_now = [started]
         simulated_daemon.store.now = lambda: simulated_now[0]
         with mock.patch.object(taema_engine, "gc_candidates",
-                               return_value=[(simulated_scope, "idle 3600s >= grace 3600s")]):
+                               return_value=[(idle_scope_path, "idle 3600s >= grace 3600s")]):
             result = simulated_daemon.gc_pass()
-            first_event = _event_lines(simulated_daemon.store.log_path, "gc_would_stop", rel)
+            first_event = _event_lines(simulated_daemon.store.log_path,
+                                       "gc_would_stop", idle_leaf)
             for minute in range(1, 24 * 60 + 1):
                 simulated_now[0] = started + minute * 60
                 simulated_daemon.gc_pass()
-        all_events = _event_lines(simulated_daemon.store.log_path, "gc_would_stop", rel)
+        all_events = _event_lines(simulated_daemon.store.log_path,
+                                  "gc_would_stop", idle_leaf)
         record("one-hour-idle-and-simulated-day-deduplicate-would-stop",
                bool(result) and result[0][2] == "would" and len(first_event) == 1
-               and len(all_events) == 1 and _process_running(simulated_pid)
-               and daemon_scope(scope_of(simulated_pid)) == rel,
+               and len(all_events) == 1 and _process_running(idle_pid)
+               and daemon_scope(scope_of(idle_pid)) == idle_leaf,
                "simulated_result=%s minutes=1440 would_stop_lines=%d"
                % (result, len(all_events)))
+
+        initial_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
+        initial_events = _event_lines(log_path, "gc_would_stop", idle_leaf)
+        record("real-hour-idle-window-started",
+               initial_gc.returncode == 0 and not initial_events
+               and _process_running(idle_pid)
+               and daemon_scope(scope_of(idle_pid)) == idle_leaf,
+               "scope=%s gc=%s prior_would_stop_lines=%d" %
+               (idle_leaf, initial_gc.stdout[-500:], len(initial_events)))
+        real_idle_started = time.monotonic()
+        time.sleep(3602)
+        real_passes = [_run(["/usr/bin/taema", "gc"], timeout=30) for _ in range(3)]
+        real_elapsed = time.monotonic() - real_idle_started
+        real_events = _event_lines(log_path, "gc_would_stop", idle_leaf)
+        record("one-hour-idle-would-stop-is-deduplicated",
+               real_elapsed >= 3600 and all(r.returncode == 0 for r in real_passes)
+               and len(real_events) == 1 and _process_running(idle_pid)
+               and daemon_scope(scope_of(idle_pid)) == idle_leaf,
+               "real_idle_seconds=%.1f scope=%s gc_passes=3 would_stop_lines=%d last_gc=%s"
+               % (real_elapsed, idle_leaf, len(real_events), real_passes[-1].stdout[-500:]))
         ok = all(step["ok"] for step in rec.steps)
     finally:
         for tree in tracked:
             kill_tree(tree, timeout=5)
-        if simulated_pid is not None:
+        if idle_fixture is not None:
             try:
-                os.kill(simulated_pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                if 'simulated' in locals():
-                    simulated.wait(timeout=5)
-            except Exception:
-                pass
-        if simulated_cgroup and os.path.isdir(simulated_cgroup):
-            try:
-                os.rmdir(simulated_cgroup)
+                shutil.rmtree(idle_fixture["runtime_dir"])
             except OSError:
                 pass
         restored = _m0_restore(snapshot)

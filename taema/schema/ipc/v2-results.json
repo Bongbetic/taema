@@ -20,13 +20,15 @@
       "additionalProperties": true
     },
     "status": {
-      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews", "latest_decision"],
+      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews", "latest_decision", "feedback_invalid", "hold"],
       "properties": {
         "mode": {"type": "string"}, "uptime_s": {"type": "integer", "minimum": 0},
         "owners": {"type": "array", "items": {"type": "object", "required": ["scope", "owner"], "properties": {"scope": {"type": "string"}, "owner": {"type": "integer"}}}},
         "pairs": {"type": "array", "items": {"type": "object"}},
         "reviews": {"type": "integer", "minimum": 0}, "auto": {"type": "object"},
-        "latest_decision": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/decision"}]}
+        "latest_decision": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/decision"}]},
+        "feedback_invalid": {"type": "integer", "minimum": 0},
+        "hold": {"type": "string"}
       },
       "additionalProperties": true
     },

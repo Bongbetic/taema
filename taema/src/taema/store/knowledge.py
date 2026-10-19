@@ -6,6 +6,7 @@ uid rules, configured cgroup and environment exclusions (see policy.py). No mode
 """
 
 from contextlib import contextmanager
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import time
 import uuid
 
 from ..config import policy
+from .. import protocol
 from . import db
 
 DECAY_DAYS = 7
@@ -37,6 +39,7 @@ STALE_DAYS = 90
 SCHEMA = 2
 MAX_VETOES = 512
 MAX_AUTO_ACTIONS = 10_000  # durable undo context; status exposes only a recent view
+MAX_FEEDBACK_IDS = 50_000
 DAILY_EXPORT_RE = re.compile(r"^state-export-(\d{8})\.json$")
 DAILY_EXPORTS_KEPT = 3
 
@@ -159,6 +162,8 @@ class Store:
         self._pending_decisions = []
         self._pending_events = []
         self._audit_context = None
+        self._feedback_replay_pending = None
+        self._feedback_replaying = False
         self.data = self._fresh()
         self._load()
         self._decay()
@@ -185,6 +190,12 @@ class Store:
             "vetoes": [],
             "auto_actions": [],
             "feedback_ids": [],
+            "feedback_invalid": 0,
+            "feedback_last_replay": "",
+            "held": False,
+            "held_scopes": [],
+            "snooze_until": 0.0,
+            "muted_apps": [],
             "leftover_expiries": {},
         }
 
@@ -208,6 +219,12 @@ class Store:
             "vetoes",
             "auto_actions",
             "feedback_ids",
+            "feedback_invalid",
+            "feedback_last_replay",
+            "held",
+            "held_scopes",
+            "snooze_until",
+            "muted_apps",
             "leftover_expiries",
         )
         return json.loads(json.dumps({field: self.data.get(field) for field in fields}))
@@ -285,6 +302,20 @@ class Store:
         self._pending_events.clear()
         self.dirty = False
         self.last_save = self.now()
+        replay_path = self._feedback_replay_pending
+        if replay_path:
+            try:
+                os.unlink(replay_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            else:
+                self._feedback_replay_pending = None
+                ids = self.data.get("feedback_ids", [])
+                if len(ids) > MAX_FEEDBACK_IDS:
+                    self.data["feedback_ids"] = ids[-MAX_FEEDBACK_IDS:]
+                    self.dirty = True
 
     def save_if_dirty(self, min_interval=0):
         """Save only when something changed and min_interval seconds passed. True when saved."""
@@ -652,67 +683,143 @@ class Store:
         ]
         if not include_pending:
             return vetoes
+        for op in self._pending_feedback_ops():
+            op_id = op.get("id")
+            if op.get("op") == "veto" and self._valid_veto_target(op.get("target")):
+                target = dict(op["target"])
+                vetoes.append({"id": op_id, **target, "created": self.now()})
+            elif op.get("op") == "unveto":
+                target = op.get("target")
+                start = target.get("start")
+                vetoes = [
+                    v
+                    for v in vetoes
+                    if not (
+                        v.get("kind") == target.get("kind")
+                        and v.get("value") == str(target.get("value"))
+                        and (start is None or v.get("start") == start)
+                    )
+                ]
+            elif op.get("op") == "undo":
+                action = self.auto_action(op.get("action_id"))
+                if action:
+                    apps = action.get("apps") or [
+                        pair[1]
+                        for pair in action.get("pairs", [])
+                        if isinstance(pair, list) and len(pair) == 2
+                    ]
+                    targets = [("app", app) for app in dict.fromkeys(apps)]
+                    if not targets and action.get("scope"):
+                        targets = [("scope", action["scope"])]
+                    for index, (kind, value) in enumerate(targets):
+                        target = {"kind": kind, "value": value, "start": None}
+                        if self._valid_veto_target(target):
+                            vetoes.append(
+                                {
+                                    "id": "%s:%d" % (op_id, index),
+                                    **target,
+                                    "created": self.now(),
+                                }
+                            )
+        return vetoes
+
+    def _feedback_batch_id(self, path):
+        try:
+            stat_result = os.stat(path)
+            identity = "%d:%d:%d:%d:" % (
+                stat_result.st_dev,
+                stat_result.st_ino,
+                stat_result.st_mtime_ns,
+                stat_result.st_size,
+            )
+            digest = hashlib.sha256(identity.encode())
+            with open(path, "rb") as source:
+                for chunk in iter(lambda: source.read(65536), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return ""
+
+    def _pending_feedback_ops(self):
+        """Yield valid queued operations in replay order, excluding applied ids."""
         known_ids = set(self.data.get("feedback_ids", []))
-        paths = (self.feedback_path + ".replay", self.feedback_path)
-        for path in paths:
+        replay = self.feedback_path + ".replay"
+        for path in (replay, self.feedback_path):
+            if path == replay and self.data.get(
+                "feedback_last_replay"
+            ) == self._feedback_batch_id(path):
+                continue
             try:
-                with open(path) as f:
-                    lines = list(f)
+                source = open(path, encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            for line in lines:
-                try:
-                    op = json.loads(line)
-                except ValueError:
-                    continue
-                if (
-                    not isinstance(op, dict)
-                    or op.get("v") != 1
-                    or op.get("id") in known_ids
-                ):
-                    continue
-                op_id = op.get("id")
-                if not isinstance(op_id, str) or not op_id or len(op_id) > 128:
-                    continue
-                known_ids.add(op_id)
-                if op.get("op") == "veto" and self._valid_veto_target(op.get("target")):
-                    target = dict(op["target"])
-                    vetoes.append({"id": op_id, **target, "created": self.now()})
-                elif op.get("op") == "unveto":
-                    target = op.get("target")
-                    if isinstance(target, dict):
-                        start = target.get("start")
-                        vetoes = [
-                            v
-                            for v in vetoes
-                            if not (
-                                v.get("kind") == target.get("kind")
-                                and v.get("value") == str(target.get("value"))
-                                and (start is None or v.get("start") == start)
-                            )
-                        ]
-                elif op.get("op") == "undo":
-                    action = self.auto_action(op.get("action_id"))
-                    if action:
-                        apps = action.get("apps") or [
-                            pair[1]
-                            for pair in action.get("pairs", [])
-                            if isinstance(pair, list) and len(pair) == 2
-                        ]
-                        targets = [("app", app) for app in dict.fromkeys(apps)]
-                        if not targets and action.get("scope"):
-                            targets = [("scope", action["scope"])]
-                        for index, (kind, value) in enumerate(targets):
-                            target = {"kind": kind, "value": value, "start": None}
-                            if self._valid_veto_target(target):
-                                vetoes.append(
-                                    {
-                                        "id": "%s:%d" % (op_id, index),
-                                        **target,
-                                        "created": self.now(),
-                                    }
-                                )
-        return vetoes
+            with source:
+                for line in source:
+                    try:
+                        op = json.loads(line)
+                        protocol.validate_feedback(op)
+                    except (ValueError, TypeError):
+                        continue
+                    op_id = op.get("id") if "v" in op else None
+                    if op_id and op_id in known_ids:
+                        continue
+                    if op_id:
+                        known_ids.add(op_id)
+                    yield op
+
+    def pending_feedback_invalid(self):
+        """Count malformed or unsupported lines that have not been replayed yet."""
+        known_ids = set(self.data.get("feedback_ids", []))
+        invalid = 0
+        replay = self.feedback_path + ".replay"
+        for path in (replay, self.feedback_path):
+            if path == replay and self.data.get(
+                "feedback_last_replay"
+            ) == self._feedback_batch_id(path):
+                continue
+            try:
+                source = open(path, encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            with source:
+                for line in source:
+                    try:
+                        op = json.loads(line)
+                        protocol.validate_feedback(op)
+                    except (ValueError, TypeError):
+                        invalid += 1
+                        continue
+                    op_id = op.get("id") if "v" in op else None
+                    if op_id and op_id in known_ids:
+                        continue
+                    if op_id:
+                        known_ids.add(op_id)
+        return invalid
+
+    def hold_reason(self, scope=None, include_pending=True):
+        """Explain a global hold, matching scope hold, or active global snooze."""
+        held = self.data.get("held") is True
+        scopes = set(self.data.get("held_scopes", []))
+        snooze_until = self.data.get("snooze_until", 0)
+        if include_pending:
+            for op in self._pending_feedback_ops():
+                if op.get("op") == "hold":
+                    target = op.get("scope")
+                    if target is None:
+                        held = op["held"]
+                    elif op["held"]:
+                        scopes.add(target)
+                    else:
+                        scopes.discard(target)
+                elif op.get("op") == "snooze":
+                    snooze_until = op["until"]
+        if held:
+            return "global hold"
+        if isinstance(snooze_until, (int, float)) and snooze_until > self.now():
+            return "snoozed"
+        if scope is not None and scope in scopes:
+            return "scope hold"
+        return ""
 
     @staticmethod
     def _veto_expired(veto, now):
@@ -990,19 +1097,21 @@ class Store:
         return True
 
     def apply_feedback_command(self, msg):
-        """Apply one versioned offline-safe policy operation once, keyed by its client id."""
-        if not isinstance(msg, dict) or msg.get("v") != 1:
+        """Apply one supported feedback operation once, keyed by its versioned id."""
+        try:
+            protocol.validate_feedback(msg)
+        except (ValueError, TypeError):
             return None
+        if "v" not in msg:
+            if not self.apply_op(msg["op"], msg["key"]):
+                return None
+            return {"ok": True}
         op_id, op = msg.get("id"), msg.get("op")
-        if not isinstance(op_id, str) or not op_id or len(op_id) > 128:
-            return None
         ids = self.data.setdefault("feedback_ids", [])
         if op_id in ids:
             return {"ok": True, "duplicate": True}
-        if op == "veto":
+        if msg["v"] in (1, 2) and op == "veto":
             target = msg.get("target")
-            if not self._valid_veto_target(target):
-                return None
             veto = self.add_veto(
                 target["kind"],
                 target["value"],
@@ -1013,16 +1122,12 @@ class Store:
             if veto is None:
                 return None
             result = {"target": self._target(veto)}
-        elif op == "unveto":
+        elif msg["v"] in (1, 2) and op == "unveto":
             target = msg.get("target")
-            if not isinstance(target, dict):
-                return None
             removed = self.remove_veto(target)
             result = {"removed": [self._target(v) for v in removed]}
-        elif op == "undo":
+        elif msg["v"] in (1, 2) and op == "undo":
             action_id = msg.get("action_id")
-            if not isinstance(action_id, str) or not action_id:
-                return None
             undone = self.undo_auto_action(action_id, feedback_id=op_id)
             if not undone:
                 return None
@@ -1031,10 +1136,8 @@ class Store:
                 "targets": [self._target(v) for v in undone["vetoes"]],
                 "pairs": undone["action"].get("pairs", []),
             }
-        elif op == "vetoed":
+        elif msg["v"] == 1 and op == "vetoed":
             target, trigger = msg.get("target"), msg.get("trigger")
-            if not isinstance(target, dict) or not isinstance(trigger, str):
-                return None
             with self.decision_context(
                 "refusal",
                 scope=target.get("value") if target.get("kind") == "scope" else None,
@@ -1043,50 +1146,165 @@ class Store:
             ):
                 self.log(event="vetoed", target=target, trigger=trigger)
             result = {"target": target}
+        elif msg["v"] == 2 and op in ("keep", "forget", "kill"):
+            if not self.apply_op(op, msg["key"]):
+                return None
+            result = {}
+        elif msg["v"] == 2 and op in ("answer", "teach"):
+            owner, leftovers, choice = (
+                msg["owner"],
+                msg["leftovers"],
+                msg["choice"],
+            )
+            if any(
+                not self._ok(owner, key)
+                or (
+                    choice != "standalone"
+                    and (
+                        policy.bad_owner(owner, self.deny)
+                        or (
+                            isinstance(
+                                self.data.get("pairs", {}).get(self.pkey(owner, key)),
+                                dict,
+                            )
+                            and self.data["pairs"][self.pkey(owner, key)].get("source")
+                            == "legacy-invalid"
+                        )
+                    )
+                )
+                for key in leftovers
+            ):
+                return None
+            kind = "answer" if op == "answer" else "teach"
+            with self.decision_context(
+                kind,
+                owner=owner,
+                authority="user",
+                why="user %s %s for %d relationship(s)"
+                % ("answered" if op == "answer" else "taught", choice, len(leftovers)),
+            ):
+                for key in leftovers:
+                    self.answer(
+                        owner,
+                        key,
+                        choice,
+                        source="explicit" if op == "answer" else "teach",
+                    )
+                self.log(
+                    event=kind, owner=owner, choice=choice, leftovers=leftovers[:8]
+                )
+            result = {"owner": owner, "choice": choice, "leftovers": leftovers}
+        elif msg["v"] == 2 and op == "mute":
+            apps = set(self.data.get("muted_apps", []))
+            if msg["muted"]:
+                apps.add(msg["app"])
+            else:
+                apps.discard(msg["app"])
+            self.data["muted_apps"] = sorted(apps)
+            self.dirty = True
+            with self.decision_context(
+                "mute" if msg["muted"] else "unmute",
+                owner=msg["app"],
+                authority="user",
+                why="user %s notifications for %s"
+                % ("muted" if msg["muted"] else "unmuted", msg["app"]),
+            ):
+                self.log(event="mute", app=msg["app"], muted=msg["muted"])
+            result = {"app": msg["app"], "muted": msg["muted"]}
+        elif msg["v"] == 2 and op == "hold":
+            scope, held = msg.get("scope"), msg["held"]
+            if scope is None:
+                self.data["held"] = held
+            else:
+                scopes = set(self.data.get("held_scopes", []))
+                if held:
+                    scopes.add(scope)
+                else:
+                    scopes.discard(scope)
+                self.data["held_scopes"] = sorted(scopes)
+            self.dirty = True
+            with self.decision_context(
+                "hold" if held else "resume",
+                scope=scope,
+                authority="user",
+                why="user %s %s"
+                % ("held" if held else "released", scope or "all actions"),
+            ):
+                self.log(event="hold", scope=scope, held=held)
+            result = {"scope": scope, "held": held}
+        elif msg["v"] == 2 and op == "snooze":
+            until = msg["until"]
+            self.data["snooze_until"] = until if until > self.now() else 0.0
+            self.dirty = True
+            with self.decision_context(
+                "snooze",
+                authority="user",
+                why="user snoozed actions until %.3f" % self.data["snooze_until"],
+            ):
+                self.log(event="snooze", until=self.data["snooze_until"])
+            result = {"until": self.data["snooze_until"]}
         else:
             return None
         ids.append(op_id)
-        del ids[:-4096]
+        if not self._feedback_replaying:
+            del ids[:-MAX_FEEDBACK_IDS]
         self.dirty = True
         return {"ok": True, **result}
 
     def apply_feedback(self, path=None):
-        """Replay and remove feedback.jsonl (written by the CLI while the daemon was down)."""
+        """Replay one queue batch and remove it only after its state is committed."""
         path = path or self.feedback_path
         work = path + ".replay"
+        if self._feedback_replay_pending:
+            return 0
         if os.path.exists(path):
-            try:
-                if os.path.exists(
-                    work
-                ):  # leftover of a crash: keep it, append the new lines
-                    with open(path, "rb") as src, open(work, "ab") as dst:
-                        dst.write(src.read())
-                    os.unlink(path)
-                else:
+            if not os.path.exists(work):
+                try:
                     os.replace(path, work)
+                except OSError:
+                    return 0
+        batch_id = self._feedback_batch_id(work)
+        if not batch_id:
+            return 0
+        if batch_id == self.data.get("feedback_last_replay"):
+            try:
+                os.unlink(work)
             except OSError:
-                return 0
+                pass
+            return 0
         n = 0
+        invalid = 0
+        self._feedback_replaying = True
         try:
-            with open(work) as f:
+            with open(work, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     try:
                         m = json.loads(line)
-                        if not isinstance(m, dict):
-                            continue
-                        if m.get("v") == 1:
+                        protocol.validate_feedback(m)
+                        if "v" in m:
                             result = self.apply_feedback_command(m)
-                            if result and not result.get("duplicate"):
+                            if result is None:
+                                invalid += 1
+                            elif not result.get("duplicate"):
                                 n += 1
                         elif self.apply_op(m.get("op"), m.get("key")):
                             n += 1
-                    except ValueError:
-                        continue
-            os.unlink(work)
-        except FileNotFoundError:
-            return 0
+                        else:
+                            invalid += 1
+                    except (ValueError, TypeError):
+                        invalid += 1
         except OSError:
-            pass
+            return 0
+        finally:
+            self._feedback_replaying = False
+        self.data["feedback_invalid"] = (
+            int(self.data.get("feedback_invalid", 0)) + invalid
+        )
+        self.data["feedback_last_replay"] = batch_id
+        self.dirty = True
+        self._feedback_replay_pending = work
+        if not self.defer_writes:
+            self.save()
         return n
 
     # ---- records ----
@@ -1285,7 +1503,7 @@ class Store:
 
     def review_holds_scope(self, scope):
         """Pair and leftover scope reviews hold; adopt reviews for shared/unit scopes are informational."""
-        return any(
+        return bool(self.hold_reason(scope)) or any(
             isinstance(r, dict)
             and r.get("scope") == scope
             and r.get("state") in ("open", "expired")

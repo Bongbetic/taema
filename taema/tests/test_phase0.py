@@ -1,6 +1,7 @@
 """Phase 0 regression tests: fake /proc and cgroup trees, malformed sockets, learner fixes."""
 
 import json
+import io
 import os
 import socket
 import stat
@@ -9,6 +10,7 @@ import tempfile
 import time
 import types
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 from taema.daemon import service as daemon
@@ -388,11 +390,28 @@ class KnowledgeHardening(unittest.TestCase):
         self.assertEqual(cli.feedback(cfg, s, "forget", "x"), "queued")
         with open(s.feedback_path) as f:
             ops = [json.loads(l) for l in f]
-        self.assertEqual(
-            ops, [{"op": "keep", "key": "adb"}, {"op": "forget", "key": "x"}]
-        )
+        self.assertEqual([op["v"] for op in ops], [2, 2])
+        self.assertEqual([op["op"] for op in ops], ["keep", "forget"])
+        self.assertEqual([op["key"] for op in ops], ["adb", "x"])
+        self.assertEqual(len({op["id"] for op in ops}), 2)
         self.assertEqual(stat.S_IMODE(os.stat(s.feedback_path).st_mode), 0o600)
         self.assertEqual(knowledge.Store(d, {}).apply_feedback(), 2)
+
+    def test_cli_status_counts_invalid_queued_feedback(self):
+        state = tmp()
+        store = knowledge.Store(state, {}, read_only=True)
+        with open(store.feedback_path, "w") as queue:
+            queue.write('{"v":2,"id":"bad","op":"mode","value":"auto"}\n')
+            queue.write("{truncated\n")
+        cfg = make_cfg(state)
+        out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_load", return_value=(cfg, store, [])),
+            mock.patch.object(cli, "ask", return_value=None),
+            redirect_stdout(out),
+        ):
+            self.assertEqual(cli.cmd_status(types.SimpleNamespace()), 1)
+        self.assertIn("feedback_invalid: 2", out.getvalue())
 
     def test_persist_seed(self):
         s = knowledge.Store(tmp(), {"persist": ["tmux"]})

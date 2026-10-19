@@ -1,5 +1,7 @@
 """Versioned envelopes and strict request validation for the Unix socket API."""
 
+import math
+
 MAX_REQUEST_ID = (1 << 53) - 1
 
 _COMMANDS = {
@@ -107,10 +109,19 @@ def _validate_feedback(args):
         "v",
         "id",
         "op",
+        "key",
         "target",
         "action_id",
         "reason",
         "trigger",
+        "owner",
+        "leftovers",
+        "choice",
+        "app",
+        "muted",
+        "scope",
+        "held",
+        "until",
     }
     if "v" not in args:
         if set(args) != legacy_fields:
@@ -122,23 +133,41 @@ def _validate_feedback(args):
         return
     if set(args) - versioned_fields:
         _fail("feedback contains an unknown field")
-    if not _is_type(args.get("v"), "integer") or args["v"] != 1:
-        _fail("versioned feedback requires v=1 and a string id")
+    version = args.get("v")
+    if not _is_type(version, "integer") or version not in (1, 2):
+        _fail("versioned feedback requires a supported version and string id")
     if (
         not _is_type(args.get("id"), "string")
         or not args["id"]
         or len(args["id"]) > 128
     ):
-        _fail("versioned feedback requires v=1 and a string id")
+        _fail("versioned feedback requires a supported version and string id")
     op = args.get("op")
-    if op not in ("veto", "unveto", "undo", "vetoed"):
+    common = {"v", "id", "op"}
+    operation_fields = (
+        {
+            "veto": common | {"target", "reason"},
+            "unveto": common | {"target"},
+            "undo": common | {"action_id"},
+            "vetoed": common | {"target", "trigger"},
+        }
+        if version == 1
+        else {
+            "keep": common | {"key"},
+            "forget": common | {"key"},
+            "kill": common | {"key"},
+            "veto": common | {"target", "reason"},
+            "unveto": common | {"target"},
+            "undo": common | {"action_id"},
+            "answer": common | {"owner", "leftovers", "choice"},
+            "teach": common | {"owner", "leftovers", "choice"},
+            "mute": common | {"app", "muted"},
+            "hold": common | {"scope", "held"},
+            "snooze": common | {"until"},
+        }
+    )
+    if op not in operation_fields:
         _fail("feedback operation is invalid")
-    operation_fields = {
-        "veto": {"v", "id", "op", "target", "reason"},
-        "unveto": {"v", "id", "op", "target"},
-        "undo": {"v", "id", "op", "action_id"},
-        "vetoed": {"v", "id", "op", "target", "trigger"},
-    }
     if set(args) - operation_fields[op]:
         _fail("feedback contains an unknown field")
     if op in ("veto", "unveto", "vetoed"):
@@ -152,8 +181,65 @@ def _validate_feedback(args):
     for field in ("action_id", "reason", "trigger"):
         if field in args and not _is_type(args[field], "string"):
             _fail("feedback %s must be a string" % field)
+    if op in ("keep", "forget", "kill"):
+        if not _is_type(args.get("key"), "string") or not args["key"]:
+            _fail("feedback key must be a non-empty string")
+    if op in ("answer", "teach"):
+        owner, leftovers, choice = (
+            args.get("owner"),
+            args.get("leftovers"),
+            args.get("choice"),
+        )
+        if not _is_type(owner, "string") or not owner or len(owner) > 256:
+            _fail("feedback owner must be a non-empty string")
+        if (
+            not _is_type(leftovers, "array")
+            or not leftovers
+            or len(leftovers) > 64
+            or any(
+                not _is_type(key, "string") or not key or len(key) > 256
+                for key in leftovers
+            )
+        ):
+            _fail("feedback leftovers must be one to 64 non-empty strings")
+        if choice not in ("stop", "keep", "standalone"):
+            _fail("feedback choice is invalid")
+    if op == "mute":
+        if (
+            not _is_type(args.get("app"), "string")
+            or not args["app"]
+            or len(args["app"]) > 256
+        ):
+            _fail("feedback app must be a non-empty string")
+        if not _is_type(args.get("muted"), "boolean"):
+            _fail("feedback muted must be a boolean")
+    if op == "hold":
+        if "scope" in args and (
+            not _is_type(args["scope"], "string")
+            or not args["scope"]
+            or len(args["scope"]) > 256
+        ):
+            _fail("feedback scope must be a non-empty string")
+        if not _is_type(args.get("held"), "boolean"):
+            _fail("feedback held must be a boolean")
+    if op == "snooze":
+        until = args.get("until")
+        if (
+            not isinstance(until, (int, float))
+            or isinstance(until, bool)
+            or not math.isfinite(until)
+            or until < 0
+        ):
+            _fail("feedback snooze expiry must be a finite timestamp")
     if op == "vetoed" and not _is_type(args.get("trigger"), "string"):
         _fail("vetoed feedback requires a trigger")
+
+
+def validate_feedback(args):
+    """Validate a legacy, v1, or v2 offline feedback operation."""
+    if not isinstance(args, dict):
+        _fail("feedback operation must be an object")
+    _validate_feedback(args)
 
 
 def _validate_args(command, args):

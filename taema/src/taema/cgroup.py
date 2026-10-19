@@ -80,6 +80,30 @@ def populated(path):
         return False
 
 
+def memory_current(path):
+    """memory.current in bytes, or None when the memory controller or file is unreadable."""
+    try:
+        with open(path + "/memory.current") as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def memory_psi(path):
+    """'some avg10=' from memory.pressure (recent memory pressure, 0-100), or None when the
+    file is unreadable or has no 'some' line."""
+    try:
+        with open(path + "/memory.pressure") as f:
+            for line in f:
+                if line.startswith("some "):
+                    for tok in line.split():
+                        if tok.startswith("avg10="):
+                            return float(tok.split("=", 1)[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def kill_tree(path):
     """cgroup.kill: SIGKILL every process in path and its descendants."""
     with open(path + "/cgroup.kill", "w") as f:

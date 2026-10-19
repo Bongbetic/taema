@@ -27,7 +27,7 @@ class TriggersTest(unittest.TestCase):
         self.assertIn("  push:\n", block)
         self.assertIn("  pull_request:\n", block)
         # Every push and every pull request: no branch, path or event filters.
-        self.assertNotRegex(block, r"^  (push|pull_request):\n[ \t]")
+        self.assertNotRegex(block, r"^  (push|pull_request):\n {3,}")
 
 
 class VoidJobsTest(unittest.TestCase):

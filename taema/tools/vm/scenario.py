@@ -675,6 +675,7 @@ def scenario_m0(rec, args, tree_holder):
         raise ScenarioError("tail is required by the VM survivor fixtures")
     tracked = []
     idle_fixture = None
+    simulated_state_dir = os.path.join(args.artifacts, "m0-simulated-gc")
     ok = False
 
     def record(name, passed, detail=""):
@@ -855,7 +856,7 @@ def scenario_m0(rec, args, tree_holder):
         cfg = taema_policy.load_config()
         cfg["mode"] = "observe"
         cfg["timers"]["idle_grace"] = 3600
-        cfg["paths"]["state_dir"] = os.path.join(args.artifacts, "m0-simulated-gc")
+        cfg["paths"]["state_dir"] = simulated_state_dir
         simulated_daemon = taema_daemon.Daemon(cfg)
         started = time.time()
         simulated_now = [started]
@@ -905,6 +906,13 @@ def scenario_m0(rec, args, tree_holder):
                 shutil.rmtree(idle_fixture["runtime_dir"])
             except OSError:
                 pass
+        # The Store makes this directory private (0700/0600). Keep the
+        # simulated audit log in the step evidence and remove private state
+        # before vmh recursively collects the public artifact tree as vmadmin.
+        try:
+            shutil.rmtree(simulated_state_dir)
+        except OSError:
+            pass
         restored = _m0_restore(snapshot)
         ok = ok and restored.returncode == 0
     return ok

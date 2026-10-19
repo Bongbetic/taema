@@ -25,7 +25,7 @@ MAX_OWNERS = 256        # pidfd owner watches
 MAX_LEAF_WATCH = 256    # cgroup.events watches (EPOLLPRI)
 MAX_SLEEP = 60.0        # longest select() sleep
 JOB_SETTLE = 1.5        # seconds between job_done and the decision (survivors must outlive it)
-JOB_LAUNCHER = 2.0      # a job shorter than this is a launcher: survivors are learned silently
+JOB_LAUNCHER = 2.0      # a job shorter than this is a launcher: its close is noise, never a pair
 STOPPED_JOB = (148, 149, 150)   # 128 + SIGTSTP/SIGTTIN/SIGTTOU: Ctrl-Z is not a close
 MAX_PENDING = 64
 PENDING_TTL = 60.0
@@ -41,7 +41,8 @@ MAX_GATE_SKIPS = 4      # fork gate: at most 4 skipped adopt passes, so every 5t
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"))
+        self.deny = policy.owner_deny(cfg)
+        self.store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"), deny=self.deny)
         self.store.apply_feedback()
         self.units = policy.load_units(cfg)
         self.sel = selectors.DefaultSelector()
@@ -417,6 +418,22 @@ class Daemon:
         self.add_deadline(time.time() + JOB_SETTLE, "job", tag)
         return {"ok": True}
 
+    def resolve_owner(self, info, left):
+        """Real application ancestor for a terminal job: the job root, a leftover's root, or the
+        first valid ancestor in a leftover's chain. Generic/digit/shell/trivial/scriptless names
+        are skipped; '' means nothing real owned the job and the close is launcher noise."""
+        cands = [info.get("root_key")]
+        for l in left:
+            cands.append(l.get("root_key"))
+            cands.extend(l.get("chain") or ())
+        for c in cands:
+            if not c:
+                continue
+            c = c.replace(knowledge.SEP, "")[:256]
+            if c and not policy.bad_owner(c, self.deny):
+                return c
+        return ""
+
     def decide_job(self, tag):
         """After the settle: who survived the job, whose are they, and is a question due."""
         j = self.jobs.pop(tag, None)
@@ -428,20 +445,18 @@ class Daemon:
         if not left:
             return
         info = self.lineage.job_info(tag) or {}
-        owner = info.get("root_key") or next((l["root_key"] for l in left if l["root_key"]), "") or j["word"]
-        owner = owner.replace(knowledge.SEP, "")[:256]
-        if not owner:
-            return
+        owner = self.resolve_owner(info, left)
         launcher = not info or j["t"] - info["first"] < JOB_LAUNCHER
         keys = list(dict.fromkeys(l["key"] for l in left))
         for k in keys:
-            self.store.observe_close(owner, k, launcher=launcher)
+            self.store.observe_close(owner, k, launcher=launcher)   # noise for launchers and bad owners
         if self.authorize(authorization.JOB_SURVIVORS).verdict == authorization.ACT:
             standalone = [l for l in left if self.store.standalone(l["key"])]
             if standalone:
                 self.guarded(lambda: self.adopt_standalone(standalone))
-        if launcher:
-            self.store.log(event="launcher_learned", job=tag, owner=owner, leftovers=keys[:8])
+        if not owner or launcher:
+            self.store.log(event="launcher_learned", job=tag, owner=owner, leftovers=keys[:8],
+                           why="no application ancestor" if not owner else "launcher")
             return
         dec = self.attribute(owner, left, job=tag)
         if self.authorize(authorization.JOB_SURVIVORS).verdict == authorization.ACT:
@@ -451,12 +466,14 @@ class Daemon:
             self.make_question(j, tag, owner, left, ask)
 
     def candidates(self, owner, left):
-        """Owners to offer, job root first, then recorded ancestors, then historical owners."""
+        """Owners to offer, job root first, then recorded ancestors, then historical owners.
+        Invalid owners (policy.bad_owner) are never offered."""
         prot = self.cfg["protected"].get("comm", [])
         out, seen = [], set()
 
         def add(kind, key):
-            if key and key not in seen and len(out) < MAX_CANDIDATES:
+            if key and key not in seen and len(out) < MAX_CANDIDATES \
+                    and not policy.bad_owner(key, self.deny):
                 seen.add(key)
                 out.append({"id": len(out) + 1, "kind": kind, "key": key, "label": lineage.clean(key, 48)})
         add("job", owner)
@@ -505,7 +522,7 @@ class Daemon:
             # the recorded owner: the app root it was a member of, else the nearest real ancestor
             owner = next((c for c in [r["root_key"], r["parent_key"]] + list(r["chain"])
                           if c and c != key and c not in SHELL_KEYS and not policy.comm_protected(c, prot)
-                          and not self.store.is_persistent(c)), None)
+                          and not self.store.is_persistent(c) and not policy.bad_owner(c, self.deny)), None)
             if owner is None:
                 continue
             owner = owner.replace(knowledge.SEP, "")[:256]

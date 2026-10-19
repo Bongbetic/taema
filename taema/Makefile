@@ -25,6 +25,7 @@ test check:
 install:
 	install -d $(LIBDIR) $(BINDIR) $(LIBEXEC) $(SVDIR)/log $(CONFDIR)/units $(SUDOERS) \
 		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(SHELLDIR) $(BASHRCD) $(FISHCONF)
+	install -d $(DOCDIR)/schema/ipc
 	find src/taema -type d -print | while read dir; do \
 		rel=$${dir#src/taema}; install -d "$(LIBDIR)$$rel"; \
 	done
@@ -45,6 +46,7 @@ install:
 	install -m644 shell/taema.bash $(BASHRCD)/taema.sh
 	install -m644 shell/taema.fish $(FISHCONF)/taema.fish
 	install -m644 docs/vm-harness.md $(DOCDIR)/
+	install -m644 schema/ipc/*.json $(DOCDIR)/schema/ipc/
 
 # Disposable Void VM test harness (docs/vm-harness.md).  Extra flags via
 # VMFLAGS, e.g. `make vm-test VMFLAGS="--allow-network --libc glibc"`.

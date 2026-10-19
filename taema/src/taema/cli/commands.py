@@ -1,6 +1,7 @@
 """`taema` command line. scoperun / scopekill / scopels are thin aliases (see bin/)."""
 
 import argparse
+from itertools import count
 import json
 import os
 import socket
@@ -14,6 +15,8 @@ from ..core import cgroup, process as inspect, lineage
 from ..governor import engine
 from ..store import knowledge
 from ..config import policy
+
+_REQUEST_IDS = count(1)
 
 
 def _load():
@@ -42,19 +45,46 @@ def sock_path(cfg):
 
 def ask(cfg, msg, timeout=3.0):
     """One JSON request to the daemon. Returns the reply dict, or None when it is not running."""
+    if not isinstance(msg, dict) or not isinstance(msg.get("cmd"), str):
+        return {"error": "invalid request", "code": "invalid_request"}
+    identifier = next(_REQUEST_IDS)
+    envelope = {
+        "v": 2,
+        "id": identifier,
+        "cmd": msg["cmd"],
+        "args": {key: value for key, value in msg.items() if key != "cmd"},
+    }
     for path in sock_paths(cfg):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
             s.connect(path)
-            s.sendall((json.dumps(msg) + "\n").encode())
+            s.sendall((json.dumps(envelope) + "\n").encode())
             buf = b""
             while not buf.endswith(b"\n"):
                 chunk = s.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
-            return json.loads(buf) if buf else None
+            reply = json.loads(buf) if buf else None
+            if isinstance(reply, dict) and reply.get("v") == 2:
+                response_id = reply.get("id")
+                if (
+                    not isinstance(response_id, int)
+                    or isinstance(response_id, bool)
+                    or response_id != identifier
+                ):
+                    return {"error": "response id mismatch", "code": "protocol_error"}
+                if reply.get("ok") is True:
+                    return reply.get("result")
+                error = reply.get("error")
+                if isinstance(error, dict):
+                    return {
+                        "error": error.get("message", "request failed"),
+                        "code": error.get("code", "operation_failed"),
+                    }
+                return {"error": "invalid error reply", "code": "protocol_error"}
+            return reply
         except (OSError, ValueError):
             continue
         finally:

@@ -1,0 +1,266 @@
+"""Versioned envelopes and strict request validation for the Unix socket API."""
+
+MAX_REQUEST_ID = (1 << 53) - 1
+
+_COMMANDS = {
+    "status": ({}, ()),
+    "review": ({}, ()),
+    "register": ({"scope": "string", "owner": "integer"}, ("scope", "owner")),
+    "attach": ({"scope": "string", "pids": "array"}, ("scope", "pids")),
+    "job_done": (
+        {
+            "shell_pid": "integer",
+            "tag": "string",
+            "status": "integer",
+            "word": "string",
+        },
+        ("shell_pid", "tag", "status", "word"),
+    ),
+    "kill_done": ({"shell_pid": "integer", "word": "string"}, ("shell_pid", "word")),
+    "ask": ({"shell_pid": "integer"}, ("shell_pid",)),
+    "answer": (
+        {"nonce": "string", "choice": "string", "owner": "string"},
+        ("nonce", "choice"),
+    ),
+    "gc": ({"dry_run": "boolean"}, ()),
+    "feedback": ({}, ()),
+}
+
+
+class ProtocolError(ValueError):
+    """A request rejected before command dispatch, with a stable wire error code."""
+
+    def __init__(self, code, message, hint):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
+
+def is_v2(message):
+    return isinstance(message, dict) and message.get("v") == 2
+
+
+def is_legacy(message):
+    """Recognize unversioned v1, including the old feedback operation's own v1 marker."""
+    return isinstance(message, dict) and (
+        "v" not in message
+        or (
+            message.get("v") == 1
+            and message.get("cmd") == "feedback"
+            and isinstance(message.get("id"), str)
+        )
+    )
+
+
+def request_id(message):
+    value = message.get("id") if isinstance(message, dict) else None
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_REQUEST_ID
+    ):
+        return value
+    return 0
+
+
+def _fail(message, hint="Check the command and its arguments."):
+    raise ProtocolError("invalid_request", message, hint)
+
+
+def _is_type(value, kind):
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "array":
+        return isinstance(value, list)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "string":
+        return isinstance(value, str)
+    return False
+
+
+def _validate_target(target):
+    if not isinstance(target, dict):
+        _fail("feedback target must be an object")
+    if set(target) - {"kind", "value", "start"}:
+        _fail("feedback target contains an unknown field")
+    if not {"kind", "value"} <= set(target):
+        _fail("feedback target requires kind and value")
+    if target["kind"] not in ("scope", "app", "pid"):
+        _fail("feedback target kind is invalid")
+    value = target["value"]
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        _fail("feedback target value must be a string or integer")
+    if not str(value) or len(str(value)) > 256:
+        _fail("feedback target value is out of range")
+    if (
+        "start" in target
+        and target["start"] is not None
+        and not _is_type(target["start"], "integer")
+    ):
+        _fail("feedback target start must be an integer or null")
+
+
+def _validate_feedback(args):
+    legacy_fields = {"op", "key"}
+    versioned_fields = {
+        "v",
+        "id",
+        "op",
+        "target",
+        "action_id",
+        "reason",
+        "trigger",
+    }
+    if "v" not in args:
+        if set(args) != legacy_fields:
+            _fail("legacy feedback requires only op and key")
+        if args["op"] not in ("keep", "forget", "kill"):
+            _fail("feedback operation is invalid")
+        if not _is_type(args["key"], "string") or not args["key"]:
+            _fail("feedback key must be a non-empty string")
+        return
+    if set(args) - versioned_fields:
+        _fail("feedback contains an unknown field")
+    if not _is_type(args.get("v"), "integer") or args["v"] != 1:
+        _fail("versioned feedback requires v=1 and a string id")
+    if (
+        not _is_type(args.get("id"), "string")
+        or not args["id"]
+        or len(args["id"]) > 128
+    ):
+        _fail("versioned feedback requires v=1 and a string id")
+    op = args.get("op")
+    if op not in ("veto", "unveto", "undo", "vetoed"):
+        _fail("feedback operation is invalid")
+    operation_fields = {
+        "veto": {"v", "id", "op", "target", "reason"},
+        "unveto": {"v", "id", "op", "target"},
+        "undo": {"v", "id", "op", "action_id"},
+        "vetoed": {"v", "id", "op", "target", "trigger"},
+    }
+    if set(args) - operation_fields[op]:
+        _fail("feedback contains an unknown field")
+    if op in ("veto", "unveto", "vetoed"):
+        if "target" not in args:
+            _fail("feedback target is required")
+        _validate_target(args["target"])
+    if op == "undo" and (
+        not _is_type(args.get("action_id"), "string") or not args["action_id"]
+    ):
+        _fail("undo requires an action id")
+    for field in ("action_id", "reason", "trigger"):
+        if field in args and not _is_type(args[field], "string"):
+            _fail("feedback %s must be a string" % field)
+    if op == "vetoed" and not _is_type(args.get("trigger"), "string"):
+        _fail("vetoed feedback requires a trigger")
+
+
+def _validate_args(command, args):
+    definition = _COMMANDS.get(command)
+    if definition is None:
+        raise ProtocolError(
+            "unknown_command", "Unknown command.", "Use a supported command."
+        )
+    fields, required = definition
+    if command == "feedback":
+        _validate_feedback(args)
+        return
+    if set(args) - set(fields):
+        _fail("command arguments contain an unknown field")
+    if not set(required) <= set(args):
+        _fail("command arguments are missing a required field")
+    for key, value in args.items():
+        if not _is_type(value, fields[key]):
+            _fail("argument %s has the wrong type" % key)
+    if command in ("register", "attach", "job_done", "kill_done", "ask"):
+        pid = args.get("owner") if command == "register" else args.get("shell_pid")
+        if pid is not None and pid <= 1:
+            _fail("process id must be greater than one")
+    if command == "attach":
+        if not 0 < len(args["pids"]) <= 64 or any(
+            not _is_type(pid, "integer") or pid <= 1 for pid in args["pids"]
+        ):
+            _fail("attach requires one to 64 process ids greater than one")
+        if not args["scope"] or len(args["scope"]) > 256:
+            _fail("attach scope is out of range")
+    if command == "job_done":
+        if (
+            not 0 <= args["status"] <= 255
+            or not args["tag"]
+            or len(args["tag"]) > 128
+            or len(args["word"]) > 32
+        ):
+            _fail("job status or command word is out of range")
+    if command == "kill_done" and args["word"] not in (
+        "kill",
+        "pkill",
+        "killall",
+        "taema",
+    ):
+        _fail("kill command word is invalid")
+    if command == "answer":
+        if not args["nonce"] or len(args["nonce"]) > 64:
+            _fail("answer nonce is invalid")
+        if args["choice"] not in ("stop", "keep", "standalone"):
+            _fail("answer choice is invalid")
+        if "owner" in args and len(args["owner"]) > 256:
+            _fail("answer owner is out of range")
+
+
+def decode_v2(message):
+    """Validate a v2 envelope and return the legacy-shaped command for dispatch."""
+    if not isinstance(message, dict):
+        _fail("request must be an object")
+    if set(message) - {"v", "id", "cmd", "args"}:
+        _fail("request envelope contains an unknown field")
+    if set(message) != {"v", "id", "cmd", "args"}:
+        _fail("request envelope is missing a required field")
+    if message["v"] != 2 or not _is_type(message["v"], "integer"):
+        raise ProtocolError(
+            "unsupported_version", "Unsupported protocol version.", "Use v=2."
+        )
+    identifier = message["id"]
+    if not _is_type(identifier, "integer") or not 0 <= identifier <= MAX_REQUEST_ID:
+        _fail("request id must be a non-negative safe integer")
+    command = message["cmd"]
+    if not _is_type(command, "string"):
+        _fail("command must be a string")
+    args = message["args"]
+    if not isinstance(args, dict):
+        _fail("args must be an object")
+    _validate_args(command, args)
+    return {"cmd": command, **args}
+
+
+def error_reply(identifier, error):
+    return {
+        "v": 2,
+        "id": identifier,
+        "ok": False,
+        "error": {
+            "code": error.code,
+            "message": str(error),
+            "hint": error.hint,
+        },
+    }
+
+
+def reply_v2(identifier, result):
+    if isinstance(result, dict) and "error" in result:
+        message = str(result["error"])
+        if message == "unknown command":
+            code, hint = "unknown_command", "Use a supported command."
+        elif message == "forbidden" or message.endswith("gone or not yours"):
+            code, hint = (
+                "forbidden",
+                "The daemon only serves processes owned by this user.",
+            )
+        elif "nonce" in message:
+            code, hint = "invalid_nonce", "Request a fresh review before answering."
+        elif message == "bad request":
+            code, hint = "invalid_request", "Check the command and its arguments."
+        else:
+            code, hint = "operation_failed", "Inspect current state before retrying."
+        return error_reply(identifier, ProtocolError(code, message, hint))
+    return {"v": 2, "id": identifier, "ok": True, "result": result}

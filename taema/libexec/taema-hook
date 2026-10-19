@@ -17,6 +17,7 @@ ASK_BUDGET = 1.5
 KEY_TIMEOUT = 15.0
 COLS = 80
 KILL_WORDS = ("kill", "pkill", "killall", "taema")
+_request_id = 0
 _CTRL = re.compile("[\x00-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
 
 
@@ -39,6 +40,15 @@ def request(msg, budget, paths=None):
     import json
     import socket
     import time
+    global _request_id
+    _request_id += 1
+    identifier = _request_id
+    envelope = {
+        "v": 2,
+        "id": identifier,
+        "cmd": msg.get("cmd"),
+        "args": {key: value for key, value in msg.items() if key != "cmd"},
+    }
     end = time.monotonic() + budget
     for path in paths or sock_paths():
         left = end - time.monotonic()
@@ -48,7 +58,7 @@ def request(msg, budget, paths=None):
         try:
             s.settimeout(left)
             s.connect(path)
-            s.sendall((json.dumps(msg) + "\n").encode())
+            s.sendall((json.dumps(envelope) + "\n").encode())
             buf = b""
             while not buf.endswith(b"\n"):
                 s.settimeout(max(0.01, end - time.monotonic()))
@@ -56,7 +66,22 @@ def request(msg, budget, paths=None):
                 if not chunk:
                     break
                 buf += chunk
-            return json.loads(buf) if buf else {}
+            reply = json.loads(buf) if buf else {}
+            if isinstance(reply, dict) and reply.get("v") == 2:
+                response_id = reply.get("id")
+                if (
+                    not isinstance(response_id, int)
+                    or isinstance(response_id, bool)
+                    or response_id != identifier
+                ):
+                    return {"error": "response id mismatch"}
+                if reply.get("ok") is True:
+                    return reply.get("result")
+                error = reply.get("error")
+                if isinstance(error, dict):
+                    return {"error": error.get("message", "request failed")}
+                return {"error": "invalid error reply"}
+            return reply
         except (OSError, ValueError):
             continue
         finally:

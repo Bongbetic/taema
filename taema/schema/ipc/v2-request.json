@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taema-ipc-v2-request",
+  "oneOf": [
+    {"$ref": "#/$defs/status"},
+    {"$ref": "#/$defs/review"},
+    {"$ref": "#/$defs/register"},
+    {"$ref": "#/$defs/attach"},
+    {"$ref": "#/$defs/job_done"},
+    {"$ref": "#/$defs/kill_done"},
+    {"$ref": "#/$defs/ask"},
+    {"$ref": "#/$defs/answer"},
+    {"$ref": "#/$defs/gc"},
+    {"$ref": "#/$defs/feedback"}
+  ],
+  "$defs": {
+    "id": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "empty": {"type": "object", "maxProperties": 0, "additionalProperties": false},
+    "target": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"enum": ["scope", "app", "pid"]},
+        "value": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+        "start": {"type": ["integer", "null"]}
+      },
+      "additionalProperties": false
+    },
+    "feedback_args": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["op", "key"],
+          "properties": {
+            "op": {"enum": ["keep", "forget", "kill"]},
+            "key": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "veto"},
+            "target": {"$ref": "#/$defs/target"},
+            "reason": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "unveto"},
+            "target": {"$ref": "#/$defs/target"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "action_id"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "undo"},
+            "action_id": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target", "trigger"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "vetoed"},
+            "target": {"$ref": "#/$defs/target"},
+            "trigger": {"type": "string"}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "status": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "status"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "review"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "register": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "register"}, "args": {"type": "object", "required": ["scope", "owner"], "properties": {"scope": {"type": "string", "minLength": 1}, "owner": {"type": "integer", "minimum": 2}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "attach": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "attach"}, "args": {"type": "object", "required": ["scope", "pids"], "properties": {"scope": {"type": "string", "minLength": 1}, "pids": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "integer", "minimum": 2}}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "job_done": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "job_done"}, "args": {"type": "object", "required": ["shell_pid", "tag", "status", "word"], "properties": {"shell_pid": {"type": "integer", "minimum": 2}, "tag": {"type": "string", "minLength": 1, "maxLength": 128}, "status": {"type": "integer", "minimum": 0, "maximum": 255}, "word": {"type": "string", "maxLength": 32}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "kill_done": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "kill_done"}, "args": {"type": "object", "required": ["shell_pid", "word"], "properties": {"shell_pid": {"type": "integer", "minimum": 2}, "word": {"enum": ["kill", "pkill", "killall", "taema"]}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "ask": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "ask"}, "args": {"type": "object", "required": ["shell_pid"], "properties": {"shell_pid": {"type": "integer", "minimum": 2}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "answer": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "answer"}, "args": {"type": "object", "required": ["nonce", "choice"], "properties": {"nonce": {"type": "string", "minLength": 1, "maxLength": 64}, "choice": {"enum": ["stop", "keep", "standalone"]}, "owner": {"type": "string"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "gc": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "gc"}, "args": {"type": "object", "properties": {"dry_run": {"type": "boolean"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "feedback": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "feedback"}, "args": {"$ref": "#/$defs/feedback_args"}},
+      "additionalProperties": false
+    }
+  }
+}

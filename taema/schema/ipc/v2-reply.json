@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taema-ipc-v2-reply",
+  "oneOf": [
+    {"$ref": "#/$defs/success"},
+    {"$ref": "#/$defs/failure"}
+  ],
+  "$defs": {
+    "id": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "hint"],
+      "properties": {
+        "code": {"enum": ["invalid_request", "unsupported_version", "unknown_command", "forbidden", "invalid_nonce", "operation_failed"]},
+        "message": {"type": "string"},
+        "hint": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "success": {
+      "type": "object",
+      "required": ["v", "id", "ok", "result"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "ok": {"const": true}, "result": {"type": "object"}},
+      "additionalProperties": false
+    },
+    "failure": {
+      "type": "object",
+      "required": ["v", "id", "ok", "error"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "ok": {"const": false}, "error": {"$ref": "#/$defs/error"}},
+      "additionalProperties": false
+    }
+  }
+}

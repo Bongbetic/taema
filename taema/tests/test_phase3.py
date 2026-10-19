@@ -42,6 +42,7 @@ class FakeDaemon:
         self.path = os.path.join(self.dir, "t.sock")
         self.replies = replies or (lambda m: {"ok": True})
         self.got = []
+        self.envelopes = []
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(self.path)
         self.srv.listen(8)
@@ -65,8 +66,21 @@ class FakeDaemon:
                     m = json.loads(buf)
                 except ValueError:
                     continue
-                self.got.append(m)
-                c.sendall((json.dumps(self.replies(m)) + "\n").encode())
+                if isinstance(m, dict) and m.get("v") == 2:
+                    self.envelopes.append(m)
+                    body = {"cmd": m.get("cmd"), **m.get("args", {})}
+                else:
+                    body = m
+                self.got.append(body)
+                result = self.replies(body)
+                if isinstance(m, dict) and m.get("v") == 2:
+                    result = {
+                        "v": 2,
+                        "id": m.get("id"),
+                        "ok": True,
+                        "result": result,
+                    }
+                c.sendall((json.dumps(result) + "\n").encode())
 
     def close(self):
         self.srv.close()
@@ -143,6 +157,10 @@ class HookSend(unittest.TestCase):
     def test_done(self):
         r = run_hook("done", "20", "20.3", "1", "npm", sock=self.d.path)
         self.assertEqual((r.returncode, r.stdout, r.stderr), (0, b"", b""))
+        self.assertEqual(self.d.envelopes[0]["v"], 2)
+        self.assertEqual(self.d.envelopes[0]["id"], 1)
+        self.assertEqual(self.d.envelopes[0]["cmd"], "job_done")
+        self.assertEqual(self.d.envelopes[0]["args"]["shell_pid"], 20)
         self.assertEqual(
             self.d.got,
             [

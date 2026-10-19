@@ -151,20 +151,22 @@ class Daemon:
         """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
         f = facts or authorization.Facts()
-        if f.scope and not f.vetoed:
+        if f.scope:
             path = (
                 f.scope
                 if os.path.isabs(f.scope)
                 else os.path.join(cgroup.base(), f.scope)
             )
-            veto = engine.veto_for_scope(self.store, path)
-            if veto:
+            veto = engine.veto_for_scope(self.store, path) if not f.vetoed else None
+            held = self.store.hold_reason(f.scope) if not f.held else ""
+            if veto or held:
                 f = authorization.Facts(
                     scope=f.scope,
                     leftover=f.leftover,
                     shared=f.shared,
                     unit_survive_logout=f.unit_survive_logout,
-                    vetoed=self.store.describe_veto(veto),
+                    vetoed=f.vetoed or (self.store.describe_veto(veto) if veto else ""),
+                    held=f.held or held,
                 )
         dec = authorization.authorize(trigger, self.mode, f)
         if dec.slot == authorization.VETO:
@@ -1667,6 +1669,8 @@ class Daemon:
                 "reviews": self.store.review_count,
                 "recovery": self.store.recovery,
                 "latest_decision": self.store.latest_decision(),
+                "feedback_invalid": self.store.data.get("feedback_invalid", 0),
+                "hold": self.store.hold_reason(),
                 "auto": self.auto_status(),
             }
         if c == "review":
@@ -1709,8 +1713,10 @@ class Daemon:
                 self.store.save_if_dirty()
             return {"candidates": candidates}
         if c == "feedback":
-            if msg.get("v") == 1:
-                result = self.store.apply_feedback_command(msg)
+            if msg.get("v") in (1, 2):
+                result = self.store.apply_feedback_command(
+                    {key: value for key, value in msg.items() if key != "cmd"}
+                )
                 if result is None:
                     return {"error": "bad request"}
                 if not result.get("duplicate"):

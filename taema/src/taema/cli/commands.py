@@ -95,19 +95,14 @@ def ask(cfg, msg, timeout=3.0):
 
 
 def feedback(cfg, store, op, key):
-    """Send an explicit answer to the daemon (single writer); append to feedback.jsonl when it is down."""
-    reply = ask(cfg, {"cmd": "feedback", "op": op, "key": key})
-    if reply and reply.get("ok"):
-        return "daemon"
-    fd = os.open(store.feedback_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a") as f:
-        f.write(json.dumps({"op": op, "key": key}) + "\n")
-    return "queued"
+    """Send feedback to the daemon or queue a uniquely identified v2 operation."""
+    how, reply = feedback_action(cfg, store, op, key=key)
+    return how if reply and reply.get("ok") else "refused"
 
 
 def feedback_action(cfg, store, op, **fields):
     """Send a versioned policy action to the daemon or append it for offline replay."""
-    msg = {"v": 1, "id": uuid.uuid4().hex, "op": op, **fields}
+    msg = {"v": 2, "id": uuid.uuid4().hex, "op": op, **fields}
     reply = ask(cfg, {"cmd": "feedback", **msg})
     if reply is not None:
         return "daemon", reply
@@ -298,15 +293,18 @@ def cmd_kill(a):
     if not path:
         return die("no scope %s" % a.name)
     veto = engine.veto_for_scope(store, path)
+    scope = cgroup.rel(path)
     facts = authorization.Facts(
-        scope=cgroup.rel(path), vetoed=veto_label(veto) if veto else ""
+        scope=scope,
+        vetoed=veto_label(veto) if veto else "",
+        held=store.hold_reason(scope),
     )
     dec = authorization.authorize(authorization.MANUAL_STOP, cfg["mode"], facts)
     if dec.verdict != authorization.ACT:
         with store.decision_context(
             "refusal",
             scope=cgroup.rel(path),
-            authority="veto" if dec.slot == authorization.VETO else dec.slot,
+            authority=("veto" if dec.slot == authorization.VETO else dec.slot),
             mode=cfg["mode"],
             why=dec.reason,
         ):
@@ -323,7 +321,7 @@ def cmd_kill(a):
                     trigger=authorization.MANUAL_STOP,
                     scope=cgroup.rel(path),
                 )
-        if dec.slot == authorization.VETO:
+        if dec.slot in (authorization.VETO, authorization.HOLD):
             return die(dec.reason, 4)
         return die("kill not allowed: %s" % dec.reason)
     leaf_name = os.path.basename(path)
@@ -618,7 +616,17 @@ def cmd_status(a):
             "daemon: not running (config mode=%s, from %s)"
             % (cfg["mode"], ", ".join(cfg["_sources"]) or "built-in defaults")
         )
+        invalid = int(store.data.get("feedback_invalid", 0))
+        print("feedback_invalid: %d" % (invalid + store.pending_feedback_invalid()))
+        hold = store.hold_reason()
+        if hold:
+            print("hold: %s" % hold)
         return 1
+    reply["feedback_invalid"] = (
+        int(reply.get("feedback_invalid", store.data.get("feedback_invalid", 0)))
+        + store.pending_feedback_invalid()
+    )
+    reply["hold"] = store.hold_reason()
     reply["config"] = cfg["_sources"]
     pairs = reply.pop("pairs", [])
     auto = reply.pop("auto", None)

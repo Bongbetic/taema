@@ -82,6 +82,99 @@
             "trigger": {"type": "string"}
           },
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "key"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"enum": ["keep", "forget", "kill"]},
+            "key": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "veto"},
+            "target": {"$ref": "#/$defs/target"},
+            "reason": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "unveto"},
+            "target": {"$ref": "#/$defs/target"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "action_id"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "undo"},
+            "action_id": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "owner", "leftovers", "choice"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"enum": ["answer", "teach"]},
+            "owner": {"type": "string", "minLength": 1, "maxLength": 256},
+            "leftovers": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+            "choice": {"enum": ["stop", "keep", "standalone"]}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "app", "muted"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "mute"},
+            "app": {"type": "string", "minLength": 1, "maxLength": 256},
+            "muted": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "held"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "hold"},
+            "scope": {"type": "string", "minLength": 1, "maxLength": 256},
+            "held": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "until"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "snooze"},
+            "until": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
         }
       ]
     },

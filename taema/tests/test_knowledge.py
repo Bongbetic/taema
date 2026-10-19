@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -145,6 +146,87 @@ class KnowledgeTests(unittest.TestCase):
             "firefox",
         )
         self.assertEqual(self.s.data["feedback_ids"], ["op-1"])
+
+    def test_v2_feedback_replay_is_idempotent_and_counts_invalid_lines(self):
+        op = {"v": 2, "id": "keep-1", "op": "keep", "key": "adb"}
+        with open(self.s.feedback_path, "w") as queue:
+            queue.write(json.dumps(op) + "\n")
+            queue.write(json.dumps(op) + "\n")
+            queue.write('{"v":2,"id":"partial","op":"keep"')
+
+        self.assertEqual(self.s.pending_feedback_invalid(), 1)
+        self.assertEqual(self.s.apply_feedback(), 1)
+        self.assertEqual(self.s.peek("adb")["user_keep"], 3.0)
+        self.assertEqual(self.s.data["feedback_invalid"], 1)
+        self.assertFalse(os.path.exists(self.s.feedback_path + ".replay"))
+        self.assertFalse(os.path.exists(self.s.feedback_path))
+
+        reopened = Store(self.d, self.seeds, self.clock)
+        with open(reopened.feedback_path, "w") as queue:
+            queue.write(json.dumps(op) + "\n")
+        self.assertEqual(reopened.apply_feedback(), 0)
+        self.assertEqual(reopened.peek("adb")["user_keep"], 3.0)
+
+    def test_feedback_replay_survives_commit_before_queue_removal(self):
+        op = {"v": 2, "id": "kill-1", "op": "kill", "key": "vite"}
+        with open(self.s.feedback_path, "w") as queue:
+            queue.write(json.dumps(op) + "\n")
+        replay = self.s.feedback_path + ".replay"
+        unlink = knowledge.os.unlink
+
+        def fail_replay_removal(path):
+            if path == replay:
+                raise OSError("simulated crash window")
+            return unlink(path)
+
+        with mock.patch.object(knowledge.os, "unlink", side_effect=fail_replay_removal):
+            self.assertEqual(self.s.apply_feedback(), 1)
+        self.assertTrue(os.path.exists(replay))
+        self.assertEqual(self.s.peek("vite")["user_kill"], 1.0)
+
+        recovered = Store(self.d, self.seeds, self.clock)
+        self.assertEqual(recovered.apply_feedback(), 0)
+        self.assertEqual(recovered.peek("vite")["user_kill"], 1.0)
+        self.assertFalse(os.path.exists(replay))
+
+    def test_v2_feedback_dispatches_pair_and_control_operations(self):
+        operations = [
+            {
+                "v": 2,
+                "id": "answer-1",
+                "op": "answer",
+                "owner": "npm",
+                "leftovers": ["vite"],
+                "choice": "keep",
+            },
+            {
+                "v": 2,
+                "id": "teach-1",
+                "op": "teach",
+                "owner": "npm",
+                "leftovers": ["webpack"],
+                "choice": "stop",
+            },
+            {"v": 2, "id": "mute-1", "op": "mute", "app": "firefox", "muted": True},
+            {"v": 2, "id": "hold-1", "op": "hold", "scope": "scope-x", "held": True},
+            {"v": 2, "id": "hold-2", "op": "hold", "held": True},
+            {"v": 2, "id": "hold-3", "op": "hold", "held": False},
+            {
+                "v": 2,
+                "id": "snooze-1",
+                "op": "snooze",
+                "until": self.clock.t + 60,
+            },
+        ]
+        for operation in operations:
+            self.assertTrue(self.s.apply_feedback_command(operation)["ok"])
+
+        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "keep")
+        self.assertEqual(self.s.pair_decision("npm", "webpack")[0], "stop")
+        self.assertEqual(self.s.data["muted_apps"], ["firefox"])
+        self.assertEqual(self.s.hold_reason("scope-x"), "snoozed")
+        self.assertTrue(self.s.review_holds_scope("scope-x"))
+        self.assertTrue(self.s.data["held_scopes"] == ["scope-x"])
 
     def test_undo_vetoes_the_stopped_app_and_keeps_its_pair(self):
         action = self.s.record_auto_action(

@@ -11,7 +11,7 @@ The ladder evaluates five slots, in spec order (``SLOTS``):
    carries hard-safety facts in 0.2.1 (engine.stop/plan_stop still revalidate at actuation), so
    the slot passes through.
 2. ``veto`` -- a user-created veto blocks matching stop targets in every mode.
-3. ``hold`` -- no hold/snooze exists yet; later M0 tickets plug it in here.
+3. ``hold`` -- a global hold, scope hold, or active snooze blocks stop actions.
 4. ``mode_capability`` -- per-trigger, per-mode **table** (``_CAPABILITY``, with two fact rules for
    the auto-mode special cases). This is the one table the M0 tickets edit instead of scattered
    call sites: e.g. issue #11 flips ``OWNER_EXIT``'s ``adopt`` cell from ``would`` to ``act``.
@@ -136,6 +136,7 @@ class Facts:
     shared: bool = False
     unit_survive_logout: bool = False
     vetoed: str = ""
+    held: str = ""
 
 
 @dataclass(frozen=True)
@@ -362,8 +363,13 @@ def _veto(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
     return "pass", ""
 
 
-def _hold(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
-    """Slot 3: holds and timed snoozes. None exist in 0.2.1; later M0 tickets plug in here."""
+def _hold(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
+    """Slot 3: a global or target hold and a timed snooze deny stop actions."""
+    if (
+        trigger in (OWNER_EXIT, JOB_SURVIVORS, GC_STOP, SESSION_END, MANUAL_STOP)
+        and facts.held
+    ):
+        return "deny", "held: " + facts.held
     return "pass", ""
 
 

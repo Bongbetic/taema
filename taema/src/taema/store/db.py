@@ -1403,13 +1403,36 @@ class StateDB:
             return
         now = time.time() if now is None else now
         self._secure_dir()
+        optional_meta_defaults = {
+            "feedback_invalid": 0,
+            "feedback_last_replay": "",
+            "held": False,
+            "held_scopes": [],
+            "snooze_until": 0.0,
+            "muted_apps": [],
+        }
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                for key in ("version", "created", "last_decay", "closes", "review_seq"):
+                for key in (
+                    "version",
+                    "created",
+                    "last_decay",
+                    "closes",
+                    "review_seq",
+                    "feedback_invalid",
+                    "feedback_last_replay",
+                    "held",
+                    "held_scopes",
+                    "snooze_until",
+                    "muted_apps",
+                ):
+                    value = data.get(key, optional_meta_defaults.get(key))
+                    if key not in optional_meta_defaults:
+                        value = data[key]
                     connection.execute(
                         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                        (key, _dump(data[key])),
+                        (key, _dump(value)),
                     )
                 if decision_seq is not None:
                     connection.execute(

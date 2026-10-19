@@ -184,6 +184,16 @@ class IpcV2Tests(unittest.TestCase):
                     "target": {"kind": "app", "value": "schema-app", "start": None},
                 },
             ),
+            (
+                "feedback",
+                {
+                    "v": 2,
+                    "id": "ipc-v2-hold",
+                    "op": "hold",
+                    "scope": "scope-ipc",
+                    "held": True,
+                },
+            ),
         ]
         for identifier, (command, args) in enumerate(requests, start=1):
             envelope = self.request(identifier, command, args)
@@ -310,6 +320,29 @@ class IpcV2Tests(unittest.TestCase):
                     "op": "veto",
                     "target": {"kind": "app", "value": "x"},
                     "trigger": "bad",
+                },
+            },
+            {
+                "v": 2,
+                "id": 1,
+                "cmd": "feedback",
+                "args": {"v": 2, "id": "x", "op": "mode", "value": "auto"},
+            },
+            {
+                "v": 2,
+                "id": 1,
+                "cmd": "feedback",
+                "args": {"v": 2, "id": "x", "op": "snooze", "until": float("nan")},
+            },
+            {
+                "v": 2,
+                "id": 1,
+                "cmd": "feedback",
+                "args": {
+                    "v": 1,
+                    "id": "x",
+                    "op": "vetoed",
+                    "target": {"kind": "app", "value": "x"},
                 },
             },
         ]

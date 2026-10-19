@@ -119,6 +119,35 @@ class VetoCommands(unittest.TestCase):
         self.assertEqual(rc, 4)
         self.assertIn("vetoed", err.getvalue())
 
+    def test_kill_refuses_a_pending_offline_hold_with_exit_four(self):
+        s = knowledge.Store(tmp(), {})
+        with FakeCg() as cg:
+            cgroup_scope = "scope-x"
+            cg.leaf(cgroup_scope)
+            cfg = make_cfg(s.dir, mode="enforce")
+            with open(s.feedback_path, "w") as queue:
+                queue.write(
+                    json.dumps(
+                        {
+                            "v": 2,
+                            "id": "hold-scope-x",
+                            "op": "hold",
+                            "scope": cgroup_scope,
+                            "held": True,
+                        }
+                    )
+                    + "\n"
+                )
+            out, err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, s, [])),
+                redirect_stdout(out),
+                redirect_stderr(err),
+            ):
+                rc = cli.main(["kill", cgroup_scope])
+        self.assertEqual(rc, 4)
+        self.assertIn("held", err.getvalue())
+
     def test_daemon_accepts_versioned_veto_action_once(self):
         d = daemon.Daemon(make_cfg(tmp(), mode="auto"))
         msg = {

@@ -1,5 +1,6 @@
 """Mode and lifecycle tests: app-root adoption, pair authority, auto stops, leftover leaves, logout,
 the attach socket command and status. Fake /proc and cgroup trees; no real signal is ever sent."""
+
 import argparse
 import io
 import json
@@ -29,6 +30,7 @@ def mi(**kw):
 
 # ---- 1. authority: auto_stop_ok ---------------------------------------------------------------
 
+
 class Authority(unittest.TestCase):
     def silent_store(self, age_days=10):
         """Store with silent stop evidence for npm>vite: 8 kills on 4 days, first seen 2 days ago."""
@@ -49,7 +51,9 @@ class Authority(unittest.TestCase):
 
     def test_ask_keep_standalone_never_act(self):
         s = store()
-        self.assertFalse(engine.auto_stop_ok(s, "npm", "vite", mi())[0])         # no evidence: ask
+        self.assertFalse(
+            engine.auto_stop_ok(s, "npm", "vite", mi())[0]
+        )  # no evidence: ask
         s.answer("npm", "vite", "keep")
         self.assertFalse(engine.auto_stop_ok(s, "npm", "vite", mi())[0])
         s.answer("npm", "tool", "standalone")
@@ -61,7 +65,9 @@ class Authority(unittest.TestCase):
         self.assertEqual(s.pair_decision("npm", "vite")[0], "stop")
         self.assertTrue(engine.auto_stop_ok(s, "npm", "vite", mi())[0])
         self.assertFalse(s.pair_explicit("npm", "vite"))
-        young = self.silent_store(age_days=1)           # store younger than 7 days and < 20 closes
+        young = self.silent_store(
+            age_days=1
+        )  # store younger than 7 days and < 20 closes
         self.assertEqual(young.pair_decision("npm", "vite")[0], "ask")
         self.assertFalse(engine.auto_stop_ok(young, "npm", "vite", mi())[0])
         few = store()
@@ -74,17 +80,17 @@ class Authority(unittest.TestCase):
             s.answer("npm", k, "stop")
         ok = lambda k="vite", **kw: engine.auto_stop_ok(s, "npm", k, mi(**kw))
         self.assertTrue(ok()[0])
-        self.assertFalse(ok(cpu=5.0)[0])                # busier than 1 %
-        self.assertFalse(ok(cpu=None)[0])               # unknown keeps
+        self.assertFalse(ok(cpu=5.0)[0])  # busier than 1 %
+        self.assertFalse(ok(cpu=None)[0])  # unknown keeps
         self.assertFalse(ok(edges=[{"kind": "unix_server"}])[0])
         self.assertFalse(ok(edges=None)[0])
         self.assertFalse(ok(protected="protected comm niri")[0])
         self.assertFalse(ok(ptmx=True)[0])
         self.assertFalse(ok(origin="")[0])
-        self.assertFalse(ok("tmux")[0])                 # persist seed, even answered stop
-        self.assertTrue(ok("adb")[0])                   # share seed alone may stop ...
+        self.assertFalse(ok("tmux")[0])  # persist seed, even answered stop
+        self.assertTrue(ok("adb")[0])  # share seed alone may stop ...
         s.apply_op("keep", "adb")
-        self.assertFalse(ok("adb")[0])                  # ... not once the user keeps it
+        self.assertFalse(ok("adb")[0])  # ... not once the user keeps it
 
     def test_regret_suspends_the_pair(self):
         s = store()
@@ -93,18 +99,23 @@ class Authority(unittest.TestCase):
         self.assertTrue(s.regret("npm", "vite"))
         self.assertEqual(s.pair_decision("npm", "vite")[0], "ask")
         self.assertFalse(engine.auto_stop_ok(s, "npm", "vite", mi())[0])
-        self.assertFalse(s.regret("npm", "vite"))       # only once per auto stop
+        self.assertFalse(s.regret("npm", "vite"))  # only once per auto stop
 
     def test_invalid_owner_pair_never_authorizes_a_stop(self):
         """The reference machine's explicit MainThread > sh/sort/head answer stays inert."""
         s = store()
         for k in ("sh", "sort", "head"):
             s.data["pairs"][s.pkey("MainThread", k)] = {
-                "first_seen": 1000.0, "ex_stop": knowledge.W_ANSWER, "ex_last": "stop"}
+                "first_seen": 1000.0,
+                "ex_stop": knowledge.W_ANSWER,
+                "ex_last": "stop",
+            }
             self.assertEqual(s.pair_decision("MainThread", k)[0], "invalid")
             self.assertFalse(s.pair_explicit("MainThread", k))
             self.assertFalse(engine.auto_stop_ok(s, "MainThread", k, mi())[0])
-            self.assertFalse(engine.auto_stop_ok(s, "MainThread", k, dict(mi(cpu=None)))[0])
+            self.assertFalse(
+                engine.auto_stop_ok(s, "MainThread", k, dict(mi(cpu=None)))[0]
+            )
 
     def test_grace_bounds(self):
         s = store()
@@ -119,24 +130,45 @@ class Authority(unittest.TestCase):
 
 # ---- 2. engine.stop allow_sigkill -------------------------------------------------------------
 
+
 class SigkillRule(unittest.TestCase):
     def run_stop(self, allow):
         sent = []
-        plan = [{"pid": 5, "comm": "x", "key": "x", "edges": [], "action": "kill", "why": "t"}]
-        with mock.patch.object(engine, "plan_stop", return_value=plan), \
-             mock.patch.object(engine, "self_guard"), \
-             mock.patch.object(engine.inspect.ProcTable, "scan", return_value=inspect.ProcTable()), \
-             mock.patch.object(engine, "_signal_all", side_effect=lambda p, pids, sig, cfg: sent.append(sig) or []), \
-             mock.patch.object(engine, "_wait_each", return_value={}), \
-             mock.patch.object(engine.cgroup, "rmdir_tree", side_effect=OSError("busy")), \
-             mock.patch.object(engine.cgroup, "tree_procs", return_value=[5]):
-            rep = engine.stop("/x/user/1/y", {"timers": {}}, store(), timeout=1, allow_sigkill=allow)
+        plan = [
+            {
+                "pid": 5,
+                "comm": "x",
+                "key": "x",
+                "edges": [],
+                "action": "kill",
+                "why": "t",
+            }
+        ]
+        with (
+            mock.patch.object(engine, "plan_stop", return_value=plan),
+            mock.patch.object(engine, "self_guard"),
+            mock.patch.object(
+                engine.inspect.ProcTable, "scan", return_value=inspect.ProcTable()
+            ),
+            mock.patch.object(
+                engine,
+                "_signal_all",
+                side_effect=lambda p, pids, sig, cfg: sent.append(sig) or [],
+            ),
+            mock.patch.object(engine, "_wait_each", return_value={}),
+            mock.patch.object(engine.cgroup, "rmdir_tree", side_effect=OSError("busy")),
+            mock.patch.object(engine.cgroup, "tree_procs", return_value=[5]),
+        ):
+            rep = engine.stop(
+                "/x/user/1/y", {"timers": {}}, store(), timeout=1, allow_sigkill=allow
+            )
         return sent, rep
 
     def test_sigkill_only_when_allowed(self):
         import signal
+
         sent, rep = self.run_stop(False)
-        self.assertEqual(sent, [signal.SIGTERM])        # one pass, no SIGKILL
+        self.assertEqual(sent, [signal.SIGTERM])  # one pass, no SIGKILL
         self.assertEqual(rep["unkilled"], [5])
         sent, _ = self.run_stop(True)
         self.assertIn(signal.SIGKILL, sent)
@@ -144,12 +176,14 @@ class SigkillRule(unittest.TestCase):
     def test_vetoed_app_is_kept_before_any_stop_signal(self):
         s = store()
         s.add_veto("app", "firefox")
-        with mock.patch.object(engine, "self_guard"), \
-             mock.patch.object(engine.cgroup, "tree_procs", return_value=[42]), \
-             mock.patch.object(engine.inspect, "starttime", return_value=1234), \
-             mock.patch.object(engine.policy, "app_key", return_value="firefox"), \
-             mock.patch.object(engine.policy, "exe_key", return_value="firefox"), \
-             mock.patch.object(engine, "_signal_all") as signal_all:
+        with (
+            mock.patch.object(engine, "self_guard"),
+            mock.patch.object(engine.cgroup, "tree_procs", return_value=[42]),
+            mock.patch.object(engine.inspect, "starttime", return_value=1234),
+            mock.patch.object(engine.policy, "app_key", return_value="firefox"),
+            mock.patch.object(engine.policy, "exe_key", return_value="firefox"),
+            mock.patch.object(engine, "_signal_all") as signal_all,
+        ):
             with self.assertRaises(engine.Vetoed):
                 engine.stop("/x/user/1/app-firefox", {"timers": {}}, s)
         signal_all.assert_not_called()
@@ -160,6 +194,7 @@ class SigkillRule(unittest.TestCase):
 
 # ---- 3. auto adoption of app roots ------------------------------------------------------------
 
+
 class AutoAdopt(ProcCase):
     def setUp(self):
         super().setUp()
@@ -168,9 +203,13 @@ class AutoAdopt(ProcCase):
         self.addCleanup(self.cg.__exit__)
         self.session = self.cg.root + "/2"
         os.makedirs(self.session)
-        self.cfg = make_cfg(tmp(), mode="auto", protected={"comm": ["niri*", "niriapp"]})
+        self.cfg = make_cfg(
+            tmp(), mode="auto", protected={"comm": ["niri*", "niriapp"]}
+        )
         self.cfg["paths"]["session_cgroup"] = self.session
-        self.fp.add(100, 1, comm="niri", sid=100, born=100.0)       # compositor: session leader, protected
+        self.fp.add(
+            100, 1, comm="niri", sid=100, born=100.0
+        )  # compositor: session leader, protected
         self.pids = []
         self.lin = Lineage(self.cfg)
 
@@ -183,7 +222,9 @@ class AutoAdopt(ProcCase):
         with open(self.session + "/cgroup.procs", "w") as f:
             f.write("".join("%d\n" % p for p in self.pids))
         lin.observe(self.fp.table(), now=self.fp.up, uptime=self.fp.up)
-        return engine.auto_adopt_plan(self.cfg, list(units), self.fp.table(), lin, store(), cap=cap)
+        return engine.auto_adopt_plan(
+            self.cfg, list(units), self.fp.table(), lin, store(), cap=cap
+        )
 
     def test_root_and_descendants_get_one_scope(self):
         self.add(200, comm="firefox")
@@ -193,18 +234,20 @@ class AutoAdopt(ProcCase):
         self.assertRegex(ops[0]["scope"], r"^app-firefox-[0-9a-f]{6}$")
         self.assertEqual(ops[0]["pids"], [200, 201])
         self.assertTrue(cgroup.valid_rel(ops[0]["scope"]))
-        self.assertEqual(ops[0]["scope"], self.plan()[0]["scope"])      # stable across passes
+        self.assertEqual(
+            ops[0]["scope"], self.plan()[0]["scope"]
+        )  # stable across passes
 
     def test_skips(self):
-        self.add(210, comm="leader", sid=210)                           # session leader
-        self.add(220, comm="niriapp")                                   # protected
-        self.add(230, comm="young", born=self.fp.up - 2)                # younger than 5 s
-        self.add(240, comm="host", fds=("/dev/ptmx",))                  # pty host
-        self.add(250, comm="viewer", tty=34816)                         # on a tty: a terminal job
+        self.add(210, comm="leader", sid=210)  # session leader
+        self.add(220, comm="niriapp")  # protected
+        self.add(230, comm="young", born=self.fp.up - 2)  # younger than 5 s
+        self.add(240, comm="host", fds=("/dev/ptmx",))  # pty host
+        self.add(250, comm="viewer", tty=34816)  # on a tty: a terminal job
         self.fp.add(260, 1, comm="bash", sid=260, tty=34816, born=1000.0)
         self.pids.append(260)
-        self.add(261, 260, comm="server")                               # child of an interactive shell
-        self.add(270, comm="tagged", env={"TAEMA_JOB": "260.1"})        # carries a job tag
+        self.add(261, 260, comm="server")  # child of an interactive shell
+        self.add(270, comm="tagged", env={"TAEMA_JOB": "260.1"})  # carries a job tag
         self.add(280, comm="okapp")
         ops = self.plan()
         self.assertEqual([o["scope"].split("-")[1] for o in ops], ["okapp"])
@@ -217,7 +260,10 @@ class AutoAdopt(ProcCase):
 
     def test_explicit_unit_wins(self):
         self.add(200, comm="firefox", exe="/usr/lib/firefox/firefox")
-        unit = {"unit": {"name": "ff", "kind": "app"}, "match": {"exe": "/usr/lib/firefox/firefox"}}
+        unit = {
+            "unit": {"name": "ff", "kind": "app"},
+            "match": {"exe": "/usr/lib/firefox/firefox"},
+        }
         self.assertEqual(self.plan(units=[unit]), [])
         self.assertEqual(len(self.plan()), 1)
 
@@ -235,8 +281,10 @@ class AutoAdopt(ProcCase):
         with open(self.session + "/cgroup.procs", "w") as f:
             f.write("200\n201\n")
         d.lineage.observe(pt, now=self.fp.up, uptime=self.fp.up)
-        with mock.patch.object(engine, "helper_move") as hm, \
-             mock.patch.object(cgroup, "proc_cgroup", return_value="/2"):
+        with (
+            mock.patch.object(engine, "helper_move") as hm,
+            mock.patch.object(cgroup, "proc_cgroup", return_value="/2"),
+        ):
             d.auto_adopt(pt)
         self.assertEqual(hm.call_args[0][2], [200, 201])
         self.assertEqual(len(d.auto_scopes), 1)
@@ -251,8 +299,10 @@ class AutoAdopt(ProcCase):
             cfg = make_cfg(tmp(), mode=mode, protected={"comm": ["niri*"]})
             cfg["paths"]["session_cgroup"] = self.session
             d = daemon.Daemon(cfg)
-            with mock.patch.object(engine, "helper_move"), \
-                 mock.patch.object(cgroup, "proc_cgroup", return_value="/2"):
+            with (
+                mock.patch.object(engine, "helper_move"),
+                mock.patch.object(cgroup, "proc_cgroup", return_value="/2"),
+            ):
                 d.adopt_pass()
             self.assertEqual(d.auto_status()["auto_adopted_scopes"], 1, mode)
 
@@ -264,16 +314,24 @@ class AutoAdopt(ProcCase):
         with open(self.session + "/cgroup.procs", "w") as f:
             f.write("200\n201\n300\n")
         d = daemon.Daemon(self.cfg)
-        d.units = [{"unit": {"name": "known-app", "kind": "app"}, "match": {"comm": "unitapp"}}]
-        with mock.patch.object(engine, "helper_move") as hm, \
-             mock.patch.object(cgroup, "move") as mv:
+        d.units = [
+            {"unit": {"name": "known-app", "kind": "app"}, "match": {"comm": "unitapp"}}
+        ]
+        with (
+            mock.patch.object(engine, "helper_move") as hm,
+            mock.patch.object(cgroup, "move") as mv,
+        ):
             d.adopt_pass()
             d.adopt_pass()
         hm.assert_not_called()
         mv.assert_not_called()
         self.assertEqual(d.auto_scopes, set())
-        self.assertFalse(any(os.path.basename(path).startswith("app-")
-                             for path in os.listdir(self.cg.base)))
+        self.assertFalse(
+            any(
+                os.path.basename(path).startswith("app-")
+                for path in os.listdir(self.cg.base)
+            )
+        )
         events = []
         if os.path.exists(d.store.log_path):
             with open(d.store.log_path) as f:
@@ -283,6 +341,7 @@ class AutoAdopt(ProcCase):
 
 # ---- 4. job survivors, GUI closes, regret, standalone -----------------------------------------
 
+
 class AutoCase(ProcCase):
     def setUp(self):
         super().setUp()
@@ -291,17 +350,36 @@ class AutoCase(ProcCase):
         self.addCleanup(self.cg.__exit__)
         self.rt = tmp()
         self.cgmap, self.edges = {}, {}
-        for p in (mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.rt}),
-                  mock.patch.object(cgroup, "proc_cgroup",
-                                    side_effect=lambda p: self.cgmap.get(p, "/user/%d/app-host" % UID)),
-                  mock.patch.object(inspect, "Snapshot", return_value=types.SimpleNamespace(ok=True)),
-                  mock.patch.object(inspect, "edges", side_effect=lambda m, s=None, pids_info=None: self.edges)):
+        for p in (
+            mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.rt}),
+            mock.patch.object(
+                cgroup,
+                "proc_cgroup",
+                side_effect=lambda p: self.cgmap.get(p, "/user/%d/app-host" % UID),
+            ),
+            mock.patch.object(
+                inspect, "Snapshot", return_value=types.SimpleNamespace(ok=True)
+            ),
+            mock.patch.object(
+                inspect,
+                "edges",
+                side_effect=lambda m, s=None, pids_info=None: self.edges,
+            ),
+        ):
             p.start()
             self.addCleanup(p.stop)
-        self.d = daemon.Daemon(make_cfg(tmp(), mode="auto", seeds={"persist": ["gpg-agent"]},
-                                        protected={"comm": ["niri*"]}))
+        self.d = daemon.Daemon(
+            make_cfg(
+                tmp(),
+                mode="auto",
+                seeds={"persist": ["gpg-agent"]},
+                protected={"comm": ["niri*"]},
+            )
+        )
         self.fp.add(20, 1, comm="bash", sid=20, tty=34816, born=1000.0)
-        stop = mock.patch.object(engine, "stop", return_value={"removed": True, "decisions": [], "left": []})
+        stop = mock.patch.object(
+            engine, "stop", return_value={"removed": True, "decisions": [], "left": []}
+        )
         self.stopm = stop.start()
         self.addCleanup(stop.stop)
 
@@ -327,14 +405,29 @@ class JobSurvivors(AutoCase):
 
     def again(self, cpu_idle=True):
         """job_done + settle for the current tag."""
-        self.d.handle({"cmd": "job_done", "shell_pid": 20, "tag": "20.1", "status": 0, "word": "npm"})
+        self.d.handle(
+            {
+                "cmd": "job_done",
+                "shell_pid": 20,
+                "tag": "20.1",
+                "status": 0,
+                "word": "npm",
+            }
+        )
         self.d.deadlines.clear()
         if cpu_idle:
             self.idle(30)
         self.d.decide_job("20.1")
 
     def prime(self):
-        self.fp.add(21, 20, comm="npm", env={"TAEMA_JOB": "20.1"}, born=self.fp.up - 6.0, pgrp=21)
+        self.fp.add(
+            21,
+            20,
+            comm="npm",
+            env={"TAEMA_JOB": "20.1"},
+            born=self.fp.up - 6.0,
+            pgrp=21,
+        )
         self.d.lineage.observe(self.fp.table())
         self.fp.remove(21)
 
@@ -350,8 +443,13 @@ class JobSurvivors(AutoCase):
         self.assertTrue(kw["allow_sigkill"])
         self.assertTrue(5 <= kw["timeout"] <= 30)
         with open(path + "/cgroup.procs") as f:
-            self.assertEqual(f.read().split(), ["30"])      # carved, no sudo
-        self.assertGreater(self.d.store.data["pairs"][knowledge.Store.pkey("npm", "vite")]["last_auto_stop"], 0)
+            self.assertEqual(f.read().split(), ["30"])  # carved, no sudo
+        self.assertGreater(
+            self.d.store.data["pairs"][knowledge.Store.pkey("npm", "vite")][
+                "last_auto_stop"
+            ],
+            0,
+        )
         st = self.d.handle({"cmd": "status"})["auto"]
         self.assertEqual(len(st["auto_stops"]), 1)
         self.assertIn("answered stop", st["auto_stops"][0]["why"])
@@ -383,7 +481,7 @@ class JobSurvivors(AutoCase):
             self.job()
         self.stopm.assert_not_called()
         self.assertIn("cpu 50.0% > 1%", self.refusals())
-        self.prime()                                    # no cpu history at all: unknown keeps
+        self.prime()  # no cpu history at all: unknown keeps
         self.d.lineage.entry(30)["cpu"] = []
         self.again(cpu_idle=False)
         self.stopm.assert_not_called()
@@ -393,7 +491,9 @@ class JobSurvivors(AutoCase):
         self.again()
         self.stopm.assert_not_called()
         self.assertIn("has edges", self.refusals())
-        self.assertFalse(os.path.exists("%s/app-host/job-20-1" % self.cg.base))   # nothing was carved
+        self.assertFalse(
+            os.path.exists("%s/app-host/job-20-1" % self.cg.base)
+        )  # nothing was carved
 
     def test_not_under_user_scope_is_signalled_in_place(self):
         self.d.store.answer("npm", "vite", "stop")
@@ -402,7 +502,7 @@ class JobSurvivors(AutoCase):
             self.job()
         self.stopm.assert_not_called()
         self.assertEqual([i["pid"] for i in sig.call_args[0][1]], [30])
-        self.assertTrue(sig.call_args[0][3])            # explicit: SIGKILL allowed
+        self.assertTrue(sig.call_args[0][3])  # explicit: SIGKILL allowed
 
     def test_standalone_adopted_never_stopped(self):
         self.d.store.answer("npm", "vite", "standalone")
@@ -420,10 +520,12 @@ class JobSurvivors(AutoCase):
         self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "stop")
         self.fp.remove(30)
         self.d.lineage.observe(self.fp.table())
-        self.fp.add(60, 1, comm="vite", born=self.fp.up - 1)           # same key, another owner
+        self.fp.add(60, 1, comm="vite", born=self.fp.up - 1)  # same key, another owner
         self.d.lineage.observe(self.fp.table())
         self.d.after_observe()
-        self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "ask")      # suspended 7 days
+        self.assertEqual(
+            self.d.store.pair_decision("npm", "vite")[0], "ask"
+        )  # suspended 7 days
         self.assertNotIn("vite", self.d.auto_recent)
         self.assertEqual([e["event"] for e in self.log()].count("regret"), 1)
 
@@ -440,7 +542,9 @@ class JobSurvivors(AutoCase):
 class GuiClose(AutoCase):
     def close_gui(self, comm="firefox", root_pid=200, survivor_pid=201, **root_kw):
         up = self.fp.up
-        self.fp.add(100, 1, comm="niri", sid=100, born=100.0)       # parent: roots need a parent entry
+        self.fp.add(
+            100, 1, comm="niri", sid=100, born=100.0
+        )  # parent: roots need a parent entry
         self.fp.add(root_pid, 100, comm=comm, born=up - 100, **root_kw)
         self.fp.add(survivor_pid, root_pid, comm="helper", born=up - 90)
         self.d.lineage.observe(self.fp.table())
@@ -488,8 +592,10 @@ class GuiClose(AutoCase):
         self.assertFalse(os.path.exists(self.cg.base + "/leftover"))
         would = [e for e in self.log() if e["event"] == "would_contain"]
         self.assertEqual(len(would), 1)
-        self.assertEqual((would[0]["owner"], would[0]["survivors"], would[0]["pids"]),
-                         ("firefox", ["helper"], [201]))
+        self.assertEqual(
+            (would[0]["owner"], would[0]["survivors"], would[0]["pids"]),
+            ("firefox", ["helper"], [201]),
+        )
 
     def test_containment_records_a_persistent_review(self):
         self.d.cfg["mode"] = "adopt"
@@ -500,13 +606,17 @@ class GuiClose(AutoCase):
         reviews = self.d.handle({"cmd": "review"})["reviews"]
         self.assertEqual(len(reviews), 1)
         review = reviews[0]
-        self.assertEqual((review["id"], review["owner"], review["survivors"], review["pids"]),
-                         (1, "firefox", ["helper"], [201]))
+        self.assertEqual(
+            (review["id"], review["owner"], review["survivors"], review["pids"]),
+            (1, "firefox", ["helper"], [201]),
+        )
         self.assertEqual(review["expires"] - review["created"], 14 * DAY)
         out = io.StringIO()
         readonly = knowledge.Store(self.d.store.dir, read_only=True)
-        with mock.patch.object(cli, "_load", return_value=(self.d.cfg, readonly, [])), \
-                redirect_stdout(out):
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.d.cfg, readonly, [])),
+            redirect_stdout(out),
+        ):
             cli.main(["review"])
         self.assertIn("review #1", out.getvalue())
         self.assertIn("owner=firefox", out.getvalue())
@@ -588,6 +698,7 @@ class GuiClose(AutoCase):
 
 # ---- 5. GC rules for leftover/* --------------------------------------------------------------
 
+
 class LeftoverGc(AutoCase):
     def leaf(self, pids=(301,), key="vite", origin="foo", cpu=100):
         for p in pids:
@@ -600,13 +711,23 @@ class LeftoverGc(AutoCase):
 
     def cands(self, t=0, auto=True):
         d = self.d
-        return engine.gc_candidates(d.cfg, [], d.store, d.idle_since, now=lambda: t, usage=d.gc_usage,
-                                    skip=d.gc_skip, noted=d.gc_noted, lin=d.lineage, auto=auto)
+        return engine.gc_candidates(
+            d.cfg,
+            [],
+            d.store,
+            d.idle_since,
+            now=lambda: t,
+            usage=d.gc_usage,
+            skip=d.gc_skip,
+            noted=d.gc_noted,
+            lin=d.lineage,
+            auto=auto,
+        )
 
     def test_pair_stop_candidate(self):
         self.leaf()
         self.d.store.answer("foo", "vite", "stop")
-        (path, why), = self.cands()
+        ((path, why),) = self.cands()
         self.assertTrue(path.endswith("leftover/x"))
         self.assertTrue(why.startswith("pair stop"))
 
@@ -614,7 +735,7 @@ class LeftoverGc(AutoCase):
         self.leaf()
         self.assertEqual(self.cands(t=0), [])
         self.assertEqual(self.cands(t=300), [])
-        (path, why), = self.cands(t=601)
+        ((path, why),) = self.cands(t=601)
         self.assertTrue(why.startswith("idle"))
 
     def test_cpu_movement_restarts_idle_window(self):
@@ -632,11 +753,11 @@ class LeftoverGc(AutoCase):
 
     def test_held_cases(self):
         self.leaf()
-        self.d.store.answer("foo", "vite", "keep")              # pair decided keep
+        self.d.store.answer("foo", "vite", "keep")  # pair decided keep
         self.assertEqual(self.cands(t=0) + self.cands(t=9999), [])
         self.d.store.answer("foo", "vite", "stop")
         self.assertEqual(len(self.cands(t=0)), 1)
-        self.d.lineage.entry(301)["host"] = True                # pty host
+        self.d.lineage.entry(301)["host"] = True  # pty host
         self.assertEqual(self.cands(t=0) + self.cands(t=9999), [])
 
     def test_share_seed_with_user_keep_held(self):
@@ -656,7 +777,9 @@ class LeftoverGc(AutoCase):
 
     def test_other_modes_only_remove_empty_leftover_leaves(self):
         self.leaf()
-        self.assertEqual(self.cands(t=0, auto=False) + self.cands(t=9999, auto=False), [])
+        self.assertEqual(
+            self.cands(t=0, auto=False) + self.cands(t=9999, auto=False), []
+        )
         self.cg.leaf("leftover/y", [])
         got = self.cands(auto=False)
         self.assertEqual([(os.path.basename(p), w) for p, w in got], [("y", "empty")])
@@ -689,7 +812,9 @@ class LeftoverGc(AutoCase):
         self.assertEqual(self.d.store.pair_decision("foo", "vite")[0], "keep")
 
     def age_review(self, scope, days):
-        review = next(r for r in self.d.store.data["reviews"] if r.get("scope") == scope)
+        review = next(
+            r for r in self.d.store.data["reviews"] if r.get("scope") == scope
+        )
         review["created"] = time.time() - days * knowledge.DAY
         review["expires"] = time.time() - 1
 
@@ -750,29 +875,58 @@ class LeftoverGc(AutoCase):
         self.d.gc_pass()
 
         self.stopm.assert_not_called()
-        self.assertTrue(any(e.get("event") == "vetoed" and e.get("trigger") == "gc_stop"
-                            for e in self.log()))
+        self.assertTrue(
+            any(
+                e.get("event") == "vetoed" and e.get("trigger") == "gc_stop"
+                for e in self.log()
+            )
+        )
 
-    def test_auto_collects_idle_shared_and_missing_runtime_unit_after_safety_checks(self):
+    def test_auto_collects_idle_shared_and_missing_runtime_unit_after_safety_checks(
+        self,
+    ):
         self.fp.add(301, 1, comm="helper", born=self.fp.up - 100)
-        self.fp.add(302, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": self.rt + "/gone"},
-                    born=self.fp.up - 100)
+        self.fp.add(
+            302,
+            1,
+            comm="catatonit",
+            env={"XDG_RUNTIME_DIR": self.rt + "/gone"},
+            born=self.fp.up - 100,
+        )
         self.d.lineage.observe(self.fp.table())
         self.idle(301, 302)
         self.cg.leaf("shared/helper-301", [301], cpu=100)
         self.cg.leaf("app-podman-deadbeef", [302], cpu=100)
-        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
-                         "match": {"comm": "catatonit"},
-                         "gc": {"env_dir_missing": "XDG_RUNTIME_DIR", "keep_while_children": True}}]
+        self.d.units = [
+            {
+                "unit": {
+                    "name": "app-podman",
+                    "kind": "app",
+                    "stop_when_unneeded": True,
+                },
+                "match": {"comm": "catatonit"},
+                "gc": {
+                    "env_dir_missing": "XDG_RUNTIME_DIR",
+                    "keep_while_children": True,
+                },
+            }
+        ]
         self.d.idle_since["shared/helper-301"] = time.time() - 601
         self.d.gc_usage["shared/helper-301"] = 100
 
         result = self.d.gc_pass()
 
-        self.assertEqual({row[0] for row in result}, {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertEqual(
+            {row[0] for row in result}, {"shared/helper-301", "app-podman-deadbeef"}
+        )
         self.assertEqual(self.stopm.call_count, 2)
-        self.assertEqual({os.path.relpath(call.args[0], self.cg.base) for call in self.stopm.call_args_list},
-                         {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertEqual(
+            {
+                os.path.relpath(call.args[0], self.cg.base)
+                for call in self.stopm.call_args_list
+            },
+            {"shared/helper-301", "app-podman-deadbeef"},
+        )
 
     def test_adopt_queues_scope_reviews_for_idle_shared_and_unit_scopes(self):
         self.d.cfg["mode"] = "adopt"
@@ -782,25 +936,47 @@ class LeftoverGc(AutoCase):
         self.idle(301, 302)
         self.cg.leaf("shared/helper-301", [301], cpu=100)
         self.cg.leaf("app-podman-deadbeef", [302], cpu=100)
-        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
-                         "match": {"comm": "catatonit"}}]
-        self.d.idle_since.update({"shared/helper-301": time.time() - 601,
-                                  "app-podman-deadbeef": time.time() - 601})
+        self.d.units = [
+            {
+                "unit": {
+                    "name": "app-podman",
+                    "kind": "app",
+                    "stop_when_unneeded": True,
+                },
+                "match": {"comm": "catatonit"},
+            }
+        ]
+        self.d.idle_since.update(
+            {
+                "shared/helper-301": time.time() - 601,
+                "app-podman-deadbeef": time.time() - 601,
+            }
+        )
         self.d.gc_usage.update({"shared/helper-301": 100, "app-podman-deadbeef": 100})
 
         result = self.d.gc_pass()
 
         self.stopm.assert_not_called()
-        self.assertEqual({row[0] for row in result}, {"shared/helper-301", "app-podman-deadbeef"})
-        self.assertEqual({r["scope"] for r in self.d.store.open_reviews()},
-                         {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertEqual(
+            {row[0] for row in result}, {"shared/helper-301", "app-podman-deadbeef"}
+        )
+        self.assertEqual(
+            {r["scope"] for r in self.d.store.open_reviews()},
+            {"shared/helper-301", "app-podman-deadbeef"},
+        )
         self.assertTrue(all(r["kind"] == "scope" for r in self.d.store.open_reviews()))
         restarted = knowledge.Store(self.d.store.dir, seeds=self.d.store.seeds)
-        self.assertEqual({r["scope"] for r in restarted.open_reviews()},
-                         {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertEqual(
+            {r["scope"] for r in restarted.open_reviews()},
+            {"shared/helper-301", "app-podman-deadbeef"},
+        )
         out = io.StringIO()
-        with mock.patch.object(cli, "_load", return_value=(self.d.cfg, self.d.store, self.d.units)), \
-                redirect_stdout(out):
+        with (
+            mock.patch.object(
+                cli, "_load", return_value=(self.d.cfg, self.d.store, self.d.units)
+            ),
+            redirect_stdout(out),
+        ):
             cli.cmd_review(argparse.Namespace())
         self.assertIn("scope=shared/helper-301", out.getvalue())
         self.assertIn("scope=app-podman-deadbeef", out.getvalue())
@@ -808,22 +984,41 @@ class LeftoverGc(AutoCase):
 
     def test_pending_adopt_scope_reviews_do_not_block_auto_gc(self):
         self.d.cfg["mode"] = "adopt"
-        for pid, comm in ((301, "helper"), (302, "catatonit"), (303, "helper"), (304, "niri")):
+        for pid, comm in (
+            (301, "helper"),
+            (302, "catatonit"),
+            (303, "helper"),
+            (304, "niri"),
+        ):
             self.fp.add(pid, 1, comm=comm, born=self.fp.up - 100)
         self.d.lineage.observe(self.fp.table())
         self.idle(301, 302, 303, 304)
-        scopes = {301: "shared/helper-301", 302: "app-podman-deadbeef",
-                  303: "shared/helper-303", 304: "shared/niri-304"}
+        scopes = {
+            301: "shared/helper-301",
+            302: "app-podman-deadbeef",
+            303: "shared/helper-303",
+            304: "shared/niri-304",
+        }
         for pid, scope in scopes.items():
             self.cg.leaf(scope, [pid], cpu=100)
             self.d.idle_since[scope] = time.time() - 601
             self.d.gc_usage[scope] = 100
-        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
-                         "match": {"comm": "catatonit"}}]
+        self.d.units = [
+            {
+                "unit": {
+                    "name": "app-podman",
+                    "kind": "app",
+                    "stop_when_unneeded": True,
+                },
+                "match": {"comm": "catatonit"},
+            }
+        ]
 
         self.d.gc_pass()
 
-        self.assertEqual({r["scope"] for r in self.d.store.open_reviews()}, set(scopes.values()))
+        self.assertEqual(
+            {r["scope"] for r in self.d.store.open_reviews()}, set(scopes.values())
+        )
         self.assertFalse(self.d.store.review_holds_scope(scopes[301]))
         self.stopm.assert_not_called()
         self.d.store.add_veto("scope", scopes[303])
@@ -831,25 +1026,58 @@ class LeftoverGc(AutoCase):
 
         self.d.gc_pass()
 
-        stopped_scopes = {os.path.relpath(call.args[0], self.cg.base)
-                          for call in self.stopm.call_args_list}
+        stopped_scopes = {
+            os.path.relpath(call.args[0], self.cg.base)
+            for call in self.stopm.call_args_list
+        }
         self.assertEqual(stopped_scopes, {scopes[301], scopes[302]})
-        self.assertEqual({r["scope"] for r in self.d.store.open_reviews()}, set(scopes.values()))
-        self.assertTrue(any(e.get("event") == "vetoed" and e.get("scope") == scopes[303]
-                            for e in self.log()))
-        self.assertTrue(any(e.get("event") == "auto_stop_refused" and e.get("scope") == scopes[304]
-                            and "protected" in e.get("why", "") for e in self.log()))
+        self.assertEqual(
+            {r["scope"] for r in self.d.store.open_reviews()}, set(scopes.values())
+        )
+        self.assertTrue(
+            any(
+                e.get("event") == "vetoed" and e.get("scope") == scopes[303]
+                for e in self.log()
+            )
+        )
+        self.assertTrue(
+            any(
+                e.get("event") == "auto_stop_refused"
+                and e.get("scope") == scopes[304]
+                and "protected" in e.get("why", "")
+                for e in self.log()
+            )
+        )
 
     def test_missing_runtime_dir_does_not_override_live_unit_children(self):
         gone = self.rt + "/gone"
-        self.fp.add(302, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": gone}, born=self.fp.up - 100)
-        self.fp.add(303, 302, comm="conmon", env={"XDG_RUNTIME_DIR": gone}, born=self.fp.up - 90)
+        self.fp.add(
+            302,
+            1,
+            comm="catatonit",
+            env={"XDG_RUNTIME_DIR": gone},
+            born=self.fp.up - 100,
+        )
+        self.fp.add(
+            303, 302, comm="conmon", env={"XDG_RUNTIME_DIR": gone}, born=self.fp.up - 90
+        )
         self.d.lineage.observe(self.fp.table())
         self.idle(302, 303)
         self.cg.leaf("app-podman-deadbeef", [302, 303], cpu=100)
-        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
-                         "match": {"comm": "catatonit"},
-                         "gc": {"env_dir_missing": "XDG_RUNTIME_DIR", "keep_while_children": True}}]
+        self.d.units = [
+            {
+                "unit": {
+                    "name": "app-podman",
+                    "kind": "app",
+                    "stop_when_unneeded": True,
+                },
+                "match": {"comm": "catatonit"},
+                "gc": {
+                    "env_dir_missing": "XDG_RUNTIME_DIR",
+                    "keep_while_children": True,
+                },
+            }
+        ]
 
         self.d.gc_pass()
 
@@ -868,8 +1096,12 @@ class LeftoverGc(AutoCase):
 
         self.stopm.assert_not_called()
         self.assertEqual(result[0][2], "would")
-        self.assertTrue(any(e.get("event") == "vetoed" and e.get("trigger") == "gc_stop"
-                            for e in self.log()))
+        self.assertTrue(
+            any(
+                e.get("event") == "vetoed" and e.get("trigger") == "gc_stop"
+                for e in self.log()
+            )
+        )
 
     def test_auto_gc_protection_check_keeps_an_idle_shared_scope(self):
         self.fp.add(301, 1, comm="niri", born=self.fp.up - 100)
@@ -889,7 +1121,9 @@ class LeftoverGc(AutoCase):
         start = time.time()
         now = [start]
         self.d.store.now = lambda: now[0]
-        with mock.patch.object(engine, "gc_candidates", return_value=[(path, "idle 600s >= grace 600s")]):
+        with mock.patch.object(
+            engine, "gc_candidates", return_value=[(path, "idle 600s >= grace 600s")]
+        ):
             for minute in range(24 * 60):
                 now[0] = start + minute * 60
                 self.d.gc_pass()
@@ -909,13 +1143,19 @@ class LeftoverGc(AutoCase):
             now[0] = start + minute * 60
             self.d.stop_leaf("scope-foo", "owner exited")
 
-        events = [e for e in self.log() if e.get("event") == "would_stop"
-                  and e.get("scope") == "scope-foo"]
+        events = [
+            e
+            for e in self.log()
+            if e.get("event") == "would_stop" and e.get("scope") == "scope-foo"
+        ]
         self.assertEqual(len(events), 1)
         now[0] = start + knowledge.DAY
         self.d.stop_leaf("scope-foo", "owner exited")
-        events = [e for e in self.log() if e.get("event") == "would_stop"
-                  and e.get("scope") == "scope-foo"]
+        events = [
+            e
+            for e in self.log()
+            if e.get("event") == "would_stop" and e.get("scope") == "scope-foo"
+        ]
         self.assertEqual(len(events), 1)
 
     def test_gc_pass_dry_run_stops_nothing(self):
@@ -934,6 +1174,7 @@ class LeftoverGc(AutoCase):
 
 # ---- 6. logout --------------------------------------------------------------------------------
 
+
 class Logout(AutoCase):
     def test_auto_keeps_everything_but_confident_stop_pairs(self):
         up = self.fp.up
@@ -949,12 +1190,16 @@ class Logout(AutoCase):
         self.cg.leaf("leftover/a", [301])
         self.cg.leaf("leftover/b", [302])
         self.cg.leaf("shared/s", [])
-        self.d.store.answer("foo", "vite", "stop")          # leftover/a: confident
-        self.d.store.answer("foo", "nohup", "keep")         # leftover/b: keep
-        self.d.store.answer("foo", "tmux", "stop")          # app scope still holds its root: kept
+        self.d.store.answer("foo", "vite", "stop")  # leftover/a: confident
+        self.d.store.answer("foo", "nohup", "keep")  # leftover/b: keep
+        self.d.store.answer(
+            "foo", "tmux", "stop"
+        )  # app scope still holds its root: kept
         self.d.end_session()
         stopped = [c[0][0] for c in self.stopm.call_args_list]
-        self.assertEqual([os.path.relpath(p, self.cg.base) for p in stopped], ["leftover/a"])
+        self.assertEqual(
+            [os.path.relpath(p, self.cg.base) for p in stopped], ["leftover/a"]
+        )
         kept = [e["scope"] for e in self.log() if e["event"] == "session_end_kept"]
         self.assertIn("app-foo-abc123", kept)
         self.assertIn("leftover/b", kept)
@@ -973,6 +1218,7 @@ class Logout(AutoCase):
 
 # ---- 7. attach command, cli fallback, status --------------------------------------------------
 
+
 class Attach(ProcCase):
     def setUp(self):
         super().setUp()
@@ -981,35 +1227,55 @@ class Attach(ProcCase):
         self.fp.add(21, 20, comm="x", born=1000.0)
 
     def att(self, **kw):
-        return self.d.handle(dict({"cmd": "attach", "scope": "scope-foo", "pids": [20]}, **kw))
+        return self.d.handle(
+            dict({"cmd": "attach", "scope": "scope-foo", "pids": [20]}, **kw)
+        )
 
     def test_valid_attach_calls_helper_per_pid(self):
         with mock.patch.object(engine, "helper_attach") as ha:
             r = self.att(pids=[20, 21, 20])
         self.assertEqual(r, {"ok": True, "attached": [20, 21]})
-        self.assertEqual([c[0][1:] for c in ha.call_args_list], [(20, "foo"), (21, "foo")])
+        self.assertEqual(
+            [c[0][1:] for c in ha.call_args_list], [(20, "foo"), (21, "foo")]
+        )
         with mock.patch.object(engine, "helper_attach"):
             self.assertTrue(self.att(scope="foo")["ok"])
 
     def test_shapes_and_foreign_pids_refused(self):
-        bad = [{"scope": 5}, {"scope": "Scope-X"}, {"scope": "scope-a/b"}, {"scope": "../x"},
-               {"scope": "scope-" + "a" * 40}, {"pids": []}, {"pids": "20"}, {"pids": [True]}, {"pids": [1]},
-               {"pids": [0]}, {"pids": ["20"]}, {"pids": list(range(2, 67))}, {"pids": None}]
+        bad = [
+            {"scope": 5},
+            {"scope": "Scope-X"},
+            {"scope": "scope-a/b"},
+            {"scope": "../x"},
+            {"scope": "scope-" + "a" * 40},
+            {"pids": []},
+            {"pids": "20"},
+            {"pids": [True]},
+            {"pids": [1]},
+            {"pids": [0]},
+            {"pids": ["20"]},
+            {"pids": list(range(2, 67))},
+            {"pids": None},
+        ]
         with mock.patch.object(engine, "helper_attach") as ha:
             for patch in bad:
                 self.assertIn("error", self.att(**patch), patch)
-            self.assertIn("error", self.att(pids=[20, 999999]))      # gone / not ours
+            self.assertIn("error", self.att(pids=[20, 999999]))  # gone / not ours
             self.assertIn("error", self.d.handle({"cmd": "attach"}))
             ha.assert_not_called()
 
     def test_foreign_uid_refused(self):
-        with mock.patch.object(inspect, "uid_of", return_value=UID + 1), \
-             mock.patch.object(engine, "helper_attach") as ha:
+        with (
+            mock.patch.object(inspect, "uid_of", return_value=UID + 1),
+            mock.patch.object(engine, "helper_attach") as ha,
+        ):
             self.assertIn("not yours", self.att()["error"])
             ha.assert_not_called()
 
     def test_helper_refusal_is_an_error(self):
-        with mock.patch.object(engine, "helper_attach", side_effect=engine.Refused("nope")):
+        with mock.patch.object(
+            engine, "helper_attach", side_effect=engine.Refused("nope")
+        ):
             self.assertIn("nope", self.att()["error"])
 
 
@@ -1018,24 +1284,38 @@ class CliRun(unittest.TestCase):
         cg = FakeCg()
         cg.__enter__()
         self.addCleanup(cg.__exit__)
-        a = argparse.Namespace(name="foo", join=False, owner=None, bind=False, cmd=["true"])
+        a = argparse.Namespace(
+            name="foo", join=False, owner=None, bind=False, cmd=["true"]
+        )
         asks = []
         cfg = make_cfg(tmp())
-        with mock.patch.object(cli, "_load", return_value=(cfg, None, [])), \
-             mock.patch.object(cli, "ask", side_effect=lambda c, m, timeout=3.0: asks.append(m) or reply), \
-             mock.patch.object(engine, "helper_attach", side_effect=err), \
-             mock.patch.object(os, "execvp") as ex, \
-             mock.patch("sys.stderr", new=io.StringIO()):
+        with (
+            mock.patch.object(cli, "_load", return_value=(cfg, None, [])),
+            mock.patch.object(
+                cli,
+                "ask",
+                side_effect=lambda c, m, timeout=3.0: asks.append(m) or reply,
+            ),
+            mock.patch.object(engine, "helper_attach", side_effect=err),
+            mock.patch.object(os, "execvp") as ex,
+            mock.patch("sys.stderr", new=io.StringIO()),
+        ):
             rc = cli.cmd_run(a)
         return rc, asks, ex
 
     def test_sudo_failure_falls_back_to_daemon(self):
-        rc, asks, ex = self.run_cmd(engine.Refused("sudo: a password is required"), {"ok": True})
-        self.assertEqual(asks[-1], {"cmd": "attach", "scope": "scope-foo", "pids": [os.getpid()]})
+        rc, asks, ex = self.run_cmd(
+            engine.Refused("sudo: a password is required"), {"ok": True}
+        )
+        self.assertEqual(
+            asks[-1], {"cmd": "attach", "scope": "scope-foo", "pids": [os.getpid()]}
+        )
         ex.assert_called_once()
 
     def test_daemon_refusal_fails_the_run(self):
-        rc, asks, ex = self.run_cmd(engine.Refused("sudo: a password is required"), {"error": "no"})
+        rc, asks, ex = self.run_cmd(
+            engine.Refused("sudo: a password is required"), {"error": "no"}
+        )
         self.assertEqual(rc, 1)
         ex.assert_not_called()
 
@@ -1063,16 +1343,21 @@ class AdoptAll(ProcCase):
         self.store = knowledge.Store(tmp(), {}, read_only=True)
 
     def test_adopt_all_includes_unknown_app_roots_and_honors_dry_run(self):
-        with mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])), \
-             mock.patch.object(engine, "helper_move") as hm, \
-             mock.patch.object(cgroup, "proc_cgroup", return_value="/2"):
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])),
+            mock.patch.object(engine, "helper_move") as hm,
+            mock.patch.object(cgroup, "proc_cgroup", return_value="/2"),
+        ):
             out = io.StringIO()
             with redirect_stdout(out):
                 rc = cli.main(["adopt", "--all", "--dry-run"])
             self.assertEqual(rc, 0)
             self.assertIn("app-firefox-", out.getvalue())
             self.assertIn("nothing moved", out.getvalue())
-            self.assertEqual([name for name in os.listdir(self.cg.base) if name.startswith("app-")], [])
+            self.assertEqual(
+                [name for name in os.listdir(self.cg.base) if name.startswith("app-")],
+                [],
+            )
             hm.assert_not_called()
 
             out = io.StringIO()
@@ -1094,8 +1379,13 @@ class StatusAndModes(ProcCase):
             d.note_auto_stop("s%d" % i, "why %d" % i, [("npm", "vite")])
         r = d.handle({"cmd": "status"})
         self.assertEqual(r["mode"], "auto")
-        self.assertEqual([s["scope"] for s in r["auto"]["auto_stops"]], ["s%d" % i for i in range(2, 7)])
-        self.assertEqual((r["pairs"][0]["action"], r["pairs"][0]["confidence"]), ("stop", 1.0))
+        self.assertEqual(
+            [s["scope"] for s in r["auto"]["auto_stops"]],
+            ["s%d" % i for i in range(2, 7)],
+        )
+        self.assertEqual(
+            (r["pairs"][0]["action"], r["pairs"][0]["confidence"]), ("stop", 1.0)
+        )
         self.assertEqual(r["standalone"], ["tool"])
         out = io.StringIO()
         with redirect_stdout(out):
@@ -1111,15 +1401,22 @@ class StatusAndModes(ProcCase):
             d.auto_scopes.add("app-firefox-deadbeef")
             reply = d.handle({"cmd": "status"})
             out = io.StringIO()
-            with mock.patch.object(cli, "_load", return_value=(cfg, d.store, [])), \
-                 mock.patch.object(cli, "ask", return_value=reply), \
-                 redirect_stdout(out):
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, d.store, [])),
+                mock.patch.object(cli, "ask", return_value=reply),
+                redirect_stdout(out),
+            ):
                 rc = cli.cmd_status(argparse.Namespace())
             self.assertEqual(rc, 0, mode)
             self.assertIn("1 auto-adopted scopes", out.getvalue(), mode)
 
     def test_mode_gates(self):
-        want = {"observe": (False, False), "adopt": (True, False), "enforce": (True, True), "auto": (True, False)}
+        want = {
+            "observe": (False, False),
+            "adopt": (True, False),
+            "enforce": (True, True),
+            "auto": (True, False),
+        }
         for mode, (mv, kl) in want.items():
             d = daemon.Daemon(make_cfg(tmp(), mode=mode))
             self.assertEqual((d.may_move(), d.may_kill()), (mv, kl), mode)
@@ -1128,7 +1425,10 @@ class StatusAndModes(ProcCase):
         d = daemon.Daemon(make_cfg(tmp(), mode="auto"))
         for k in ("sh", "sort", "head"):
             d.store.data["pairs"][d.store.pkey("MainThread", k)] = {
-                "first_seen": 1000.0, "ex_stop": knowledge.W_ANSWER, "ex_last": "stop"}
+                "first_seen": 1000.0,
+                "ex_stop": knowledge.W_ANSWER,
+                "ex_last": "stop",
+            }
         r = d.handle({"cmd": "status"})
         rows = {(p["owner"], p["leftover"]): p for p in r["pairs"]}
         for k in ("sh", "sort", "head"):
@@ -1155,8 +1455,12 @@ class StatusAndModes(ProcCase):
     def test_adopt_pass_auto_adopts_in_adopt_enforce_and_auto_modes(self):
         for mode in ("adopt", "enforce", "auto"):
             d = daemon.Daemon(make_cfg(tmp(), mode=mode))
-            with mock.patch.object(d, "auto_adopt") as aa, \
-                 mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable()):
+            with (
+                mock.patch.object(d, "auto_adopt") as aa,
+                mock.patch.object(
+                    inspect.ProcTable, "scan", return_value=inspect.ProcTable()
+                ),
+            ):
                 d.adopt_pass()
             aa.assert_called_once()
 
@@ -1169,12 +1473,14 @@ class StatusAndModes(ProcCase):
         self.assertAlmostEqual(lin.cpu_pct(5), 100.0)
         e["cpu"] = [(0.0, 0), (60.0, 30 * HZ // 100)]
         self.assertAlmostEqual(lin.cpu_pct(5), 0.5)
-        e["cpu"] = [(50.0, 0), (60.0, 5)]           # 10 s of history: unknown
+        e["cpu"] = [(50.0, 0), (60.0, 5)]  # 10 s of history: unknown
         self.assertIsNone(lin.cpu_pct(5))
         self.assertIsNone(lin.cpu_pct(99))
 
     def test_proc_stat_cpu_ticks_are_parsed(self):
-        row = inspect._parse_stat(b"7 (a b) S 1 7 7 0 -1 0 0 0 0 0 100 50 0 0 20 0 1 0 4242 0 0\n")
+        row = inspect._parse_stat(
+            b"7 (a b) S 1 7 7 0 -1 0 0 0 0 0 100 50 0 0 20 0 1 0 4242 0 0\n"
+        )
         self.assertEqual((row.cpu, row.start), (150, 4242))
 
 

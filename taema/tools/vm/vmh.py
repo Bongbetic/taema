@@ -15,6 +15,7 @@ SSH known_hosts and QEMU serial logs inside per-run directories, and forwards
 SSH on loopback only.  Base images are cached; every run boots a disposable
 qcow2 overlay that is discarded afterwards (clean snapshot per run).
 """
+
 import argparse
 import hashlib
 import json
@@ -54,6 +55,7 @@ class RunError(HarnessError):
 
 # ---- configuration ---------------------------------------------------------
 
+
 def load_config(path=None):
     """Load and validate one harness config file (defaults live in config.toml)."""
     path = path or CONFIG_PATH
@@ -87,12 +89,15 @@ def _validate(raw, path="<config>"):
     libcs = need("libcs", list)
     for c in libcs:
         if c not in LIBCS:
-            raise HarnessError("%s: unknown libc %r (want %s)" % (path, c, "/".join(LIBCS)))
+            raise HarnessError(
+                "%s: unknown libc %r (want %s)" % (path, c, "/".join(LIBCS))
+            )
     scenarios = need("scenarios", list)
     for s in scenarios:
         if s not in SCENARIOS:
-            raise HarnessError("%s: unknown scenario %r (want %s)"
-                               % (path, s, "/".join(SCENARIOS)))
+            raise HarnessError(
+                "%s: unknown scenario %r (want %s)" % (path, s, "/".join(SCENARIOS))
+            )
     if raw.get("accel", "auto") not in ACCELS:
         raise HarnessError("%s: unknown accel %r" % (path, raw.get("accel")))
     need("memory_mb", int, 512)
@@ -132,8 +137,9 @@ def _validate(raw, path="<config>"):
             raise HarnessError("%s: images.%s.tarball missing" % (path, libc))
         sha = entry.get("sha256")
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
-            raise HarnessError("%s: images.%s.sha256 must be a 64-char hex digest"
-                               % (path, libc))
+            raise HarnessError(
+                "%s: images.%s.sha256 must be a 64-char hex digest" % (path, libc)
+            )
     return raw
 
 
@@ -172,18 +178,24 @@ def state_dir(cfg):
 
 def image_spec(cfg, libc):
     entry = cfg["images"][libc]
-    return {"tarball": entry["tarball"], "sha256": entry["sha256"],
-            "url": cfg["images"]["base_url"].rstrip("/") + "/" + entry["tarball"]}
+    return {
+        "tarball": entry["tarball"],
+        "sha256": entry["sha256"],
+        "url": cfg["images"]["base_url"].rstrip("/") + "/" + entry["tarball"],
+    }
 
 
 def cache_paths(cfg, libc):
     d = os.path.join(state_dir(cfg), "images", libc)
     tarball = cfg["images"][libc]["tarball"]
-    return {"dir": d, "tarball": os.path.join(d, tarball),
-            "rootfs": os.path.join(d, "rootfs"),
-            "base": os.path.join(d, "base.qcow2"),
-            "kernel": os.path.join(d, "vmlinuz"),
-            "initrd": os.path.join(d, "initramfs.img")}
+    return {
+        "dir": d,
+        "tarball": os.path.join(d, tarball),
+        "rootfs": os.path.join(d, "rootfs"),
+        "base": os.path.join(d, "base.qcow2"),
+        "kernel": os.path.join(d, "vmlinuz"),
+        "initrd": os.path.join(d, "initramfs.img"),
+    }
 
 
 def ssh_key_paths(cfg):
@@ -192,8 +204,12 @@ def ssh_key_paths(cfg):
 
 
 def previous_pkg_path(cfg):
-    return os.path.join(state_dir(cfg), "pkg", "previous",
-                        os.path.basename(cfg["images"]["previous_url"]))
+    return os.path.join(
+        state_dir(cfg),
+        "pkg",
+        "previous",
+        os.path.basename(cfg["images"]["previous_url"]),
+    )
 
 
 def read_version(root=TAEMA_ROOT):
@@ -217,20 +233,25 @@ def package_repo_dir(cfg):
 
 
 def package_path(cfg):
-    return os.path.join(package_repo_dir(cfg),
-                        "taema-%s_1.noarch.xbps" % read_version())
+    return os.path.join(
+        package_repo_dir(cfg), "taema-%s_1.noarch.xbps" % read_version()
+    )
 
 
 def previous_version(cfg):
-    m = re.match(r"taema-(.+?)(?:_\d+)?\.noarch\.xbps$",
-                 os.path.basename(cfg["images"]["previous_url"]))
+    m = re.match(
+        r"taema-(.+?)(?:_\d+)?\.noarch\.xbps$",
+        os.path.basename(cfg["images"]["previous_url"]),
+    )
     if not m:
-        raise HarnessError("cannot derive previous version from %s"
-                           % cfg["images"]["previous_url"])
+        raise HarnessError(
+            "cannot derive previous version from %s" % cfg["images"]["previous_url"]
+        )
     return m.group(1)
 
 
 # ---- prerequisites and acceleration ---------------------------------------
+
 
 def _tool_ok(tool):
     if "/" in tool:
@@ -270,8 +291,11 @@ def free_port():
 
 def create_run_dir(cfg, libc, name=None):
     runs = os.path.join(state_dir(cfg), "runs")
-    name = name or "%s-%d-%s" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
-                                 os.getpid(), libc)
+    name = name or "%s-%d-%s" % (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+        os.getpid(),
+        libc,
+    )
     path = os.path.join(runs, name)
     if os.path.exists(path):
         raise HarnessError("run dir exists: %s (refusing to reuse a snapshot)" % path)
@@ -281,21 +305,47 @@ def create_run_dir(cfg, libc, name=None):
 
 # ---- command builders ------------------------------------------------------
 
+
 def qemu_argv(cfg, libc, *, kvm, port, run_dir):
     cp = cache_paths(cfg, libc)
-    accel = ["-accel", "kvm", "-cpu", "host"] if kvm else ["-accel", "tcg", "-cpu", "qemu64"]
-    return [cfg["tools"]["qemu"],
-            "-name", "taema-vm-" + os.path.basename(run_dir),
-            "-m", str(cfg["memory_mb"]), "-smp", str(cfg["cpus"])] + accel + [
-            "-kernel", cp["kernel"], "-initrd", cp["initrd"],
-            "-append", "root=/dev/vda rw console=ttyS0,115200 loglevel=3",
-            "-drive", "file=%s,if=virtio,format=qcow2" % os.path.join(run_dir, "disk.qcow2"),
-            "-nic", "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:%d-:22" % port,
-            "-serial", "file:" + os.path.join(run_dir, "serial.log"),
-            "-display", "none",
-            "-monitor", "none",
-            "-pidfile", os.path.join(run_dir, "qemu.pid"),
-            "-no-reboot"]
+    accel = (
+        ["-accel", "kvm", "-cpu", "host"]
+        if kvm
+        else ["-accel", "tcg", "-cpu", "qemu64"]
+    )
+    return (
+        [
+            cfg["tools"]["qemu"],
+            "-name",
+            "taema-vm-" + os.path.basename(run_dir),
+            "-m",
+            str(cfg["memory_mb"]),
+            "-smp",
+            str(cfg["cpus"]),
+        ]
+        + accel
+        + [
+            "-kernel",
+            cp["kernel"],
+            "-initrd",
+            cp["initrd"],
+            "-append",
+            "root=/dev/vda rw console=ttyS0,115200 loglevel=3",
+            "-drive",
+            "file=%s,if=virtio,format=qcow2" % os.path.join(run_dir, "disk.qcow2"),
+            "-nic",
+            "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:%d-:22" % port,
+            "-serial",
+            "file:" + os.path.join(run_dir, "serial.log"),
+            "-display",
+            "none",
+            "-monitor",
+            "none",
+            "-pidfile",
+            os.path.join(run_dir, "qemu.pid"),
+            "-no-reboot",
+        ]
+    )
 
 
 def overlay_argv(base, overlay, qemu_img="qemu-img"):
@@ -303,25 +353,56 @@ def overlay_argv(base, overlay, qemu_img="qemu-img"):
 
 
 def ssh_argv(cfg, port, key, known_hosts, user, remote=None):
-    argv = [cfg["tools"]["ssh"], "-i", key, "-p", str(port),
-            "-o", "UserKnownHostsFile=" + known_hosts,
-            "-o", "GlobalKnownHostsFile=/dev/null",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
-            "-o", "ConnectTimeout=5",
-            "%s@127.0.0.1" % user]
+    argv = [
+        cfg["tools"]["ssh"],
+        "-i",
+        key,
+        "-p",
+        str(port),
+        "-o",
+        "UserKnownHostsFile=" + known_hosts,
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "LogLevel=ERROR",
+        "-o",
+        "ConnectTimeout=5",
+        "%s@127.0.0.1" % user,
+    ]
     if remote is not None:
         argv.append(remote)
     return argv
 
 
 def scp_argv(cfg, port, key, known_hosts, sources, dest):
-    return [cfg["tools"]["scp"], "-r", "-i", key, "-P", str(port),
-            "-o", "UserKnownHostsFile=" + known_hosts,
-            "-o", "GlobalKnownHostsFile=/dev/null",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
-            "-o", "ConnectTimeout=5"] + list(sources) + [dest]
+    return (
+        [
+            cfg["tools"]["scp"],
+            "-r",
+            "-i",
+            key,
+            "-P",
+            str(port),
+            "-o",
+            "UserKnownHostsFile=" + known_hosts,
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "ConnectTimeout=5",
+        ]
+        + list(sources)
+        + [dest]
+    )
 
 
 def mkimage_argv(cfg, rootfs, pub):
@@ -331,12 +412,19 @@ def mkimage_argv(cfg, rootfs, pub):
     (kernel rule), so unshare creates the PID namespace and mounts proc at
     <rootfs>/proc before mkimage.sh runs; the script itself never mounts /proc.
     """
-    return [cfg["tools"]["unshare"], "-rmfp",
-            "--mount-proc=" + os.path.join(rootfs, "proc"),
-            "sh", os.path.join(VM_DIR, "mkimage.sh"), rootfs, pub]
+    return [
+        cfg["tools"]["unshare"],
+        "-rmfp",
+        "--mount-proc=" + os.path.join(rootfs, "proc"),
+        "sh",
+        os.path.join(VM_DIR, "mkimage.sh"),
+        rootfs,
+        pub,
+    ]
 
 
 # ---- plan ------------------------------------------------------------------
+
 
 def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     """A machine-readable description of everything `run` would do."""
@@ -357,10 +445,12 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     if "upgrade" in scenarios:
         network_urls.append(cfg["images"]["previous_url"])
 
-    sources = [os.path.join(VM_DIR, "provision.sh"),
-               os.path.join(VM_DIR, "scenario.py"),
-               pub,
-               package_repo_dir(cfg)]
+    sources = [
+        os.path.join(VM_DIR, "provision.sh"),
+        os.path.join(VM_DIR, "scenario.py"),
+        pub,
+        package_repo_dir(cfg),
+    ]
     if "upgrade" in scenarios:
         sources.append(prev)
 
@@ -372,43 +462,109 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
         qemu = qemu_argv(cfg, libc, kvm=kvm, port=port, run_dir=run_dir)
         steps = [
             {"name": "wait-ssh", "user": vmadmin},
-            {"name": "mkdir-bootstrap",
-             "argv": ssh_argv(cfg, port, key, known, vmadmin,
-                              "mkdir -p %s/previous-repo" % GUEST_TMP)},
-            {"name": "scp-bootstrap",
-             "argv": scp_argv(cfg, port, key, known, sources,
-                              vmadmin + "@127.0.0.1:" + GUEST_TMP + "/")},
-            {"name": "provision",
-             "argv": ssh_argv(cfg, port, key, known, vmadmin,
-                              "sudo -n sh %s/provision.sh --package-dir %s/%s --user %s"
-                              " --authorized-key %s/%s"
-                              % (GUEST_TMP, GUEST_TMP, repo_name, cfg["test_user"],
-                                 GUEST_TMP, os.path.basename(pub)))},
+            {
+                "name": "mkdir-bootstrap",
+                "argv": ssh_argv(
+                    cfg,
+                    port,
+                    key,
+                    known,
+                    vmadmin,
+                    "mkdir -p %s/previous-repo" % GUEST_TMP,
+                ),
+            },
+            {
+                "name": "scp-bootstrap",
+                "argv": scp_argv(
+                    cfg,
+                    port,
+                    key,
+                    known,
+                    sources,
+                    vmadmin + "@127.0.0.1:" + GUEST_TMP + "/",
+                ),
+            },
+            {
+                "name": "provision",
+                "argv": ssh_argv(
+                    cfg,
+                    port,
+                    key,
+                    known,
+                    vmadmin,
+                    "sudo -n sh %s/provision.sh --package-dir %s/%s --user %s"
+                    " --authorized-key %s/%s"
+                    % (
+                        GUEST_TMP,
+                        GUEST_TMP,
+                        repo_name,
+                        cfg["test_user"],
+                        GUEST_TMP,
+                        os.path.basename(pub),
+                    ),
+                ),
+            },
         ]
         for s in scenarios:
             remote = "python3 %s/scenario.py %s --artifacts %s/artifacts" % (
-                GUEST_TMP, s, GUEST_TMP)
+                GUEST_TMP,
+                s,
+                GUEST_TMP,
+            )
             if s == "upgrade":
-                remote += (" --package-dir %s/%s --previous %s/previous-repo/%s"
-                           " --previous-version %s --current-version %s"
-                           % (GUEST_TMP, repo_name, GUEST_TMP,
-                              os.path.basename(prev), previous_version(cfg),
-                              read_version()))
-            steps.append({"name": "scenario:" + s,
-                          "argv": ssh_argv(cfg, port, key, known, cfg["test_user"], remote)})
-        steps.append({"name": "collect",
-                      "argv": scp_argv(cfg, port, key, known,
-                                       [vmadmin + "@127.0.0.1:%s/artifacts/" % GUEST_TMP],
-                                       os.path.join(run_dir, "artifacts") + "/")})
+                remote += (
+                    " --package-dir %s/%s --previous %s/previous-repo/%s"
+                    " --previous-version %s --current-version %s"
+                    % (
+                        GUEST_TMP,
+                        repo_name,
+                        GUEST_TMP,
+                        os.path.basename(prev),
+                        previous_version(cfg),
+                        read_version(),
+                    )
+                )
+            steps.append(
+                {
+                    "name": "scenario:" + s,
+                    "argv": ssh_argv(cfg, port, key, known, cfg["test_user"], remote),
+                }
+            )
+        steps.append(
+            {
+                "name": "collect",
+                "argv": scp_argv(
+                    cfg,
+                    port,
+                    key,
+                    known,
+                    [vmadmin + "@127.0.0.1:%s/artifacts/" % GUEST_TMP],
+                    os.path.join(run_dir, "artifacts") + "/",
+                ),
+            }
+        )
         steps.append({"name": "teardown"})
-        vms.append({"libc": libc, "run_dir": run_dir, "port": port, "key": key,
-                    "pub": pub, "qemu": qemu, "steps": steps})
+        vms.append(
+            {
+                "libc": libc,
+                "run_dir": run_dir,
+                "port": port,
+                "key": key,
+                "pub": pub,
+                "qemu": qemu,
+                "steps": steps,
+            }
+        )
 
-    return {"accel": accel, "kvm": kvm, "scenarios": scenarios, "libcs": libcs,
-            "package": {"path": pkg,
-                        "argv": ["sh", BUILD_XBPS, package_repo_dir(cfg)]},
-            "network": {"urls": network_urls},
-            "vms": vms}
+    return {
+        "accel": accel,
+        "kvm": kvm,
+        "scenarios": scenarios,
+        "libcs": libcs,
+        "package": {"path": pkg, "argv": ["sh", BUILD_XBPS, package_repo_dir(cfg)]},
+        "network": {"urls": network_urls},
+        "vms": vms,
+    }
 
 
 def print_plan(plan, out):
@@ -417,8 +573,10 @@ def print_plan(plan, out):
     for url in plan["network"]["urls"]:
         out.write("network: %s\n" % url)
     for vm in plan["vms"]:
-        out.write("VM %s accel=%s port=%d run=%s\n"
-                  % (vm["libc"], plan["accel"], vm["port"], vm["run_dir"]))
+        out.write(
+            "VM %s accel=%s port=%d run=%s\n"
+            % (vm["libc"], plan["accel"], vm["port"], vm["run_dir"])
+        )
         out.write("  qemu: %s\n" % " ".join(vm["qemu"]))
         for step in vm["steps"]:
             line = "  step: %s" % step["name"]
@@ -430,6 +588,7 @@ def print_plan(plan, out):
 
 
 # ---- network (opt-in) ------------------------------------------------------
+
 
 def _sha256(path):
     h = hashlib.sha256()
@@ -458,8 +617,9 @@ def _download(url, dest, sha256=None):
 def fetch_image(cfg, libc, allow_network=False):
     """Download and verify one base tarball; refused without --allow-network."""
     if not allow_network:
-        raise HarnessError("base image %s is not cached; re-run with --allow-network"
-                           % libc)
+        raise HarnessError(
+            "base image %s is not cached; re-run with --allow-network" % libc
+        )
     spec = image_spec(cfg, libc)
     cp = cache_paths(cfg, libc)
     if os.path.isfile(cp["tarball"]) and _sha256(cp["tarball"]) == spec["sha256"]:
@@ -470,8 +630,9 @@ def fetch_image(cfg, libc, allow_network=False):
 
 def fetch_previous(cfg, allow_network=False):
     if not allow_network:
-        raise HarnessError("previous release package is not cached; "
-                           "re-run with --allow-network")
+        raise HarnessError(
+            "previous release package is not cached; re-run with --allow-network"
+        )
     dest = previous_pkg_path(cfg)
     if os.path.isfile(dest):
         return dest
@@ -481,11 +642,15 @@ def fetch_previous(cfg, allow_network=False):
 
 # ---- image build -----------------------------------------------------------
 
+
 def find_rootfs(extract_dir):
     if os.path.isdir(os.path.join(extract_dir, "etc")):
         return extract_dir
-    kids = [k for k in os.listdir(extract_dir)
-            if os.path.isdir(os.path.join(extract_dir, k))]
+    kids = [
+        k
+        for k in os.listdir(extract_dir)
+        if os.path.isdir(os.path.join(extract_dir, k))
+    ]
     if len(kids) == 1 and os.path.isdir(os.path.join(extract_dir, kids[0], "etc")):
         return os.path.join(extract_dir, kids[0])
     raise HarnessError("extracted tarball has no etc/ under %s" % extract_dir)
@@ -515,8 +680,16 @@ def build_image(cfg, libc, log=None):
     # --no-same-owner: we are unprivileged; device nodes (dev/) are excluded
     # because they cannot be created without root (runits devtmpfs recreates
     # them at boot).  -p keeps setuid bits (sudo) intact.
-    cmd = [cfg["tools"]["tar"], "-xJpf", cp["tarball"], "-C", extract,
-           "--no-same-owner", "--exclude=./dev", "--exclude=dev"]
+    cmd = [
+        cfg["tools"]["tar"],
+        "-xJpf",
+        cp["tarball"],
+        "-C",
+        extract,
+        "--no-same-owner",
+        "--exclude=./dev",
+        "--exclude=dev",
+    ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RunError("extract failed: %s" % r.stderr[-800:])
@@ -528,8 +701,7 @@ def build_image(cfg, libc, log=None):
 
     log("configuring rootfs in a user namespace")
     os.makedirs(os.path.join(rootfs, "proc"), exist_ok=True)
-    r = subprocess.run(mkimage_argv(cfg, rootfs, pub),
-                       capture_output=True, text=True)
+    r = subprocess.run(mkimage_argv(cfg, rootfs, pub), capture_output=True, text=True)
     if r.returncode != 0:
         raise RunError("mkimage failed: %s\n%s" % (r.stdout[-800:], r.stderr[-800:]))
 
@@ -540,16 +712,21 @@ def build_image(cfg, libc, log=None):
     with open(raw, "wb") as f:
         f.truncate(size * 1024 * 1024)
     log("creating ext4 filesystem (mke2fs -d)")
-    r = subprocess.run([cfg["tools"]["mke2fs"], "-F", "-q", "-t", "ext4",
-                        "-d", rootfs, raw], capture_output=True, text=True)
+    r = subprocess.run(
+        [cfg["tools"]["mke2fs"], "-F", "-q", "-t", "ext4", "-d", rootfs, raw],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         raise RunError("mke2fs failed: %s" % r.stderr[-800:])
 
     # Keep kernel and initramfs on the host side for direct -kernel boot.
-    boot = [f for f in os.listdir(os.path.join(rootfs, "boot"))
-            if f.startswith("vmlinuz")]
-    initrd = [f for f in os.listdir(os.path.join(rootfs, "boot"))
-              if f.startswith("initramfs")]
+    boot = [
+        f for f in os.listdir(os.path.join(rootfs, "boot")) if f.startswith("vmlinuz")
+    ]
+    initrd = [
+        f for f in os.listdir(os.path.join(rootfs, "boot")) if f.startswith("initramfs")
+    ]
     if not boot or not initrd:
         raise RunError("no kernel/initramfs in the image boot directory")
     shutil.copy2(os.path.join(rootfs, "boot", sorted(boot)[-1]), cp["kernel"])
@@ -559,8 +736,11 @@ def build_image(cfg, libc, log=None):
     tmp = cp["base"] + ".building"
     if os.path.exists(tmp):
         os.unlink(tmp)
-    r = subprocess.run([cfg["tools"]["qemu_img"], "convert", "-f", "raw", "-O", "qcow2",
-                        raw, tmp], capture_output=True, text=True)
+    r = subprocess.run(
+        [cfg["tools"]["qemu_img"], "convert", "-f", "raw", "-O", "qcow2", raw, tmp],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         raise RunError("qemu-img convert failed: %s" % r.stderr[-800:])
     os.replace(tmp, cp["base"])
@@ -571,11 +751,18 @@ def build_image(cfg, libc, log=None):
 
 # ---- package build ---------------------------------------------------------
 
+
 def build_package(cfg):
-    r = subprocess.run(["sh", BUILD_XBPS, package_repo_dir(cfg)], cwd=TAEMA_ROOT,
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        ["sh", BUILD_XBPS, package_repo_dir(cfg)],
+        cwd=TAEMA_ROOT,
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
-        raise RunError("package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:]))
+        raise RunError(
+            "package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:])
+        )
     pkg = package_path(cfg)
     if not os.path.isfile(pkg):
         raise RunError("package build produced no %s" % pkg)
@@ -584,13 +771,28 @@ def build_package(cfg):
 
 # ---- run pipeline ----------------------------------------------------------
 
+
 def ensure_ssh_key(cfg):
     key, pub = ssh_key_paths(cfg)
     if os.path.isfile(key) and os.path.isfile(pub):
         return key, pub
     os.makedirs(os.path.dirname(key), exist_ok=True)
-    r = subprocess.run([cfg["tools"]["ssh_keygen"], "-q", "-t", "ed25519", "-N", "",
-                        "-C", "taema-vm", "-f", key], capture_output=True, text=True)
+    r = subprocess.run(
+        [
+            cfg["tools"]["ssh_keygen"],
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "taema-vm",
+            "-f",
+            key,
+        ],
+        capture_output=True,
+        text=True,
+    )
     if r.returncode != 0:
         raise RunError("ssh-keygen failed: %s" % r.stderr[-400:])
     os.chmod(key, 0o600)
@@ -603,8 +805,10 @@ def wait_ssh(cfg, port, key, known, user, timeout, qemu, serial):
     while time.monotonic() < deadline:
         if qemu.poll() is not None:
             tail = _tail(serial)
-            raise RunError("qemu exited before ssh was ready (rc=%s)\nserial tail:\n%s"
-                           % (qemu.returncode, tail))
+            raise RunError(
+                "qemu exited before ssh was ready (rc=%s)\nserial tail:\n%s"
+                % (qemu.returncode, tail)
+            )
         try:
             r = subprocess.run(probe, capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired:
@@ -612,8 +816,9 @@ def wait_ssh(cfg, port, key, known, user, timeout, qemu, serial):
         if r is not None and r.returncode == 0:
             return
         time.sleep(2)
-    raise RunError("ssh not ready within %ss\nserial tail:\n%s"
-                   % (timeout, _tail(serial)))
+    raise RunError(
+        "ssh not ready within %ss\nserial tail:\n%s" % (timeout, _tail(serial))
+    )
 
 
 def _tail(path, n=40):
@@ -640,9 +845,15 @@ def run_step(name, argv, run_dir, timeout=None):
     with open(_log_file(run_dir, name), "w") as f:
         f.write("$ %s\n%s\n%s" % (" ".join(argv), r.stdout, r.stderr))
     if r.returncode != 0:
-        raise RunError("step %s failed (rc=%d); see %s\n%s"
-                       % (name, r.returncode, _log_file(run_dir, name),
-                          (r.stdout + r.stderr)[-600:]))
+        raise RunError(
+            "step %s failed (rc=%d); see %s\n%s"
+            % (
+                name,
+                r.returncode,
+                _log_file(run_dir, name),
+                (r.stdout + r.stderr)[-600:],
+            )
+        )
     return r
 
 
@@ -670,8 +881,9 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     run_dir_abs = run_dir
     qemu = qemu_argv(cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs)
     overlay = os.path.join(run_dir, "disk.qcow2")
-    ovr = overlay_argv(cache_paths(cfg, libc)["base"], overlay,
-                       qemu_img=cfg["tools"]["qemu_img"])
+    ovr = overlay_argv(
+        cache_paths(cfg, libc)["base"], overlay, qemu_img=cfg["tools"]["qemu_img"]
+    )
     r = subprocess.run(ovr, capture_output=True, text=True)
     if r.returncode != 0:
         raise RunError("overlay creation failed: %s" % r.stderr[-400:])
@@ -682,43 +894,95 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     pkg_src = package_repo_dir(cfg)
     prev = previous_pkg_path(cfg)
 
-    err.write("vmh: booting %s VM (accel=%s, port=%d, run=%s)\n"
-              % (libc, plan["accel"], port, run_dir))
+    err.write(
+        "vmh: booting %s VM (accel=%s, port=%d, run=%s)\n"
+        % (libc, plan["accel"], port, run_dir)
+    )
     with open(os.path.join(run_dir, "qemu.log"), "w") as qlog:
         proc = subprocess.Popen(qemu, stdout=qlog, stderr=subprocess.STDOUT)
     try:
-        wait_ssh(cfg, port, key, known, admin, cfg["boot_timeout_s"], proc,
-                 os.path.join(run_dir, "serial.log"))
-        run_step("mkdir-bootstrap",
-                 ssh_argv(cfg, port, key, known, admin,
-                          "mkdir -p %s/previous-repo" % GUEST_TMP), run_dir)
-        sources = [os.path.join(VM_DIR, "provision.sh"),
-                   os.path.join(VM_DIR, "scenario.py"), pub, pkg_src]
+        wait_ssh(
+            cfg,
+            port,
+            key,
+            known,
+            admin,
+            cfg["boot_timeout_s"],
+            proc,
+            os.path.join(run_dir, "serial.log"),
+        )
+        run_step(
+            "mkdir-bootstrap",
+            ssh_argv(
+                cfg, port, key, known, admin, "mkdir -p %s/previous-repo" % GUEST_TMP
+            ),
+            run_dir,
+        )
+        sources = [
+            os.path.join(VM_DIR, "provision.sh"),
+            os.path.join(VM_DIR, "scenario.py"),
+            pub,
+            pkg_src,
+        ]
         if "upgrade" in scenarios:
             sources.append(prev)
-        run_step("scp-bootstrap",
-                 scp_argv(cfg, port, key, known, sources, admin + "@127.0.0.1:" + GUEST_TMP + "/"),
-                 run_dir, timeout=300)
-        run_step("provision",
-                 ssh_argv(cfg, port, key, known, admin,
-                          "sudo -n sh %s/provision.sh --package-dir %s/%s --user %s"
-                          " --authorized-key %s/%s"
-                          % (GUEST_TMP, GUEST_TMP, repo_name, user,
-                             GUEST_TMP, os.path.basename(pub))),
-                 run_dir, timeout=300)
+        run_step(
+            "scp-bootstrap",
+            scp_argv(
+                cfg, port, key, known, sources, admin + "@127.0.0.1:" + GUEST_TMP + "/"
+            ),
+            run_dir,
+            timeout=300,
+        )
+        run_step(
+            "provision",
+            ssh_argv(
+                cfg,
+                port,
+                key,
+                known,
+                admin,
+                "sudo -n sh %s/provision.sh --package-dir %s/%s --user %s"
+                " --authorized-key %s/%s"
+                % (
+                    GUEST_TMP,
+                    GUEST_TMP,
+                    repo_name,
+                    user,
+                    GUEST_TMP,
+                    os.path.basename(pub),
+                ),
+            ),
+            run_dir,
+            timeout=300,
+        )
         results = {}
         for s in scenarios:
             remote = "python3 %s/scenario.py %s --artifacts %s/artifacts" % (
-                GUEST_TMP, s, GUEST_TMP)
+                GUEST_TMP,
+                s,
+                GUEST_TMP,
+            )
             if s == "upgrade":
-                remote += (" --package-dir %s/%s --previous %s/previous-repo/%s"
-                           " --previous-version %s --current-version %s"
-                           % (GUEST_TMP, repo_name, GUEST_TMP, os.path.basename(prev),
-                              previous_version(cfg), read_version()))
+                remote += (
+                    " --package-dir %s/%s --previous %s/previous-repo/%s"
+                    " --previous-version %s --current-version %s"
+                    % (
+                        GUEST_TMP,
+                        repo_name,
+                        GUEST_TMP,
+                        os.path.basename(prev),
+                        previous_version(cfg),
+                        read_version(),
+                    )
+                )
             try:
-                run_step("scenario-" + s,
-                         ssh_argv(cfg, port, key, known, user, remote),
-                         run_dir, timeout=cfg["scenario_timeout_s"])
+                run_step(
+                    "scenario-" + s,
+                    ssh_argv(cfg, port, key, known, user, remote),
+                    run_dir,
+                    timeout=cfg["scenario_timeout_s"],
+                )
                 results[s] = "PASS"
             except RunError as e:
                 # A failed scenario is a result, not a pipeline abort: record
@@ -730,10 +994,19 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
         dest = os.path.join(run_dir, "artifacts")
         os.makedirs(dest, exist_ok=True)
         try:
-            run_step("collect",
-                     scp_argv(cfg, port, key, known,
-                              [admin + "@127.0.0.1:%s/artifacts/" % GUEST_TMP],
-                              dest + "/"), run_dir, timeout=120)
+            run_step(
+                "collect",
+                scp_argv(
+                    cfg,
+                    port,
+                    key,
+                    known,
+                    [admin + "@127.0.0.1:%s/artifacts/" % GUEST_TMP],
+                    dest + "/",
+                ),
+                run_dir,
+                timeout=120,
+            )
         except RunError as e:
             err.write("vmh: collect failed (continuing to teardown): %s\n" % e)
         return results
@@ -749,8 +1022,9 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
 def cmd_run(cfg, args, out, err):
     libcs = cfg["libcs"]
     scenarios = cfg["scenarios"]
-    plan = build_plan(cfg, libcs=libcs, scenarios=scenarios,
-                      kvm=(False if args.tcg else None))
+    plan = build_plan(
+        cfg, libcs=libcs, scenarios=scenarios, kvm=(False if args.tcg else None)
+    )
 
     missing = doctor(cfg)
     if missing:
@@ -771,8 +1045,9 @@ def cmd_run(cfg, args, out, err):
     if "upgrade" in scenarios and not os.path.isfile(previous_pkg_path(cfg)):
         need_net.append("previous release package")
     if need_net and not args.allow_network:
-        raise HarnessError("not cached: %s; re-run with --allow-network"
-                           % ", ".join(need_net))
+        raise HarnessError(
+            "not cached: %s; re-run with --allow-network" % ", ".join(need_net)
+        )
 
     ensure_ssh_key(cfg)
     if args.allow_network:
@@ -789,8 +1064,9 @@ def cmd_run(cfg, args, out, err):
 
     if args.no_build:
         if not os.path.isfile(package_path(cfg)):
-            raise HarnessError("package not built: %s (run without --no-build)"
-                               % package_path(cfg))
+            raise HarnessError(
+                "package not built: %s (run without --no-build)" % package_path(cfg)
+            )
     else:
         err.write("vmh: building package from the working tree\n")
         build_package(cfg)
@@ -800,7 +1076,8 @@ def cmd_run(cfg, args, out, err):
     for libc in libcs:
         run_dir = create_run_dir(cfg, libc)
         (summary["vms"].setdefault(libc, {})).update(
-            {"run_dir": run_dir, "scenarios": {}})
+            {"run_dir": run_dir, "scenarios": {}}
+        )
         try:
             vm_plan = next(v for v in plan["vms"] if v["libc"] == libc)
             vm_plan["keep_run"] = args.keep_run
@@ -822,14 +1099,16 @@ def cmd_run(cfg, args, out, err):
 
 # ---- entry points ----------------------------------------------------------
 
+
 def cmd_doctor(cfg, out, err):
     missing = doctor(cfg)
     if missing:
         for m in missing:
             err.write("vmh: missing required tool: %s\n" % m)
         return 2
-    out.write("vmh: all tools present (kvm=%s)\n"
-              % ("yes" if kvm_available() else "no"))
+    out.write(
+        "vmh: all tools present (kvm=%s)\n" % ("yes" if kvm_available() else "no")
+    )
     return 0
 
 
@@ -838,8 +1117,10 @@ def cmd_fetch(cfg, args, out, err):
         path = fetch_image(cfg, libc, allow_network=args.allow_network)
         out.write("vmh: image %s ok: %s\n" % (libc, path))
     if "upgrade" in cfg["scenarios"]:
-        out.write("vmh: previous release ok: %s\n" % fetch_previous(
-            cfg, allow_network=args.allow_network))
+        out.write(
+            "vmh: previous release ok: %s\n"
+            % fetch_previous(cfg, allow_network=args.allow_network)
+        )
     return 0
 
 
@@ -857,29 +1138,50 @@ def main(argv, out=None, err=None):
     out = out or sys.stdout
     err = err or sys.stderr
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--config", help="harness config file (default: tools/vm/config.toml)")
+    common.add_argument(
+        "--config", help="harness config file (default: tools/vm/config.toml)"
+    )
     common.add_argument("--state-dir", help="override paths.state_dir")
     net = argparse.ArgumentParser(add_help=False)
-    net.add_argument("--allow-network", action="store_true",
-                     help="permit downloads (base images, previous release)")
+    net.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="permit downloads (base images, previous release)",
+    )
     runp = argparse.ArgumentParser(add_help=False)
-    runp.add_argument("--libc", help="comma-separated libcs to boot (default from config)")
-    runp.add_argument("--scenarios", help="comma-separated: smoke,m0,upgrade,remove or all")
+    runp.add_argument(
+        "--libc", help="comma-separated libcs to boot (default from config)"
+    )
+    runp.add_argument(
+        "--scenarios", help="comma-separated: smoke,m0,upgrade,remove or all"
+    )
     runp.add_argument("--tcg", action="store_true", help="force TCG emulation")
     runp.add_argument("--dry-run", action="store_true", help="print the plan and exit")
-    runp.add_argument("--no-build", action="store_true",
-                      help="reuse the package already in the package repo")
-    runp.add_argument("--keep-run", action="store_true",
-                      help="keep the run's disk overlay for debugging")
+    runp.add_argument(
+        "--no-build",
+        action="store_true",
+        help="reuse the package already in the package repo",
+    )
+    runp.add_argument(
+        "--keep-run",
+        action="store_true",
+        help="keep the run's disk overlay for debugging",
+    )
 
     parser = argparse.ArgumentParser(
-        prog="vmh", description="disposable Void VM test harness for taema")
+        prog="vmh", description="disposable Void VM test harness for taema"
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor", parents=[common], help="check prerequisites")
     sub.add_parser("fetch", parents=[common, net], help="download cached base images")
-    sub.add_parser("build", parents=[common], help="build the .xbps from the working tree")
-    sub.add_parser("run", parents=[common, net, runp],
-                   help="build, boot, provision, and run scenarios")
+    sub.add_parser(
+        "build", parents=[common], help="build the .xbps from the working tree"
+    )
+    sub.add_parser(
+        "run",
+        parents=[common, net, runp],
+        help="build, boot, provision, and run scenarios",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -889,8 +1191,10 @@ def main(argv, out=None, err=None):
             state_dir=getattr(args, "state_dir", None),
             libcs=parse_libcs(args.libc) if getattr(args, "libc", None) else None,
             scenarios=parse_scenarios(args.scenarios)
-            if getattr(args, "scenarios", None) else None,
-            accel="tcg" if getattr(args, "tcg", False) else None)
+            if getattr(args, "scenarios", None)
+            else None,
+            accel="tcg" if getattr(args, "tcg", False) else None,
+        )
         if args.cmd == "doctor":
             return cmd_doctor(cfg, out, err)
         if args.cmd == "fetch":

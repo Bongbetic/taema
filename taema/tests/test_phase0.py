@@ -1,4 +1,5 @@
 """Phase 0 regression tests: fake /proc and cgroup trees, malformed sockets, learner fixes."""
+
 import json
 import os
 import socket
@@ -10,7 +11,7 @@ import types
 import unittest
 from unittest import mock
 
-from taema import cgroup, cli, daemon, engine, inspect, knowledge, policy
+from taema import cgroup, cli, daemon, engine, inspect, knowledge
 
 UID = os.getuid()
 
@@ -20,10 +21,20 @@ def tmp():
 
 
 def make_cfg(state, **extra):
-    cfg = {"mode": "observe", "paths": {"state_dir": state, "units_dir": tmp(), "hooks_dir": tmp(),
-                                        "socket": os.path.join(state, "a.sock"),
-                                        "socket_fallback": os.path.join(state, "b.sock")},
-           "timers": {}, "protected": {}, "seeds": {}, "_sources": []}
+    cfg = {
+        "mode": "observe",
+        "paths": {
+            "state_dir": state,
+            "units_dir": tmp(),
+            "hooks_dir": tmp(),
+            "socket": os.path.join(state, "a.sock"),
+            "socket_fallback": os.path.join(state, "b.sock"),
+        },
+        "timers": {},
+        "protected": {},
+        "seeds": {},
+        "_sources": [],
+    }
     cfg.update(extra)
     return cfg
 
@@ -74,6 +85,7 @@ class BadSnap:
 
 # ---- inspect / injectable roots -----------------------------------------------------------
 
+
 class ProcRoot(unittest.TestCase):
     def test_fake_proc_tree(self):
         root = tmp()
@@ -81,7 +93,9 @@ class ProcRoot(unittest.TestCase):
         with open(root + "/77/comm", "w") as f:
             f.write("my app\n")
         with open(root + "/77/stat", "w") as f:
-            f.write("77 (my (app)) S 5 77 77 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4242 0 0\n")
+            f.write(
+                "77 (my (app)) S 5 77 77 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4242 0 0\n"
+            )
         with mock.patch.object(inspect, "PROC", root):
             self.assertEqual(inspect.comm(77), "my app")
             self.assertEqual(inspect.ppid_map(), {77: 5})
@@ -98,23 +112,34 @@ class ProcRoot(unittest.TestCase):
         r = types.SimpleNamespace(returncode=1, stdout="")
         with mock.patch.object(inspect.subprocess, "run", return_value=r):
             self.assertIsNone(inspect._ss("-xpn"))
-        with mock.patch.object(inspect.subprocess, "run", side_effect=subprocess.TimeoutExpired("ss", 1)):
+        with mock.patch.object(
+            inspect.subprocess, "run", side_effect=subprocess.TimeoutExpired("ss", 1)
+        ):
             self.assertIsNone(inspect._ss("-xpn"))
 
 
 # ---- plan_stop with failed ss ---------------------------------------------------------------
 
+
 def plan(snap, members=(10, 11), protected=(), hard=False):
     store = knowledge.Store(tmp(), {})
-    with mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)), \
-         mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in members})), \
-         mock.patch.object(engine.inspect, "Snapshot", return_value=snap), \
-         mock.patch.object(engine.inspect, "edges", return_value={}), \
-         mock.patch.object(engine.inspect, "comm", side_effect=lambda p: "p%d" % p), \
-         mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: "p%d" % p), \
-         mock.patch.object(engine.policy, "protected_reason",
-                           side_effect=lambda p, c, pp=None: "protected" if p in protected else None):
+    with (
+        mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)),
+        mock.patch.object(
+            engine.inspect.ProcTable,
+            "scan",
+            return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in members}),
+        ),
+        mock.patch.object(engine.inspect, "Snapshot", return_value=snap),
+        mock.patch.object(engine.inspect, "edges", return_value={}),
+        mock.patch.object(engine.inspect, "comm", side_effect=lambda p: "p%d" % p),
+        mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: "p%d" % p),
+        mock.patch.object(
+            engine.policy,
+            "protected_reason",
+            side_effect=lambda p, c, pp=None: "protected" if p in protected else None,
+        ),
+    ):
         out = engine.plan_stop("/x/user/1/y", {}, store, hard=hard)
     return {d["pid"]: (d["action"], d["why"]) for d in out}
 
@@ -135,6 +160,7 @@ class EdgeScanFailed(unittest.TestCase):
 
 # ---- stop: tautology, signalling, hook -------------------------------------------------------
 
+
 class StopAccounting(unittest.TestCase):
     def run_stop(self, pids, keys, term_survivors, grace=0.3):
         """Fake scope: SIGTERM removes every pid except term_survivors; SIGKILL removes the rest."""
@@ -145,26 +171,42 @@ class StopAccounting(unittest.TestCase):
 
             def fake_signal(p, pids_, sig, cfg):
                 sent.append((sig, sorted(pids_)))
-                cur = [x for x in cgroup.tree_procs(p)
-                       if sig == engine.signal.SIGTERM and x in term_survivors]
+                cur = [
+                    x
+                    for x in cgroup.tree_procs(p)
+                    if sig == engine.signal.SIGTERM and x in term_survivors
+                ]
                 cg.set_procs("scope-t", cur)
                 return list(pids_)
 
-            with mock.patch.object(engine, "_signal_all", side_effect=fake_signal), \
-                 mock.patch.object(engine, "self_guard"), \
-                 mock.patch.object(engine, "_wait_each", wraps=engine._wait_each), \
-                 mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in pids})), \
-                 mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()), \
-                 mock.patch.object(engine.inspect, "edges", return_value={}), \
-                 mock.patch.object(engine.inspect, "comm", side_effect=lambda p: keys[p]), \
-                 mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: keys[p]), \
-                 mock.patch.object(engine.policy, "protected_reason", return_value=None):
+            with (
+                mock.patch.object(engine, "_signal_all", side_effect=fake_signal),
+                mock.patch.object(engine, "self_guard"),
+                mock.patch.object(engine, "_wait_each", wraps=engine._wait_each),
+                mock.patch.object(
+                    engine.inspect.ProcTable,
+                    "scan",
+                    return_value=engine.inspect.ProcTable.from_ppid(
+                        {p: 1 for p in pids}
+                    ),
+                ),
+                mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()),
+                mock.patch.object(engine.inspect, "edges", return_value={}),
+                mock.patch.object(
+                    engine.inspect, "comm", side_effect=lambda p: keys[p]
+                ),
+                mock.patch.object(
+                    engine.policy, "exe_key", side_effect=lambda p: keys[p]
+                ),
+                mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            ):
                 engine.stop(path, make_cfg(tmp()), store, timeout=grace, passes=1)
         return store, sent
 
     def test_only_survivors_count_as_sigkill_needed(self):
-        store, sent = self.run_stop([4001, 4002], {4001: "polite", 4002: "stubborn"}, {4002})
+        store, sent = self.run_stop(
+            [4001, 4002], {4001: "polite", 4002: "stubborn"}, {4002}
+        )
         self.assertEqual(store.peek("polite")["sigkill_needed"], 0)
         self.assertEqual(store.peek("stubborn")["sigkill_needed"], 1)
         self.assertEqual(store.peek("polite")["killed"], 1)
@@ -188,10 +230,18 @@ class SignalAll(unittest.TestCase):
     def patched(self, members, protected=None, send=None):
         fd = os.open(os.devnull, os.O_RDONLY)
         send = send or mock.Mock()
-        return fd, send, [mock.patch.object(engine.os, "pidfd_open", return_value=fd),
-                          mock.patch.object(engine.signal, "pidfd_send_signal", send),
-                          mock.patch.object(engine.cgroup, "tree_procs", return_value=members),
-                          mock.patch.object(engine.policy, "protected_reason", return_value=protected)]
+        return (
+            fd,
+            send,
+            [
+                mock.patch.object(engine.os, "pidfd_open", return_value=fd),
+                mock.patch.object(engine.signal, "pidfd_send_signal", send),
+                mock.patch.object(engine.cgroup, "tree_procs", return_value=members),
+                mock.patch.object(
+                    engine.policy, "protected_reason", return_value=protected
+                ),
+            ],
+        )
 
     def run_it(self, members, protected=None, send=None):
         fd, send, ps = self.patched(members, protected, send)
@@ -224,10 +274,14 @@ class SignalAll(unittest.TestCase):
             self.assertEqual(sent, [])
 
     def test_fallback_to_os_kill(self):
-        with mock.patch.object(engine.os, "pidfd_open", side_effect=OSError(38, "nosys")), \
-             mock.patch.object(engine.cgroup, "tree_procs", return_value=[123]), \
-             mock.patch.object(engine.policy, "protected_reason", return_value=None), \
-             mock.patch.object(engine.os, "kill", side_effect=PermissionError) as k:
+        with (
+            mock.patch.object(
+                engine.os, "pidfd_open", side_effect=OSError(38, "nosys")
+            ),
+            mock.patch.object(engine.cgroup, "tree_procs", return_value=[123]),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(engine.os, "kill", side_effect=PermissionError) as k,
+        ):
             self.assertEqual(engine._signal_all("/x", [123], 15, {}), [])
             k.assert_called_once_with(123, 15)
 
@@ -250,6 +304,7 @@ class Hook(unittest.TestCase):
 
 # ---- knowledge ---------------------------------------------------------------------------------
 
+
 class KnowledgeHardening(unittest.TestCase):
     def test_graceful_floor_and_reprobe(self):
         s = knowledge.Store(tmp(), {})
@@ -257,7 +312,7 @@ class KnowledgeHardening(unittest.TestCase):
         r["killed"], r["sigkill_needed"] = 10, 10
         self.assertEqual(s.graceful_timeout("k", 0), (2.0, True))
         self.assertEqual(s.graceful_timeout("k", 10), (2.0, True))
-        s.rec("k")["stops"] = 9    # the 10th stop re-probes with the full grace
+        s.rec("k")["stops"] = 9  # the 10th stop re-probes with the full grace
         self.assertEqual(s.graceful_timeout("k", 10), (10.0, True))
         s2 = knowledge.Store(tmp(), {})
         self.assertEqual(s2.graceful_timeout("fresh", 0.5), (2.0, True))
@@ -288,7 +343,9 @@ class KnowledgeHardening(unittest.TestCase):
         with open(os.path.join(d, kept[0])) as f:
             self.assertEqual(f.read(), "{not json")
         with open(path, "w") as f:
-            f.write("[1]")      # wrong shape, but a .corrupt copy already exists: left alone
+            f.write(
+                "[1]"
+            )  # wrong shape, but a .corrupt copy already exists: left alone
         knowledge.Store(d, {})
         self.assertEqual(len([n for n in os.listdir(d) if ".corrupt" in n]), 1)
         with open(os.path.join(d, kept[0])) as f:
@@ -337,7 +394,9 @@ class KnowledgeHardening(unittest.TestCase):
         self.assertEqual(cli.feedback(cfg, s, "forget", "x"), "queued")
         with open(s.feedback_path) as f:
             ops = [json.loads(l) for l in f]
-        self.assertEqual(ops, [{"op": "keep", "key": "adb"}, {"op": "forget", "key": "x"}])
+        self.assertEqual(
+            ops, [{"op": "keep", "key": "adb"}, {"op": "forget", "key": "x"}]
+        )
         self.assertEqual(stat.S_IMODE(os.stat(s.feedback_path).st_mode), 0o600)
         self.assertEqual(knowledge.Store(d, {}).apply_feedback(), 2)
 
@@ -350,15 +409,18 @@ class KnowledgeHardening(unittest.TestCase):
 
 # ---- engine: matches, names, gc ----------------------------------------------------------------
 
+
 class MatchesAndNames(unittest.TestCase):
     def test_empty_match_table_rejected(self):
         engine._warned.clear()
-        with mock.patch.object(engine.inspect, "exe", return_value="/x"), \
-             mock.patch.object(engine.sys, "stderr") as err:
+        with (
+            mock.patch.object(engine.inspect, "exe", return_value="/x"),
+            mock.patch.object(engine.sys, "stderr") as err,
+        ):
             self.assertFalse(engine._matches({}, 1))
             self.assertFalse(engine._matches({"env_exclude": {"A": "b"}}, 1))
             self.assertFalse(engine._matches({}, 1))
-        self.assertEqual(len(engine._warned), 2)     # logged once per table
+        self.assertEqual(len(engine._warned), 2)  # logged once per table
         self.assertTrue(err.write.called)
 
     def test_known_key_matches(self):
@@ -367,8 +429,10 @@ class MatchesAndNames(unittest.TestCase):
             self.assertFalse(engine._matches({"comm": "bar"}, 1))
 
     def test_unit_for_leaf_prefix(self):
-        units = [{"unit": {"name": "claude-desktop", "kind": "app"}},
-                 {"unit": {"name": "vm", "kind": "scope"}}]
+        units = [
+            {"unit": {"name": "claude-desktop", "kind": "app"}},
+            {"unit": {"name": "vm", "kind": "scope"}},
+        ]
         self.assertIs(engine.unit_for_leaf(units, "claude-desktop"), units[0])
         self.assertIs(engine.unit_for_leaf(units, "claude-desktop-ab12cd34"), units[0])
         self.assertIsNone(engine.unit_for_leaf(units, "vm-1"))
@@ -376,7 +440,16 @@ class MatchesAndNames(unittest.TestCase):
 
     def test_leaf_slug_always_valid(self):
         seen = set()
-        for name in ("Xwayland", "g++", "my app", "", "UPPER_case.x", "plain-name", "ünï", "a" * 80):
+        for name in (
+            "Xwayland",
+            "g++",
+            "my app",
+            "",
+            "UPPER_case.x",
+            "plain-name",
+            "ünï",
+            "a" * 80,
+        ):
             for pid in (None, 42):
                 slug = engine.leaf_slug(name, pid)
                 self.assertTrue(cgroup.valid_rel("shared/" + slug), slug)
@@ -398,13 +471,30 @@ class GcRules(unittest.TestCase):
 
     def run_gc(self, cfg=None, idle=None, usage=None, skip=None, noted=None, snap=None):
         cfg = cfg or make_cfg(tmp(), seeds={"share": ["adb"], "persist": ["tmux"]})
-        with mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid({})), \
-             mock.patch.object(engine.inspect, "Snapshot", return_value=snap or OkSnap()), \
-             mock.patch.object(engine.inspect, "edges", return_value={}), \
-             mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: self.keys.get(p, "x")):
-            return engine.gc_candidates(cfg, [], self.store, {} if idle is None else idle,
-                                        now=lambda: self.t[0], usage=usage, skip=skip, noted=noted)
+        with (
+            mock.patch.object(
+                engine.inspect.ProcTable,
+                "scan",
+                return_value=engine.inspect.ProcTable.from_ppid({}),
+            ),
+            mock.patch.object(
+                engine.inspect, "Snapshot", return_value=snap or OkSnap()
+            ),
+            mock.patch.object(engine.inspect, "edges", return_value={}),
+            mock.patch.object(
+                engine.policy, "exe_key", side_effect=lambda p: self.keys.get(p, "x")
+            ),
+        ):
+            return engine.gc_candidates(
+                cfg,
+                [],
+                self.store,
+                {} if idle is None else idle,
+                now=lambda: self.t[0],
+                usage=usage,
+                skip=skip,
+                noted=noted,
+            )
 
     def test_persist_and_share_seed_leaves_never_candidates(self):
         self.cg.leaf("shared/tmux-5", [5], cpu=1)
@@ -417,7 +507,7 @@ class GcRules(unittest.TestCase):
         self.assertEqual(self.run_gc(idle=idle, noted=noted), [])
         self.assertEqual(noted, {"shared/tmux-5", "shared/adb-6"})
         with open(self.store.log_path) as f:
-            self.assertEqual(f.read().count("gc_skip"), 2)     # logged once each
+            self.assertEqual(f.read().count("gc_skip"), 2)  # logged once each
 
     def test_user_keep_leaf_skipped(self):
         self.cg.leaf("shared/foo-7", [7], cpu=1)
@@ -443,11 +533,11 @@ class GcRules(unittest.TestCase):
         idle, usage = {}, {}
         self.run_gc(idle=idle, usage=usage)
         self.t[0] += 400
-        self.cg.set_cpu("shared/foo-8", 99999)          # busy: window restarts
+        self.cg.set_cpu("shared/foo-8", 99999)  # busy: window restarts
         self.assertEqual(self.run_gc(idle=idle, usage=usage), [])
-        self.t[0] += 400                                # 800 s since first sight, 400 since restart
+        self.t[0] += 400  # 800 s since first sight, 400 since restart
         self.assertEqual(self.run_gc(idle=idle, usage=usage), [])
-        self.t[0] += 300                                # flat for 700 s >= 600
+        self.t[0] += 300  # flat for 700 s >= 600
         self.assertEqual(len(self.run_gc(idle=idle, usage=usage)), 1)
 
     def test_missing_cpu_stat_falls_back_to_edges_only(self):
@@ -474,6 +564,7 @@ class GcRules(unittest.TestCase):
 
 # ---- daemon ------------------------------------------------------------------------------------
 
+
 class DaemonSocket(unittest.TestCase):
     def setUp(self):
         self.state = tmp()
@@ -487,22 +578,47 @@ class DaemonSocket(unittest.TestCase):
             self.d.srv.close()
 
     def test_bad_shapes(self):
-        for msg in ([], "x", None, 5, 1.5, {"cmd": 5}, {"cmd": None}, {}, {"cmd": "register"},
-                    {"cmd": "register", "scope": 5, "owner": 1}, {"cmd": "register", "scope": "scope-x"},
-                    {"cmd": "register", "scope": "scope-x", "owner": "7"},
-                    {"cmd": "register", "scope": "scope-x", "owner": True},
-                    {"cmd": "feedback", "op": 1, "key": []}, {"cmd": "feedback"}):
+        for msg in (
+            [],
+            "x",
+            None,
+            5,
+            1.5,
+            {"cmd": 5},
+            {"cmd": None},
+            {},
+            {"cmd": "register"},
+            {"cmd": "register", "scope": 5, "owner": 1},
+            {"cmd": "register", "scope": "scope-x"},
+            {"cmd": "register", "scope": "scope-x", "owner": "7"},
+            {"cmd": "register", "scope": "scope-x", "owner": True},
+            {"cmd": "feedback", "op": 1, "key": []},
+            {"cmd": "feedback"},
+        ):
             r = self.d.handle(msg)
             self.assertIn("error", r, msg)
 
     def test_register_validation(self):
         me = os.getpid()
-        for scope, owner in (("scope-x", 1), ("scope-x", 0), ("scope-x", -4), ("../etc", me),
-                             ("Scope-X", me), ("a//b", me), ("", me)):
-            self.assertIn("error", self.d.handle({"cmd": "register", "scope": scope, "owner": owner}),
-                          (scope, owner))
+        for scope, owner in (
+            ("scope-x", 1),
+            ("scope-x", 0),
+            ("scope-x", -4),
+            ("../etc", me),
+            ("Scope-X", me),
+            ("a//b", me),
+            ("", me),
+        ):
+            self.assertIn(
+                "error",
+                self.d.handle({"cmd": "register", "scope": scope, "owner": owner}),
+                (scope, owner),
+            )
         with mock.patch.object(daemon.inspect, "uid_of", return_value=UID + 1):
-            self.assertIn("error", self.d.handle({"cmd": "register", "scope": "scope-x", "owner": me}))
+            self.assertIn(
+                "error",
+                self.d.handle({"cmd": "register", "scope": "scope-x", "owner": me}),
+            )
         self.assertEqual(self.d.owners, {})
 
     def test_register_ok_and_deduped(self):
@@ -510,13 +626,20 @@ class DaemonSocket(unittest.TestCase):
         self.assertEqual(self.d.handle(msg), {"watching": True})
         self.assertEqual(self.d.handle(msg), {"watching": True})
         self.assertEqual(len(self.d.owners), 1)
-        self.assertEqual(self.d.handle({"cmd": "status"})["owners"], [{"scope": "scope-x", "owner": os.getpid()}])
+        self.assertEqual(
+            self.d.handle({"cmd": "status"})["owners"],
+            [{"scope": "scope-x", "owner": os.getpid()}],
+        )
 
     def test_feedback_command(self):
-        self.assertEqual(self.d.handle({"cmd": "feedback", "op": "keep", "key": "adb"}), {"ok": True})
+        self.assertEqual(
+            self.d.handle({"cmd": "feedback", "op": "keep", "key": "adb"}), {"ok": True}
+        )
         self.assertEqual(self.d.store.peek("adb")["user_keep"], 3.0)
-        self.assertFalse(self.d.store.dirty)    # saved
-        self.assertIn("error", self.d.handle({"cmd": "feedback", "op": "nuke", "key": "adb"}))
+        self.assertFalse(self.d.store.dirty)  # saved
+        self.assertIn(
+            "error", self.d.handle({"cmd": "feedback", "op": "nuke", "key": "adb"})
+        )
 
     def converse(self, payload, send_close=False):
         """One real round trip over a unix socket pair against Daemon.serve."""
@@ -537,8 +660,16 @@ class DaemonSocket(unittest.TestCase):
         return json.loads(c.recv(65536))
 
     def test_serve_survives_junk(self):
-        for payload in (b"[1,2\n", b"\xff\xfe\n", b"[]\n", b"5\n", b'"x"\n', b"null\n",
-                        b'{"cmd": []}\n', b'{"cmd":"register","scope":{},"owner":[]}\n'):
+        for payload in (
+            b"[1,2\n",
+            b"\xff\xfe\n",
+            b"[]\n",
+            b"5\n",
+            b'"x"\n',
+            b"null\n",
+            b'{"cmd": []}\n',
+            b'{"cmd":"register","scope":{},"owner":[]}\n',
+        ):
             self.assertIn("error", self.converse(payload), payload)
 
     def test_serve_accepts_eof_framed_and_valid(self):
@@ -565,17 +696,20 @@ class DaemonSocket(unittest.TestCase):
         path = os.path.join(tmp(), "t.sock")
         with mock.patch.dict(os.environ, {"TAEMA_SOCKET": path}):
             self.d.check_socket()
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode) & 0o077, 0)   # owner only
+            self.assertEqual(
+                stat.S_IMODE(os.stat(path).st_mode) & 0o077, 0
+            )  # owner only
             os.unlink(path)
             self.d.check_socket()
             self.assertTrue(os.path.exists(path))
             first = self.d.srv
             self.d.check_socket()
-            self.assertIs(self.d.srv, first)       # untouched while the path is there
+            self.assertIs(self.d.srv, first)  # untouched while the path is there
 
     def test_guarded_logs_instead_of_raising(self):
         def boom():
             raise RuntimeError("x")
+
         self.d.guarded(boom)
         self.d.guarded(lambda: 1 / 0)
         with open(self.d.store.log_path) as f:
@@ -599,15 +733,19 @@ class DaemonActions(unittest.TestCase):
         unit = {"unit": {"name": "claude-desktop", "kind": "app"}}
         self.d.units = [unit]
         self.cg.leaf("claude-desktop-ab12cd34", [])
-        with mock.patch.object(daemon.engine, "stop") as st, \
-             mock.patch.object(daemon.policy, "hook_for", return_value="/h"):
+        with (
+            mock.patch.object(daemon.engine, "stop") as st,
+            mock.patch.object(daemon.policy, "hook_for", return_value="/h"),
+        ):
             self.d.stop_leaf("claude-desktop-ab12cd34", "t")
         self.assertIs(st.call_args[0][3], unit)
         self.assertEqual(st.call_args[1]["hook"], "/h")
 
     def test_stop_leaf_broad_errors_caught(self):
         self.cg.leaf("scope-x", [])
-        with mock.patch.object(daemon.engine, "stop", side_effect=PermissionError("no")):
+        with mock.patch.object(
+            daemon.engine, "stop", side_effect=PermissionError("no")
+        ):
             self.d.stop_leaf("scope-x", "t")
         self.assertIn("stop_error", self.log())
 
@@ -624,18 +762,30 @@ class DaemonActions(unittest.TestCase):
     def test_gc_stopped_only_when_removed(self):
         self.cg.leaf("shared/foo-1", [])
         path = self.cg.base + "/shared/foo-1"
-        rep = {"scope": "shared/foo-1", "removed": False, "left": [1],
-               "decisions": [{"action": "skip", "pid": 1}]}
-        with mock.patch.object(daemon.engine, "gc_candidates", return_value=[(path, "idle")]), \
-             mock.patch.object(daemon.engine, "stop", return_value=rep):
+        rep = {
+            "scope": "shared/foo-1",
+            "removed": False,
+            "left": [1],
+            "decisions": [{"action": "skip", "pid": 1}],
+        }
+        with (
+            mock.patch.object(
+                daemon.engine, "gc_candidates", return_value=[(path, "idle")]
+            ),
+            mock.patch.object(daemon.engine, "stop", return_value=rep),
+        ):
             self.d.gc_pass()
         out = self.log()
         self.assertNotIn("gc_stopped", out)
         self.assertIn("kept: protected member", out)
         self.assertIn("shared/foo-1", self.d.gc_skip)
         rep2 = dict(rep, removed=True)
-        with mock.patch.object(daemon.engine, "gc_candidates", return_value=[(path, "idle")]), \
-             mock.patch.object(daemon.engine, "stop", return_value=rep2):
+        with (
+            mock.patch.object(
+                daemon.engine, "gc_candidates", return_value=[(path, "idle")]
+            ),
+            mock.patch.object(daemon.engine, "stop", return_value=rep2),
+        ):
             self.d.gc_pass()
         self.assertIn("gc_stopped", self.log())
 
@@ -643,12 +793,16 @@ class DaemonActions(unittest.TestCase):
 class CliRun(unittest.TestCase):
     def test_owner_gone_dies_before_attach(self):
         with FakeCg() as cg:
-            args = types.SimpleNamespace(name="x", join=False, owner=2 ** 22 + 12345, bind=False, cmd=["true"])
+            args = types.SimpleNamespace(
+                name="x", join=False, owner=2**22 + 12345, bind=False, cmd=["true"]
+            )
             cfg = make_cfg(tmp())
-            with mock.patch.object(cli, "_load", return_value=(cfg, None, [])), \
-                 mock.patch.object(cli.engine, "helper_attach") as att, \
-                 mock.patch.object(cli.os, "execvp") as ex, \
-                 mock.patch.object(inspect, "PROC", tmp()):
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, None, [])),
+                mock.patch.object(cli.engine, "helper_attach") as att,
+                mock.patch.object(cli.os, "execvp") as ex,
+                mock.patch.object(inspect, "PROC", tmp()),
+            ):
                 rc = cli.cmd_run(args)
             self.assertNotEqual(rc, 0)
             att.assert_not_called()
@@ -658,12 +812,26 @@ class CliRun(unittest.TestCase):
     def test_register_before_attach(self):
         order = []
         with FakeCg():
-            args = types.SimpleNamespace(name="x", join=False, owner=os.getpid(), bind=False, cmd=["true"])
+            args = types.SimpleNamespace(
+                name="x", join=False, owner=os.getpid(), bind=False, cmd=["true"]
+            )
             cfg = make_cfg(tmp())
-            with mock.patch.object(cli, "_load", return_value=(cfg, None, [])), \
-                 mock.patch.object(cli, "ask", side_effect=lambda *a, **k: order.append("ask") or {"watching": True}), \
-                 mock.patch.object(cli.engine, "helper_attach", side_effect=lambda *a: order.append("attach")), \
-                 mock.patch.object(cli.os, "execvp"):
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, None, [])),
+                mock.patch.object(
+                    cli,
+                    "ask",
+                    side_effect=lambda *a, **k: (
+                        order.append("ask") or {"watching": True}
+                    ),
+                ),
+                mock.patch.object(
+                    cli.engine,
+                    "helper_attach",
+                    side_effect=lambda *a: order.append("attach"),
+                ),
+                mock.patch.object(cli.os, "execvp"),
+            ):
                 cli.cmd_run(args)
         self.assertEqual(order, ["ask", "attach"])
 

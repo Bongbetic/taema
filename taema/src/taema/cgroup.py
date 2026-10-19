@@ -1,10 +1,11 @@
 """cgroup v2 helpers for the delegated tree /sys/fs/cgroup/user/<uid>."""
+
 import errno
 import os
 import re
 
 CG = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
-LEAF_PARENTS = ("shared", "leftover")   # top-level dirs holding removable leaves
+LEAF_PARENTS = ("shared", "leftover")  # top-level dirs holding removable leaves
 _REL = re.compile(r"[a-z0-9][a-z0-9_./-]{0,96}")
 
 
@@ -33,7 +34,7 @@ def resolve(name, uid=None):
 
 def rel(path, uid=None):
     b = base(uid) + "/"
-    return path[len(b):] if path.startswith(b) else path
+    return path[len(b) :] if path.startswith(b) else path
 
 
 def mkleaf(relpath, uid=None):
@@ -59,7 +60,9 @@ def procs(path):
 
 def subdirs(path):
     try:
-        return sorted(e.path for e in os.scandir(path) if e.is_dir(follow_symlinks=False))
+        return sorted(
+            e.path for e in os.scandir(path) if e.is_dir(follow_symlinks=False)
+        )
     except FileNotFoundError:
         return []
 
@@ -132,7 +135,9 @@ def rmdir_tree(path):
 def proc_cgroup(pid):
     """The cgroup v2 path of a pid ('/2', '/user/1000/scope-x'), or None."""
     try:
-        with open("%s/%d/cgroup" % (os.environ.get("TAEMA_PROCROOT", "/proc"), pid)) as f:
+        with open(
+            "%s/%d/cgroup" % (os.environ.get("TAEMA_PROCROOT", "/proc"), pid)
+        ) as f:
             for line in f:
                 if line.startswith("0::"):
                     return line[3:].strip()
@@ -144,7 +149,7 @@ def proc_cgroup(pid):
 def is_prefix(target_path, cgroup_line):
     """True when cgroup_line (as read from /proc, e.g. /user/1000/app-x/session-1) is the
     target (absolute filesystem path) or lies below it."""
-    t = target_path[len(CG):] if target_path.startswith(CG) else target_path
+    t = target_path[len(CG) :] if target_path.startswith(CG) else target_path
     t = t.rstrip("/")
     c = (cgroup_line or "").rstrip("/")
     return c == t or c.startswith(t + "/")

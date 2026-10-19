@@ -5,6 +5,7 @@ containment and adoption in adopt, auto, and enforce. Further tests pin the slot
 Implementation Decisions 2 and prove that every daemon/CLI decision point asks the ladder instead
 of checking the mode itself.
 """
+
 import argparse
 import io
 import os
@@ -22,45 +23,136 @@ REAL_STOP = engine.stop
 
 # (trigger, facts, expected) with expected = {mode: (verdict, authority)}.
 TRUTH = [
-    (authorization.OWNER_EXIT, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("act", "unit"),
-        "enforce": ("act", "unit"), "auto": ("act", "unit")}),
-    (authorization.UNIT_ADOPT, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("act", "mode"),
-        "enforce": ("act", "mode"), "auto": ("act", "mode")}),
-    (authorization.AUTO_ADOPT, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("act", "mode"),
-        "enforce": ("act", "mode"), "auto": ("act", "mode")}),
-    (authorization.GUI_CLOSE, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("act", "mode"),
-        "enforce": ("act", "mode"), "auto": ("act", "mode")}),
-    (authorization.JOB_SURVIVORS, authorization.Facts(), {
-        "observe": ("keep", ""), "adopt": ("keep", ""),
-        "enforce": ("keep", ""), "auto": ("act", "mode")}),
-    (authorization.LEFTOVER_LEAVES, authorization.Facts(), {
-        "observe": ("keep", ""), "adopt": ("keep", ""),
-        "enforce": ("keep", ""), "auto": ("act", "mode")}),
-    (authorization.GC_STOP, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("would", ""),
-        "enforce": ("act", "unit"), "auto": ("act", "mode")}),
-    (authorization.GC_STOP, authorization.Facts(leftover=True), {
-        "observe": ("would", ""), "adopt": ("would", ""),
-        "enforce": ("act", "unit"), "auto": ("act", "pair")}),
-    (authorization.GC_REMOVE_EMPTY, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("act", "mode"),
-        "enforce": ("act", "mode"), "auto": ("act", "mode")}),
-    (authorization.SESSION_END, authorization.Facts(), {
-        "observe": ("would", ""), "adopt": ("would", ""),
-        "enforce": ("act", "unit"), "auto": ("act", "pair")}),
-    (authorization.SESSION_END, authorization.Facts(shared=True), {
-        "observe": ("would", ""), "adopt": ("would", ""),
-        "enforce": ("act", "unit"), "auto": ("keep", "")}),
-    (authorization.SESSION_END, authorization.Facts(unit_survive_logout=True), {
-        "observe": ("keep", ""), "adopt": ("keep", ""),
-        "enforce": ("keep", ""), "auto": ("keep", "")}),
-    (authorization.MANUAL_STOP, authorization.Facts(), {
-        "observe": ("act", "manual"), "adopt": ("act", "manual"),
-        "enforce": ("act", "manual"), "auto": ("act", "manual")}),
+    (
+        authorization.OWNER_EXIT,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("act", "unit"),
+            "enforce": ("act", "unit"),
+            "auto": ("act", "unit"),
+        },
+    ),
+    (
+        authorization.UNIT_ADOPT,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("act", "mode"),
+            "enforce": ("act", "mode"),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.AUTO_ADOPT,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("act", "mode"),
+            "enforce": ("act", "mode"),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.GUI_CLOSE,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("act", "mode"),
+            "enforce": ("act", "mode"),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.JOB_SURVIVORS,
+        authorization.Facts(),
+        {
+            "observe": ("keep", ""),
+            "adopt": ("keep", ""),
+            "enforce": ("keep", ""),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.LEFTOVER_LEAVES,
+        authorization.Facts(),
+        {
+            "observe": ("keep", ""),
+            "adopt": ("keep", ""),
+            "enforce": ("keep", ""),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.GC_STOP,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("would", ""),
+            "enforce": ("act", "unit"),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.GC_STOP,
+        authorization.Facts(leftover=True),
+        {
+            "observe": ("would", ""),
+            "adopt": ("would", ""),
+            "enforce": ("act", "unit"),
+            "auto": ("act", "pair"),
+        },
+    ),
+    (
+        authorization.GC_REMOVE_EMPTY,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("act", "mode"),
+            "enforce": ("act", "mode"),
+            "auto": ("act", "mode"),
+        },
+    ),
+    (
+        authorization.SESSION_END,
+        authorization.Facts(),
+        {
+            "observe": ("would", ""),
+            "adopt": ("would", ""),
+            "enforce": ("act", "unit"),
+            "auto": ("act", "pair"),
+        },
+    ),
+    (
+        authorization.SESSION_END,
+        authorization.Facts(shared=True),
+        {
+            "observe": ("would", ""),
+            "adopt": ("would", ""),
+            "enforce": ("act", "unit"),
+            "auto": ("keep", ""),
+        },
+    ),
+    (
+        authorization.SESSION_END,
+        authorization.Facts(unit_survive_logout=True),
+        {
+            "observe": ("keep", ""),
+            "adopt": ("keep", ""),
+            "enforce": ("keep", ""),
+            "auto": ("keep", ""),
+        },
+    ),
+    (
+        authorization.MANUAL_STOP,
+        authorization.Facts(),
+        {
+            "observe": ("act", "manual"),
+            "adopt": ("act", "manual"),
+            "enforce": ("act", "manual"),
+            "auto": ("act", "manual"),
+        },
+    ),
 ]
 
 
@@ -71,18 +163,28 @@ class TruthTable(unittest.TestCase):
         for trigger, facts, want in TRUTH:
             for mode in MODES:
                 dec = authorization.authorize(trigger, mode, facts)
-                self.assertEqual((dec.verdict, dec.authority), want[mode],
-                                 "%s in %s" % (trigger, mode))
-                self.assertTrue(dec.reason, "%s in %s: decision needs a reason" % (trigger, mode))
+                self.assertEqual(
+                    (dec.verdict, dec.authority),
+                    want[mode],
+                    "%s in %s" % (trigger, mode),
+                )
+                self.assertTrue(
+                    dec.reason, "%s in %s: decision needs a reason" % (trigger, mode)
+                )
                 # Only the unit authority can deny; nothing else contributes a vote in 0.2.1.
                 deny = bool(facts.unit_survive_logout)
-                self.assertEqual(dec.slot, "authority" if deny else "mode_capability",
-                                 "%s in %s" % (trigger, mode))
+                self.assertEqual(
+                    dec.slot,
+                    "authority" if deny else "mode_capability",
+                    "%s in %s" % (trigger, mode),
+                )
 
     def test_slot_order_matches_the_spec(self):
         # spec #1, Implementation Decisions 2: hard safety -> veto -> hold -> capability -> authority
-        self.assertEqual(authorization.SLOTS,
-                         ("hard_safety", "veto", "hold", "mode_capability", "authority"))
+        self.assertEqual(
+            authorization.SLOTS,
+            ("hard_safety", "veto", "hold", "mode_capability", "authority"),
+        )
 
     def test_unknown_trigger_or_mode_fails_closed(self):
         with self.assertRaises(ValueError):
@@ -91,20 +193,30 @@ class TruthTable(unittest.TestCase):
             authorization.authorize(authorization.OWNER_EXIT, "yolo")
 
     def test_survive_logout_reason_names_the_authority(self):
-        dec = authorization.authorize(authorization.SESSION_END, "enforce",
-                                      authorization.Facts(unit_survive_logout=True))
+        dec = authorization.authorize(
+            authorization.SESSION_END,
+            "enforce",
+            authorization.Facts(unit_survive_logout=True),
+        )
         self.assertEqual(dec.verdict, "keep")
         self.assertIn("survive_logout", dec.reason)
 
     def test_veto_denies_every_stop_trigger_before_mode_authority(self):
         facts = authorization.Facts(scope="leftover/firefox", vetoed="app firefox")
         for mode in authorization.MODES:
-            for trigger in (authorization.OWNER_EXIT, authorization.JOB_SURVIVORS,
-                            authorization.GC_STOP, authorization.SESSION_END,
-                            authorization.MANUAL_STOP):
+            for trigger in (
+                authorization.OWNER_EXIT,
+                authorization.JOB_SURVIVORS,
+                authorization.GC_STOP,
+                authorization.SESSION_END,
+                authorization.MANUAL_STOP,
+            ):
                 dec = authorization.authorize(trigger, mode, facts)
-                self.assertEqual((dec.verdict, dec.slot), (authorization.KEEP, authorization.VETO),
-                                 (mode, trigger))
+                self.assertEqual(
+                    (dec.verdict, dec.slot),
+                    (authorization.KEEP, authorization.VETO),
+                    (mode, trigger),
+                )
                 self.assertIn("app firefox", dec.reason)
 
 
@@ -125,7 +237,7 @@ class DaemonRouting(AutoCase):
         m = self.asked()
         self.d.stop_leaf("scope-x", "owner 5 exited")
         self.assertIn(authorization.OWNER_EXIT, self.triggers(m))
-        self.stopm.assert_called_once()                     # auto: acts
+        self.stopm.assert_called_once()  # auto: acts
 
     def test_owner_bound_scope_stops_in_mutating_modes_and_logs_once_in_observe(self):
         for mode in MODES:
@@ -138,8 +250,12 @@ class DaemonRouting(AutoCase):
 
                 if mode == "observe":
                     self.stopm.assert_not_called()
-                    events = [e for e in self.log() if e.get("event") == "would_stop"
-                              and e.get("scope") == "scope-observe"]
+                    events = [
+                        e
+                        for e in self.log()
+                        if e.get("event") == "would_stop"
+                        and e.get("scope") == "scope-observe"
+                    ]
                     self.assertEqual(len(events), 1)
                 else:
                     self.stopm.assert_called_once()
@@ -151,24 +267,41 @@ class DaemonRouting(AutoCase):
                     self.d.cfg["mode"] = mode
                     self.stopm.reset_mock()
                     name = "owner-" + mode + "-" + source
-                    args = argparse.Namespace(name=name, join=False, bind=source == "bind",
-                                              owner=os.getpid() if source == "owner" else None,
-                                              cmd=["true"])
-                    with mock.patch.object(cli, "_load", return_value=(self.d.cfg, self.d.store, [])), \
-                            mock.patch.object(cli, "ask", side_effect=lambda _cfg, msg: self.d.handle(msg)), \
-                            mock.patch.object(inspect, "uid_of", return_value=os.getuid()), \
-                            mock.patch.object(inspect, "starttime", return_value=123), \
-                            mock.patch.object(cli.engine, "helper_attach"), \
-                            mock.patch.object(cli.os, "execvp"):
+                    args = argparse.Namespace(
+                        name=name,
+                        join=False,
+                        bind=source == "bind",
+                        owner=os.getpid() if source == "owner" else None,
+                        cmd=["true"],
+                    )
+                    with (
+                        mock.patch.object(
+                            cli, "_load", return_value=(self.d.cfg, self.d.store, [])
+                        ),
+                        mock.patch.object(
+                            cli, "ask", side_effect=lambda _cfg, msg: self.d.handle(msg)
+                        ),
+                        mock.patch.object(inspect, "uid_of", return_value=os.getuid()),
+                        mock.patch.object(inspect, "starttime", return_value=123),
+                        mock.patch.object(cli.engine, "helper_attach"),
+                        mock.patch.object(cli.os, "execvp"),
+                    ):
                         cli.cmd_run(args)
 
-                    fd = next(fd for fd, (leaf, _pid, _start) in self.d.owners.items()
-                              if leaf == "scope-" + name)
+                    fd = next(
+                        fd
+                        for fd, (leaf, _pid, _start) in self.d.owners.items()
+                        if leaf == "scope-" + name
+                    )
                     self.d.on_owner_exit(fd)
                     if mode == "observe":
                         self.stopm.assert_not_called()
-                        events = [e for e in self.log() if e.get("event") == "would_stop"
-                                  and e.get("scope") == "scope-" + name]
+                        events = [
+                            e
+                            for e in self.log()
+                            if e.get("event") == "would_stop"
+                            and e.get("scope") == "scope-" + name
+                        ]
                         self.assertEqual(len(events), 1)
                     else:
                         self.stopm.assert_called_once()
@@ -181,17 +314,27 @@ class DaemonRouting(AutoCase):
                 app = "app-" + mode
                 self.fp.add(root, 1, comm="qemu", sid=root, born=self.fp.up - 100)
                 self.cg.leaf(app, [root])
-                self.d.units = [{"unit": {"name": app, "kind": "app"}, "children": [
-                    {"name": "vm", "ancestor_comm": "qemu", "binds_to": "root"},
-                ]}]
+                self.d.units = [
+                    {
+                        "unit": {"name": app, "kind": "app"},
+                        "children": [
+                            {"name": "vm", "ancestor_comm": "qemu", "binds_to": "root"},
+                        ],
+                    }
+                ]
                 self.stopm.reset_mock()
-                with mock.patch.object(engine, "auto_adopt_plan", return_value=[]), \
-                        mock.patch.object(inspect, "uid_of", return_value=os.getuid()), \
-                        mock.patch.object(inspect, "starttime", return_value=123), \
-                        mock.patch.object(os, "pidfd_open",
-                                          side_effect=lambda _pid: os.open(os.devnull, os.O_RDONLY)), \
-                        mock.patch.object(self.d.sel, "register"), \
-                        mock.patch.object(self.d.sel, "unregister"):
+                with (
+                    mock.patch.object(engine, "auto_adopt_plan", return_value=[]),
+                    mock.patch.object(inspect, "uid_of", return_value=os.getuid()),
+                    mock.patch.object(inspect, "starttime", return_value=123),
+                    mock.patch.object(
+                        os,
+                        "pidfd_open",
+                        side_effect=lambda _pid: os.open(os.devnull, os.O_RDONLY),
+                    ),
+                    mock.patch.object(self.d.sel, "register"),
+                    mock.patch.object(self.d.sel, "unregister"),
+                ):
                     self.d.adopt_pass()
 
                     self.assertEqual(len(self.d.owners), 1)
@@ -200,8 +343,11 @@ class DaemonRouting(AutoCase):
                     self.d.on_owner_exit(fd)
                 if mode == "observe":
                     self.stopm.assert_not_called()
-                    events = [e for e in self.log() if e.get("event") == "would_stop"
-                              and e.get("scope") == leaf]
+                    events = [
+                        e
+                        for e in self.log()
+                        if e.get("event") == "would_stop" and e.get("scope") == leaf
+                    ]
                     self.assertEqual(len(events), 1)
                 else:
                     self.stopm.assert_called_once()
@@ -211,21 +357,29 @@ class DaemonRouting(AutoCase):
         self.fp.add(4001, 1, comm="server")
         self.fp.add(4002, 1, comm="niri")
         self.cg.leaf("scope-bound", [4001, 4002])
-        self.edges[4001] = [{"kind": "tcp_client", "detail": "127.0.0.1:9", "peers": [90]}]
-        with mock.patch.object(inspect, "uid_of", return_value=os.getuid()), \
-                mock.patch.object(engine, "stop", wraps=REAL_STOP), \
-                mock.patch.object(engine, "_signal_all") as signal_all:
+        self.edges[4001] = [
+            {"kind": "tcp_client", "detail": "127.0.0.1:9", "peers": [90]}
+        ]
+        with (
+            mock.patch.object(inspect, "uid_of", return_value=os.getuid()),
+            mock.patch.object(engine, "stop", wraps=REAL_STOP),
+            mock.patch.object(engine, "_signal_all") as signal_all,
+        ):
             self.d.stop_leaf("scope-bound", "owner 5 exited")
 
         signal_all.assert_not_called()
         self.assertTrue(os.path.isdir(self.cg.base + "/shared/server-4001"))
         stopped = [e for e in self.log() if e.get("event") == "stop"][-1]
-        self.assertEqual({d["pid"]: d["action"] for d in stopped["decisions"]},
-                         {4001: "share", 4002: "skip"})
+        self.assertEqual(
+            {d["pid"]: d["action"] for d in stopped["decisions"]},
+            {4001: "share", 4002: "skip"},
+        )
 
     def test_adopt_pass_asks_unit_adopt_and_auto_adopt(self):
         m = self.asked()
-        with mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable()):
+        with mock.patch.object(
+            inspect.ProcTable, "scan", return_value=inspect.ProcTable()
+        ):
             self.d.adopt_pass()
         got = self.triggers(m)
         self.assertIn(authorization.UNIT_ADOPT, got)
@@ -251,7 +405,15 @@ class DaemonRouting(AutoCase):
         self.fp.add(30, 1, comm="vite", env=env, born=up - 5.0, sid=30)
         self.d.lineage.observe(self.fp.table())
         self.fp.remove(21)
-        self.d.handle({"cmd": "job_done", "shell_pid": 20, "tag": "20.1", "status": 0, "word": "npm"})
+        self.d.handle(
+            {
+                "cmd": "job_done",
+                "shell_pid": 20,
+                "tag": "20.1",
+                "status": 0,
+                "word": "npm",
+            }
+        )
         self.d.deadlines.clear()
         self.idle(30)
         m = self.asked()
@@ -264,13 +426,15 @@ class DaemonRouting(AutoCase):
         self.d.lineage.entry(301)["root_key"] = "foo"
         self.idle(301)
         self.cg.leaf("leftover/x", [301], cpu=100)
-        self.d.idle_since["leftover/x"] = time.time() - 5000   # past the idle grace: a candidate
+        self.d.idle_since["leftover/x"] = (
+            time.time() - 5000
+        )  # past the idle grace: a candidate
         self.d.gc_usage["leftover/x"] = 100
-        self.cg.leaf("scope-e", [])                          # empty leaf on the second pass
+        self.cg.leaf("scope-e", [])  # empty leaf on the second pass
         m = self.asked()
         self.d.gc_pass()
         got = self.triggers(m)
-        self.assertIn(authorization.LEFTOVER_LEAVES, got)    # GC candidate selection
+        self.assertIn(authorization.LEFTOVER_LEAVES, got)  # GC candidate selection
         self.assertIn(authorization.GC_STOP, got)
         self.assertIn(authorization.GC_REMOVE_EMPTY, got)
 
@@ -282,7 +446,7 @@ class DaemonRouting(AutoCase):
         self.assertIn(authorization.LEFTOVER_LEAVES, got)
         self.assertIn(authorization.SESSION_END, got)
         kept = [e["scope"] for e in self.log() if e["event"] == "session_end_kept"]
-        self.assertEqual(kept, ["app-x"])                    # auto: empty scope has no pair
+        self.assertEqual(kept, ["app-x"])  # auto: empty scope has no pair
 
 
 class ManualKillRouting(unittest.TestCase):
@@ -292,18 +456,24 @@ class ManualKillRouting(unittest.TestCase):
         cfg = make_cfg(tmp(), mode="observe")
         store = knowledge.Store(tmp(), {})
         rep = {"scope": "scope-x", "decisions": [], "removed": True, "left": []}
-        a = argparse.Namespace(name="x", timeout=None, force=False, hard=False,
-                               keep=None, dry_run=False)
-        with mock.patch.object(cli, "_load", return_value=(cfg, store, [])), \
-                mock.patch.object(cgroup, "resolve", return_value="/cg/user/1/scope-x"), \
-                mock.patch.object(engine, "stop", return_value=rep), \
-                mock.patch.object(authorization, "authorize",
-                                  wraps=authorization.authorize) as m:
+        a = argparse.Namespace(
+            name="x", timeout=None, force=False, hard=False, keep=None, dry_run=False
+        )
+        with (
+            mock.patch.object(cli, "_load", return_value=(cfg, store, [])),
+            mock.patch.object(cgroup, "resolve", return_value="/cg/user/1/scope-x"),
+            mock.patch.object(engine, "stop", return_value=rep),
+            mock.patch.object(
+                authorization, "authorize", wraps=authorization.authorize
+            ) as m,
+        ):
             out = io.StringIO()
             with redirect_stdout(out):
                 rc = cli.cmd_kill(a)
         self.assertEqual(rc, 0)
-        self.assertEqual([c.args[0] for c in m.call_args_list], [authorization.MANUAL_STOP])
+        self.assertEqual(
+            [c.args[0] for c in m.call_args_list], [authorization.MANUAL_STOP]
+        )
         self.assertEqual(out.getvalue(), "scope scope-x stopped\n")
 
 

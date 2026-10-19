@@ -1,4 +1,5 @@
 """Resource-budget smoke test: repeated passes on a fake tree must not grow state."""
+
 import os
 import unittest
 from unittest import mock
@@ -24,21 +25,52 @@ class Budget(unittest.TestCase):
             os.makedirs(cg.root + "/3")
             write(cg.root + "/3/cgroup.procs", "8\n")
             d = daemon.Daemon(make_cfg(tmp(), mode="observe"))
-            d.units = [{"unit": {"name": "app-busy", "kind": "app"}, "match": {"comm": "x"}}]
-            with mock.patch.object(inspect, "PROC", proc), \
-                 mock.patch.object(inspect, "Snapshot", return_value=type("S", (), {"ok": True, "unix": [],
-                                    "tcp": [], "tcp_listen": [], "by_inode": {}})()), \
-                 mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable.from_ppid({7: 1, 8: 1})), \
-                 mock.patch.object(daemon.engine.policy, "exe_key", return_value="k"):
+            d.units = [
+                {"unit": {"name": "app-busy", "kind": "app"}, "match": {"comm": "x"}}
+            ]
+            with (
+                mock.patch.object(inspect, "PROC", proc),
+                mock.patch.object(
+                    inspect,
+                    "Snapshot",
+                    return_value=type(
+                        "S",
+                        (),
+                        {
+                            "ok": True,
+                            "unix": [],
+                            "tcp": [],
+                            "tcp_listen": [],
+                            "by_inode": {},
+                        },
+                    )(),
+                ),
+                mock.patch.object(
+                    inspect.ProcTable,
+                    "scan",
+                    return_value=inspect.ProcTable.from_ppid({7: 1, 8: 1}),
+                ),
+                mock.patch.object(daemon.engine.policy, "exe_key", return_value="k"),
+            ):
                 d.adopt_pass()
                 d.gc_pass()
-                before = (len(d.owners), len(d.idle_since), len(d.store.sigs), len(d.gc_usage),
-                          size(d.store.log_path))
+                before = (
+                    len(d.owners),
+                    len(d.idle_since),
+                    len(d.store.sigs),
+                    len(d.gc_usage),
+                    size(d.store.log_path),
+                )
                 for _ in range(N):
                     d.adopt_pass()
                     d.gc_pass()
-                after = (len(d.owners), len(d.idle_since), len(d.store.sigs), len(d.gc_usage),
-                         size(d.store.log_path))
+                after = (
+                    len(d.owners),
+                    len(d.idle_since),
+                    len(d.store.sigs),
+                    len(d.gc_usage),
+                    size(d.store.log_path),
+                )
             self.assertEqual(before, after)
 
     def test_idle_loop_sleeps_more_than_a_second(self):

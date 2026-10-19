@@ -22,11 +22,13 @@ def load_helper():
 
 def neutral(comm="catatonit", cg="/2", env=None):
     """Patch a fake process owned by the caller, so one rule at a time can be tested."""
-    return [mock.patch.object(policy.inspect, "uid_of", return_value=os.getuid()),
-            mock.patch.object(policy.inspect, "is_kernel_thread", return_value=False),
-            mock.patch.object(policy.inspect, "comm", return_value=comm),
-            mock.patch.object(policy.inspect, "environ", return_value=env or {}),
-            mock.patch.object(policy.cgroup, "proc_cgroup", return_value=cg)]
+    return [
+        mock.patch.object(policy.inspect, "uid_of", return_value=os.getuid()),
+        mock.patch.object(policy.inspect, "is_kernel_thread", return_value=False),
+        mock.patch.object(policy.inspect, "comm", return_value=comm),
+        mock.patch.object(policy.inspect, "environ", return_value=env or {}),
+        mock.patch.object(policy.cgroup, "proc_cgroup", return_value=cg),
+    ]
 
 
 class Patched:
@@ -46,7 +48,19 @@ class CgroupTests(unittest.TestCase):
     def test_valid_rel(self):
         for ok in ("scope-x", "app-claude-desktop/session-12", "shared/adb-5"):
             self.assertTrue(cgroup.valid_rel(ok), ok)
-        for bad in ("", "..", "a/../b", "a//b", "/abs", "A", "a/", "-x", "a b", "./x", "x/."):
+        for bad in (
+            "",
+            "..",
+            "a/../b",
+            "a//b",
+            "/abs",
+            "A",
+            "a/",
+            "-x",
+            "a b",
+            "./x",
+            "x/.",
+        ):
             self.assertFalse(cgroup.valid_rel(bad), bad)
 
     def test_prefix_guard(self):
@@ -64,35 +78,55 @@ class ConfigTests(unittest.TestCase):
 
     def test_default_config_loads_and_mode_is_valid(self):
         cfg = self.cfg()
-        self.assertIn(cfg["mode"], policy.MODES)       # the shipped file picks the mode (auto)
+        self.assertIn(
+            cfg["mode"], policy.MODES
+        )  # the shipped file picks the mode (auto)
         self.assertEqual(cfg["paths"]["session_cgroup"], "auto")
-        self.assertEqual(cfg["paths"]["socket"], "/run/user/%d/taema.sock" % os.getuid())
+        self.assertEqual(
+            cfg["paths"]["socket"], "/run/user/%d/taema.sock" % os.getuid()
+        )
         self.assertEqual(cfg["paths"]["helper"], "/usr/libexec/taema/taema-attach")
 
     def test_user_layer_can_add_but_not_remove_protected(self):
-        system = {"mode": "observe", "protected": {"comm": ["niri", "pipewire"],
-                                                   "env_prefix": {"XDG_RUNTIME_DIR": ["/run/a"]}},
-                  "timers": {"idle_grace": 600}}
-        user = {"mode": "enforce", "protected": {"comm": ["myshell"],
-                                                 "env_prefix": {"XDG_RUNTIME_DIR": ["/run/b"]}},
-                "timers": {"idle_grace": 60}}
+        system = {
+            "mode": "observe",
+            "protected": {
+                "comm": ["niri", "pipewire"],
+                "env_prefix": {"XDG_RUNTIME_DIR": ["/run/a"]},
+            },
+            "timers": {"idle_grace": 600},
+        }
+        user = {
+            "mode": "enforce",
+            "protected": {
+                "comm": ["myshell"],
+                "env_prefix": {"XDG_RUNTIME_DIR": ["/run/b"]},
+            },
+            "timers": {"idle_grace": 60},
+        }
         m = policy.merge(system, user)
         self.assertEqual(m["mode"], "enforce")
         self.assertEqual(m["timers"]["idle_grace"], 60)
         self.assertEqual(m["protected"]["comm"], ["niri", "pipewire", "myshell"])
-        self.assertEqual(m["protected"]["env_prefix"]["XDG_RUNTIME_DIR"], ["/run/a", "/run/b"])
+        self.assertEqual(
+            m["protected"]["env_prefix"]["XDG_RUNTIME_DIR"], ["/run/a", "/run/b"]
+        )
         # an empty user list does not clear the system list
-        self.assertEqual(policy.merge(system, {"protected": {"comm": []}})["protected"]["comm"],
-                         ["niri", "pipewire"])
+        self.assertEqual(
+            policy.merge(system, {"protected": {"comm": []}})["protected"]["comm"],
+            ["niri", "pipewire"],
+        )
 
     def test_layered_load(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "taema"))
             with open(os.path.join(d, "taema", "taema.toml"), "w") as f:
                 f.write('mode = "adopt"\n[protected]\ncomm = ["extra"]\n')
-            with mock.patch.object(policy, "SYSTEM_CONFIG", SYSTEM_TOML), \
-                 mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d}), \
-                 mock.patch.dict(os.environ, {}, clear=False):
+            with (
+                mock.patch.object(policy, "SYSTEM_CONFIG", SYSTEM_TOML),
+                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": d}),
+                mock.patch.dict(os.environ, {}, clear=False),
+            ):
                 os.environ.pop("TAEMA_CONFIG", None)
                 cfg = policy.load_config()
         self.assertEqual(cfg["mode"], "adopt")
@@ -120,7 +154,12 @@ class ConfigTests(unittest.TestCase):
         m = policy.merge(system, user)
         self.assertEqual(m["learner"]["deny_owners"], ["a", "b"])
         # an empty user list never clears the system list
-        self.assertEqual(policy.merge(system, {"learner": {"deny_owners": []}})["learner"]["deny_owners"], ["a"])
+        self.assertEqual(
+            policy.merge(system, {"learner": {"deny_owners": []}})["learner"][
+                "deny_owners"
+            ],
+            ["a"],
+        )
 
 
 class OwnerDenylist(unittest.TestCase):
@@ -128,15 +167,32 @@ class OwnerDenylist(unittest.TestCase):
 
     def test_each_rejected_class(self):
         cases = [
-            ("MainThread", "generic"), ("Thread-1", "generic"), ("pool-3", "generic"),
-            ("GC", "generic"), ("Finalizer", "generic"),
-            ("3.12", "digit"), ("2024.1", "digit"),
-            ("sh", "shell"), ("bash", "shell"), ("dash", "shell"), ("zsh", "shell"),
-            ("fish", "shell"), ("bash:deploy.sh", "shell"),
-            ("sleep", "trivial"), ("cat", "trivial"), ("head", "trivial"),
-            ("sort", "trivial"), ("grep", "trivial"), ("true", "trivial"),
-            ("python3", "script"), ("python3.12", "script"), ("node", "script"),
-            ("java", "script"), ("perl", "script"), ("", "empty"), (None, "empty"),
+            ("MainThread", "generic"),
+            ("Thread-1", "generic"),
+            ("pool-3", "generic"),
+            ("GC", "generic"),
+            ("Finalizer", "generic"),
+            ("3.12", "digit"),
+            ("2024.1", "digit"),
+            ("sh", "shell"),
+            ("bash", "shell"),
+            ("dash", "shell"),
+            ("zsh", "shell"),
+            ("fish", "shell"),
+            ("bash:deploy.sh", "shell"),
+            ("sleep", "trivial"),
+            ("cat", "trivial"),
+            ("head", "trivial"),
+            ("sort", "trivial"),
+            ("grep", "trivial"),
+            ("true", "trivial"),
+            ("python3", "script"),
+            ("python3.12", "script"),
+            ("node", "script"),
+            ("java", "script"),
+            ("perl", "script"),
+            ("", "empty"),
+            (None, "empty"),
         ]
         for key, why in cases:
             reason = policy.bad_owner(key)
@@ -144,21 +200,37 @@ class OwnerDenylist(unittest.TestCase):
             self.assertIn(why, reason, repr(key))
 
     def test_plausible_application_names_pass(self):
-        for ok in ("npm", "firefox", "code", "own0", "vite", "MainThreadly",
-                   "node:vite.js", "python3:http.server", "java:com.Main", "zsh-job"):
+        for ok in (
+            "npm",
+            "firefox",
+            "code",
+            "own0",
+            "vite",
+            "MainThreadly",
+            "node:vite.js",
+            "python3:http.server",
+            "java:com.Main",
+            "zsh-job",
+        ):
             self.assertIsNone(policy.bad_owner(ok), ok)
 
     def test_configured_entries_extend_the_defaults(self):
         self.assertIsNone(policy.bad_owner("gpu-render"))
         self.assertIn("denied", policy.bad_owner("gpu-render", ["gpu-*"]))
-        self.assertIsNone(policy.bad_owner("gpurender", ["gpu-*"]))     # only matching entries reject
-        self.assertIsNotNone(policy.bad_owner("MainThread", ["gpu-*"])) # the defaults still apply
+        self.assertIsNone(
+            policy.bad_owner("gpurender", ["gpu-*"])
+        )  # only matching entries reject
+        self.assertIsNotNone(
+            policy.bad_owner("MainThread", ["gpu-*"])
+        )  # the defaults still apply
         self.assertIsNotNone(policy.bad_owner("Thread-1", ["gpu-*"]))
 
     def test_owner_deny_reads_the_learner_section(self):
         self.assertEqual(policy.owner_deny(None), [])
         self.assertEqual(policy.owner_deny({}), [])
-        self.assertEqual(policy.owner_deny({"learner": {"deny_owners": ["gpu-*"]}}), ["gpu-*"])
+        self.assertEqual(
+            policy.owner_deny({"learner": {"deny_owners": ["gpu-*"]}}), ["gpu-*"]
+        )
 
 
 class PolicyTests(unittest.TestCase):
@@ -197,8 +269,16 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNone(policy.protected_reason(4242, cfg))
 
     def test_env_exclude(self):
-        self.assertTrue(policy.env_excluded({"XDG_RUNTIME_DIR": "/run/x/1000"}, {"XDG_RUNTIME_DIR": "/run/x/*"}))
-        self.assertFalse(policy.env_excluded({"XDG_RUNTIME_DIR": "/run/user/1000"}, {"XDG_RUNTIME_DIR": "/run/x/*"}))
+        self.assertTrue(
+            policy.env_excluded(
+                {"XDG_RUNTIME_DIR": "/run/x/1000"}, {"XDG_RUNTIME_DIR": "/run/x/*"}
+            )
+        )
+        self.assertFalse(
+            policy.env_excluded(
+                {"XDG_RUNTIME_DIR": "/run/user/1000"}, {"XDG_RUNTIME_DIR": "/run/x/*"}
+            )
+        )
 
     def test_units_parse(self):
         cfg = self.cfg()
@@ -206,30 +286,50 @@ class PolicyTests(unittest.TestCase):
         for d in ("etc/units", "examples/units"):
             cfg["paths"]["units_dir"] = os.path.join(ROOT, d)
             names |= {u["unit"]["name"] for u in policy.load_units(cfg)}
-        self.assertEqual(names, {"app-claude-desktop", "app-herdr", "app-podman", "scope-emulator"})
+        self.assertEqual(
+            names, {"app-claude-desktop", "app-herdr", "app-podman", "scope-emulator"}
+        )
 
     def test_user_unit_replaces_system_unit_of_same_file(self):
-        with tempfile.TemporaryDirectory() as sysd, tempfile.TemporaryDirectory() as cfgd:
+        with (
+            tempfile.TemporaryDirectory() as sysd,
+            tempfile.TemporaryDirectory() as cfgd,
+        ):
             os.makedirs(os.path.join(cfgd, "taema", "units"))
             with open(os.path.join(sysd, "podman.toml"), "w") as f:
                 f.write('[unit]\nname = "app-podman"\nkind = "app"\n')
             with open(os.path.join(cfgd, "taema", "units", "podman.toml"), "w") as f:
-                f.write('[unit]\nname = "app-podman"\nkind = "app"\nstop_when_unneeded = true\n')
+                f.write(
+                    '[unit]\nname = "app-podman"\nkind = "app"\nstop_when_unneeded = true\n'
+                )
             cfg = self.cfg()
-            with mock.patch.object(policy, "SYSTEM_UNITS", sysd), \
-                 mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfgd}):
+            with (
+                mock.patch.object(policy, "SYSTEM_UNITS", sysd),
+                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": cfgd}),
+            ):
                 units = policy.load_units(cfg)
         self.assertEqual(len(units), 1)
         self.assertTrue(units[0]["unit"]["stop_when_unneeded"])
 
     def test_session_cgroups_auto(self):
         cfg = self.cfg()
-        dirs = [cgroup.CG + "/2", cgroup.CG + "/7", cgroup.CG + "/user", cgroup.CG + "/other"]
+        dirs = [
+            cgroup.CG + "/2",
+            cgroup.CG + "/7",
+            cgroup.CG + "/user",
+            cgroup.CG + "/other",
+        ]
         procs = {cgroup.CG + "/2": [10], cgroup.CG + "/7": [20]}
         owners = {10: os.getuid(), 20: 0}
-        with mock.patch.object(policy.cgroup, "subdirs", return_value=dirs), \
-             mock.patch.object(policy.cgroup, "procs", side_effect=lambda d: procs.get(d, [])), \
-             mock.patch.object(policy.inspect, "uid_of", side_effect=lambda p: owners[p]):
+        with (
+            mock.patch.object(policy.cgroup, "subdirs", return_value=dirs),
+            mock.patch.object(
+                policy.cgroup, "procs", side_effect=lambda d: procs.get(d, [])
+            ),
+            mock.patch.object(
+                policy.inspect, "uid_of", side_effect=lambda p: owners[p]
+            ),
+        ):
             self.assertEqual(policy.session_cgroups(cfg), [cgroup.CG + "/2"])
 
 
@@ -241,10 +341,16 @@ class HelperTests(unittest.TestCase):
 
     def fake(self, owner, comm="sleep", cg="/2", env=b""):
         h = self.h
-        files = {"comm": comm.encode() + b"\n", "cgroup": ("0::%s\n" % cg).encode(), "environ": env}
+        files = {
+            "comm": comm.encode() + b"\n",
+            "cgroup": ("0::%s\n" % cg).encode(),
+            "environ": env,
+        }
         st = mock.Mock(st_uid=owner)
-        return [mock.patch.object(h.os, "stat", return_value=st),
-                mock.patch.object(h, "read_proc", side_effect=lambda pid, n: files[n])]
+        return [
+            mock.patch.object(h.os, "stat", return_value=st),
+            mock.patch.object(h, "read_proc", side_effect=lambda pid, n: files[n]),
+        ]
 
     def test_paths(self):
         for ok in ("scope-x", "app-podman-1/conmon-2", "shared/adb-5"):
@@ -254,8 +360,11 @@ class HelperTests(unittest.TestCase):
 
     def test_check_pid_rules(self):
         h = self.h
-        rules = {"comm": ["niri", "gvfsd*"], "env_prefix": {"XDG_RUNTIME_DIR": ["/run/mytool"]},
-                 "cgroup_prefix": ["/sys/fs/cgroup/other"]}
+        rules = {
+            "comm": ["niri", "gvfsd*"],
+            "env_prefix": {"XDG_RUNTIME_DIR": ["/run/mytool"]},
+            "cgroup_prefix": ["/sys/fs/cgroup/other"],
+        }
         with Patched(self.fake(1000)):
             self.assertEqual(h.check_pid(50, 1000, rules), ("sleep", "/2"))
         with Patched(self.fake(1001)):
@@ -269,7 +378,9 @@ class HelperTests(unittest.TestCase):
         with Patched(self.fake(1000, cg="/user/1001/scope-x")):
             self.assertRaises(h.Refused, h.check_pid, 50, 1000, rules)
         with Patched(self.fake(1000, cg="/user/1000/app-x")):
-            self.assertEqual(h.check_pid(50, 1000, rules), ("sleep", "/user/1000/app-x"))
+            self.assertEqual(
+                h.check_pid(50, 1000, rules), ("sleep", "/user/1000/app-x")
+            )
         self.assertRaises(h.Refused, h.check_pid, 1, 1000, rules)
 
     def test_requires_sudo(self):

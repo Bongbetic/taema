@@ -1,0 +1,54 @@
+# Run the test suites and the package build on every push and pull request, so a
+# regression fails the commit or pull request instead of surfacing at release time.
+# The Void jobs mirror the tag-triggered release workflow: the distribution Python in
+# the glibc and musl containers, tests and the build as an unprivileged user. The
+# Python job covers 3.11, the supported floor (D17). The local equivalents are in
+# "Checks" of the README.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  void:
+    name: void (${{ matrix.libc }})
+    runs-on: ubuntu-latest
+    container: ghcr.io/void-linux/void-${{ matrix.libc }}:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [glibc, musl]
+    steps:
+      - name: Install tools
+        run: |
+          xbps-install -Syu xbps
+          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow
+      - uses: actions/checkout@v4
+      - name: Test as an unprivileged user
+        run: |
+          # The tests assume a normal user, so run them as one.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && make test"
+      - name: Build the package as an unprivileged user
+        run: |
+          # build-xbps.sh runs the test suites first, then stages and packs the package.
+          mkdir -p "$RUNNER_TEMP/repo"
+          chown builder "$RUNNER_TEMP/repo"
+          su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && tools/build-xbps.sh '$RUNNER_TEMP/repo'"
+
+  python-floor:
+    name: python 3.11
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Test
+        run: make -C taema test

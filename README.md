@@ -283,6 +283,22 @@ Maintainer setup, once: the repository is signed with an RSA key. Store the priv
 the Actions secret `XBPS_PRIVKEY`. Nothing else is needed. If the key ever changes, every
 user has to accept the new fingerprint.
 
+## Checks
+
+The `ci` workflow runs on every push and pull request: the unit and packaging test
+suites and the package build, as an unprivileged user, in the Void glibc and Void musl
+containers with the distribution Python, plus Python 3.11, the supported floor. Run the
+same checks locally from the repository root:
+
+```sh
+make -C taema test        # the test suites (unit and packaging)
+taema/tools/build-xbps.sh # the package build; runs the suites first, needs xbps-create/xbps-rindex
+```
+
+The test suites need only Python 3.11+ and `make`. A failing step fails the workflow
+run, which marks the commit and the pull request as failed. The tag-triggered `release`
+workflow is separate and unchanged.
+
 ## Layout
 
 ```

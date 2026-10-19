@@ -22,6 +22,10 @@ class Refused(Exception):
     pass
 
 
+class Vetoed(Refused):
+    """A user veto matched the stop target."""
+
+
 # ---- helpers ------------------------------------------------------------------------------
 
 def helper_path(cfg):
@@ -170,11 +174,26 @@ def _run_hook(hook):
         p.wait()
 
 
+def veto_for_scope(store, path):
+    """Resolve scope, app, and pid vetoes against a leaf and its current members."""
+    members = []
+    for pid in cgroup.tree_procs(path):
+        start = inspect.starttime(pid)
+        apps = {policy.app_key(pid), policy.exe_key(pid)}
+        members.append({"pid": pid, "start": start, "apps": [key for key in apps if key]})
+    return store.match_veto(scope=cgroup.rel(path), members=members)
+
+
 def stop(path, cfg, store, unit=None, timeout=None, force=False, hard=False, keep=(),
          dry_run=False, hook=None, passes=3, allow_sigkill=True):
     """Stop a scope: move shared members aside, run the hook, SIGTERM, SIGKILL leftovers, rmdir.
     allow_sigkill=False (auto mode, pairs not explicitly answered): members that ignore SIGTERM live."""
     self_guard(path)
+    veto = veto_for_scope(store, path)
+    if veto:
+        target = store._target(veto)
+        store.log(event="vetoed", trigger="stop", scope=cgroup.rel(path), target=target)
+        raise Vetoed("vetoed " + store.describe_veto(veto))
     report = {"scope": cgroup.rel(path), "decisions": [], "removed": False, "left": []}
     ran_hook = False
     counted, killed_keys, sigkill_keys = set(), set(), set()

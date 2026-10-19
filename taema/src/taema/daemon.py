@@ -101,7 +101,18 @@ class Daemon:
     def authorize(self, trigger, facts=None):
         """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
-        return authorization.authorize(trigger, self.mode, facts)
+        f = facts or authorization.Facts()
+        if f.scope and not f.vetoed:
+            path = f.scope if os.path.isabs(f.scope) else os.path.join(cgroup.base(), f.scope)
+            veto = engine.veto_for_scope(self.store, path)
+            if veto:
+                f = authorization.Facts(scope=f.scope, leftover=f.leftover, shared=f.shared,
+                                        unit_survive_logout=f.unit_survive_logout,
+                                        vetoed=self.store.describe_veto(veto))
+        dec = authorization.authorize(trigger, self.mode, f)
+        if dec.slot == authorization.VETO:
+            self.store.log(event="vetoed", trigger=trigger, scope=f.scope or None, target=dec.reason)
+        return dec
 
     # ---- owner watch ----
     def watch_owner(self, leaf, pid):
@@ -135,16 +146,19 @@ class Daemon:
         path = "%s/%s" % (cgroup.base(), leaf)
         if not os.path.isdir(path):
             return
-        dec = self.authorize(authorization.OWNER_EXIT)
+        dec = self.authorize(authorization.OWNER_EXIT, authorization.Facts(scope=leaf))
         if dec.verdict == authorization.WOULD_ACT:
             self.store.log(event="would_stop", scope=leaf, why=why, mode=self.mode)
             return
-        if dec.verdict != authorization.ACT:   # keep: a future veto/hold blocks silently here
+        if dec.verdict != authorization.ACT:
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
         try:
             rep = engine.stop(path, self.cfg, self.store, unit, hook=policy.hook_for(self.cfg, leaf))
             self.note_stop(rep)
+            stopped = [d["key"] for d in rep.get("decisions", []) if d.get("action") == "kill"]
+            if stopped:
+                self.note_auto_stop(leaf, why, [], apps=stopped)
             self.store.log(event="stopped", scope=leaf, why=why)
         except engine.Refused as e:
             self.store.log(event="stop_refused", scope=leaf, why=str(e))
@@ -271,12 +285,14 @@ class Daemon:
                 self.store.log(event="regret", owner=hit[0], leftover=e["key"])
                 del self.auto_recent[e["key"]]
 
-    def note_auto_stop(self, scope, why, pairs):
-        """Remember an auto stop: knowledge (regret window), status ring, decisions.log."""
+    def note_auto_stop(self, scope, why, pairs, apps=()):
+        """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
         for o, k in pairs:
             self.store.auto_stopped(o, k)
             self.auto_recent[k] = (o, now)
+        self.store.record_auto_action(scope, why, pairs, apps)
+        self.store.save_if_dirty()
         while len(self.auto_recent) > 256:
             del self.auto_recent[min(self.auto_recent, key=lambda k: self.auto_recent[k][1])]
         self.auto_stops.append({"ts": int(now), "scope": scope, "why": why,
@@ -361,7 +377,8 @@ class Daemon:
             self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
             return False
         self.note_stop(rep)
-        self.note_auto_stop(leaf, why, list(dict.fromkeys(pairs)))
+        self.note_auto_stop(leaf, why, list(dict.fromkeys(pairs)),
+                            apps=[d["key"] for d in rep["decisions"] if d.get("action") == "kill"])
         return rep["removed"]
 
     def auto_stop_survivors(self, tag, owner, left, dec):
@@ -369,6 +386,18 @@ class Daemon:
         are carved into <host scope>/job-<id> (when the host scope is under user/<uid>, no sudo) and
         stopped there, else signalled in place. Everyone else is left alone."""
         want = [l for l in left if dec.get(l["key"], ("",))[0] == "stop"]
+        if not want:
+            return
+        allowed = []
+        for l in want:
+            veto = self.store.match_veto(members=[{"pid": l["pid"], "start": l.get("start"),
+                                                   "apps": [l["key"]]}])
+            if veto:
+                self.store.log(event="vetoed", trigger=authorization.JOB_SURVIVORS, job=tag,
+                               pid=l["pid"], target=self.store._target(veto))
+            else:
+                allowed.append(l)
+        want = allowed
         if not want:
             return
         infos = {i["pid"]: i for i in self._infos([l["pid"] for l in want], origin=owner)}
@@ -404,7 +433,8 @@ class Daemon:
                 self.store.log(event="auto_stop_refused", scope=cgroup.rel(dest), why=str(e))
         if loose:
             engine.signal_survivors(self.cfg, loose, grace, explicit)
-        self.note_auto_stop("job-" + slug, "closed job %s: %s" % (tag, self.store.pair_decision(*pairs[0])[2]), pairs)
+        self.note_auto_stop("job-" + slug, "closed job %s: %s" % (tag, self.store.pair_decision(*pairs[0])[2]),
+                            pairs, apps=[l["key"] for l in good])
 
     def attribute(self, owner, leftovers, root=None, job=None):
         """Log would_attribute / would_stop for each distinct leftover key. Returns {key: decision}."""
@@ -493,7 +523,10 @@ class Daemon:
                            why="no application ancestor" if not owner else "launcher")
             return
         dec = self.attribute(owner, left, job=tag)
-        if self.authorize(authorization.JOB_SURVIVORS).verdict == authorization.ACT:
+        members = [{"pid": l["pid"], "start": l.get("start"), "apps": [l["key"]]} for l in left]
+        veto = self.store.match_veto(members=members)
+        facts = authorization.Facts(vetoed=self.store.describe_veto(veto) if veto else "")
+        if self.authorize(authorization.JOB_SURVIVORS, facts).verdict == authorization.ACT:
             self.guarded(lambda: self.auto_stop_survivors(tag, owner, left, dec))
         ask = [k for k in keys if dec[k][0] == "ask" and self.store.can_ask((owner, k))]
         if ask:
@@ -795,6 +828,9 @@ class Daemon:
                 self.store.log(event="gc_refused", scope=leaf, why=str(e))
                 continue
             self.note_stop(rep)
+            stopped = [d["key"] for d in rep.get("decisions", []) if d.get("action") == "kill"]
+            if stopped:
+                self.note_auto_stop(leaf, why, [], apps=stopped)
             if rep["removed"]:
                 self.store.log(event="gc_stopped", scope=leaf, why=why)
             elif any(d["action"] == "skip" for d in rep["decisions"]):
@@ -852,8 +888,12 @@ class Daemon:
                     self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
             try:
-                self.note_stop(engine.stop(d, self.cfg, self.store, unit,
-                                           hook=policy.hook_for(self.cfg, os.path.basename(d))))
+                rep = engine.stop(d, self.cfg, self.store, unit,
+                                  hook=policy.hook_for(self.cfg, os.path.basename(d)))
+                self.note_stop(rep)
+                stopped = [x["key"] for x in rep.get("decisions", []) if x.get("action") == "kill"]
+                if stopped:
+                    self.note_auto_stop(cgroup.rel(d), "session ended", [], apps=stopped)
             except engine.Refused:
                 pass
         self.session_seen = False   # wait for the next login before acting again
@@ -907,6 +947,12 @@ class Daemon:
         if c == "gc":
             return {"candidates": self.gc_pass(dry_run=msg.get("dry_run") is True)}
         if c == "feedback":
+            if msg.get("v") == 1:
+                result = self.store.apply_feedback_command(msg)
+                if result is None:
+                    return {"error": "bad request"}
+                self.store.save_if_dirty()
+                return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):
                 return {"error": "bad request"}
             self.store.save_if_dirty()

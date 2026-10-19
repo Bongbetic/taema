@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 
@@ -101,6 +102,64 @@ class KnowledgeTests(unittest.TestCase):
         reloaded = Store(self.d, self.seeds, self.clock)
         self.assertEqual(reloaded.review_count, MAX_OPEN_REVIEWS)
         self.assertEqual(reloaded.data["review_seq"], MAX_OPEN_REVIEWS + 1)
+
+    def test_veto_matches_scope_app_and_pid_instance(self):
+        self.s.add_veto("scope", "leftover/firefox")
+        self.s.add_veto("app", "node:vite.js")
+        self.s.add_veto("pid", "42", start=1234)
+
+        self.assertEqual(self.s.match_veto(scope="leftover/firefox")["kind"], "scope")
+        self.assertEqual(self.s.match_veto(members=[{"pid": 7, "start": 8,
+                                                     "apps": ["node:vite.js"]}])["kind"], "app")
+        self.assertEqual(self.s.match_veto(members=[{"pid": 42, "start": 1234}])["kind"], "pid")
+        self.assertIsNone(self.s.match_veto(members=[{"pid": 42, "start": 1235}]))
+
+    def test_offline_veto_feedback_is_versioned_and_idempotent(self):
+        op = {"v": 1, "id": "op-1", "op": "veto",
+              "target": {"kind": "app", "value": "firefox"}}
+        with open(self.s.feedback_path, "w") as f:
+            f.write(json.dumps(op) + "\n")
+            f.write(json.dumps(op) + "\n")
+
+        self.assertEqual(self.s.apply_feedback(), 1)
+        self.assertEqual(self.s.apply_feedback(), 0)
+        self.assertEqual(self.s.match_veto(members=[{"pid": 1, "start": 2,
+                                                     "apps": ["firefox"]}])["value"], "firefox")
+        self.assertEqual(self.s.data["feedback_ids"], ["op-1"])
+
+    def test_undo_vetoes_the_stopped_app_and_keeps_its_pair(self):
+        action = self.s.record_auto_action("leftover/vite", "pair stop",
+                                           [("npm", "vite")], ["vite"])
+        undone = self.s.undo_auto_action(action["id"], feedback_id="undo-1")
+
+        self.assertEqual(undone["vetoes"][0]["value"], "vite")
+        self.assertEqual(self.s.match_veto(members=[{"pid": 7, "start": 8,
+                                                     "apps": ["vite"]}])["kind"], "app")
+        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "keep")
+
+    def test_offline_unveto_replay_removes_only_the_named_veto(self):
+        veto = self.s.add_veto("app", "firefox")
+        op = {"v": 1, "id": "remove-1", "op": "unveto",
+              "target": {"kind": "app", "value": "firefox", "start": None}}
+        with open(self.s.feedback_path, "w") as f:
+            f.write(json.dumps(op) + "\n")
+
+        self.assertEqual(self.s.apply_feedback(), 1)
+        self.assertIsNone(self.s.match_veto(members=[{"pid": 7, "start": 8,
+                                                      "apps": ["firefox"]}]))
+        self.assertEqual(veto["value"], "firefox")
+
+    def test_pending_offline_undo_vetoes_before_replay_and_keeps_after_replay(self):
+        action = self.s.record_auto_action("leftover/vite", "pair stop",
+                                           [("npm", "vite")], ["vite"])
+        op = {"v": 1, "id": "undo-pending", "op": "undo", "action_id": action["id"]}
+        with open(self.s.feedback_path, "w") as f:
+            f.write(json.dumps(op) + "\n")
+
+        self.assertEqual(self.s.match_veto(members=[{"pid": 7, "apps": ["vite"]}])["value"], "vite")
+        self.assertEqual(self.s.apply_feedback(), 1)
+        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "keep")
+        self.assertEqual(self.s.match_veto(members=[{"pid": 7, "apps": ["vite"]}])["value"], "vite")
 
 
 if __name__ == "__main__":

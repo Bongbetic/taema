@@ -95,6 +95,17 @@ class TruthTable(unittest.TestCase):
         self.assertEqual(dec.verdict, "keep")
         self.assertIn("survive_logout", dec.reason)
 
+    def test_veto_denies_every_stop_trigger_before_mode_authority(self):
+        facts = authorization.Facts(scope="leftover/firefox", vetoed="app firefox")
+        for mode in authorization.MODES:
+            for trigger in (authorization.OWNER_EXIT, authorization.JOB_SURVIVORS,
+                            authorization.GC_STOP, authorization.SESSION_END,
+                            authorization.MANUAL_STOP):
+                dec = authorization.authorize(trigger, mode, facts)
+                self.assertEqual((dec.verdict, dec.slot), (authorization.KEEP, authorization.VETO),
+                                 (mode, trigger))
+                self.assertIn("app firefox", dec.reason)
+
 
 class DaemonRouting(AutoCase):
     """AC 1: every daemon path that moves, stops, or adopts asks the ladder, not the mode."""

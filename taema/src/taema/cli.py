@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import time
+import uuid
 
 from . import authorization, cgroup, engine, inspect, knowledge, lineage, policy
 
@@ -60,6 +61,68 @@ def feedback(cfg, store, op, key):
     with os.fdopen(fd, "a") as f:
         f.write(json.dumps({"op": op, "key": key}) + "\n")
     return "queued"
+
+
+def feedback_action(cfg, store, op, **fields):
+    """Send a versioned policy action to the daemon or append it for offline replay."""
+    msg = {"v": 1, "id": uuid.uuid4().hex, "op": op, **fields}
+    reply = ask(cfg, {"cmd": "feedback", **msg})
+    if reply is not None:
+        return "daemon", reply
+    fd = os.open(store.feedback_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(json.dumps(msg) + "\n")
+    return "queued", {"ok": True, "queued": True}
+
+
+def veto_target(target, store=None, for_removal=False):
+    """Resolve an explicit SCOPE, APP, or current PID into a stable veto target."""
+    if not isinstance(target, str) or not target:
+        raise ValueError("target is empty")
+    kind, value = None, target
+    for prefix in ("scope:", "app:", "pid:"):
+        if target.startswith(prefix):
+            kind, value = prefix[:-1], target[len(prefix):]
+            break
+    if not value:
+        raise ValueError("target is empty")
+    if kind == "pid" or (kind is None and value.isdigit()):
+        if not value.isdigit():
+            raise ValueError("pid must be a number")
+        pid = int(value)
+        if for_removal and store is not None:
+            existing = next((v for v in store._active_vetoes()
+                             if v.get("kind") == "pid" and v.get("value") == str(pid)), None)
+            if existing:
+                return store._target(existing)
+        start = inspect.starttime(pid)
+        if pid <= 1 or start is None or inspect.uid_of(pid) != os.getuid():
+            raise ValueError("pid is gone or not yours")
+        return {"kind": "pid", "value": str(pid), "start": start}
+    if kind == "scope":
+        path = cgroup.resolve(value)
+        if path:
+            value = cgroup.rel(path)
+        elif not cgroup.valid_rel(value):
+            raise ValueError("bad scope name")
+        return {"kind": "scope", "value": value, "start": None}
+    if kind == "app":
+        return {"kind": "app", "value": value, "start": None}
+    path = cgroup.resolve(value)
+    if path:
+        return {"kind": "scope", "value": cgroup.rel(path), "start": None}
+    if store is not None:
+        found = next((v for v in store._active_vetoes() if v.get("value") == value), None)
+        if found:
+            return store._target(found)
+    return {"kind": "app", "value": value, "start": None}
+
+
+def veto_label(target):
+    label = "%s %s" % (target["kind"], target["value"])
+    if target["kind"] == "pid" and target.get("start") is not None:
+        label += " (starttime %s)" % target["start"]
+    return label
 
 
 def die(msg, code=1):
@@ -123,12 +186,21 @@ def cmd_run(a):
 # ---- kill ---------------------------------------------------------------------------------
 
 def cmd_kill(a):
+    if getattr(a, "do_not_kill", False):
+        return die("kill and --do-not-kill cannot be combined", 2)
     cfg, store, units = _load()
     path = cgroup.resolve(a.name)
     if not path:
         return die("no scope %s" % a.name)
-    dec = authorization.authorize(authorization.MANUAL_STOP, cfg["mode"])
+    veto = engine.veto_for_scope(store, path)
+    facts = authorization.Facts(scope=cgroup.rel(path),
+                                vetoed=veto_label(veto) if veto else "")
+    dec = authorization.authorize(authorization.MANUAL_STOP, cfg["mode"], facts)
     if dec.verdict != authorization.ACT:
+        if dec.slot == authorization.VETO:
+            store.log(event="vetoed", trigger=authorization.MANUAL_STOP, scope=cgroup.rel(path),
+                      target=dec.reason)
+            return die(dec.reason, 4)
         return die("kill not allowed: %s" % dec.reason)
     leaf_name = os.path.basename(path)
     unit = engine.unit_for_leaf(units, leaf_name)
@@ -137,6 +209,8 @@ def cmd_kill(a):
                           keep=[x for x in (a.keep or "").split(",") if x], dry_run=a.dry_run,
                           hook=policy.hook_for(cfg, leaf_name))
     except engine.Refused as e:
+        if isinstance(e, engine.Vetoed):
+            return die(str(e), 4)
         return die(str(e))
     for d in rep["decisions"]:
         print("%-5s %7d %-18s %s" % (d["action"], d["pid"], d["comm"][:18], d["why"][:110]))
@@ -236,8 +310,63 @@ def cmd_keep(a):
     return 0
 
 
+def cmd_do_not_kill(a):
+    cfg, store, _units = _load()
+    if a.target:
+        try:
+            targets = [veto_target(a.target, store)]
+        except ValueError as e:
+            return die(str(e))
+    else:
+        action = store.auto_action()
+        if not action:
+            return die("no automatic stop to veto")
+        apps = action.get("apps") or [pair[1] for pair in action.get("pairs", [])
+                                       if isinstance(pair, list) and len(pair) == 2]
+        targets = ([{"kind": "app", "value": app, "start": None}
+                    for app in dict.fromkeys(apps)] if apps else
+                   [{"kind": "scope", "value": action["scope"], "start": None}])
+    for target in targets:
+        how, reply = feedback_action(cfg, store, "veto", target=target)
+        if not reply or not reply.get("ok"):
+            return die(reply.get("error", "could not add veto"))
+        print("vetoed %s (%s)" % (veto_label(target), how))
+    return 0
+
+
+def cmd_undo(_a):
+    cfg, store, _units = _load()
+    action = store.auto_action()
+    if not action:
+        return die("no automatic stop to undo")
+    how, reply = feedback_action(cfg, store, "undo", action_id=action["id"])
+    if not reply or not reply.get("ok"):
+        return die(reply.get("error", "could not undo automatic stop"))
+    targets = reply.get("targets") or [
+        {"kind": "app", "value": app} for app in action.get("apps", [])]
+    print("undo: %s; vetoed %s" % (
+        action.get("scope", "automatic stop"),
+        ", ".join(veto_label(t) for t in targets) or "the stopped scope"))
+    return 0
+
+
 def cmd_forget(a):
     cfg, store, units = _load()
+    if getattr(a, "veto", False):
+        try:
+            target = veto_target(a.exe, store, for_removal=True)
+        except ValueError as e:
+            return die(str(e))
+        existed = any(v.get("kind") == target["kind"] and v.get("value") == str(target["value"])
+                      and (target.get("start") is None or v.get("start") == target.get("start"))
+                      for v in store._active_vetoes())
+        how, reply = feedback_action(cfg, store, "unveto", target=target)
+        if not reply or not reply.get("ok"):
+            return die(reply.get("error", "could not remove veto"))
+        removed = reply.get("removed", []) or existed
+        print("forgot veto for %s (%s)" % (veto_label(target), how)
+              if removed else "no veto for %s (%s)" % (veto_label(target), how))
+        return 0
     known = store.forget(a.exe)
     feedback(cfg, store, "forget", a.exe)
     print("forgot %s" % a.exe if known else "nothing learned for %s" % a.exe)
@@ -340,7 +469,9 @@ def main(argv):
     from . import __version__
     p = argparse.ArgumentParser(prog="taema", description="Dependency-aware cgroup v2 process scopes")
     p.add_argument("--version", action="version", version="taema " + __version__)
-    sub = p.add_subparsers(dest="c", required=True)
+    p.add_argument("--do-not-kill", nargs="?", const="", metavar="TARGET",
+                   help="veto a target, or the latest automatic stop")
+    sub = p.add_subparsers(dest="c")
     s = sub.add_parser("run", help="run CMD inside scope-NAME")
     s.add_argument("--join", action="store_true")
     s.add_argument("--owner", type=int, help="stop the scope when this pid exits")
@@ -351,6 +482,8 @@ def main(argv):
     s = sub.add_parser("kill", help="stop a scope; shared members are moved aside, not killed")
     s.add_argument("-t", "--timeout", type=float)
     s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--do-not-kill", action="store_true",
+                   help="conflicts with kill; use the do-not-kill command separately")
     s.add_argument("--force", action="store_true", help="ignore learned/seed defaults")
     s.add_argument("--hard", action="store_true", help="also ignore detected outside users")
     s.add_argument("--keep", help="comma list of exe names to move aside instead of killing")
@@ -359,13 +492,20 @@ def main(argv):
     s = sub.add_parser("ls"); s.set_defaults(f=cmd_ls)
     s = sub.add_parser("explain"); s.add_argument("target"); s.set_defaults(f=cmd_explain)
     s = sub.add_parser("keep"); s.add_argument("exe"); s.set_defaults(f=cmd_keep)
-    s = sub.add_parser("forget"); s.add_argument("exe"); s.set_defaults(f=cmd_forget)
+    s = sub.add_parser("forget"); s.add_argument("--veto", action="store_true"); s.add_argument("exe"); s.set_defaults(f=cmd_forget)
+    s = sub.add_parser("do-not-kill", aliases=["dnk", "never"])
+    s.add_argument("target", nargs="?"); s.set_defaults(f=cmd_do_not_kill)
+    s = sub.add_parser("undo"); s.set_defaults(f=cmd_undo)
     s = sub.add_parser("status"); s.set_defaults(f=cmd_status)
     s = sub.add_parser("review", help="list pending close reviews"); s.set_defaults(f=cmd_review)
     s = sub.add_parser("gc"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_gc)
     s = sub.add_parser("adopt"); s.add_argument("--all", action="store_true"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_adopt)
     s = sub.add_parser("daemon"); s.set_defaults(f=cmd_daemon)
     a = p.parse_args(argv)
+    if a.c is None:
+        if a.do_not_kill is None:
+            p.error("a command is required")
+        return cmd_do_not_kill(argparse.Namespace(target=a.do_not_kill or None))
     if a.c == "run":
         if a.cmd and a.cmd[0] == "--":
             a.cmd = a.cmd[1:]

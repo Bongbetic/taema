@@ -10,7 +10,7 @@ The ladder evaluates five slots, in spec order (``SLOTS``):
 1. ``hard_safety`` -- never root/other users/protected/self, dependencies, PID reuse. No trigger
    carries hard-safety facts in 0.2.1 (engine.stop/plan_stop still revalidate at actuation), so
    the slot passes through.
-2. ``veto`` -- no veto exists in 0.2.1; issue #10 plugs it in here.
+2. ``veto`` -- a user-created veto blocks matching stop targets in every mode.
 3. ``hold`` -- no hold/snooze exists yet; later M0 tickets plug it in here.
 4. ``mode_capability`` -- per-trigger, per-mode **table** (``_CAPABILITY``, with two fact rules for
    the auto-mode special cases). This is the one table the M0 tickets edit instead of scattered
@@ -92,7 +92,8 @@ _Cell = tuple[Verdict, Authority, str]
 class Facts:
     """Known facts the slots may consult. Defaults are "not applicable", which passes through.
 
-    scope: the cgroup leaf/rel the trigger targets (inputs for future veto/hold matching).
+    scope: the cgroup leaf/rel the trigger targets.
+    vetoed: the matching user veto, already resolved from the store and observed members.
     leftover: target sits under leftover/* (GC stop candidates).
     shared: target is the shared/ helper tree (session end).
     unit_survive_logout: the target's unit sets kill.survive_logout (session end).
@@ -102,6 +103,7 @@ class Facts:
     leftover: bool = False
     shared: bool = False
     unit_survive_logout: bool = False
+    vetoed: str = ""
 
 
 @dataclass(frozen=True)
@@ -205,8 +207,10 @@ def _hard_safety(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
     return "pass", ""
 
 
-def _veto(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
-    """Slot 2: vetoes (do-not-kill/dnk/never). None exist in 0.2.1; issue #10 plugs in here."""
+def _veto(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
+    """Slot 2: a user veto blocks every stop trigger before mode or learned authority."""
+    if trigger in (OWNER_EXIT, JOB_SURVIVORS, GC_STOP, SESSION_END, MANUAL_STOP) and facts.vetoed:
+        return "deny", "vetoed: " + facts.vetoed
     return "pass", ""
 
 

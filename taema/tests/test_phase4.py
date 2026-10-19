@@ -141,6 +141,22 @@ class SigkillRule(unittest.TestCase):
         sent, _ = self.run_stop(True)
         self.assertIn(signal.SIGKILL, sent)
 
+    def test_vetoed_app_is_kept_before_any_stop_signal(self):
+        s = store()
+        s.add_veto("app", "firefox")
+        with mock.patch.object(engine, "self_guard"), \
+             mock.patch.object(engine.cgroup, "tree_procs", return_value=[42]), \
+             mock.patch.object(engine.inspect, "starttime", return_value=1234), \
+             mock.patch.object(engine.policy, "app_key", return_value="firefox"), \
+             mock.patch.object(engine.policy, "exe_key", return_value="firefox"), \
+             mock.patch.object(engine, "_signal_all") as signal_all:
+            with self.assertRaises(engine.Vetoed):
+                engine.stop("/x/user/1/app-firefox", {"timers": {}}, s)
+        signal_all.assert_not_called()
+        with open(s.log_path) as f:
+            events = [json.loads(line)["event"] for line in f]
+        self.assertIn("vetoed", events)
+
 
 # ---- 3. auto adoption of app roots ------------------------------------------------------------
 

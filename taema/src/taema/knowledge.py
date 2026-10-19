@@ -9,6 +9,7 @@ import json
 import math
 import os
 import time
+import uuid
 
 from . import policy
 
@@ -99,7 +100,8 @@ class Store:
     def _fresh(self):
         return {"version": SCHEMA, "last_decay": self.now(), "created": self.now(), "closes": 0,
                 "exes": {}, "pairs": {}, "standalone": {}, "noise": {},
-                "asked": {"day": 0, "n": 0}, "reviews": [], "review_seq": 0}
+                "asked": {"day": 0, "n": 0}, "reviews": [], "review_seq": 0,
+                "vetoes": [], "auto_actions": [], "feedback_ids": []}
 
     def _migrate(self, data):
         """v1 (exes only) -> v2: add pairs, standalone, asked, noise; keep every exe record."""
@@ -112,6 +114,10 @@ class Store:
         if "reviews" not in data or not isinstance(data.get("reviews"), list):
             data["reviews"] = []
             self.dirty = True
+        for field in ("vetoes", "auto_actions", "feedback_ids"):
+            if not isinstance(data.get(field), list):
+                data[field] = []
+                self.dirty = True
         seq = data.get("review_seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
             seq = max((r.get("id", 0) for r in data["reviews"] if isinstance(r, dict)
@@ -207,6 +213,198 @@ class Store:
         for k in [k for k in self.sigs if k.startswith(prefix) and k not in keep]:
             del self.sigs[k]
 
+    # ---- vetoes and automatic-stop correction -----------------------------------------------
+    @staticmethod
+    def _valid_veto_target(target):
+        if not isinstance(target, dict) or target.get("kind") not in ("scope", "app", "pid"):
+            return False
+        value = target.get("value")
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            return False
+        value = str(value)
+        if not value or len(value) > 256 or SEP in value:
+            return False
+        if target["kind"] == "pid":
+            try:
+                pid = int(value)
+            except ValueError:
+                return False
+            start = target.get("start")
+            return pid > 1 and isinstance(start, int) and not isinstance(start, bool) and start > 0
+        return isinstance(target.get("start"), type(None))
+
+    @staticmethod
+    def _target(veto):
+        return {"kind": veto["kind"], "value": veto["value"], "start": veto.get("start")}
+
+    @staticmethod
+    def describe_veto(veto):
+        label = "%s %s" % (veto["kind"], veto["value"])
+        if veto["kind"] == "pid" and veto.get("start") is not None:
+            label += " (starttime %s)" % veto["start"]
+        return label
+
+    def add_veto(self, kind, value, start=None, identifier=None, reason=""):
+        """Create a durable veto for one scope, app key, or pid/start-time instance."""
+        target = {"kind": kind, "value": value, "start": start}
+        if not self._valid_veto_target(target):
+            return None
+        target["value"] = str(target["value"])
+        if identifier is not None and (not isinstance(identifier, str) or not identifier or len(identifier) > 128):
+            return None
+        identifier = identifier or uuid.uuid4().hex
+        existing = next((v for v in self.data["vetoes"] if isinstance(v, dict)
+                         and v.get("id") == identifier), None)
+        if existing:
+            return dict(existing)
+        veto = {"id": identifier, **target, "created": self.now()}
+        if isinstance(reason, str) and reason:
+            veto["reason"] = reason[:256]
+        self.data["vetoes"].append(veto)
+        self.dirty = True
+        self.log(event="veto_added", target=self._target(veto))
+        return dict(veto)
+
+    def remove_veto(self, target):
+        """Remove only a matching veto. PID removal may omit start to clear that pid's instances."""
+        if not isinstance(target, dict) or target.get("kind") not in ("scope", "app", "pid"):
+            return []
+        value = target.get("value")
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            return []
+        value = str(value)
+        start = target.get("start")
+        if start is not None and (not isinstance(start, int) or isinstance(start, bool)):
+            return []
+        removed = []
+        keep = []
+        for veto in self.data["vetoes"]:
+            same = isinstance(veto, dict) and veto.get("kind") == target["kind"] \
+                and veto.get("value") == value and (start is None or veto.get("start") == start)
+            (removed if same else keep).append(veto)
+        if removed:
+            self.data["vetoes"] = keep
+            self.dirty = True
+            self.log(event="veto_removed", target={"kind": target["kind"], "value": value, "start": start})
+        return [dict(v) for v in removed]
+
+    def _active_vetoes(self, include_pending=True):
+        vetoes = [dict(v) for v in self.data["vetoes"] if isinstance(v, dict)
+                  and self._valid_veto_target(v)]
+        if not include_pending:
+            return vetoes
+        known_ids = set(self.data.get("feedback_ids", []))
+        paths = (self.feedback_path + ".replay", self.feedback_path)
+        for path in paths:
+            try:
+                with open(path) as f:
+                    lines = list(f)
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    op = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(op, dict) or op.get("v") != 1 or op.get("id") in known_ids:
+                    continue
+                op_id = op.get("id")
+                if not isinstance(op_id, str) or not op_id or len(op_id) > 128:
+                    continue
+                known_ids.add(op_id)
+                if op.get("op") == "veto" and self._valid_veto_target(op.get("target")):
+                    target = dict(op["target"])
+                    vetoes.append({"id": op_id, **target, "created": self.now()})
+                elif op.get("op") == "unveto":
+                    target = op.get("target")
+                    if isinstance(target, dict):
+                        start = target.get("start")
+                        vetoes = [v for v in vetoes if not (
+                            v.get("kind") == target.get("kind") and v.get("value") == str(target.get("value"))
+                            and (start is None or v.get("start") == start))]
+                elif op.get("op") == "undo":
+                    action = self.auto_action(op.get("action_id"))
+                    if action:
+                        apps = action.get("apps") or [pair[1] for pair in action.get("pairs", [])
+                                                       if isinstance(pair, list) and len(pair) == 2]
+                        targets = [("app", app) for app in dict.fromkeys(apps)]
+                        if not targets and action.get("scope"):
+                            targets = [("scope", action["scope"])]
+                        for index, (kind, value) in enumerate(targets):
+                            target = {"kind": kind, "value": value, "start": None}
+                            if self._valid_veto_target(target):
+                                vetoes.append({"id": "%s:%d" % (op_id, index), **target,
+                                               "created": self.now()})
+        return vetoes
+
+    def match_veto(self, scope=None, members=(), include_pending=True):
+        """Return the first veto matching a scope or observed member identities."""
+        for veto in self._active_vetoes(include_pending):
+            kind, value = veto.get("kind"), veto.get("value")
+            if kind == "scope" and isinstance(scope, str) \
+                    and (scope == value or scope.startswith(value.rstrip("/") + "/")):
+                return dict(veto)
+            for member in members or ():
+                if not isinstance(member, dict):
+                    continue
+                if kind == "app" and value in member.get("apps", ()):
+                    return dict(veto)
+                if kind == "pid" and str(member.get("pid")) == value \
+                        and (member.get("start") is None or member.get("start") == veto.get("start")):
+                    return dict(veto)
+        return None
+
+    def record_auto_action(self, scope, why, pairs=(), apps=()):
+        """Keep enough durable context to target the latest automatic stop after restart."""
+        normalized_pairs = []
+        for pair in pairs:
+            if isinstance(pair, (tuple, list)) and len(pair) == 2 and all(
+                    isinstance(x, str) and x and len(x) <= 256 for x in pair):
+                normalized_pairs.append([pair[0], pair[1]])
+        normalized_apps = list(dict.fromkeys(x for x in apps if isinstance(x, str) and x and len(x) <= 256))
+        for _owner, app in normalized_pairs:
+            if app not in normalized_apps:
+                normalized_apps.append(app)
+        action = {"id": uuid.uuid4().hex, "scope": str(scope)[:256], "why": str(why)[:512],
+                  "pairs": normalized_pairs[:32], "apps": normalized_apps[:64], "ts": self.now()}
+        actions = self.data.setdefault("auto_actions", [])
+        actions.append(action)
+        del actions[:-50]
+        self.dirty = True
+        return dict(action)
+
+    def auto_action(self, identifier=None):
+        actions = [a for a in self.data.get("auto_actions", []) if isinstance(a, dict)]
+        if identifier is None:
+            return dict(actions[-1]) if actions else None
+        action = next((a for a in actions if a.get("id") == identifier), None)
+        return dict(action) if action else None
+
+    def undo_auto_action(self, identifier=None, feedback_id=None):
+        """Veto the apps from one automatic stop and add explicit keep evidence to its pairs."""
+        action = self.auto_action(identifier)
+        if not action:
+            return None
+        apps = action.get("apps") or [pair[1] for pair in action.get("pairs", [])
+                                       if isinstance(pair, list) and len(pair) == 2]
+        targets = [("app", app) for app in dict.fromkeys(apps)]
+        if not targets and action.get("scope"):
+            targets = [("scope", action["scope"])]
+        vetoes = []
+        for index, (kind, value) in enumerate(targets):
+            veto = self.add_veto(kind, value,
+                                 identifier=("%s:%d" % (feedback_id, index)) if feedback_id else None,
+                                 reason="undo automatic stop")
+            if veto:
+                vetoes.append(veto)
+        for pair in action.get("pairs", []):
+            if isinstance(pair, list) and len(pair) == 2:
+                self.answer(pair[0], pair[1], "keep")
+        self.log(event="undo", action_id=action.get("id"), scope=action.get("scope"),
+                 vetoes=[self._target(v) for v in vetoes], pairs=action.get("pairs", [])[:8])
+        self.dirty = True
+        return {"action": action, "vetoes": vetoes}
+
     # ---- feedback ----
     def apply_op(self, op, key):
         """One explicit user answer: keep | forget | kill. Returns False for a bad op or key."""
@@ -220,6 +418,52 @@ class Store:
             self.forget(key)
         self.log(event=op, exe=key)
         return True
+
+    def apply_feedback_command(self, msg):
+        """Apply one versioned offline-safe policy operation once, keyed by its client id."""
+        if not isinstance(msg, dict) or msg.get("v") != 1:
+            return None
+        op_id, op = msg.get("id"), msg.get("op")
+        if not isinstance(op_id, str) or not op_id or len(op_id) > 128:
+            return None
+        ids = self.data.setdefault("feedback_ids", [])
+        if op_id in ids:
+            return {"ok": True, "duplicate": True}
+        if op == "veto":
+            target = msg.get("target")
+            if not self._valid_veto_target(target):
+                return None
+            veto = self.add_veto(target["kind"], target["value"], target.get("start"),
+                                 identifier=op_id, reason=msg.get("reason", ""))
+            result = {"target": self._target(veto)}
+        elif op == "unveto":
+            target = msg.get("target")
+            if not isinstance(target, dict):
+                return None
+            removed = self.remove_veto(target)
+            result = {"removed": [self._target(v) for v in removed]}
+        elif op == "undo":
+            action_id = msg.get("action_id")
+            if not isinstance(action_id, str) or not action_id:
+                return None
+            undone = self.undo_auto_action(action_id, feedback_id=op_id)
+            if not undone:
+                return None
+            result = {"action_id": action_id,
+                      "targets": [self._target(v) for v in undone["vetoes"]],
+                      "pairs": undone["action"].get("pairs", [])}
+        elif op == "vetoed":
+            target, trigger = msg.get("target"), msg.get("trigger")
+            if not isinstance(target, dict) or not isinstance(trigger, str):
+                return None
+            self.log(event="vetoed", target=target, trigger=trigger)
+            result = {"target": target}
+        else:
+            return None
+        ids.append(op_id)
+        del ids[:-4096]
+        self.dirty = True
+        return {"ok": True, **result}
 
     def apply_feedback(self, path=None):
         """Replay and remove feedback.jsonl (written by the CLI while the daemon was down)."""
@@ -241,7 +485,13 @@ class Store:
                 for line in f:
                     try:
                         m = json.loads(line)
-                        if isinstance(m, dict) and self.apply_op(m.get("op"), m.get("key")):
+                        if not isinstance(m, dict):
+                            continue
+                        if m.get("v") == 1:
+                            result = self.apply_feedback_command(m)
+                            if result and not result.get("duplicate"):
+                                n += 1
+                        elif self.apply_op(m.get("op"), m.get("key")):
                             n += 1
                     except ValueError:
                         continue

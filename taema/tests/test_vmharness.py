@@ -1,4 +1,5 @@
 """Disposable Void VM harness: config, plans, refusals, and the guest scenario API."""
+import contextlib
 import importlib.util
 import io
 import json
@@ -12,7 +13,13 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(ROOT)
 VM_DIR = os.path.join(ROOT, "tools", "vm")
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 def load(name):
@@ -97,6 +104,14 @@ class VmTestCase(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         code = vmh.main(list(argv), out=out, err=err)
         return code, out.getvalue(), err.getvalue()
+
+    def stub_tool(self, key, body):
+        """Replace one configured tool with a custom stub script."""
+        path = self.tools[key]
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, 0o755)
+        return path
 
 
 class ConfigTest(VmTestCase):
@@ -298,6 +313,210 @@ class DryRunTest(VmTestCase):
         self.assertFalse(os.path.exists(self.state), "dry run must not create the state dir")
 
 
+class ImageBuildScriptTest(VmTestCase):
+    """Rootless image-build script generation (no live extraction or boot)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = vmh.load_config(self.write_config())
+        self.script = read_text(os.path.join(VM_DIR, "mkimage.sh"))
+
+    def test_mkimage_argv_runs_under_mount_and_pid_namespace_with_proc(self):
+        rootfs = os.path.join(self.state, "images", "glibc", "rootfs")
+        pub = os.path.join(self.state, "images", "id_ed25519.pub")
+        argv = vmh.mkimage_argv(self.cfg, rootfs, pub)
+        self.assertEqual(argv[0], self.tools["unshare"])
+        self.assertIn("-rmfp", argv)
+        # a user namespace may only mount procfs alongside its own PID
+        # namespace, so unshare must mount it at rootfs/proc before the script
+        self.assertIn("--mount-proc=" + os.path.join(rootfs, "proc"), argv)
+        self.assertEqual(argv[-4:], ["sh", os.path.join(VM_DIR, "mkimage.sh"),
+                                     rootfs, pub])
+
+    def test_mkimage_script_never_mounts_proc_itself(self):
+        self.assertNotIn("mount -t proc", self.script)
+
+    def test_mkimage_enables_services_in_durable_default_runlevel(self):
+        # /var/service points into /run (tmpfs), so enablement links must be
+        # written under /etc/runit/runsvdir/default to survive guest boots
+        self.assertIn('mkdir -p "$R/etc/runit/runsvdir/default"', self.script)
+        self.assertIn('ln -sf /etc/sv/sshd "$R/etc/runit/runsvdir/default/sshd"',
+                      self.script)
+        self.assertIn('ln -sf /etc/sv/dhcpcd "$R/etc/runit/runsvdir/default/dhcpcd"',
+                      self.script)
+
+    def test_mkimage_fixup_reads_guest_file_and_is_idempotent(self):
+        # sed must read the fixup file inside the rootfs; the old code read
+        # the *host* path /etc/vmh-fixup.sh, which does not exist
+        self.assertNotIn("1r /etc/vmh-fixup.sh", self.script)
+        self.assertIn('sed -i "1r $R/etc/vmh-fixup.sh"', self.script)
+        # re-running mkimage on a configured rootfs must not stack fixups
+        self.assertIn("grep -q 'vmh-fixed'", self.script)
+
+    def test_mkimage_strips_host_environment_from_chroot(self):
+        # a host TMPDIR/XBPS_* override does not exist inside the chroot and
+        # would make xbps-install fail while staging package scripts
+        self.assertIn("env -u TMPDIR -u XBPS_ROOT -u XBPS_ARCH -u XBPS_TARGET_ARCH",
+                      self.script)
+
+    def test_mkimage_fixup_preserves_setuid_bits_across_chown(self):
+        # chown clears set-user-ID/set-group-ID bits (POSIX); without a
+        # restore pass sudo refuses to run and provisioning dies with
+        # "sudo: /usr/bin/sudo must be owned by uid 0 and have the setuid bit"
+        # (observed on the reference machine's first live provision step)
+        self.assertIn("-perm -4000", self.script)          # snapshot selector
+        self.assertIn("-perm -2000", self.script)          # setgid too
+        self.assertIn("chmod 4755 /usr/bin/sudo /usr/bin/su", self.script)
+        # snapshot before chown, restore after it
+        self.assertLess(self.script.index("-perm -4000"),
+                        self.script.index("chown -R 0:0"))
+        self.assertLess(self.script.index("chown -R 0:0"),
+                        self.script.index("done < /etc/vmh-suid.bak"))
+
+
+class TransportTest(VmTestCase):
+    """SSH/SCP command generation: recursive copies, loopback, private hosts."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = vmh.load_config(self.write_config())
+
+    def test_scp_transfers_are_recursive(self):
+        # bootstrap copies the package repository directory and collect
+        # copies the artifacts directory; scp refuses directories without -r
+        argv = vmh.scp_argv(self.cfg, 2222, "/k", "/kh",
+                            [os.path.join(VM_DIR, "provision.sh")],
+                            "vmadmin@127.0.0.1:/tmp/taema-vm/")
+        self.assertEqual(argv[0], self.tools["scp"])
+        self.assertIn("-r", argv)
+
+    def test_ssh_is_loopback_only_with_private_known_hosts(self):
+        known = os.path.join(self.state, "runs", "x", "known_hosts")
+        argv = vmh.ssh_argv(self.cfg, 2222, "/k", known, "vmadmin", "true")
+        self.assertIn("UserKnownHostsFile=" + known, argv)
+        self.assertIn("GlobalKnownHostsFile=/dev/null", argv)
+        self.assertIn("BatchMode=yes", argv)
+        self.assertNotIn(os.path.expanduser("~/.ssh/known_hosts"), argv)
+        self.assertEqual(argv[-2:], ["vmadmin@127.0.0.1", "true"])
+
+
+class RunPipelineTest(VmTestCase):
+    """The `run` pipeline against stubbed transports: no QEMU, no network."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg_path = self.write_config(libcs=["glibc"], scenarios=["smoke"])
+        self.cfg = vmh.load_config(self.cfg_path)
+        self.stub_tool("qemu", "#!/bin/sh\nexec sleep 60\n")
+        self.stub_tool("qemu_img", "#!/bin/sh\nexit 0\n")
+        self.stub_tool("scp", "#!/bin/sh\nexit 0\n")
+        self.fail_marker = os.path.join(self.tmp, "fail-scenario")
+        self.stub_tool(
+            "ssh",
+            "#!/bin/sh\n"
+            'case "$*" in *scenario.py*) [ -f "%s" ] && exit 1 ;; esac\n'
+            "exit 0\n" % self.fail_marker)
+        # Offline cache: fake base image, keypair and package, so `run` needs
+        # neither --allow-network nor a real package build.
+        cp = vmh.cache_paths(self.cfg, "glibc")
+        os.makedirs(cp["dir"], exist_ok=True)
+        with open(cp["base"], "wb") as f:
+            f.write(b"base")
+        key, pub = vmh.ssh_key_paths(self.cfg)
+        os.makedirs(os.path.dirname(key), exist_ok=True)
+        for p in (key, pub):
+            with open(p, "wb") as f:
+                f.write(b"key")
+        pkg = vmh.package_path(self.cfg)
+        os.makedirs(os.path.dirname(pkg), exist_ok=True)
+        with open(pkg, "wb") as f:
+            f.write(b"pkg")
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def run_offline(self):
+        return vmh.main(["run", "--config", self.cfg_path,
+                         "--state-dir", self.state, "--tcg", "--no-build",
+                         "--libc", "glibc"], out=self.out, err=self.err)
+
+    def _only_run_dir(self):
+        runs = os.path.join(self.state, "runs")
+        names = os.listdir(runs)
+        self.assertEqual(len(names), 1, names)
+        return os.path.join(runs, names[0])
+
+    def test_offline_run_passes_and_saves_logs_and_results(self):
+        code = self.run_offline()
+        self.assertEqual(code, 0, self.err.getvalue())
+        run_dir = self._only_run_dir()
+        with open(os.path.join(run_dir, "summary.json")) as f:
+            summary = json.load(f)
+        self.assertEqual(summary["accel"], "tcg")
+        self.assertEqual(summary["vms"]["glibc"]["scenarios"], {"smoke": "PASS"})
+        for rel in ("qemu.log", "logs/provision.log", "logs/scenario-smoke.log",
+                    "logs/collect.log"):
+            self.assertTrue(os.path.isfile(os.path.join(run_dir, rel)), rel)
+        # the disposable overlay is discarded without --keep-run
+        self.assertFalse(os.path.exists(os.path.join(run_dir, "disk.qcow2")))
+
+    def test_failing_scenario_recorded_and_artifacts_still_collected(self):
+        with open(self.fail_marker, "w") as f:
+            f.write("")
+        code = self.run_offline()
+        self.assertEqual(code, 1, self.err.getvalue())
+        run_dir = self._only_run_dir()
+        with open(os.path.join(run_dir, "summary.json")) as f:
+            summary = json.load(f)
+        self.assertEqual(summary["vms"]["glibc"]["scenarios"], {"smoke": "FAIL"})
+        self.assertTrue(
+            os.path.isfile(os.path.join(run_dir, "logs/scenario-smoke.log")))
+        # a failed scenario must not skip artifact collection
+        self.assertTrue(os.path.isfile(os.path.join(run_dir, "logs/collect.log")))
+
+
+class HarnessCliParsingTest(VmTestCase):
+    def test_parse_scenarios_all(self):
+        self.assertEqual(vmh.parse_scenarios("all"), ["smoke", "upgrade", "remove"])
+
+    def test_parse_libcs(self):
+        self.assertEqual(vmh.parse_libcs("glibc, musl"), ["glibc", "musl"])
+
+    def test_previous_version_derived_from_default_config(self):
+        self.assertEqual(vmh.previous_version(vmh.load_config()), "0.2.1")
+
+    def test_unknown_subcommand_is_usage_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                vmh.main(["teleport"], out=io.StringIO(), err=io.StringIO())
+        self.assertEqual(cm.exception.code, 2)
+
+
+class HarnessSurfacesTest(unittest.TestCase):
+    """Docs, make targets and the opt-in KVM workflow: text contracts."""
+
+    def test_docs_document_one_command_scenarios_and_safety(self):
+        docs = read_text(os.path.join(ROOT, "docs", "vm-harness.md"))
+        self.assertIn("make -C taema vm-test", docs)
+        self.assertIn("Scenario API", docs)
+        self.assertIn("--allow-network", docs)
+        self.assertIn("never", docs)          # host-safety guarantees section
+        self.assertIn("cgroups", docs)
+        self.assertIn("artifacts", docs)
+
+    def test_makefile_targets_invoke_the_harness(self):
+        mk = read_text(os.path.join(ROOT, "Makefile"))
+        for target in ("vm-test", "vm-dry-run", "vm-doctor"):
+            self.assertIn(target + ":", mk)
+        self.assertIn("tools/vm/vmh.py run", mk)
+
+    def test_workflow_is_opt_in_kvm_only_and_uploads_artifacts(self):
+        wf = read_text(os.path.join(REPO, ".github", "workflows", "vm-harness.yml"))
+        self.assertIn("workflow_dispatch", wf)
+        self.assertNotIn("  push:", wf)  # never auto-runs without KVM
+        self.assertIn("kvm", wf)
+        self.assertIn("upload-artifact", wf)
+        self.assertNotIn("continue-on-error", wf)
+
+
 class ScenarioApiTest(unittest.TestCase):
     """Guest-side API: locally testable against temp dirs and real local processes."""
 
@@ -457,6 +676,60 @@ def process_alive(pid):
     except OSError:
         return False
     return True
+
+
+class ProvisionScriptTest(unittest.TestCase):
+    """provision.sh refusal paths; all of them exit before any setup step."""
+
+    def run_provision(self, *args):
+        return subprocess.run(
+            ["sh", os.path.join(VM_DIR, "provision.sh")] + list(args),
+            capture_output=True, text=True)
+
+    def test_no_arguments_is_usage_error(self):
+        r = self.run_provision()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage:", r.stderr)
+
+    def test_unknown_argument_rejected(self):
+        r = self.run_provision("--frobnicate")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown argument", r.stderr)
+
+    def test_missing_package_dir_fails_before_any_setup(self):
+        user = "taemavmprovnobody"
+        r = self.run_provision("--package-dir", "/nonexistent/taema-repo",
+                               "--user", user)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no such package dir", r.stderr)
+        # the refusal happens before useradd: the host user list is untouched
+        probe = subprocess.run(["id", "-u", user], capture_output=True, text=True)
+        self.assertNotEqual(probe.returncode, 0,
+                            "provision.sh must refuse before creating users")
+
+
+class ScenarioCliParsingTest(unittest.TestCase):
+    """scenario.py argument handling: usage errors before anything runs."""
+
+    def _usage_error(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                scenario.main(argv)
+        return cm.exception.code
+
+    def test_missing_artifacts_is_usage_error(self):
+        self.assertEqual(self._usage_error(["smoke"]), 2)
+
+    def test_unknown_scenario_is_usage_error(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertEqual(self._usage_error(["wipe", "--artifacts", tmp]), 2)
+
+    def test_non_integer_timeout_is_usage_error(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertEqual(
+            self._usage_error(["smoke", "--artifacts", tmp, "--timeout", "soon"]), 2)
 
 
 class ScriptSyntaxTest(unittest.TestCase):

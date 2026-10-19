@@ -54,14 +54,18 @@ directory would be reused.
 2. **Base images** (cached under `build/vm/images/<libc>/`): Void publishes no
    qcow2 images, so the harness builds one per libc from the pinned official
    rootfs tarball (sha256 in `tools/vm/config.toml`):
-   extract → configure inside `unshare -rm` (`tools/vm/mkimage.sh`: kernel,
-   sshd with key-only login for the `vmadmin` admin, dhcpcd, runtime
-   dependencies, enable services) → assemble the ext4 disk with `mke2fs -d`
+   extract → configure inside `unshare -rmfp --mount-proc=<rootfs>/proc`
+   (`tools/vm/mkimage.sh`: kernel plus a generic initramfs, sshd with key-only
+   login for the `vmadmin` admin, dhcpcd, runtime dependencies, services
+   enabled in the durable `/etc/runit/runsvdir/default` runlevel) → assemble
+   the ext4 disk with `mke2fs -d`
    (no root, no loop devices, no host mounts) → `qemu-img convert` to
    `base.qcow2`, keep `vmlinuz`/`initramfs.img` for direct `-kernel` boot.
    Because extraction is unprivileged, every file carries the builder's uid;
    a fixup prepended to `/etc/runit/1` chowns the rootfs once, before any
-   service starts (sshd StrictModes and sudo require correct owners).
+   service starts (sshd StrictModes and sudo require correct owners) and
+   restores the setuid/setgid bits that chown clears, so `sudo -n` provisioning
+   works inside the guest.
 3. **Every run starts from a clean snapshot**: a fresh run directory
    (`build/vm/runs/<ts>-<pid>-<libc>/`) gets its own qcow2 overlay backed by
    the cached base; the overlay is deleted at teardown (`--keep-run` keeps it
@@ -144,9 +148,14 @@ is unavailable).  Job artifacts upload `taema/build/vm/runs/`.
 
 The locally testable parts are covered by `tests/test_vmharness.py` in the
 ordinary suite (`make test`): config validation, image/cache layout, QEMU and
-overlay argv (KVM vs TCG, loopback-only forwarding), fresh-run-dir refusal,
-prerequisite and network refusals, plan step ordering, side-effect-free
-`--dry-run`, and the scenario API (spawn/close/kill trees, event waits, scope
+overlay argv (KVM vs TCG, loopback-only forwarding), recursive/private
+SSH/SCP transport argv, the rootless `mkimage.sh` script generation
+(proc handled by `unshare --mount-proc`, durable service enablement, idempotent
+ownership fixup), fresh-run-dir refusal, prerequisite and network refusals,
+plan step ordering, side-effect-free `--dry-run`, the full `run` pipeline
+against stubbed transports (per-scenario PASS/FAIL results and artifact
+collection without any boot), CLI argument handling for `vmh` and
+`scenario.py`, and the scenario API (spawn/close/kill trees, event waits, scope
 assertions against a fake cgroup tree, log capture, privileged argv).
 Everything that needs a bootable guest (image build, provisioning, live
 scenarios) requires `--allow-network` and is exercised by `vmh run`.

@@ -208,11 +208,17 @@ def read_version(root=TAEMA_ROOT):
     return m.group(1)
 
 
-def package_path(cfg):
+def package_repo_dir(cfg):
+    """Absolute path of the local xbps repository the package builds into."""
     repo = cfg["paths"]["package_repo"]
     if not os.path.isabs(repo):
         repo = os.path.join(TAEMA_ROOT, repo)
-    return os.path.join(repo, "taema-%s_1.noarch.xbps" % read_version())
+    return repo
+
+
+def package_path(cfg):
+    return os.path.join(package_repo_dir(cfg),
+                        "taema-%s_1.noarch.xbps" % read_version())
 
 
 def previous_version(cfg):
@@ -310,12 +316,24 @@ def ssh_argv(cfg, port, key, known_hosts, user, remote=None):
 
 
 def scp_argv(cfg, port, key, known_hosts, sources, dest):
-    return [cfg["tools"]["scp"], "-i", key, "-P", str(port),
+    return [cfg["tools"]["scp"], "-r", "-i", key, "-P", str(port),
             "-o", "UserKnownHostsFile=" + known_hosts,
             "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=5"] + list(sources) + [dest]
+
+
+def mkimage_argv(cfg, rootfs, pub):
+    """argv to configure an extracted rootfs, confined to a user namespace.
+
+    A user namespace may only mount procfs when it also owns a PID namespace
+    (kernel rule), so unshare creates the PID namespace and mounts proc at
+    <rootfs>/proc before mkimage.sh runs; the script itself never mounts /proc.
+    """
+    return [cfg["tools"]["unshare"], "-rmfp",
+            "--mount-proc=" + os.path.join(rootfs, "proc"),
+            "sh", os.path.join(VM_DIR, "mkimage.sh"), rootfs, pub]
 
 
 # ---- plan ------------------------------------------------------------------
@@ -339,6 +357,12 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     if "upgrade" in scenarios:
         network_urls.append(cfg["images"]["previous_url"])
 
+    sources = [os.path.join(VM_DIR, "provision.sh"),
+               os.path.join(VM_DIR, "scenario.py"),
+               package_repo_dir(cfg)]
+    if "upgrade" in scenarios:
+        sources.append(prev)
+
     vms = []
     for libc in libcs:
         run_dir = os.path.join(state_dir(cfg), "runs", "RUN-" + libc)
@@ -351,18 +375,7 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
              "argv": ssh_argv(cfg, port, key, known, vmadmin,
                               "mkdir -p %s/previous-repo" % GUEST_TMP)},
             {"name": "scp-bootstrap",
-             "argv": scp_argv(cfg, port, key, known,
-                              [os.path.join(VM_DIR, "provision.sh"),
-                               os.path.join(VM_DIR, "scenario.py"),
-                               os.path.join(TAEMA_ROOT, cfg["paths"]["package_repo"])
-                               if not os.path.isabs(cfg["paths"]["package_repo"])
-                               else cfg["paths"]["package_repo"],
-                               prev] if "upgrade" in scenarios else
-                              [os.path.join(VM_DIR, "provision.sh"),
-                               os.path.join(VM_DIR, "scenario.py"),
-                               os.path.join(TAEMA_ROOT, cfg["paths"]["package_repo"])
-                               if not os.path.isabs(cfg["paths"]["package_repo"])
-                               else cfg["paths"]["package_repo"]],
+             "argv": scp_argv(cfg, port, key, known, sources,
                               vmadmin + "@127.0.0.1:" + GUEST_TMP + "/")},
             {"name": "provision",
              "argv": ssh_argv(cfg, port, key, known, vmadmin,
@@ -510,8 +523,8 @@ def build_image(cfg, libc, log=None):
     rootfs = cp["rootfs"]
 
     log("configuring rootfs in a user namespace")
-    mkimage = os.path.join(VM_DIR, "mkimage.sh")
-    r = subprocess.run([cfg["tools"]["unshare"], "-rm", "sh", mkimage, rootfs, pub],
+    os.makedirs(os.path.join(rootfs, "proc"), exist_ok=True)
+    r = subprocess.run(mkimage_argv(cfg, rootfs, pub),
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RunError("mkimage failed: %s\n%s" % (r.stdout[-800:], r.stderr[-800:]))
@@ -661,9 +674,7 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     admin = "vmadmin"
     user = cfg["test_user"]
     repo_name = os.path.basename(cfg["paths"]["package_repo"].rstrip("/"))
-    pkg_src = (os.path.join(TAEMA_ROOT, cfg["paths"]["package_repo"])
-               if not os.path.isabs(cfg["paths"]["package_repo"])
-               else cfg["paths"]["package_repo"])
+    pkg_src = package_repo_dir(cfg)
     prev = previous_pkg_path(cfg)
 
     err.write("vmh: booting %s VM (accel=%s, port=%d, run=%s)\n"
@@ -697,10 +708,16 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
                            " --previous-version %s --current-version %s"
                            % (GUEST_TMP, repo_name, GUEST_TMP, os.path.basename(prev),
                               previous_version(cfg), read_version()))
-            r = run_step("scenario-" + s,
+            try:
+                run_step("scenario-" + s,
                          ssh_argv(cfg, port, key, known, user, remote),
                          run_dir, timeout=cfg["scenario_timeout_s"])
-            results[s] = "PASS" if r.returncode == 0 else "FAIL"
+                results[s] = "PASS"
+            except RunError as e:
+                # A failed scenario is a result, not a pipeline abort: record
+                # it, keep going, and still collect the artifacts below.
+                results[s] = "FAIL"
+                err.write("vmh: %s scenario %s failed: %s\n" % (libc, s, e))
             out.write("vmh: %s %s: %s\n" % (libc, s, results[s]))
         # collect guest artifacts even when a scenario failed
         dest = os.path.join(run_dir, "artifacts")

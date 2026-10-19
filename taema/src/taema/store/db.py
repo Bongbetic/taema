@@ -370,9 +370,9 @@ def _read_legacy_state(path):
 
 
 def _read_legacy_events(state_dir):
-    """Read the latest rotated and active audit lines; malformed lines are skipped."""
+    """Read rotated and active audit lines oldest first; malformed lines are skipped."""
     lines = deque(maxlen=LEGACY_EVENT_LIMIT)
-    for name in ("decisions.log.1", "decisions.log"):
+    for name in ("decisions.log.2", "decisions.log.1", "decisions.log"):
         try:
             with open(
                 os.path.join(state_dir, name), encoding="utf-8", errors="replace"
@@ -814,21 +814,50 @@ def _prune(connection, now):
     )
     decision_refs = (
         "id NOT IN (SELECT decision_id FROM vetoes WHERE decision_id IS NOT NULL) "
-        "AND id NOT IN (SELECT decision_id FROM events WHERE decision_id IS NOT NULL) "
-        "AND undo IS NULL"
+        "AND CASE WHEN json_valid(undo) AND "
+        "json_type(undo, '$._taema_audit') = 'object' THEN "
+        "CASE WHEN coalesce(json_extract(undo, '$._taema_audit.undoable'), 0) = 1 "
+        "THEN CASE WHEN kind IN ('stop', 'auto_stop') THEN NOT EXISTS ("
+        "SELECT 1 FROM auto_actions WHERE "
+        "json_extract(auto_actions.payload, '$.id') = "
+        "json_extract(decisions.undo, '$.payload.action_id')) ELSE 0 END "
+        "ELSE 1 END ELSE undo IS NULL END"
     )
-    connection.execute(
-        "DELETE FROM decisions WHERE ts < ? AND %s" % decision_refs,
-        (now - DECISION_RETENTION,),
+    expired_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM decisions WHERE ts < ? AND %s "
+            "ORDER BY coalesce(ts, 0), id" % decision_refs,
+            (now - DECISION_RETENTION,),
+        )
+    ]
+    connection.executemany(
+        "DELETE FROM events WHERE decision_id = ?",
+        [(identifier,) for identifier in expired_ids],
     )
-    _trim_oldest(
-        connection,
-        "decisions",
-        "id",
-        MAX_DECISIONS,
-        "coalesce(ts, 0), id",
-        decision_refs,
+    connection.executemany(
+        "DELETE FROM decisions WHERE id = ?",
+        [(identifier,) for identifier in expired_ids],
     )
+    count = connection.execute("SELECT count(*) FROM decisions").fetchone()[0]
+    excess = count - MAX_DECISIONS
+    if excess > 0:
+        old_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM decisions WHERE %s "
+                "ORDER BY coalesce(ts, 0), id LIMIT ?" % decision_refs,
+                (excess,),
+            )
+        ]
+        connection.executemany(
+            "DELETE FROM events WHERE decision_id = ?",
+            [(identifier,) for identifier in old_ids],
+        )
+        connection.executemany(
+            "DELETE FROM decisions WHERE id = ?",
+            [(identifier,) for identifier in old_ids],
+        )
 
     connection.execute(
         "DELETE FROM mem_samples WHERE ts < ?", (now - MEM_SAMPLE_RETENTION,)
@@ -1273,7 +1302,103 @@ class StateDB:
             }
         return data
 
-    def save_state(self, data, now=None):
+    def audit_sequences(self):
+        """Return persistent high-water marks for decision ids and event sequence numbers."""
+        if not self.available:
+            return 0, 0
+        with self.connection() as connection:
+            values = {
+                row["key"]: _load(row["value"], 0)
+                for row in connection.execute(
+                    "SELECT key, value FROM meta WHERE key IN (?, ?)",
+                    ("audit.decision_seq", "audit.event_seq"),
+                )
+            }
+            decision_max = connection.execute(
+                "SELECT coalesce(max(id), 0) FROM decisions"
+            ).fetchone()[0]
+            event_max = connection.execute(
+                "SELECT coalesce(max(seq), 0) FROM events"
+            ).fetchone()[0]
+        return (
+            max(_number(values.get("audit.decision_seq"), 0), decision_max),
+            max(_number(values.get("audit.event_seq"), 0), event_max),
+        )
+
+    @staticmethod
+    def _decision(row):
+        stored = _load(row["undo"], None)
+        if isinstance(stored, dict) and isinstance(stored.get("_taema_audit"), dict):
+            audit = stored["_taema_audit"]
+            payload = stored.get("payload")
+            mode = audit.get("mode") or "unknown"
+            corr = audit.get("corr") or "legacy-%s" % row["id"]
+            undoable = audit.get("undoable") is True
+        else:
+            payload = stored
+            mode = "unknown"
+            corr = "legacy-%s" % row["id"]
+            undoable = stored is not None
+        return {
+            "id": row["id"],
+            "ts": row["ts"] or 0,
+            "kind": row["kind"] or "legacy",
+            "scope": row["scope"],
+            "owner": row["owner"],
+            "authority": row["authority"] or "none",
+            "why": row["why"] or "",
+            "mode": mode,
+            "corr": corr,
+            "undoable": undoable,
+            "undo": payload,
+        }
+
+    def decision(self, identifier):
+        """Read one decision row without exposing SQLite rows to the store API."""
+        if (
+            not self.available
+            or not isinstance(identifier, int)
+            or isinstance(identifier, bool)
+        ):
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT id, ts, kind, scope, owner, authority, why, undo "
+                "FROM decisions WHERE id = ?",
+                (identifier,),
+            ).fetchone()
+        return self._decision(row) if row else None
+
+    def decisions(self, limit=50, undoable=False):
+        """Read recent decisions, optionally limiting the result to undo targets."""
+        if not self.available:
+            return []
+        predicate = (
+            "WHERE kind IN ('stop', 'auto_stop') AND json_valid(undo) AND "
+            "coalesce(json_extract(undo, '$._taema_audit.undoable'), 0) = 1 AND "
+            "EXISTS (SELECT 1 FROM auto_actions WHERE "
+            "json_extract(auto_actions.payload, '$.id') = "
+            "json_extract(decisions.undo, '$.payload.action_id'))"
+            if undoable
+            else ""
+        )
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT id, ts, kind, scope, owner, authority, why, undo "
+                "FROM decisions %s ORDER BY id DESC LIMIT ?" % predicate,
+                (limit,),
+            ).fetchall()
+        return [self._decision(row) for row in rows]
+
+    def save_state(
+        self,
+        data,
+        now=None,
+        decisions=(),
+        events=(),
+        decision_seq=None,
+        event_seq=None,
+    ):
         if self.read_only:
             return
         now = time.time() if now is None else now
@@ -1286,6 +1411,62 @@ class StateDB:
                         "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
                         (key, _dump(data[key])),
                     )
+                if decision_seq is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                        ("audit.decision_seq", _dump(decision_seq)),
+                    )
+                if event_seq is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                        ("audit.event_seq", _dump(event_seq)),
+                    )
+                connection.executemany(
+                    """INSERT INTO decisions
+                       (id, ts, kind, scope, owner, authority, why, undo)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         ts=excluded.ts, kind=excluded.kind, scope=excluded.scope,
+                         owner=excluded.owner, authority=excluded.authority,
+                         why=excluded.why, undo=excluded.undo""",
+                    [
+                        (
+                            decision["id"],
+                            decision["ts"],
+                            decision["kind"],
+                            decision.get("scope"),
+                            decision.get("owner"),
+                            decision["authority"],
+                            decision["why"],
+                            _dump(
+                                {
+                                    "_taema_audit": {
+                                        "mode": decision["mode"],
+                                        "corr": decision["corr"],
+                                        "undoable": decision.get("undoable", False),
+                                    },
+                                    "payload": decision.get("undo"),
+                                }
+                            ),
+                        )
+                        for decision in decisions
+                    ],
+                )
+                connection.executemany(
+                    """INSERT OR REPLACE INTO events
+                       (seq, ts, event, decision_id, data)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            event["seq"],
+                            event["ts"],
+                            event["event"],
+                            event.get("decision_id"),
+                            _dump(event["data"]),
+                        )
+                        for event in events
+                    ],
+                )
                 connection.execute("DELETE FROM exes")
                 connection.executemany(
                     """INSERT INTO exes

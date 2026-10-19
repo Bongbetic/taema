@@ -1,6 +1,7 @@
 """`taema` command line. scoperun / scopekill / scopels are thin aliases (see bin/)."""
 
 import argparse
+from contextlib import nullcontext
 from itertools import count
 import json
 import os
@@ -26,6 +27,7 @@ def _load():
         cfg.get("seeds"),
         read_only=True,
         deny=policy.owner_deny(cfg),
+        mode=cfg.get("mode", "observe"),
     )
     return cfg, store, policy.load_units(cfg)
 
@@ -223,19 +225,49 @@ def cmd_run(a):
             pass
         return die("register failed: %s" % reply["error"])
     try:
-        try:
-            engine.helper_attach(cfg, os.getpid(), name)
-        except engine.Refused as e:
-            if not _sudo_denied(str(e)):
-                raise
-            # no taema group in this shell yet: the daemon has it and attaches us
-            r = ask(
-                cfg, {"cmd": "attach", "scope": "scope-" + name, "pids": [os.getpid()]}
+        trace = (
+            store.decision_context(
+                "containment",
+                scope="scope-" + name,
+                owner=owner,
+                authority="user",
+                mode=cfg["mode"],
+                why="attach the launched process to its requested scope",
             )
-            if not (r and r.get("ok")):
-                raise engine.Refused(
-                    "%s (daemon: %s)" % (e, (r or {}).get("error", "not running"))
+            if store is not None
+            else nullcontext()
+        )
+        with trace:
+            try:
+                engine.helper_attach(cfg, os.getpid(), name)
+                if store is not None:
+                    store.log(
+                        event="containment", scope="scope-" + name, pids=[os.getpid()]
+                    )
+            except engine.Refused as e:
+                if store is not None:
+                    store.log(event="attach_refused", scope="scope-" + name, why=str(e))
+                if not _sudo_denied(str(e)):
+                    raise
+                # no taema group in this shell yet: the daemon has it and attaches us
+                r = ask(
+                    cfg,
+                    {
+                        "cmd": "attach",
+                        "scope": "scope-" + name,
+                        "pids": [os.getpid()],
+                    },
                 )
+                if not (r and r.get("ok")):
+                    raise engine.Refused(
+                        "%s (daemon: %s)" % (e, (r or {}).get("error", "not running"))
+                    )
+                if store is not None:
+                    store.log(
+                        event="attach_delegated",
+                        scope="scope-" + name,
+                        pids=[os.getpid()],
+                    )
     except engine.Refused as e:
         try:
             os.rmdir(leaf)
@@ -271,34 +303,58 @@ def cmd_kill(a):
     )
     dec = authorization.authorize(authorization.MANUAL_STOP, cfg["mode"], facts)
     if dec.verdict != authorization.ACT:
+        with store.decision_context(
+            "refusal",
+            scope=cgroup.rel(path),
+            authority="veto" if dec.slot == authorization.VETO else dec.slot,
+            mode=cfg["mode"],
+            why=dec.reason,
+        ):
+            if dec.slot == authorization.VETO:
+                store.log(
+                    event="vetoed",
+                    trigger=authorization.MANUAL_STOP,
+                    scope=cgroup.rel(path),
+                    target=dec.reason,
+                )
+            else:
+                store.log(
+                    event="kill_refused",
+                    trigger=authorization.MANUAL_STOP,
+                    scope=cgroup.rel(path),
+                )
         if dec.slot == authorization.VETO:
-            store.log(
-                event="vetoed",
-                trigger=authorization.MANUAL_STOP,
-                scope=cgroup.rel(path),
-                target=dec.reason,
-            )
             return die(dec.reason, 4)
         return die("kill not allowed: %s" % dec.reason)
     leaf_name = os.path.basename(path)
     unit = engine.unit_for_leaf(units, leaf_name)
-    try:
-        rep = engine.stop(
-            path,
-            cfg,
-            store,
-            unit,
-            timeout=a.timeout,
-            force=a.force,
-            hard=a.hard,
-            keep=[x for x in (a.keep or "").split(",") if x],
-            dry_run=a.dry_run,
-            hook=policy.hook_for(cfg, leaf_name),
-        )
-    except engine.Refused as e:
-        if isinstance(e, engine.Vetoed):
-            return die(str(e), 4)
-        return die(str(e))
+    with store.decision_context(
+        "stop",
+        scope=cgroup.rel(path),
+        authority=dec.authority or "manual",
+        mode=cfg["mode"],
+        why=dec.reason,
+    ):
+        try:
+            rep = engine.stop(
+                path,
+                cfg,
+                store,
+                unit,
+                timeout=a.timeout,
+                force=a.force,
+                hard=a.hard,
+                keep=[x for x in (a.keep or "").split(",") if x],
+                dry_run=a.dry_run,
+                hook=policy.hook_for(cfg, leaf_name),
+                decision_authority=dec.authority or "manual",
+                decision_why=dec.reason,
+            )
+        except engine.Refused as e:
+            store.log(event="refusal", scope=cgroup.rel(path), why=str(e))
+            if isinstance(e, engine.Vetoed):
+                return die(str(e), 4)
+            return die(str(e))
     for d in rep["decisions"]:
         print(
             "%-5s %7d %-18s %s"
@@ -459,7 +515,8 @@ def cmd_undo(_a):
     action = store.auto_action()
     if not action:
         return die("no automatic stop to undo")
-    how, reply = feedback_action(cfg, store, "undo", action_id=action["id"])
+    target_id = action.get("decision_id") or action["id"]
+    how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
     if not reply or not reply.get("ok"):
         return die(reply.get("error", "could not undo automatic stop"))
     targets = reply.get("targets") or [

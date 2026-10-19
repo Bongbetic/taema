@@ -2,13 +2,31 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "taema-ipc-v2-command-results",
   "$defs": {
+    "decision": {
+      "type": "object",
+      "required": ["id", "ts", "kind", "scope", "owner", "authority", "mode", "why", "corr", "undoable"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "ts": {"type": "number", "minimum": 0},
+        "kind": {"type": "string"},
+        "scope": {"type": ["string", "null"]},
+        "owner": {"type": ["string", "null"]},
+        "authority": {"type": "string"},
+        "mode": {"type": "string"},
+        "why": {"type": "string"},
+        "corr": {"type": "string"},
+        "undoable": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
     "status": {
-      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews"],
+      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews", "latest_decision"],
       "properties": {
         "mode": {"type": "string"}, "uptime_s": {"type": "integer", "minimum": 0},
         "owners": {"type": "array", "items": {"type": "object", "required": ["scope", "owner"], "properties": {"scope": {"type": "string"}, "owner": {"type": "integer"}}}},
         "pairs": {"type": "array", "items": {"type": "object"}},
-        "reviews": {"type": "integer", "minimum": 0}, "auto": {"type": "object"}
+        "reviews": {"type": "integer", "minimum": 0}, "auto": {"type": "object"},
+        "latest_decision": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/decision"}]}
       },
       "additionalProperties": true
     },

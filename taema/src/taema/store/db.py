@@ -1,11 +1,20 @@
 """SQLite connection, schema migration, and persistence for :mod:`store.knowledge`."""
 
 from contextlib import contextmanager
+from collections import deque
+import filecmp
+import glob
 import json
+import math
 import os
+import re
+import shutil
 import sqlite3
+import tempfile
 import time
 from urllib.parse import quote
+
+from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
 SCHEMA_VERSION = 3
@@ -25,6 +34,9 @@ MEM_SAMPLE_RETENTION = 7 * DAY
 MEM_ROLLUP_RETENTION = 365 * DAY
 PAIR_RETENTION = 30 * DAY
 REVIEW_RETENTION = 30 * DAY
+LEGACY_BACKUP_RETENTION = 30 * DAY
+LEGACY_EVENT_LIMIT = 10_000
+_LEGACY_MARKER = "migration.legacy_import"
 
 _MIGRATIONS = {
     1: """
@@ -260,6 +272,516 @@ def _load(value, fallback):
         return fallback
 
 
+def _number(value, fallback=None):
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    ):
+        return value
+    return fallback
+
+
+def _integer(value, fallback=0):
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and -(1 << 63) <= value < (1 << 63)
+    ):
+        return value
+    return fallback
+
+
+def _text(value, fallback=None):
+    return value if isinstance(value, str) else fallback
+
+
+def _legacy_backup(path, now):
+    """Make one private, atomic backup without modifying the legacy source."""
+    for candidate in sorted(glob.glob(path + ".backup-*"), reverse=True):
+        try:
+            if os.path.isfile(candidate) and filecmp.cmp(
+                path, candidate, shallow=False
+            ):
+                return candidate
+        except OSError:
+            continue
+    stamp = int(now)
+    suffix = 0
+    while True:
+        tail = "-%d" % suffix if suffix else ""
+        destination = "%s.backup-%d%s" % (path, stamp, tail)
+        if not os.path.exists(destination):
+            break
+        suffix += 1
+    directory = os.path.dirname(path) or "."
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".%s.backup-" % os.path.basename(path), dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as backup:
+            with open(path, "rb") as source:
+                shutil.copyfileobj(source, backup)
+            backup.flush()
+            os.fchmod(backup.fileno(), 0o600)
+            os.fsync(backup.fileno())
+        os.utime(temporary, (now, now))
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    os.chmod(destination, 0o600)
+    return destination
+
+
+def _prune_legacy_backups(path, now):
+    """Expire only backups created by this importer after their 30-day window."""
+    pattern = re.compile(
+        r"^%s\.backup-\d+(?:-\d+)?$" % re.escape(os.path.basename(path))
+    )
+    for candidate in glob.glob(path + ".backup-*"):
+        try:
+            if (
+                pattern.fullmatch(os.path.basename(candidate))
+                and os.path.isfile(candidate)
+                and os.stat(candidate).st_mtime <= (now - LEGACY_BACKUP_RETENTION)
+            ):
+                os.unlink(candidate)
+        except OSError:
+            continue
+
+
+def _read_legacy_state(path):
+    try:
+        with open(path, encoding="utf-8") as legacy:
+            value = json.load(legacy)
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, UnicodeError, ValueError):
+        return None, "invalid_json"
+    if not isinstance(value, dict) or not isinstance(value.get("exes"), dict):
+        return None, "invalid_shape"
+    return value, "ready"
+
+
+def _read_legacy_events(state_dir):
+    """Read the latest rotated and active audit lines; malformed lines are skipped."""
+    lines = deque(maxlen=LEGACY_EVENT_LIMIT)
+    for name in ("decisions.log.1", "decisions.log"):
+        try:
+            with open(
+                os.path.join(state_dir, name), encoding="utf-8", errors="replace"
+            ) as log:
+                lines.extend(log)
+        except OSError:
+            continue
+    events = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def _has_state(connection):
+    for table in (
+        "exes",
+        "pairs",
+        "standalone",
+        "asked",
+        "noise",
+        "apps",
+        "instances",
+        "parents",
+        "signatures",
+        "vetoes",
+        "reviews",
+        "auto_actions",
+        "feedback_applied",
+        "leftover_expiries",
+        "decisions",
+        "events",
+        "mem_samples",
+        "mem_rollup",
+        "frozen",
+        "oom_adj",
+    ):
+        if connection.execute("SELECT 1 FROM %s LIMIT 1" % table).fetchone():
+            return True
+    return False
+
+
+def _ensure_legacy_app(connection, key, record=None):
+    if not isinstance(key, str) or not key or len(key) > 512:
+        return
+    record = record if isinstance(record, dict) else {}
+    connection.execute(
+        """INSERT OR IGNORE INTO apps
+           (key, kind, display, exe, first_seen, last_seen, confidence)
+           VALUES (?, 'exe', ?, ?, ?, ?, 'low')""",
+        (
+            key,
+            key,
+            key,
+            _number(record.get("first_seen")),
+            _number(record.get("last_seen")),
+        ),
+    )
+
+
+def _write_legacy_state(connection, state, now, deny):
+    """Insert legacy Store state once, leaving already-written SQLite rows authoritative."""
+    existing_pairs = bool(connection.execute("SELECT 1 FROM pairs LIMIT 1").fetchone())
+    meta = {
+        "version": 2,
+        "created": _number(state.get("created"), now),
+        "last_decay": _number(state.get("last_decay"), now),
+        "closes": _integer(state.get("closes")),
+        "review_seq": _integer(state.get("review_seq")),
+    }
+    for key, value in meta.items():
+        statement = "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)"
+        if not existing_pairs or key == "version":
+            statement = "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)"
+        connection.execute(statement, (key, _dump(value)))
+
+    exes = state.get("exes", {})
+    if isinstance(exes, dict):
+        for key, record in exes.items():
+            if not isinstance(key, str) or not key or not isinstance(record, dict):
+                continue
+            connection.execute(
+                """INSERT OR IGNORE INTO exes
+                   (key, counters, term_exit_ms, idle_grace_scale, stops, last_seen, payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    key,
+                    _dump({name: record.get(name, 0.0) for name in _COUNTERS}),
+                    _dump(record.get("term_exit_ms", [])),
+                    _number(record.get("idle_grace_scale"), 1.0),
+                    _integer(record.get("stops")),
+                    _number(record.get("last_seen")),
+                    _dump(record),
+                ),
+            )
+            _ensure_legacy_app(connection, key, record)
+
+    pairs = state.get("pairs", {})
+    if not isinstance(pairs, dict):
+        pairs = {}
+    reviews = state.get("reviews", [])
+    if not isinstance(reviews, list):
+        reviews = []
+    max_review_id = max(
+        (
+            _integer(review.get("id"), 0)
+            for review in reviews
+            if isinstance(review, dict)
+        ),
+        default=0,
+    )
+    db_review_id = connection.execute(
+        "SELECT coalesce(max(id), 0) FROM reviews"
+    ).fetchone()[0]
+    meta_review_seq = connection.execute(
+        "SELECT value FROM meta WHERE key = 'review_seq'"
+    ).fetchone()
+    review_seq = max(
+        _integer(state.get("review_seq")),
+        max_review_id,
+        _integer(db_review_id),
+        _integer(_load(meta_review_seq["value"], 0)) if meta_review_seq else 0,
+    )
+    review_order = connection.execute(
+        "SELECT coalesce(max(seq), -1) + 1 FROM reviews"
+    ).fetchone()[0]
+
+    for pair_key, original in pairs.items():
+        if not isinstance(pair_key, str) or not isinstance(original, dict):
+            continue
+        owner, separator, leftover = pair_key.partition("\0")
+        if not separator or not owner or not leftover or "\0" in leftover:
+            continue
+        record = dict(original)
+        invalid = bool(
+            not isinstance(owner, str)
+            or len(owner) > 256
+            or policy.bad_owner(owner, deny)
+            or original.get("source") == "legacy-invalid"
+            or not isinstance(leftover, str)
+            or len(leftover) > 256
+        )
+        legacy_answer = _text(record.get("ex_last"))
+        explicit_stop = _number(record.get("ex_stop"), 0)
+        explicit_keep = _number(record.get("ex_keep"), 0)
+        has_explicit_answer = bool(
+            explicit_stop or explicit_keep or legacy_answer in ("stop", "keep")
+        )
+        if legacy_answer not in ("stop", "keep"):
+            legacy_answer = "stop" if explicit_stop >= explicit_keep else "keep"
+        if invalid:
+            record["source"] = "legacy-invalid"
+            record["ex_stop"] = 0.0
+            record["ex_keep"] = 0.0
+            record["ex_last"] = None
+        else:
+            record["source"] = _text(record.get("source"), "legacy")
+        connection.execute(
+            """INSERT OR IGNORE INTO pairs
+               (owner, leftover, sig, stop, keep, ex_stop, ex_keep, ex_last, ex_ts,
+                closes, kills, launches, stop_ok, respawn, days, probation, first_seen,
+                last_seen, last_asked, last_auto_stop, last_keep, suspended_until, source,
+                payload)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                owner,
+                leftover,
+                _text(record.get("sig")),
+                _number(record.get("stop"), 0),
+                _number(record.get("keep"), 0),
+                0 if invalid else _number(record.get("ex_stop"), 0),
+                0 if invalid else _number(record.get("ex_keep"), 0),
+                None if invalid else _text(record.get("ex_last")),
+                _number(record.get("ex_ts")),
+                _integer(record.get("closes")),
+                _integer(record.get("kills")),
+                _integer(record.get("launches")),
+                _integer(record.get("stop_ok")),
+                _integer(record.get("respawn")),
+                _dump(record.get("days", [])),
+                _integer(record.get("probation")),
+                _number(record.get("first_seen")),
+                _number(record.get("last_seen")),
+                _number(record.get("last_asked"), 0),
+                _number(record.get("last_auto_stop"), 0),
+                _number(record.get("last_keep"), 0),
+                _number(record.get("suspended_until"), 0),
+                _text(record.get("source"), "legacy"),
+                _dump(record),
+            ),
+        )
+        if connection.execute("SELECT changes()").fetchone()[0] == 0:
+            continue
+
+        for app_key in (owner, leftover):
+            _ensure_legacy_app(connection, app_key)
+        if invalid and has_explicit_answer:
+            review_seq += 1
+            review_order += 1
+            review = {
+                "id": review_seq,
+                "kind": "legacy-invalid",
+                "owner": owner,
+                "survivors": [leftover],
+                "answer": legacy_answer,
+                "reason": "legacy owner identity needs confirmation",
+                "created": _number(record.get("ex_ts"), now),
+                "expires": now + 14 * DAY,
+                "state": "open",
+            }
+            connection.execute(
+                """INSERT INTO reviews
+                   (id, seq, kind, owner, sig, scope, pids, mem, created, expires,
+                    shown, state, payload)
+                   VALUES (?, ?, ?, ?, NULL, NULL, '[]', NULL, ?, ?, NULL, 'open', ?)""",
+                (
+                    review_seq,
+                    review_order - 1,
+                    "legacy-invalid",
+                    owner,
+                    review["created"],
+                    review["expires"],
+                    _dump(review),
+                ),
+            )
+    standalone = state.get("standalone", {})
+    if isinstance(standalone, dict):
+        for key, value in standalone.items():
+            if not isinstance(key, str) or not key:
+                continue
+            record = value if isinstance(value, dict) else {"n": _integer(value)}
+            connection.execute(
+                "INSERT OR IGNORE INTO standalone(key, n, ts, payload) VALUES (?, ?, ?, ?)",
+                (
+                    key,
+                    _integer(record.get("n")),
+                    _number(record.get("ts")),
+                    _dump(record),
+                ),
+            )
+            _ensure_legacy_app(connection, key, record)
+
+    noise = state.get("noise", {})
+    if isinstance(noise, dict):
+        connection.executemany(
+            "INSERT OR IGNORE INTO noise(key, n) VALUES (?, ?)",
+            [
+                (key, _integer(value))
+                for key, value in noise.items()
+                if isinstance(key, str) and key
+            ],
+        )
+
+    asked = state.get("asked", {})
+    if isinstance(asked, dict) and "day" in asked:
+        connection.execute(
+            "INSERT OR IGNORE INTO asked(day, n) VALUES (?, ?)",
+            (_integer(asked.get("day")), _integer(asked.get("n"))),
+        )
+
+    review_order = connection.execute(
+        "SELECT coalesce(max(seq), -1) + 1 FROM reviews"
+    ).fetchone()[0]
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        identifier = _integer(review.get("id"), -1)
+        if identifier < 0:
+            continue
+        connection.execute(
+            """INSERT OR IGNORE INTO reviews
+               (id, seq, kind, owner, sig, scope, pids, mem, created, expires,
+                shown, state, payload)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                identifier,
+                review_order,
+                _text(review.get("kind")),
+                _text(review.get("owner")),
+                _text(review.get("sig")),
+                _text(review.get("scope")),
+                _dump(review.get("pids", [])),
+                _integer(review.get("mem"), 0),
+                _number(review.get("created")),
+                _number(review.get("expires")),
+                _number(review.get("shown")),
+                _text(review.get("state"), "open"),
+                _dump(review),
+            ),
+        )
+        if isinstance(review.get("owner"), str):
+            _ensure_legacy_app(connection, review["owner"])
+        survivors = review.get("survivors", [])
+        if isinstance(survivors, list):
+            for key in survivors:
+                _ensure_legacy_app(connection, key)
+        review_order += 1
+
+    vetoes = state.get("vetoes", [])
+    veto_sequence = connection.execute(
+        "SELECT coalesce(max(seq), -1) + 1 FROM vetoes"
+    ).fetchone()[0]
+    if isinstance(vetoes, list):
+        for index, veto in enumerate(vetoes):
+            if not isinstance(veto, dict):
+                continue
+            identifier = veto.get("id") or "legacy-veto-%d" % index
+            connection.execute(
+                """INSERT OR IGNORE INTO vetoes
+                   (id, seq, kind, match, value, start, created, expires, reason,
+                    source, decision_id, payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(identifier),
+                    veto_sequence + index,
+                    str(veto.get("kind", "")),
+                    _dump({"value": veto.get("value"), "start": veto.get("start")}),
+                    str(veto.get("value", "")),
+                    _integer(veto.get("start"), 0)
+                    if veto.get("start") is not None
+                    else None,
+                    _number(veto.get("created")),
+                    _number(veto.get("expires")),
+                    _text(veto.get("reason")),
+                    _text(veto.get("source")),
+                    _integer(veto.get("decision_id"), 0)
+                    if veto.get("decision_id") is not None
+                    else None,
+                    _dump(veto),
+                ),
+            )
+            if veto.get("kind") == "app" and isinstance(veto.get("value"), str):
+                _ensure_legacy_app(connection, veto["value"])
+
+    auto_actions = state.get("auto_actions", [])
+    action_sequence = connection.execute(
+        "SELECT coalesce(max(seq), -1) + 1 FROM auto_actions"
+    ).fetchone()[0]
+    if isinstance(auto_actions, list):
+        for index, action in enumerate(auto_actions):
+            if not isinstance(action, dict):
+                continue
+            identifier = action.get("id") or "legacy-action-%d" % index
+            connection.execute(
+                "INSERT OR IGNORE INTO auto_actions(id, seq, ts, scope, payload) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(identifier),
+                    action_sequence + index,
+                    _number(action.get("ts")),
+                    _text(action.get("scope")),
+                    _dump({**action, "id": str(identifier)}),
+                ),
+            )
+            for key in action.get("apps", []):
+                _ensure_legacy_app(connection, key)
+            for pair in action.get("pairs", []):
+                if isinstance(pair, list):
+                    for key in pair[:2]:
+                        _ensure_legacy_app(connection, key)
+
+    feedback_ids = state.get("feedback_ids", [])
+    feedback_sequence = connection.execute(
+        "SELECT coalesce(max(seq), -1) + 1 FROM feedback_applied"
+    ).fetchone()[0]
+    if isinstance(feedback_ids, list):
+        connection.executemany(
+            "INSERT OR IGNORE INTO feedback_applied(id, seq, created) VALUES (?, ?, NULL)",
+            [
+                (str(identifier), feedback_sequence + index)
+                for index, identifier in enumerate(feedback_ids)
+            ],
+        )
+
+    expiries = state.get("leftover_expiries", {})
+    if isinstance(expiries, dict):
+        connection.executemany(
+            "INSERT OR IGNORE INTO leftover_expiries(scope, payload) VALUES (?, ?)",
+            [
+                (scope, _dump(value))
+                for scope, value in expiries.items()
+                if isinstance(scope, str)
+            ],
+        )
+    connection.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('review_seq', ?)",
+        (_dump(review_seq),),
+    )
+
+
+def _write_legacy_events(connection, events, now):
+    first = connection.execute(
+        "SELECT coalesce(max(seq), 0) + 1 FROM events"
+    ).fetchone()[0]
+    connection.executemany(
+        "INSERT INTO events(seq, ts, event, decision_id, data) VALUES (?, ?, ?, NULL, ?)",
+        [
+            (
+                first + index,
+                _number(event.get("ts"), now),
+                event.get("event") if isinstance(event.get("event"), str) else "legacy",
+                _dump(event),
+            )
+            for index, event in enumerate(events)
+        ],
+    )
+
+
 def _trim_oldest(connection, table, key, cap, order, eligible="1"):
     count = connection.execute("SELECT count(*) FROM %s" % table).fetchone()[0]
     excess = count - cap
@@ -326,7 +848,7 @@ def _prune(connection, now):
         "owner || char(0) || leftover",
         MAX_PAIRS,
         "coalesce(last_seen, first_seen, 0), owner, leftover",
-        "NOT (ex_last = 'keep' AND ex_keep > stop)",
+        "source != 'legacy-invalid' AND NOT (ex_last = 'keep' AND ex_keep > stop)",
     )
 
     connection.execute(
@@ -344,6 +866,8 @@ def _prune(connection, now):
         "WHERE NOT EXISTS (SELECT 1 FROM pairs WHERE owner = candidate.key "
         "AND (ex_stop > 0 OR ex_keep > 0)) "
         "AND NOT EXISTS (SELECT 1 FROM standalone WHERE key = candidate.key) "
+        "AND NOT EXISTS (SELECT 1 FROM pairs WHERE source = 'legacy-invalid' "
+        "AND (owner = candidate.key OR leftover = candidate.key)) "
         "AND NOT EXISTS (SELECT 1 FROM vetoes WHERE kind = 'app' "
         "AND value = candidate.key AND (expires IS NULL OR expires > ?)) "
         "ORDER BY coalesce(last_seen, 0), key "
@@ -443,12 +967,64 @@ class StateDB:
                 raise
             version = next_version
 
+    def import_legacy(self, path, now=None, deny=()):
+        """Import the old JSON store and audit trail exactly once, in one transaction."""
+        if self.read_only:
+            return "read_only"
+        now = time.time() if now is None else now
+        _prune_legacy_backups(path, now)
+        with self.connection() as connection:
+            marker = connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (_LEGACY_MARKER,)
+            ).fetchone()
+        if marker:
+            return _load(marker["value"], "complete")
+
+        backup = _legacy_backup(path, now) if os.path.isfile(path) else None
+        state, state_status = _read_legacy_state(path)
+        events = _read_legacy_events(os.path.dirname(path))
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                marker = connection.execute(
+                    "SELECT value FROM meta WHERE key = ?", (_LEGACY_MARKER,)
+                ).fetchone()
+                if marker:
+                    connection.commit()
+                    return _load(marker["value"], "complete")
+                existing_state = _has_state(connection)
+                if state is not None:
+                    _write_legacy_state(connection, state, now, deny)
+                    status = "merged" if existing_state else "imported"
+                else:
+                    status = state_status
+                if events:
+                    _write_legacy_events(connection, events, now)
+                    if status == "missing":
+                        status = "audit_only"
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?)",
+                    (_LEGACY_MARKER, _dump(status)),
+                )
+                if backup:
+                    connection.execute(
+                        "INSERT INTO meta(key, value) VALUES (?, ?)",
+                        ("migration.legacy_backup", _dump(backup)),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return status
+
     def load_state(self, data):
         if not self.available:
             return data
         with self.connection() as connection:
             connection.execute("BEGIN")
             for row in connection.execute("SELECT key, value FROM meta"):
+                if row["key"].startswith("migration."):
+                    continue
                 data[row["key"]] = _load(row["value"], row["value"])
 
             for row in connection.execute("SELECT key, payload FROM exes"):

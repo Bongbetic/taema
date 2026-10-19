@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import time
 import uuid
 
@@ -547,6 +548,19 @@ def cmd_review(a):
     print("open reviews: %d" % len(reviews))
     now = time.time()
     for review in reviews:
+        if review.get("kind") == "legacy-invalid":
+            age = max(0, int(now - review.get("created", now)))
+            print(
+                "review #%s legacy owner=%s survivor=%s previous=%s age=%ds"
+                % (
+                    review.get("id", "?"),
+                    lineage.clean(review.get("owner", "?"), 40),
+                    lineage.clean((review.get("survivors") or ["?"])[0], 40),
+                    lineage.clean(review.get("answer", "?"), 16),
+                    age,
+                )
+            )
+            continue
         if review.get("kind") == "scope":
             age = max(0, int(now - review.get("created", now)))
             print(
@@ -573,6 +587,35 @@ def cmd_review(a):
                 age,
             )
         )
+    return 0
+
+
+def cmd_learn_export(a):
+    """Write the current store in the JSON format understood by the 0.2 release."""
+    _cfg, store, _units = _load()
+    payload = json.dumps(store.export_legacy(), indent=2, sort_keys=True) + "\n"
+    if not a.output:
+        sys.stdout.write(payload)
+        return 0
+    path = os.path.abspath(os.path.expanduser(a.output))
+    directory = os.path.dirname(path)
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".taema-export-", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except OSError as error:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+        return die("could not write export: %s" % error)
     return 0
 
 
@@ -686,6 +729,12 @@ def main(argv):
     s.set_defaults(f=cmd_status)
     s = sub.add_parser("review", help="list pending close reviews")
     s.set_defaults(f=cmd_review)
+    s = sub.add_parser("learn", help="inspect or export learned state")
+    learn = s.add_subparsers(dest="learn_command", required=True)
+    export = learn.add_parser("export", help="export state for a 0.2 downgrade")
+    export.add_argument("--format", choices=("v2",), required=True)
+    export.add_argument("--output", help="write atomically to PATH instead of stdout")
+    export.set_defaults(f=cmd_learn_export)
     s = sub.add_parser("gc")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(f=cmd_gc)

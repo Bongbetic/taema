@@ -137,6 +137,7 @@ class Store:
         self.last_save = 0.0
         self.sigs = {}  # change-detection signatures for log lines (see changed())
         self.db = db.StateDB(self.path, read_only=self.read_only)
+        self.db.import_legacy(self.legacy_path, now=self.now(), deny=self.deny)
         self.data = self._fresh()
         self._load()
         self._decay()
@@ -162,6 +163,27 @@ class Store:
 
     def _load(self):
         self.data = self.db.load_state(self.data)
+
+    def export_legacy(self):
+        """Return the state fields understood by the 0.2 JSON store."""
+        fields = (
+            "version",
+            "last_decay",
+            "created",
+            "closes",
+            "exes",
+            "pairs",
+            "standalone",
+            "noise",
+            "asked",
+            "reviews",
+            "review_seq",
+            "vetoes",
+            "auto_actions",
+            "feedback_ids",
+            "leftover_expiries",
+        )
+        return json.loads(json.dumps({field: self.data.get(field) for field in fields}))
 
     # ---- persistence ----
     def _mkdir(self):
@@ -796,6 +818,7 @@ class Store:
                     k
                     for k in cands
                     if k != keep
+                    and pairs[k].get("source") != "legacy-invalid"
                     and not (
                         pairs[k].get("ex_last") == "keep"
                         and pairs[k].get("ex_keep", 0) > pairs[k].get("stop", 0)
@@ -1103,6 +1126,9 @@ class Store:
             return True
         if policy.bad_owner(owner, self.deny):
             return False  # an explicit answer never lands on a bad key
+        existing = self.data.get("pairs", {}).get(self.pkey(owner, leftover))
+        if isinstance(existing, dict) and existing.get("source") == "legacy-invalid":
+            return False
         p = self._pair(owner, leftover)
         p["ex_" + choice] += W_ANSWER
         p["ex_last"] = choice
@@ -1201,6 +1227,8 @@ class Store:
 
     def _decide(self, owner, p):
         """decide() behind the owner-hygiene gate: an invalid owner never asks, stops or keeps."""
+        if isinstance(p, dict) and p.get("source") == "legacy-invalid":
+            return "invalid", 0.0, "invalid legacy owner: requires review"
         why = policy.bad_owner(owner, self.deny)
         if why:
             return "invalid", 0.0, "invalid owner: %s" % why
@@ -1229,6 +1257,8 @@ class Store:
         if a.get("day") == int(now // DAY) and a.get("n", 0) >= ASK_PER_DAY:
             return False
         p = self.data["pairs"].get(self.pkey(*pair))
+        if p and p.get("source") == "legacy-invalid":
+            return False
         return not (p and p.get("last_asked") and now - p["last_asked"] < ASK_PAIR_GAP)
 
     def mark_asked(self, pairs, now=None):
@@ -1240,7 +1270,12 @@ class Store:
             a["day"], a["n"] = day, 0
         a["n"] += 1
         for o, l in pairs:
-            if self._ok(o, l) and not policy.bad_owner(o, self.deny):
+            pair = self.data["pairs"].get(self.pkey(o, l))
+            if (
+                self._ok(o, l)
+                and not policy.bad_owner(o, self.deny)
+                and not (pair and pair.get("source") == "legacy-invalid")
+            ):
                 self._pair(o, l)["last_asked"] = now
         self.dirty = True
 

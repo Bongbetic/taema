@@ -1,0 +1,116 @@
+"""Package boundaries, compatibility imports, and installed layout."""
+
+import ast
+import importlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+PACKAGE = Path(__file__).resolve().parents[1]
+
+
+class PackageLayoutTests(unittest.TestCase):
+    def test_legacy_module_paths_alias_the_new_modules(self):
+        module_pairs = (
+            ("taema.authorization", "taema.model.authorization"),
+            ("taema.cgroup", "taema.core.cgroup"),
+            ("taema.engine", "taema.governor.engine"),
+            ("taema.inspect", "taema.core.process"),
+            ("taema.knowledge", "taema.store.knowledge"),
+            ("taema.lineage", "taema.core.lineage"),
+            ("taema.policy", "taema.config.policy"),
+        )
+        for legacy_name, package_name in module_pairs:
+            with self.subTest(legacy=legacy_name):
+                self.assertIs(
+                    importlib.import_module(legacy_name),
+                    importlib.import_module(package_name),
+                )
+
+    def test_legacy_cli_and_daemon_exports_are_preserved(self):
+        package_pairs = (
+            ("taema.cli", "taema.cli.commands"),
+            ("taema.daemon", "taema.daemon.service"),
+        )
+        for package_name, implementation_name in package_pairs:
+            with self.subTest(package=package_name):
+                package = importlib.import_module(package_name)
+                implementation = importlib.import_module(implementation_name)
+                for name, value in vars(implementation).items():
+                    if not name.startswith("_"):
+                        self.assertIs(getattr(package, name), value)
+
+    def test_authorization_model_has_no_io_dependencies_or_calls(self):
+        source = PACKAGE / "src" / "taema" / "model" / "authorization.py"
+        tree = ast.parse(source.read_text())
+        allowed_imports = {"__future__", "dataclasses", "typing"}
+        imports = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split(".", 1)[0])
+        self.assertLessEqual(imports, allowed_imports)
+
+        forbidden_calls = {"open", "input", "print", "exec", "eval", "__import__"}
+        calls = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertTrue(forbidden_calls.isdisjoint(calls))
+
+    def test_install_keeps_nested_packages_importable(self):
+        wrapper = subprocess.run(
+            [str(PACKAGE / "bin" / "taema"), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(wrapper.returncode, 0, wrapper.stderr)
+        self.assertIn("usage: taema", wrapper.stdout)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary)
+            subprocess.run(
+                ["make", "install", f"DESTDIR={stage}"],
+                cwd=PACKAGE,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            wrapper_path = stage / "usr" / "bin" / "taema"
+            self.assertTrue(wrapper_path.is_file())
+            self.assertTrue(os.access(wrapper_path, os.X_OK))
+            package_root = stage / "usr" / "lib" / "taema"
+            installed = package_root / "taema"
+            for relative in (
+                "model/authorization.py",
+                "core/cgroup.py",
+                "core/process.py",
+                "core/lineage.py",
+                "store/knowledge.py",
+                "governor/engine.py",
+                "daemon/service.py",
+                "cli/commands.py",
+                "config/policy.py",
+            ):
+                with self.subTest(module=relative):
+                    self.assertTrue((installed / relative).is_file())
+
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(package_root)
+            result = subprocess.run(
+                [sys.executable, "-m", "taema", "--help"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage: taema", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

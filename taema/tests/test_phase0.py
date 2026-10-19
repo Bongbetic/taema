@@ -11,7 +11,11 @@ import types
 import unittest
 from unittest import mock
 
-from taema import cgroup, cli, daemon, engine, inspect, knowledge
+from taema.daemon import service as daemon
+import taema.cli.commands as cli
+from taema.core import cgroup, process as inspect
+from taema.governor import engine
+from taema.store import knowledge
 
 UID = os.getuid()
 

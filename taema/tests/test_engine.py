@@ -2,7 +2,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from taema import engine, knowledge
+from taema.governor import engine
+from taema.store import knowledge
 
 
 def decide(

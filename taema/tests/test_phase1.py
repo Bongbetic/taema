@@ -9,7 +9,11 @@ import time
 import unittest
 from unittest import mock
 
-from taema import cgroup, daemon, engine, inspect, knowledge, policy
+from taema.daemon import service as daemon
+from taema.core import cgroup, process as inspect
+from taema.governor import engine
+from taema.store import knowledge
+from taema.config import policy
 from tests.test_phase0 import FakeCg, OkSnap, UID, make_cfg, tmp
 
 

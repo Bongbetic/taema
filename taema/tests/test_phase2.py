@@ -6,8 +6,11 @@ import time
 import unittest
 from unittest import mock
 
-from taema import daemon, inspect, knowledge, lineage, policy
-from taema.lineage import HZ, Lineage
+from taema.daemon import service as daemon
+from taema.core import process as inspect, lineage
+from taema.store import knowledge
+from taema.config import policy
+from taema.core.lineage import HZ, Lineage
 from tests.test_phase0 import FakeCg, make_cfg, tmp
 
 DAY = 86400.0

@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 
-from taema.knowledge import MAX_OPEN_REVIEWS, Store
+from taema.store.knowledge import MAX_OPEN_REVIEWS, Store
 
 DAY = 86400.0
 

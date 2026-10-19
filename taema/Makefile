@@ -2,7 +2,6 @@
 DESTDIR ?=
 PYTHON  ?= python3
 
-PY_FILES  = $(wildcard src/taema/*.py)
 LIBDIR    = $(DESTDIR)/usr/lib/taema/taema
 BINDIR    = $(DESTDIR)/usr/bin
 LIBEXEC   = $(DESTDIR)/usr/libexec/taema
@@ -26,7 +25,12 @@ test check:
 install:
 	install -d $(LIBDIR) $(BINDIR) $(LIBEXEC) $(SVDIR)/log $(CONFDIR)/units $(SUDOERS) \
 		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(SHELLDIR) $(BASHRCD) $(FISHCONF)
-	install -m644 $(PY_FILES) $(LIBDIR)/
+	find src/taema -type d -print | while read dir; do \
+		rel=$${dir#src/taema}; install -d "$(LIBDIR)$$rel"; \
+	done
+	find src/taema -type f -name '*.py' -print | while read file; do \
+		rel=$${file#src/taema/}; install -m644 "$$file" "$(LIBDIR)/$$rel"; \
+	done
 	install -m755 bin/taema bin/scoperun bin/scopekill bin/scopels $(BINDIR)/
 	install -m755 libexec/taema-attach libexec/taemad-user libexec/taemad-log libexec/taema-svstop libexec/taema-hook $(LIBEXEC)/
 	install -m755 sv/taema/run sv/taema/finish $(SVDIR)/

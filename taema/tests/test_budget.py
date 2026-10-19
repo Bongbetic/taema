@@ -4,7 +4,8 @@ import os
 import unittest
 from unittest import mock
 
-from taema import daemon, inspect
+from taema.daemon import service as daemon
+from taema.core import process as inspect
 from tests.test_phase0 import FakeCg, make_cfg, tmp
 from tests.test_phase1 import write
 

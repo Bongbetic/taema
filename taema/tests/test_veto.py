@@ -7,7 +7,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from taema import cli, daemon, knowledge
+from taema.daemon import service as daemon
+import taema.cli.commands as cli
+from taema.store import knowledge
 from tests.test_phase0 import FakeCg, make_cfg, tmp
 
 

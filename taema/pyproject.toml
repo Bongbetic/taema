@@ -16,19 +16,19 @@ warn_redundant_casts = true
 
 # Keep legacy modules on default checking, suppressing only recorded baseline errors.
 [[tool.mypy.overrides]]
-module = ["taema.inspect", "taema.engine", "taema.cli"]
+module = ["taema.core.process", "taema.governor.engine", "taema.cli.commands"]
 disable_error_code = ["var-annotated"]
 
 [[tool.mypy.overrides]]
-module = "taema.lineage"
+module = "taema.core.lineage"
 disable_error_code = ["var-annotated", "assignment"]
 
 [[tool.mypy.overrides]]
-module = "taema.knowledge"
+module = "taema.store.knowledge"
 disable_error_code = ["var-annotated", "assignment", "index", "union-attr"]
 
 [[tool.mypy.overrides]]
-module = "taema.daemon"
+module = "taema.daemon.service"
 disable_error_code = [
   "var-annotated",
   "assignment",
@@ -43,12 +43,9 @@ module = [
   "taema.authorization.*",
   "taema.model",
   "taema.model.*",
-  "taema.store",
-  "taema.store.*",
-  "taema.governor",
-  "taema.governor.*",
 ]
-# New domain modules use strict checking as they are added.
+# Pure authorization/model modules use strict checking. The moved store and governor
+# implementations retain their existing gradual typing baseline.
 disallow_any_generics = true
 disallow_subclassing_any = true
 disallow_untyped_calls = true
@@ -81,12 +78,12 @@ minimum_new_percent = 85.0
 [tool.taema.coverage.existing_baseline]
 "src/taema/__init__.py" = 100
 "src/taema/__main__.py" = 0
-"src/taema/authorization.py" = 100
-"src/taema/cgroup.py" = 86
-"src/taema/cli.py" = 73
-"src/taema/daemon.py" = 88
-"src/taema/engine.py" = 90
-"src/taema/inspect.py" = 96
-"src/taema/knowledge.py" = 91
-"src/taema/lineage.py" = 94
-"src/taema/policy.py" = 95
+"src/taema/model/authorization.py" = 100
+"src/taema/core/cgroup.py" = 86
+"src/taema/cli/commands.py" = 73
+"src/taema/daemon/service.py" = 88
+"src/taema/governor/engine.py" = 90
+"src/taema/core/process.py" = 96
+"src/taema/store/knowledge.py" = 91
+"src/taema/core/lineage.py" = 94
+"src/taema/config/policy.py" = 95

@@ -14,7 +14,11 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from taema import authorization, cgroup, cli, engine, inspect, knowledge
+import taema.cli.commands as cli
+from taema.model import authorization
+from taema.core import cgroup, process as inspect
+from taema.governor import engine
+from taema.store import knowledge
 from tests.test_phase0 import make_cfg, tmp
 from tests.test_phase4 import AutoCase
 

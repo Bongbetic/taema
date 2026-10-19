@@ -310,18 +310,36 @@ user has to accept the new fingerprint.
 ## Checks
 
 The `ci` workflow runs on every push and pull request: the unit and packaging test
-suites and the package build, as an unprivileged user, in the Void glibc and Void musl
-containers with the distribution Python, plus Python 3.11, the supported floor. Run the
-same checks locally from the repository root:
+suites and package build, as an unprivileged user, in the Void glibc and Void musl
+containers with the distribution Python. Its Python 3.11 job also runs Ruff lint and
+format checks, mypy, and the coverage report and gate. Reproduce that quality job from
+the repository root with:
+
+```sh
+python3 -m venv /tmp/taema-quality-venv
+/tmp/taema-quality-venv/bin/python -m pip install ruff==0.17.1 mypy==2.4.0 coverage==7.16.2
+cd taema
+/tmp/taema-quality-venv/bin/ruff check src tests tools
+/tmp/taema-quality-venv/bin/ruff format --check src tests tools
+/tmp/taema-quality-venv/bin/mypy src/taema
+PYTHONPATH=src /tmp/taema-quality-venv/bin/coverage run -m unittest discover -s tests -t .
+/tmp/taema-quality-venv/bin/coverage report
+/tmp/taema-quality-venv/bin/coverage json -o /tmp/taema-coverage.json
+/tmp/taema-quality-venv/bin/python tools/check_coverage.py /tmp/taema-coverage.json
+cd ..
+```
+
+Run the Void test and package build steps locally from the repository root with:
 
 ```sh
 make -C taema test        # the test suites (unit and packaging)
 taema/tools/build-xbps.sh # the package build; runs the suites first, needs xbps-create/xbps-rindex
 ```
 
-The test suites need only Python 3.11+ and `make`. A failing step fails the workflow
-run, which marks the commit and the pull request as failed. The tag-triggered `release`
-workflow is separate and unchanged.
+The test suites need only Python 3.11+ and `make`; the package build also needs
+`xbps-create` and `xbps-rindex`. A failing step fails the workflow run, which marks the
+commit and the pull request as failed. The tag-triggered `release` workflow is separate
+and unchanged.
 
 ## Layout
 

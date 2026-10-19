@@ -208,9 +208,22 @@ program.
 
 ```sh
 taema run emulator emulator -avd Pixel_8 -no-window   # start a program in a scope
-taema ls                                              # scopes and process counts
+taema ls                                              # scopes, counts, memory, pressure
 taema kill emulator                                   # empty the scope
 ```
+
+```
+name                         procs       MEM    PSI  comms
+scope-emulator                 12      1.5G   0.42  emulator,qemu-system-x86
+  qemu-9                        1      1.4G   0.42  qemu-system-x86
+scope-web                       3     24.7M   1.20  firefox,WebExtensions
+scope-fresh                     1         -      -  sleep
+shared                          0         -      -
+  adb-1                         1    768.0K   0.00  adb
+```
+
+`MEM` is the scope's current memory in human-readable bytes, `PSI` its recent memory
+pressure (`some avg10`); a scope without readable memory files shows `-`.
 
 ```
 kill    41210 qemu-system-x86    no outside users

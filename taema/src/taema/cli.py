@@ -156,6 +156,22 @@ def cmd_kill(a):
 
 # ---- ls / explain / keep / forget ---------------------------------------------------------
 
+def _fmt_mem(n):
+    """Human-readable byte count (1.5G, 512); '-' when the fact is unknown."""
+    if n is None:
+        return "-"
+    x = float(n)
+    for u in ("B", "K", "M", "G", "T"):
+        if x < 1024 or u == "T":
+            return "%d" % x if u == "B" else "%.1f%s" % (x, u)
+        x /= 1024.0
+
+
+def _fmt_psi(v):
+    """memory pressure 'some avg10' with two decimals; '-' when the fact is unknown."""
+    return "-" if v is None else "%.2f" % v
+
+
 def _walk(path, depth, out):
     pids = cgroup.procs(path)
     comms = []
@@ -163,7 +179,9 @@ def _walk(path, depth, out):
         c = inspect.comm(p)
         if c and c not in comms:
             comms.append(c)
-    out.append((depth, os.path.basename(path) if depth else cgroup.rel(path), len(pids), ",".join(comms)))
+    out.append((depth, os.path.basename(path) if depth else cgroup.rel(path), len(pids),
+                _fmt_mem(cgroup.memory_current(path)), _fmt_psi(cgroup.memory_psi(path)),
+                ",".join(comms)))
     for d in cgroup.subdirs(path):
         _walk(d, depth + 1, out)
 
@@ -177,8 +195,11 @@ def cmd_ls(a):
         _walk(d, 0, rows)
     if not rows:
         print("no scopes")
-    for depth, name, n, comms in rows:
-        print("%s%-*s %4d  %s" % ("  " * depth, 28 - 2 * depth, name, n, comms[:80]))
+    else:
+        print("%-28s %4s  %8s %6s  %s" % ("name", "procs", "MEM", "PSI", "comms"))
+        for depth, name, n, mem, psi, comms in rows:
+            print("%s%-*s %4d  %8s %6s  %s" % ("  " * depth, 28 - 2 * depth, name, n, mem, psi,
+                                               comms[:80]))
     return 0
 
 

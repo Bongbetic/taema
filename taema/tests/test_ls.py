@@ -5,7 +5,8 @@ import io
 import unittest
 from contextlib import redirect_stdout
 
-from taema import cgroup, cli
+import taema.cli.commands as cli
+from taema.core import cgroup
 from tests.test_phase0 import FakeCg
 from tests.test_phase1 import write
 

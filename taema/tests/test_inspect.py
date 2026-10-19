@@ -1,6 +1,6 @@
 import unittest
 
-from taema import inspect
+from taema.core import process as inspect
 
 SERVER = (
     'u_str ESTAB 0 0 /run/user/1000/herdr.sock 100 * 101 users:(("herdr",pid=50,fd=9))'

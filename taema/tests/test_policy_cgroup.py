@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from taema import cgroup, policy
+from taema.core import cgroup
+from taema.config import policy
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SYSTEM_TOML = os.path.join(ROOT, "etc", "taema.toml")

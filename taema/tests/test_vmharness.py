@@ -919,6 +919,17 @@ class ScenarioApiTest(unittest.TestCase):
                 procroot=self.procroot,
             )
 
+    def test_alive_treats_zombie_as_terminated(self):
+        proc_dir = os.path.join(self.procroot, "123")
+        os.makedirs(proc_dir)
+        with open(os.path.join(proc_dir, "stat"), "w") as f:
+            f.write("123 (fixture with ) in name) Z 1 1\n")
+
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            with mock.patch.object(scenario.os, "kill") as kill:
+                self.assertFalse(scenario._alive(123))
+        kill.assert_not_called()
+
     def test_capture_daemon_logs_copies_available_files(self):
         state = os.path.join(self.tmp, "state")
         os.makedirs(state)
@@ -1016,11 +1027,7 @@ class ScenarioApiTest(unittest.TestCase):
 
 
 def process_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return scenario._alive(pid)
 
 
 class ProvisionScriptTest(unittest.TestCase):

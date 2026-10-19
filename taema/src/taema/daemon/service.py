@@ -19,7 +19,11 @@ import stat
 import struct
 import time
 
-from . import authorization, cgroup, engine, inspect, knowledge, lineage, policy
+from ..model import authorization
+from ..core import cgroup, process as inspect, lineage
+from ..governor import engine
+from ..store import knowledge
+from ..config import policy
 
 MAX_OWNERS = 256  # pidfd owner watches
 MAX_LEAF_WATCH = 256  # cgroup.events watches (EPOLLPRI)
@@ -1578,7 +1582,7 @@ class Daemon:
     def _want_path(self):
         path = os.environ.get("TAEMA_SOCKET") or None
         if not path:
-            from .cli import sock_path
+            from ..cli.commands import sock_path
 
             path = sock_path(self.cfg)
         return path

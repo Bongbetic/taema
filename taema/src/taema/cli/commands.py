@@ -8,7 +8,11 @@ import sys
 import time
 import uuid
 
-from . import authorization, cgroup, engine, inspect, knowledge, lineage, policy
+from ..model import authorization
+from ..core import cgroup, process as inspect, lineage
+from ..governor import engine
+from ..store import knowledge
+from ..config import policy
 
 
 def _load():
@@ -613,13 +617,13 @@ def cmd_adopt(a):
 
 
 def cmd_daemon(a):
-    from . import daemon
+    from ..daemon import service as daemon
 
     return daemon.run()
 
 
 def main(argv):
-    from . import __version__
+    from .. import __version__
 
     p = argparse.ArgumentParser(
         prog="taema", description="Dependency-aware cgroup v2 process scopes"

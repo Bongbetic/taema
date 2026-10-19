@@ -167,6 +167,15 @@ def _reaped(pid):
 
 
 def _alive(pid):
+    """Whether pid can still run; a zombie has exited even if its parent has not reaped it."""
+    try:
+        with open(os.path.join(PROCROOT, str(pid), "stat")) as f:
+            stat = f.read()
+        end = stat.rfind(")")
+        if end >= 0 and stat[end + 2 : end + 3] == "Z":
+            return False
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
     except OSError:

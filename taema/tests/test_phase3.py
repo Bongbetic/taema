@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest import mock
 
-from taema import daemon
+from taema.daemon import service as daemon
 from tests.test_phase0 import FakeCg, make_cfg, tmp
 from tests.test_phase2 import ProcCase
 

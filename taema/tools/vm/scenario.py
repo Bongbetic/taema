@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import time
+from unittest import mock
 
 CGROOT = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
 PROCROOT = os.environ.get("TAEMA_PROCROOT", "/proc")
@@ -38,6 +39,7 @@ import json, os, signal, subprocess, sys, time
 def main():
     n = int(sys.argv[1])
     workdir = sys.argv[2]
+    child_argv = json.loads(sys.argv[3]) if len(sys.argv) > 3 else ["/bin/sleep", "3600"]
 
     # Popen starts this launcher as a session leader. Its child can therefore
     # create a distinct session with setsid(), then fork a non-session-leader
@@ -56,7 +58,7 @@ def main():
 
     children = []
     for _ in range(n):
-        p = subprocess.Popen(["/bin/sleep", "3600"], stdout=subprocess.DEVNULL,
+        p = subprocess.Popen(child_argv, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         children.append(p.pid)
     tmp = os.path.join(workdir, "tree.json.tmp")
@@ -107,7 +109,7 @@ def configured_adopt_interval():
 
 # ---- process tree ----------------------------------------------------------
 
-def spawn_gui_tree(workdir, children=2, timeout=10):
+def spawn_gui_tree(workdir, children=2, timeout=10, child_argv=None):
     """Start a detached fake GUI app with `children` sleeping descendants.
 
     Returns root/child/supervisor pids, session id, workdir, and launcher Popen.
@@ -119,7 +121,10 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
     with open(app, "w") as f:
         f.write(APP_ROOT)
     log = open(os.path.join(workdir, "root.log"), "w")
-    proc = subprocess.Popen([sys.executable, app, str(children), workdir],
+    argv = [sys.executable, app, str(children), workdir]
+    if child_argv is not None:
+        argv.append(json.dumps([str(arg) for arg in child_argv]))
+    proc = subprocess.Popen(argv,
                             cwd=workdir, stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
     log.close()
@@ -492,6 +497,391 @@ def scenario_smoke(rec, args, tree_holder):
     return all(s["ok"] for s in rec.steps)
 
 
+def _m0_config_paths():
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    taema_dir = os.path.join(config_home, "taema")
+    return (os.path.join(taema_dir, "taema.toml"),
+            os.path.join(taema_dir, "units", "m0-pause.toml"))
+
+
+def _m0_snapshot(paths):
+    snapshot = {}
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                snapshot[path] = f.read()
+        except FileNotFoundError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _m0_write_mode(mode, idle_grace=3600, adopt_interval=2, gc_interval=3600):
+    config_path, unit_path = _m0_config_paths()
+    os.makedirs(os.path.dirname(unit_path), exist_ok=True)
+    with open(config_path, "w") as f:
+        f.write('mode = "%s"\n\n[timers]\nadopt_interval = %s\ngc_interval = %s\n'
+                'idle_grace = %s\nleftover_expire_days = 0\n'
+                % (mode, adopt_interval, gc_interval, idle_grace))
+    with open(unit_path, "w") as f:
+        f.write('[unit]\nname = "app-m0pause"\nkind = "app"\n'
+                'group_by_env = "XDG_RUNTIME_DIR"\nstop_when_unneeded = true\n\n'
+                '[match]\ncomm = "m0pause"\n\n'
+                '[gc]\nenv_dir_missing = "XDG_RUNTIME_DIR"\n'
+                'keep_while_children = true\n')
+    restart = run_privileged(["sv", "restart", "taema"], timeout=45)
+    if restart.returncode != 0:
+        raise ScenarioError("could not restart taema for mode %s: %s%s"
+                            % (mode, restart.stdout, restart.stderr))
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        status = _run(["/usr/bin/taema", "status"], timeout=10)
+        if status.returncode == 0 and '"mode": "%s"' % mode in status.stdout:
+            return status
+        time.sleep(0.25)
+    raise ScenarioError("taema did not restart in %s mode: %s%s"
+                        % (mode, status.stdout, status.stderr))
+
+
+def _m0_restore(snapshot):
+    for path, contents in snapshot.items():
+        if contents is None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(contents)
+    return run_privileged(["sv", "restart", "taema"], timeout=45)
+
+
+def _process_running(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            stat_line = f.read()
+        return stat_line.rsplit(")", 1)[1].lstrip().split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _wait_process_dead(pid, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _process_running(pid):
+            return True
+        time.sleep(0.1)
+    return not _process_running(pid)
+
+
+def _spawn_bound_tree(name, workdir, child_argv, timeout=10):
+    os.makedirs(workdir, exist_ok=True)
+    marker = os.path.join(workdir, "bound.json")
+    gate = os.path.join(workdir, "release-owner")
+    script = (
+        "import json, os, subprocess, sys, time; "
+        "work, gate = sys.argv[1:3]; "
+        "child = subprocess.Popen(json.loads(sys.argv[3]), "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "open(os.path.join(work, 'bound.json'), 'w').write(json.dumps("
+        "{'owner': os.getpid(), 'child': child.pid})); "
+        "exec('while not os.path.exists(gate):\\n time.sleep(0.05)')")
+    proc = subprocess.Popen(["/usr/bin/taema", "run", "--bind", name,
+                             sys.executable, "-c", script, workdir, gate,
+                             json.dumps([str(x) for x in child_argv])],
+                            cwd=workdir, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.STDOUT, start_new_session=False)
+    marker_path = os.path.join(workdir, "bound.json")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(marker_path):
+            with open(marker_path) as f:
+                pids = json.load(f)
+            return {"root": int(pids["owner"]), "children": [int(pids["child"])],
+                    "workdir": workdir, "proc": proc, "gate": gate}
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    raise ScenarioError("taema run --bind %s did not start its fixture (rc=%s)"
+                        % (name, proc.poll()))
+
+
+def _spawn_pause_process(workdir, runtime_dir, timeout=10):
+    os.makedirs(workdir, exist_ok=True)
+    os.makedirs(runtime_dir, exist_ok=True)
+    marker = os.path.join(workdir, "pause.pid")
+    script = (
+        "import ctypes, os, signal, sys; "
+        "libc = ctypes.CDLL(None, use_errno=True); "
+        "libc.prctl(15, ctypes.c_char_p(b'm0pause'), 0, 0, 0); "
+        "open(sys.argv[1], 'w').write(str(os.getpid())); signal.pause()")
+    env = dict(os.environ, XDG_RUNTIME_DIR=runtime_dir)
+    proc = subprocess.Popen([sys.executable, "-c", script, marker], env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                pid = int(f.read())
+            return {"root": pid, "children": [], "proc": proc,
+                    "workdir": workdir, "runtime_dir": runtime_dir}
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+    raise ScenarioError("m0 pause fixture did not start (rc=%s)" % proc.poll())
+
+
+def _event_lines(path, event, scope=None):
+    try:
+        with open(path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+    except OSError:
+        return []
+    return [item for item in lines if item.get("event") == event
+            and (scope is None or item.get("scope") == scope)]
+
+
+def scenario_m0(rec, args, tree_holder):
+    """Exercise the 0.3.0 adopt, auto, owner-exit and observe acceptance in a live guest."""
+    config_paths = _m0_config_paths()
+    snapshot = _m0_snapshot(config_paths)
+    log_path = os.path.join(args.state_dir, "decisions.log")
+    tail = shutil.which("tail") or "/usr/bin/tail"
+    if not os.path.isfile(tail):
+        raise ScenarioError("tail is required by the VM survivor fixtures")
+    tracked = []
+    simulated_cgroup = None
+    simulated_pid = None
+    ok = False
+
+    def record(name, passed, detail=""):
+        rec.step(name, passed, detail)
+        if not passed:
+            raise ScenarioError("%s: %s" % (name, detail))
+
+    def track(tree):
+        tracked.append(tree)
+        tree_holder.append(tree)
+        return tree
+
+    try:
+        status = _m0_write_mode("adopt", idle_grace=3600, adopt_interval=2)
+        record("adopt-mode-ready", status.returncode == 0, status.stdout[:300])
+
+        tree = track(spawn_gui_tree(os.path.join(args.artifacts, "m0-adopt"),
+                                    children=2))
+        adopted = wait_for_scope(tree["root"], ["app-"], timeout=30)
+        record("adopt-root-contained", True, "root=%d scope=%s" % (tree["root"], adopted))
+        time.sleep(max(5.5, configured_adopt_interval() + 1.0))
+        adopt_interval = configured_adopt_interval()
+        close_root(tree["root"], timeout=15)
+        closed_at = time.monotonic()
+        leftover = wait_for_scope(tree["children"][0], ["leftover/"],
+                                  timeout=adopt_interval + 2.0, poll=0.05)
+        contained_at = time.monotonic()
+        containment_latency = contained_at - closed_at
+        members = [assert_scope_member(pid, "leftover/") for pid in tree["children"]]
+        record("adopt-survivors-contained", members[0] == members[1] == leftover,
+               "scope=%s members=%s" % (leftover, members))
+        record("adopt-containment-within-one-interval",
+               containment_latency <= adopt_interval + 0.1,
+               "close_to_containment=%.3fs adopt_interval=%.3fs poll_tolerance=0.1s"
+               % (containment_latency, adopt_interval))
+        review = _run(["/usr/bin/taema", "review"], timeout=30)
+        review_events = _event_lines(log_path, "review_created", leftover)
+        record("adopt-review-lists-contained-survivors",
+               review.returncode == 0 and "open reviews:" in review.stdout
+               and "owner=" in review.stdout and "survivors=sleep" in review.stdout
+               and bool(review_events),
+               "review=%s event=%s" %
+               ((review.stdout + review.stderr)[:700], review_events[-1:] or "missing"))
+
+        veto = _run(["/usr/bin/taema", "do-not-kill", "app:sleep"], timeout=30)
+        record("adopt-do-not-kill-app", veto.returncode == 0,
+               (veto.stdout + veto.stderr).strip()[:400])
+        refused = _run(["/usr/bin/taema", "kill", leftover], timeout=30)
+        record("adopt-manual-kill-refused-with-four",
+               refused.returncode == 4 and all(_process_running(pid) for pid in tree["children"]),
+               "rc=%d output=%s" % (refused.returncode,
+                                    (refused.stdout + refused.stderr).strip()[:500]))
+
+        bound = track(_spawn_bound_tree("m0-bind", os.path.join(args.artifacts, "m0-bind"),
+                                         [tail, "-f", "/dev/null"]))
+        bound_scope = wait_for_scope(bound["root"], ["scope-m0-bind"], timeout=30)
+        open(bound["gate"], "w").close()
+        bound["proc"].wait(timeout=20)
+        record("adopt-bind-owner-exit-stops-scope",
+               _wait_process_dead(bound["children"][0])
+               and not os.path.isdir(os.path.join(CGROOT, "user", str(os.getuid()), bound_scope)),
+               "scope=%s child=%d" % (bound_scope, bound["children"][0]))
+
+        bound_veto = track(_spawn_bound_tree("m0-veto", os.path.join(args.artifacts, "m0-veto"),
+                                              ["/bin/sleep", "3600"]))
+        veto_scope = wait_for_scope(bound_veto["root"], ["scope-m0-veto"], timeout=30)
+        veto_cmd = _run(["/usr/bin/taema", "do-not-kill", "scope:" + veto_scope], timeout=30)
+        record("owner-exit-veto-registered", veto_cmd.returncode == 0,
+               (veto_cmd.stdout + veto_cmd.stderr).strip()[:400])
+        refused = _run(["/usr/bin/taema", "kill", "m0-veto"], timeout=30)
+        record("vetoed-manual-scope-kill-refused-with-four",
+               refused.returncode == 4 and _process_running(bound_veto["children"][0]),
+               "rc=%d output=%s" % (refused.returncode,
+                                    (refused.stdout + refused.stderr).strip()[:500]))
+        open(bound_veto["gate"], "w").close()
+        bound_veto["proc"].wait(timeout=20)
+        wait_for_event(log_path, '"trigger": "owner_exit"', timeout=30)
+        record("vetoed-owner-close-stops-nothing",
+               _process_running(bound_veto["children"][0])
+               and scope_of(bound_veto["children"][0]) == veto_scope,
+               "scope=%s child=%d remains running" %
+               (veto_scope, bound_veto["children"][0]))
+
+        status = _m0_write_mode("observe", idle_grace=3600, adopt_interval=2)
+        record("observe-mode-ready", status.returncode == 0, status.stdout[:300])
+        observed = track(spawn_gui_tree(os.path.join(args.artifacts, "m0-observe"),
+                                        children=1, child_argv=[tail, "-f", "/dev/null"]))
+        original_scope = scope_of(observed["children"][0])
+        wait_for_event(log_path, "adopt_would", timeout=30)
+        time.sleep(max(5.5, configured_adopt_interval() + 1.0))
+        close_root(observed["root"], timeout=15)
+        wait_for_event(log_path, "would_contain", timeout=30)
+        record("observe-close-mutates-no-scope-or-process",
+               _process_running(observed["children"][0])
+               and scope_of(observed["children"][0]) == original_scope
+               and not scope_matches(original_scope, "app-")
+               and not scope_matches(original_scope, "leftover/"),
+               "child=%d before=%s after=%s" %
+               (observed["children"][0], original_scope,
+                scope_of(observed["children"][0])))
+
+        status = _m0_write_mode("auto", idle_grace=0, adopt_interval=2, gc_interval=3600)
+        record("auto-mode-ready", status.returncode == 0, status.stdout[:300])
+        automatic = track(spawn_gui_tree(os.path.join(args.artifacts, "m0-auto-leftover"),
+                                         children=1, child_argv=[tail, "-f", "/dev/null"]))
+        wait_for_scope(automatic["root"], ["app-"], timeout=30)
+        time.sleep(max(5.5, configured_adopt_interval() + 1.0))
+        close_root(automatic["root"], timeout=15)
+        auto_leftover = wait_for_scope(automatic["children"][0], ["leftover/"], timeout=30)
+        gc_result = _run(["/usr/bin/taema", "gc"], timeout=30)
+        review = _run(["/usr/bin/taema", "review"], timeout=30)
+        auto_review_events = _event_lines(log_path, "review_created", auto_leftover)
+        record("auto-keeps-and-reviews-unlearned-leftover",
+               gc_result.returncode == 0 and review.returncode == 0
+               and _process_running(automatic["children"][0])
+               and scope_of(automatic["children"][0]) == auto_leftover
+               and "survivors=tail" in review.stdout and bool(auto_review_events),
+               "scope=%s gc=%s review=%s event=%s" %
+               (auto_leftover, gc_result.stdout[-500:], review.stdout[-700:],
+                auto_review_events[-1:] or "missing"))
+
+        eligible = track(_spawn_pause_process(
+            os.path.join(args.artifacts, "m0-pause-eligible"),
+            os.path.join(args.artifacts, "runtime-eligible")))
+        vetoed = track(_spawn_pause_process(
+            os.path.join(args.artifacts, "m0-pause-vetoed"),
+            os.path.join(args.artifacts, "runtime-vetoed")))
+        eligible_scope = wait_for_scope(eligible["root"], ["app-m0pause-"], timeout=30)
+        vetoed_scope = wait_for_scope(vetoed["root"], ["app-m0pause-"], timeout=30)
+        time.sleep(35)
+        scope_veto = _run(["/usr/bin/taema", "do-not-kill", "scope:" + vetoed_scope], timeout=30)
+        record("auto-pause-veto-registered", scope_veto.returncode == 0,
+               (scope_veto.stdout + scope_veto.stderr).strip()[:400])
+        os.rmdir(eligible["runtime_dir"])
+        eligible_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
+        record("auto-stops-idle-pause-after-runtime-disappears",
+               eligible_gc.returncode == 0 and _wait_process_dead(eligible["root"])
+               and not os.path.isdir(os.path.join(CGROOT, "user", str(os.getuid()),
+                                                  eligible_scope)),
+               "scope=%s gc=%s" % (eligible_scope, eligible_gc.stdout[-700:]))
+        os.rmdir(vetoed["runtime_dir"])
+        vetoed_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
+        wait_for_event(log_path, '"trigger": "gc_stop"', timeout=30)
+        record("auto-gc-veto-keeps-pause-scope",
+               vetoed_gc.returncode == 0 and _process_running(vetoed["root"])
+               and scope_of(vetoed["root"]) == vetoed_scope,
+               "scope=%s gc=%s" % (vetoed_scope, vetoed_gc.stdout[-700:]))
+
+        status = _m0_write_mode("observe", idle_grace=3600, adopt_interval=2)
+        record("simulated-gc-observe-mode-ready", status.returncode == 0, status.stdout[:300])
+        sys.path.insert(0, "/usr/lib/taema")
+        from taema import daemon as taema_daemon, engine as taema_engine, policy as taema_policy
+
+        simulated = subprocess.Popen(["/bin/sleep", "7200"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        simulated_pid = simulated.pid
+        rel = "shared/m0-gc-hour"
+        simulated_scope = os.path.join(CGROOT, "user", str(os.getuid()),
+                                       rel)
+        simulated_cgroup = simulated_scope
+        os.makedirs(simulated_scope, exist_ok=True)
+        with open(os.path.join(simulated_scope, "cgroup.procs"), "w") as f:
+            f.write("%d\n" % simulated_pid)
+        time.sleep(1)
+        initial_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
+        initial_events = _event_lines(log_path, "gc_would_stop", "shared/m0-gc-hour")
+        record("real-hour-idle-window-started",
+               initial_gc.returncode == 0 and not initial_events,
+               "gc=%s prior_would_stop_lines=%d" %
+               (initial_gc.stdout[-500:], len(initial_events)))
+        real_idle_started = time.monotonic()
+        time.sleep(3602)
+        real_passes = [_run(["/usr/bin/taema", "gc"], timeout=30) for _ in range(3)]
+        real_elapsed = time.monotonic() - real_idle_started
+        real_events = _event_lines(log_path, "gc_would_stop", "shared/m0-gc-hour")
+        record("one-hour-idle-would-stop-is-deduplicated",
+               real_elapsed >= 3600 and all(r.returncode == 0 for r in real_passes)
+               and len(real_events) == 1 and _process_running(simulated_pid)
+               and scope_of(simulated_pid) == rel,
+               "real_idle_seconds=%.1f gc_passes=3 would_stop_lines=%d last_gc=%s"
+               % (real_elapsed, len(real_events), real_passes[-1].stdout[-500:]))
+
+        cfg = taema_policy.load_config()
+        cfg["mode"] = "observe"
+        cfg["timers"]["idle_grace"] = 3600
+        cfg["paths"]["state_dir"] = os.path.join(args.artifacts, "m0-simulated-gc")
+        simulated_daemon = taema_daemon.Daemon(cfg)
+        started = time.time()
+        simulated_now = [started]
+        simulated_daemon.store.now = lambda: simulated_now[0]
+        with mock.patch.object(taema_engine, "gc_candidates",
+                               return_value=[(simulated_scope, "idle 3600s >= grace 3600s")]):
+            result = simulated_daemon.gc_pass()
+            first_event = _event_lines(simulated_daemon.store.log_path, "gc_would_stop", rel)
+            for minute in range(1, 24 * 60 + 1):
+                simulated_now[0] = started + minute * 60
+                simulated_daemon.gc_pass()
+        all_events = _event_lines(simulated_daemon.store.log_path, "gc_would_stop", rel)
+        record("one-hour-idle-and-simulated-day-deduplicate-would-stop",
+               bool(result) and result[0][2] == "would" and len(first_event) == 1
+               and len(all_events) == 1 and _process_running(simulated_pid)
+               and scope_of(simulated_pid) == rel,
+               "simulated_result=%s minutes=1440 would_stop_lines=%d"
+               % (result, len(all_events)))
+        ok = all(step["ok"] for step in rec.steps)
+    finally:
+        for tree in tracked:
+            kill_tree(tree, timeout=5)
+        if simulated_pid is not None:
+            try:
+                os.kill(simulated_pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                if 'simulated' in locals():
+                    simulated.wait(timeout=5)
+            except Exception:
+                pass
+        if simulated_cgroup and os.path.isdir(simulated_cgroup):
+            try:
+                os.rmdir(simulated_cgroup)
+            except OSError:
+                pass
+        restored = _m0_restore(snapshot)
+        ok = ok and restored.returncode == 0
+    return ok
+
+
 def scenario_upgrade(rec, args, tree_holder):
     """Install the previous release, then upgrade back to the working tree."""
     prevdir = os.path.dirname(args.previous)
@@ -550,7 +940,7 @@ def scenario_remove(rec, args, tree_holder):
     return all(s["ok"] for s in rec.steps)
 
 
-SCENARIOS = {"smoke": scenario_smoke, "upgrade": scenario_upgrade,
+SCENARIOS = {"smoke": scenario_smoke, "m0": scenario_m0, "upgrade": scenario_upgrade,
              "remove": scenario_remove}
 
 

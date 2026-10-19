@@ -39,7 +39,7 @@ BUILD_XBPS = os.path.join(TAEMA_ROOT, "tools", "build-xbps.sh")
 GUEST_TMP = "/tmp/taema-vm"
 
 LIBCS = ("glibc", "musl")
-SCENARIOS = ("smoke", "upgrade", "remove")
+SCENARIOS = ("smoke", "m0", "upgrade", "remove")
 ACCELS = ("auto", "kvm", "tcg")
 IMAGE_KEYS = ("dir", "tarball", "rootfs", "base", "kernel", "initrd")
 
@@ -864,7 +864,7 @@ def main(argv, out=None, err=None):
                      help="permit downloads (base images, previous release)")
     runp = argparse.ArgumentParser(add_help=False)
     runp.add_argument("--libc", help="comma-separated libcs to boot (default from config)")
-    runp.add_argument("--scenarios", help="comma-separated: smoke,upgrade,remove or all")
+    runp.add_argument("--scenarios", help="comma-separated: smoke,m0,upgrade,remove or all")
     runp.add_argument("--tcg", action="store_true", help="force TCG emulation")
     runp.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     runp.add_argument("--no-build", action="store_true",

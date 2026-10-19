@@ -10,7 +10,7 @@ artifacts.
 ## The one command
 
 ```sh
-make -C taema vm-test                      # smoke on glibc + musl (default)
+make -C taema vm-test                      # smoke + M0 acceptance on glibc + musl (default)
 make -C taema vm-test VMFLAGS="--libc glibc"          # one libc only
 make -C taema vm-test VMFLAGS="--allow-network --scenarios all"
 ```
@@ -102,6 +102,12 @@ Built-in scenarios:
   is contained in an `app-*` scope → wait for the matching `adopt` audit event
   → close the root → assert both survivors are members of the same
   `leftover/*` scope → capture daemon logs.
+- **m0** — exercise GUI survivor containment and review in `adopt`, manual-stop
+  vetoes, `taema run --bind` owner exit, runtime-directory GC in `auto`, and
+  observe-mode no-mutation plus deduplicated would-stop audit records. It waits
+  one real hour for an idle scope to reach its GC threshold, checks repeated
+  unchanged passes, then advances a clock through a separate simulated 24-hour
+  GC test. The per-scenario timeout is long enough for the real idle window.
 - **upgrade** — index and install the previous release package, assert its
   version, install the current package from the working tree, assert the
   version, service, and daemon health (when the working tree still has the

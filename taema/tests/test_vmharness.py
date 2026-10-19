@@ -120,10 +120,11 @@ class ConfigTest(VmTestCase):
     def test_default_config_valid(self):
         cfg = vmh.load_config()
         self.assertEqual(cfg["libcs"], ["glibc", "musl"])
-        self.assertEqual(cfg["scenarios"], ["smoke"])
+        self.assertEqual(cfg["scenarios"], ["smoke", "m0"])
         self.assertIn(cfg["accel"], ("auto", "kvm", "tcg"))
         self.assertGreaterEqual(cfg["memory_mb"], 512)
         self.assertGreater(cfg["boot_timeout_s"], 0)
+        self.assertGreaterEqual(cfg["scenario_timeout_s"], 3600)
 
     def test_default_images_pinned(self):
         cfg = vmh.load_config()
@@ -302,13 +303,14 @@ class PlanTest(VmTestCase):
 
     def test_plan_step_order(self):
         plan = vmh.build_plan(self.cfg, libcs=["glibc"],
-                              scenarios=["smoke", "upgrade", "remove"], kvm=False)
+                              scenarios=["smoke", "m0", "upgrade", "remove"], kvm=False)
         names = [s["name"] for s in plan["vms"][0]["steps"]]
         self.assertEqual(names[0], "wait-ssh")
         self.assertIn("scp-bootstrap", names)
         self.assertIn("provision", names)
         self.assertLess(names.index("provision"), names.index("scenario:smoke"))
-        self.assertLess(names.index("scenario:smoke"), names.index("scenario:upgrade"))
+        self.assertLess(names.index("scenario:smoke"), names.index("scenario:m0"))
+        self.assertLess(names.index("scenario:m0"), names.index("scenario:upgrade"))
         self.assertLess(names.index("scenario:upgrade"), names.index("scenario:remove"))
         self.assertEqual(names[-1], "teardown")
         self.assertIn("collect", names)
@@ -322,7 +324,7 @@ class PlanTest(VmTestCase):
 
 class DryRunTest(VmTestCase):
     def test_dry_run_prints_plan_without_side_effects(self):
-        path = self.write_config()
+        path = self.write_config(scenarios=["smoke", "m0"])
         code, out, err = self.run_main("run", "--dry-run", "--config", path,
                                        "--state-dir", self.state, "--tcg")
         self.assertEqual(code, 0, err)
@@ -331,6 +333,7 @@ class DryRunTest(VmTestCase):
         self.assertIn("glibc", out)
         self.assertIn("musl", out)
         self.assertIn("scenario:smoke", out)
+        self.assertIn("scenario:m0", out)
         self.assertFalse(os.path.exists(self.state), "dry run must not create the state dir")
 
 
@@ -522,7 +525,11 @@ class RunPipelineTest(VmTestCase):
 
 class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
-        self.assertEqual(vmh.parse_scenarios("all"), ["smoke", "upgrade", "remove"])
+        self.assertEqual(vmh.parse_scenarios("all"), ["smoke", "m0", "upgrade", "remove"])
+
+    def test_m0_acceptance_is_a_registered_guest_scenario(self):
+        self.assertIn("m0", vmh.SCENARIOS)
+        self.assertIn("m0", scenario.SCENARIOS)
 
     def test_parse_libcs(self):
         self.assertEqual(vmh.parse_libcs("glibc, musl"), ["glibc", "musl"])
@@ -586,6 +593,8 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn("workflow_dispatch", wf)
         self.assertNotIn("  push:", wf)  # never auto-runs without KVM
         self.assertIn("kvm", wf)
+        self.assertIn('default: "smoke,m0"', wf)
+        self.assertIn("timeout-minutes: 180", wf)
         self.assertIn("upload-artifact", wf)
         self.assertNotIn("continue-on-error", wf)
 
@@ -646,6 +655,15 @@ class ScenarioApiTest(unittest.TestCase):
         self.assertFalse(process_alive(root))
         for pid in self.tree["children"]:
             self.assertTrue(process_alive(pid), "children must survive a root close")
+
+    def test_spawn_gui_tree_accepts_a_distinct_survivor_command(self):
+        tail = shutil.which("tail")
+        self.assertIsNotNone(tail)
+        work = os.path.join(self.tmp, "work-tail")
+        self.tree = scenario.spawn_gui_tree(
+            work, children=1, child_argv=[tail, "-f", "/dev/null"])
+        self.assertEqual(os.path.realpath("/proc/%d/exe" % self.tree["children"][0]),
+                         os.path.realpath(tail))
 
     def test_wait_for_event_returns_matching_line(self):
         log = os.path.join(self.tmp, "decisions.log")

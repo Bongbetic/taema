@@ -14,7 +14,7 @@ on:
         required: true
       scenarios:
         description: "Comma-separated scenarios or 'all'"
-        default: "smoke"
+        default: "smoke,m0"
         required: true
       allow_network:
         description: "Permit first-time image/package downloads"
@@ -24,7 +24,7 @@ on:
 jobs:
   vm:
     runs-on: [self-hosted, linux, x64, kvm]
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 

@@ -67,8 +67,8 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
     """Start a fake GUI app: a root process that spawns `children` sleepers.
 
     Returns {"root": pid, "children": [pids], "workdir": ..., "proc": Popen}.
-    The root runs in its own session so a closed login shell cannot take the
-    tree down with it.
+    The root stays in the caller's login session so the daemon can adopt it;
+    the smoke scenario keeps that session open until after the root is closed.
     """
     os.makedirs(workdir, exist_ok=True)
     app = os.path.join(workdir, "app_root.py")
@@ -76,8 +76,7 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
         f.write(APP_ROOT)
     log = open(os.path.join(workdir, "root.log"), "w")
     proc = subprocess.Popen([sys.executable, app, str(children), workdir],
-                            cwd=workdir, start_new_session=True,
-                            stdout=log, stderr=subprocess.STDOUT)
+                            cwd=workdir, stdout=log, stderr=subprocess.STDOUT)
     log.close()
     treefile = os.path.join(workdir, "tree.json")
     deadline = time.monotonic() + timeout

@@ -540,6 +540,26 @@ class HarnessCliParsingTest(VmTestCase):
 class HarnessSurfacesTest(unittest.TestCase):
     """Docs, make targets and the opt-in KVM workflow: text contracts."""
 
+    def test_release_notes_document_adopt_change_and_version(self):
+        notes = read_text(os.path.join(REPO, "CHANGELOG.md"))
+        self.assertIn("## Behaviour changes", notes)
+        self.assertIn("### adopt now contains and asks", notes)
+        self.assertIn("leftover/", notes)
+        self.assertIn("review", notes)
+
+        workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
+        self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
+        self.assertEqual(vmh.read_version(ROOT), "0.3.0")
+
+    def test_readme_mode_table_describes_adopt_lifecycle(self):
+        readme = read_text(os.path.join(REPO, "README.md"))
+        self.assertIn(
+            "| `adopt` | Adopts eligible apps, contains GUI survivors under `leftover/` "
+            "for review, and honors `taema run --bind` by stopping that scope when "
+            "its command exits; idle shared and unit scopes are reviewed, not stopped. |",
+            readme,
+        )
+
     def test_docs_document_one_command_scenarios_and_safety(self):
         docs = read_text(os.path.join(ROOT, "docs", "vm-harness.md"))
         self.assertIn("make -C taema vm-test", docs)

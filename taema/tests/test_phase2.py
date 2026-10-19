@@ -484,9 +484,11 @@ class KnowledgeV2(unittest.TestCase):
             self.s.observe_close("own%d" % i, "x")
         self.assertLessEqual(len(self.s.data["pairs"]), knowledge.MAX_PAIRS)
 
-    def test_launcher_pair_keeps_and_owners_of(self):
+    def test_launcher_close_counts_noise_and_owners_of(self):
         self.s.observe_close("zsh-job", "app", launcher=True)
-        self.assertEqual(self.s.pair_decision("zsh-job", "app")[0], "keep")
+        self.assertEqual(self.s.data["noise"], {"app": 1})            # launcher: no pair at all
+        self.assertNotIn(self.s.pkey("zsh-job", "app"), self.s.data["pairs"])
+        self.assertEqual(self.s.pair_decision("zsh-job", "app")[0], "ask")
         self.s.answer("code", "app", "stop")
         self.assertEqual(self.s.owners_of("app")[0], "code")
 
@@ -504,6 +506,66 @@ class KnowledgeV2(unittest.TestCase):
         s2 = self.fresh()
         self.assertEqual(s2.pair_decision("npm", "vite")[0], "stop")
         self.assertTrue(s2.standalone("tool"))
+
+    def legacy(self, owner, leftover, **extra):
+        """A pair record written by an older release (invalid owners included)."""
+        p = {"first_seen": self.c()}
+        p.update(extra)
+        self.s.data["pairs"][self.s.pkey(owner, leftover)] = p
+
+    def test_invalid_owner_close_counts_noise_without_a_pair(self):
+        for owner in ("MainThread", "sleep", "3.12", ""):
+            self.assertTrue(self.s.observe_close(owner, "vite"), owner)
+        self.assertFalse(self.s.observe_close("MainThread", ""))    # malformed leftover
+        self.assertEqual(self.s.data["noise"], {"vite": 4})
+        self.assertEqual(self.s.data["pairs"], {})
+        self.assertEqual(self.s.data["closes"], 0)
+
+    def test_launcher_close_counts_noise_without_a_pair(self):
+        self.assertTrue(self.s.observe_close("npm", "vite", launcher=True))
+        self.assertEqual(self.s.data["noise"], {"vite": 1})
+        self.assertNotIn(self.s.pkey("npm", "vite"), self.s.data["pairs"])
+        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "ask")
+
+    def test_configured_deny_extends_the_defaults_in_the_store(self):
+        s = knowledge.Store(self.d, {}, self.c, deny=["gpu-*"])
+        self.assertTrue(s.observe_close("gpu-render", "x"))      # denied -> noise, not a pair
+        self.assertTrue(s.observe_close("MainThread", "x"))      # built-in class -> noise
+        self.assertEqual(s.data["pairs"], {})
+        self.assertEqual(s.data["noise"], {"x": 2})
+        self.assertFalse(s.observe_kill_inferred("gpu-render", "y"))
+        self.assertEqual(s.data["pairs"], {})
+
+    def test_noise_survives_save_and_migration(self):
+        self.s.observe_close("sleep", "vite")
+        self.s.save()
+        self.assertEqual(knowledge.Store(self.d, {}, self.c).data["noise"], {"vite": 1})
+        d = tmp()
+        with open(d + "/knowledge.json", "w") as f:
+            json.dump({"last_decay": self.c(), "exes": {}, "pairs": {}, "version": 2}, f)
+        self.assertEqual(knowledge.Store(d, {}, self.c).data["noise"], {})
+
+    def test_legacy_invalid_owner_pair_never_asks_answers_or_stops(self):
+        for k in ("sh", "sort", "head"):
+            self.legacy("MainThread", k, ex_stop=3.0, ex_last="stop")
+            self.assertEqual(self.s.pair_decision("MainThread", k)[0], "invalid")
+            self.assertIn("invalid owner", self.s.pair_decision("MainThread", k)[2])
+            self.assertFalse(self.s.can_ask(("MainThread", k)))
+            self.assertFalse(self.s.pair_explicit("MainThread", k))
+            self.assertFalse(self.s.answer("MainThread", k, "keep"))
+        self.assertEqual([r["action"] for r in self.s.pairs_summary()], ["invalid"] * 3)
+        self.assertIn("invalid owner", self.s.pairs_summary()[0]["why"])
+
+    def test_invalid_owner_never_gets_new_pair_state(self):
+        self.s.mark_asked([("MainThread", "vite")])
+        self.s.auto_stopped("MainThread", "vite")
+        self.assertFalse(self.s.regret("MainThread", "vite"))
+        self.assertFalse(self.s.observe_kill_inferred("MainThread", "vite"))
+        self.assertEqual(self.s.data["pairs"], {})
+
+    def test_legacy_launcher_pair_still_keeps(self):
+        self.legacy("npm", "code", launches=3)
+        self.assertEqual(self.s.pair_decision("npm", "code")[0], "keep")
 
 
 # ---- 4. daemon: job_done -> question flow ------------------------------------------------------------------
@@ -645,9 +707,9 @@ class JobFlow(ProcCase):
         self.settle()
         self.assertEqual(self.d.pending, {})
         self.assertFalse(os.path.exists("%s/taema/q.20" % self.rt))
-        p = self.d.store.data["pairs"][knowledge.Store.pkey("npm", "code")]
-        self.assertEqual((p["closes"], p["launches"]), (1, 1))
-        self.assertEqual(self.d.store.pair_decision("npm", "code")[0], "keep")
+        # launcher closes are noise: counted, never a pair
+        self.assertEqual(self.d.store.data["pairs"], {})
+        self.assertEqual(self.d.store.data["noise"], {"code": 1})
         ev = [e["event"] for e in self.log()]
         self.assertIn("launcher_learned", ev)
 
@@ -775,6 +837,92 @@ class JobFlow(ProcCase):
         self.assertEqual(self.d.store.data["pairs"][knowledge.Store.pkey("app", "worker")]["closes"], 1)
         ev = self.log()
         self.assertEqual([(e["owner"], e["leftover"]) for e in ev if e["event"] == "would_attribute"], [("app", "worker")])
+
+
+class OwnerHygiene(JobFlow):
+    """Ticket #6 at the daemon level: rejected owner classes, the launcher path, unresolved
+    ancestry and the legacy MainThread answer all stay out of pairs and questions."""
+
+    REJECTED = ("MainThread", "Thread-1", "pool-3", "GC", "Finalizer",
+                "3.12", "2024.1",
+                "sh", "bash", "dash", "zsh", "fish",
+                "sleep", "cat", "head", "sort", "grep", "true",
+                "python3", "python3.12", "node", "java", "perl")
+
+    def junk_job(self, comm, word=None):
+        """A terminal job whose root is `comm`, plus one setsid'd survivor. A fresh daemon every
+        round keeps lineage/store state from bleeding between cases."""
+        for pid in (21, 30):
+            if os.path.isdir("%s/%d" % (self.fp.root, pid)):
+                self.fp.remove(pid)
+        self.d = daemon.Daemon(make_cfg(tmp(), seeds={"persist": ["gpg-agent"]},
+                                        protected={"comm": ["niri*"]}))
+        env = {"TAEMA_JOB": "20.1"}
+        up = self.fp.up
+        self.fp.add(21, 20, comm=comm, env=env, born=up - 6.0, pgrp=21)
+        self.fp.add(30, 1, comm="vite", env=env, born=up - 5.0, sid=30)
+        self.d.lineage.observe(self.fp.table())
+        self.fp.remove(21)
+        self.d.handle({"cmd": "job_done", "shell_pid": 20, "tag": "20.1", "status": 0,
+                       "word": word or comm})
+        self.d.decide_job("20.1")
+
+    def test_every_rejected_owner_class_is_noise_not_a_pair(self):
+        for comm in self.REJECTED:
+            with self.subTest(comm=comm):
+                self.junk_job(comm)
+                self.assertEqual(self.d.store.data["pairs"], {}, comm)
+                self.assertEqual(self.d.store.data["noise"], {"vite": 1}, comm)
+                self.assertEqual(self.d.pending, {}, comm)
+                self.assertIsNone(self.ask()["question"], comm)
+                ev = [e for e in self.log() if e["event"] == "launcher_learned"]
+                self.assertEqual([e.get("why") for e in ev], ["no application ancestor"], comm)
+
+    def test_unresolved_job_is_noise_even_when_the_typed_word_is_an_app(self):
+        self.junk_job("sleep", word="code")       # ancestry is junk: the word never becomes the owner
+        self.assertEqual(self.d.store.data["pairs"], {})
+        self.assertEqual(self.d.store.data["noise"], {"vite": 1})
+        self.assertEqual(self.d.pending, {})
+
+    def test_job_resolves_through_the_chain_to_a_real_application(self):
+        env = {"TAEMA_JOB": "20.1"}
+        up = self.fp.up
+        self.fp.add(21, 20, comm="MainThread", env=env, born=up - 6.0, pgrp=21)   # junk wrapper root
+        self.fp.add(22, 21, comm="code", env=env, born=up - 5.5, pgrp=21)         # the real app below it
+        self.fp.add(30, 22, comm="vite", env=env, born=up - 5.0, sid=30)          # setsid'd survivor
+        self.d.lineage.observe(self.fp.table())
+        self.fp.remove(21)
+        self.d.handle({"cmd": "job_done", "shell_pid": 20, "tag": "20.1", "status": 0, "word": "code"})
+        self.d.decide_job("20.1")
+        pairs = self.d.store.data["pairs"]
+        self.assertIn(knowledge.Store.pkey("code", "vite"), pairs)
+        self.assertFalse([k for k in pairs if k.startswith("MainThread\0")], pairs)
+        # the junk wrapper's own root close is noise; the job close resolves to "code"
+        self.assertEqual(self.d.store.data["noise"], {"code": 1})
+        self.assertEqual(self.d.pending[1]["owner"], "code")
+
+    def test_configured_deny_entry_turns_the_job_into_noise(self):
+        self.d = daemon.Daemon(make_cfg(tmp(), seeds={"persist": ["gpg-agent"]},
+                                        protected={"comm": ["niri*"]},
+                                        learner={"deny_owners": ["npm"]}))
+        self.job()                                  # normal job; its root key "npm" is denied by config
+        self.settle()
+        self.assertEqual(self.d.store.data["pairs"], {})
+        self.assertEqual(self.d.store.data["noise"], {"vite": 1})
+        self.assertEqual(self.d.pending, {})
+
+    def test_answered_mainthread_pair_is_never_offered_or_asked(self):
+        for k in ("sh", "sort", "head", "vite"):
+            self.d.store.data["pairs"][knowledge.Store.pkey("MainThread", k)] = {
+                "first_seen": time.time(), "ex_stop": 3.0, "ex_last": "stop"}
+        self.job()                                  # owner npm, leftover vite
+        self.settle()
+        q = self.d.pending[1]
+        self.assertEqual(q["owner"], "npm")
+        self.assertNotIn("MainThread", [c["key"] for c in q["candidates"]])
+        for k in ("sh", "sort", "head"):
+            self.assertEqual(self.d.store.pair_decision("MainThread", k)[0], "invalid")
+            self.assertFalse(self.d.store.can_ask(("MainThread", k)))
 
 
 class Misc(ProcCase):

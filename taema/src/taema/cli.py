@@ -11,7 +11,8 @@ from . import cgroup, engine, inspect, knowledge, lineage, policy
 
 def _load():
     cfg = policy.load_config()
-    store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"), read_only=True)
+    store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"), read_only=True,
+                            deny=policy.owner_deny(cfg))
     return cfg, store, policy.load_units(cfg)
 
 

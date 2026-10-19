@@ -64,3 +64,11 @@ share = ["catatonit", "conmon", "adb", "herdr", "GradleDaemon", "kotlin-daemon"]
 # Long-lived by design: never garbage-collected as idle, only stopped by an explicit answer.
 persist = ["tmux", "screen", "zellij", "abduco", "dtach", "mosh-server", "ssh-agent", "gpg-agent", "keyboxd", "dirmngr"]
 kill = ["qemu-system-x86_64", "qemu-system-x86_64-headless", "emulator", "node", "python3", "java"]
+
+# Learner hygiene: names that must never own a learned (owner, leftover) pair. Generic thread
+# names, digit-led names, shells, trivial commands and scriptless interpreters are always
+# rejected; entries here extend that built-in list (shell-style globs allowed), and a user
+# file may only add to the list set here. Launcher jobs and closes with no real application
+# ancestor are recorded as noise instead of pairs.
+# [learner]
+# deny_owners = ["gpu-render", "wrapper-*"]

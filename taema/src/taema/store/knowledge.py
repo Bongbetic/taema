@@ -5,6 +5,7 @@ gracefully, and how long an idle shared leaf should live. Not learned: protected
 uid rules, configured cgroup and environment exclusions (see policy.py). No model, no network.
 """
 
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -28,7 +29,9 @@ COUNTERS = (
     "user_kill",
 )
 SEED_SHARE_PRIOR = 3.0
-LOG_MAX = 1 << 20  # decisions.log rotates to decisions.log.1 at 1 MiB
+LOG_MAX = 1 << 20  # active and two rotated decisions.log files, each at most 1 MiB
+LOG_ROTATIONS = 2
+MAX_LOG_LINE = 64 << 10
 MAX_EXES = 512
 STALE_DAYS = 90
 SCHEMA = 2
@@ -126,7 +129,15 @@ def decide(p, now, created, closes_total):
 
 
 class Store:
-    def __init__(self, state_dir, seeds=None, now=time.time, read_only=False, deny=()):
+    def __init__(
+        self,
+        state_dir,
+        seeds=None,
+        now=time.time,
+        read_only=False,
+        deny=(),
+        mode="observe",
+    ):
         self.dir = state_dir
         self.path = os.path.join(state_dir, "state.db")
         self.legacy_path = os.path.join(state_dir, "knowledge.json")
@@ -136,6 +147,7 @@ class Store:
         self.seeds = seeds or {}
         self.read_only = read_only  # CLI: the daemon is the single writer
         self.deny = tuple(deny)  # configured owner-deny entries (extend the defaults)
+        self.mode = mode
         self.dirty = False
         self.defer_writes = False
         self.last_save = 0.0
@@ -143,6 +155,10 @@ class Store:
         self.db = db.StateDB(self.path, read_only=self.read_only, deny=self.deny)
         self.db.import_legacy(self.legacy_path, now=self.now(), deny=self.deny)
         self.recovery = self.db.load_recovery()
+        self._decision_seq, self._event_seq = self.db.audit_sequences()
+        self._pending_decisions = []
+        self._pending_events = []
+        self._audit_context = None
         self.data = self._fresh()
         self._load()
         self._decay()
@@ -257,7 +273,16 @@ class Store:
             return
         self.enforce_caps()
         self._prune_vetoes()
-        self.db.save_state(self.data, now=self.now())
+        self.db.save_state(
+            self.data,
+            now=self.now(),
+            decisions=self._pending_decisions,
+            events=self._pending_events,
+            decision_seq=self._decision_seq,
+            event_seq=self._event_seq,
+        )
+        self._pending_decisions.clear()
+        self._pending_events.clear()
         self.dirty = False
         self.last_save = self.now()
 
@@ -273,17 +298,191 @@ class Store:
         return True
 
     def log(self, **fields):
-        fields["ts"] = round(self.now(), 3)
+        timestamp = round(self.now(), 3)
+        event = fields.pop("event", "unknown")
+        context = self._audit_context or {}
+        mode = fields.pop("mode", None) or self.mode
+        decision_id = fields.pop("decision_id", context.get("id"))
+        corr = fields.pop("corr", context.get("corr"))
+        why = fields.pop("why", None)
+        if why is None:
+            why = (
+                fields.get("reason")
+                or fields.get("error")
+                or fields.get("target")
+                or ""
+            )
+        record = {
+            "ts": timestamp,
+            "event": event,
+            "mode": mode,
+            "decision_id": decision_id,
+            "corr": corr,
+            "why": str(why)[:1024],
+            **fields,
+        }
+        if not self.read_only:
+            self._event_seq += 1
+            self._pending_events.append(
+                {
+                    "seq": self._event_seq,
+                    "ts": timestamp,
+                    "event": event,
+                    "decision_id": decision_id,
+                    "data": record,
+                }
+            )
+            self.dirty = True
+        encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        if len(encoded) > MAX_LOG_LINE:
+            record = {
+                "ts": timestamp,
+                "event": event,
+                "mode": mode,
+                "decision_id": decision_id,
+                "corr": corr,
+                "why": (str(why)[:512] + " [event truncated]")[:1024],
+                "truncated": True,
+            }
+            encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
         self._mkdir()
         try:
-            if os.stat(self.log_path).st_size >= LOG_MAX:
-                os.replace(self.log_path, self.log_path + ".1")
+            current_size = os.stat(self.log_path).st_size
         except OSError:
-            pass
+            current_size = 0
+        if current_size and current_size + len(encoded) > LOG_MAX:
+            for index in range(LOG_ROTATIONS, 0, -1):
+                source = (
+                    self.log_path
+                    if index == 1
+                    else "%s.%d" % (self.log_path, index - 1)
+                )
+                destination = "%s.%d" % (self.log_path, index)
+                if index == LOG_ROTATIONS:
+                    try:
+                        os.unlink(destination)
+                    except FileNotFoundError:
+                        pass
+                try:
+                    os.replace(source, destination)
+                    os.chmod(destination, 0o600)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
         fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a") as f:
+        with os.fdopen(fd, "ab") as f:
             os.fchmod(f.fileno(), 0o600)
-            f.write(json.dumps(fields, sort_keys=True) + "\n")
+            f.write(encoded)
+
+    def record_decision(
+        self,
+        kind,
+        scope=None,
+        owner=None,
+        authority="none",
+        mode=None,
+        why="",
+        undo=None,
+        corr=None,
+    ):
+        """Record one durable lifecycle decision and return its trace identifiers."""
+        correlation = corr or uuid.uuid4().hex
+        if self.read_only:
+            identifier = uuid.uuid4().hex
+        else:
+            self._decision_seq += 1
+            identifier = self._decision_seq
+        decision = {
+            "id": identifier,
+            "ts": round(self.now(), 3),
+            "kind": str(kind),
+            "scope": str(scope)[:256] if scope is not None else None,
+            "owner": str(owner)[:256] if owner is not None else None,
+            "authority": str(authority or "none"),
+            "mode": mode or self.mode,
+            "why": str(why)[:1024],
+            "corr": correlation,
+            "undoable": undo is not None,
+            "undo": undo,
+        }
+        if not self.read_only:
+            self._pending_decisions.append(decision)
+            self.dirty = True
+        return decision
+
+    @contextmanager
+    def decision_context(
+        self,
+        kind,
+        scope=None,
+        owner=None,
+        authority="none",
+        mode=None,
+        why="",
+        undo=None,
+        corr=None,
+    ):
+        """Attach related audit events to one decision for the duration of an action."""
+        decision = self.record_decision(
+            kind,
+            scope=scope,
+            owner=owner,
+            authority=authority,
+            mode=mode,
+            why=why,
+            undo=undo,
+            corr=corr,
+        )
+        previous = self._audit_context
+        self._audit_context = decision
+        try:
+            yield decision
+        except Exception as error:
+            decision["outcome"] = "refused"
+            self.log(event="refusal", why=str(error), scope=decision["scope"])
+            raise
+        finally:
+            self._audit_context = previous
+
+    def decision(self, identifier):
+        """Return a retained decision, including any uncommitted record in this writer."""
+        if isinstance(identifier, int) and not isinstance(identifier, bool):
+            pending = next(
+                (item for item in self._pending_decisions if item["id"] == identifier),
+                None,
+            )
+            return dict(pending) if pending else self.db.decision(identifier)
+        return None
+
+    def latest_decision(self):
+        pending = self._pending_decisions[-1] if self._pending_decisions else None
+        committed = self.db.decisions(limit=1)
+        if pending and (not committed or pending["id"] > committed[0]["id"]):
+            return dict(pending)
+        return committed[0] if committed else None
+
+    def latest_undoable_decision(self):
+        action_ids = {
+            action.get("id")
+            for action in self.data.get("auto_actions", [])
+            if isinstance(action, dict)
+        }
+        pending = next(
+            (
+                item
+                for item in reversed(self._pending_decisions)
+                if item["undoable"]
+                and item["kind"] in ("stop", "auto_stop")
+                and isinstance(item.get("undo"), dict)
+                and item["undo"].get("action_id") in action_ids
+            ),
+            None,
+        )
+        committed = self.db.decisions(limit=1, undoable=True)
+        if pending and (not committed or pending["id"] > committed[0]["id"]):
+            return dict(pending)
+        return committed[0] if committed else None
 
     def changed(self, key, sig):
         """True when sig differs from the last one seen for key (and remembers it)."""
@@ -341,7 +540,7 @@ class Store:
             label += " (starttime %s)" % veto["start"]
         return label
 
-    def add_veto(self, kind, value, start=None, identifier=None, reason=""):
+    def add_veto(self, kind, value, start=None, identifier=None, reason="", corr=None):
         """Create a durable veto for one scope, app key, or pid/start-time instance."""
         target = {"kind": kind, "value": value, "start": start}
         if not self._valid_veto_target(target):
@@ -364,14 +563,40 @@ class Store:
             return dict(existing)
         self._prune_vetoes()
         if len(self.data["vetoes"]) >= MAX_VETOES:
+            with self.decision_context(
+                "refusal",
+                scope=target["value"] if kind == "scope" else None,
+                authority="user",
+                why="veto capacity prevents adding protection",
+            ):
+                self.log(event="veto_refused", target=self._target(target))
             return None
-        veto = {"id": identifier, **target, "created": self.now()}
-        if isinstance(reason, str) and reason:
-            veto["reason"] = reason[:256]
-        self.data["vetoes"].append(veto)
-        self.dirty = True
-        self.log(event="veto_added", target=self._target(veto))
-        return dict(veto)
+
+        def append_veto(decision):
+            veto = {
+                "id": identifier,
+                **target,
+                "created": self.now(),
+                "decision_id": decision["id"],
+            }
+            if isinstance(reason, str) and reason:
+                veto["reason"] = reason[:256]
+            self.data["vetoes"].append(veto)
+            self.dirty = True
+            self.log(event="veto_added", target=self._target(veto))
+            return dict(veto)
+
+        active = self._audit_context
+        if corr and active and active.get("corr") == corr:
+            return append_veto(active)
+        with self.decision_context(
+            "veto",
+            scope=target["value"] if kind == "scope" else None,
+            authority="user",
+            why=reason or "user added a veto",
+            corr=corr,
+        ) as decision:
+            return append_veto(decision)
 
     def remove_veto(self, target):
         """Remove only a matching veto. PID removal may omit start to clear that pid's instances."""
@@ -403,10 +628,17 @@ class Store:
         if removed:
             self.data["vetoes"] = keep
             self.dirty = True
-            self.log(
-                event="veto_removed",
-                target={"kind": target["kind"], "value": value, "start": start},
-            )
+            with self.decision_context(
+                "veto_removed",
+                scope=value if target["kind"] == "scope" else None,
+                owner=value if target["kind"] == "app" else None,
+                authority="user",
+                why="user removed a veto",
+            ):
+                self.log(
+                    event="veto_removed",
+                    target={"kind": target["kind"], "value": value, "start": start},
+                )
         return [dict(v) for v in removed]
 
     def _active_vetoes(self, include_pending=True):
@@ -529,7 +761,9 @@ class Store:
                     return dict(veto)
         return None
 
-    def record_auto_action(self, scope, why, pairs=(), apps=()):
+    def record_auto_action(
+        self, scope, why, pairs=(), apps=(), decision=None, owner=None, authority="mode"
+    ):
         """Keep enough durable context to target the latest automatic stop after restart."""
         normalized_pairs = []
         for pair in pairs:
@@ -553,24 +787,133 @@ class Store:
             "apps": normalized_apps[:64],
             "ts": self.now(),
         }
+        undo = {
+            "action_id": action["id"],
+            "scope": action["scope"],
+            "pairs": action["pairs"],
+            "apps": action["apps"],
+            "ts": action["ts"],
+        }
+        if decision is None:
+            decision = self.record_decision(
+                "auto_stop",
+                scope=action["scope"],
+                owner=owner or (normalized_pairs[0][0] if normalized_pairs else None),
+                authority=authority,
+                why=action["why"],
+                undo=undo,
+            )
+        else:
+            decision["undo"] = undo
+            decision["undoable"] = True
+            if not self.read_only and not any(
+                item["id"] == decision["id"] for item in self._pending_decisions
+            ):
+                self._pending_decisions.append(decision)
+        action["decision_id"] = decision["id"]
+        action["corr"] = decision["corr"]
         actions = self.data.setdefault("auto_actions", [])
         actions.append(action)
         del actions[:-MAX_AUTO_ACTIONS]
         self.dirty = True
+        self.log(
+            event="auto_stop",
+            scope=action["scope"],
+            why=action["why"],
+            pairs=action["pairs"][:8],
+            decision_id=action["decision_id"],
+            corr=action["corr"],
+        )
         return dict(action)
 
     def auto_action(self, identifier=None):
         actions = [a for a in self.data.get("auto_actions", []) if isinstance(a, dict)]
         if identifier is None:
-            return dict(actions[-1]) if actions else None
+            decision = self.latest_undoable_decision()
+            if decision:
+                return self._action_for_decision(decision, actions)
+            action = actions[-1] if actions else None
+            if action and not action.get("decision_id") and not self.read_only:
+                return self._record_legacy_action(action)
+            return dict(action) if action else None
+        decision_id = identifier
+        if isinstance(identifier, str) and identifier.isdecimal():
+            decision_id = int(identifier)
+        decision = self.decision(decision_id)
+        if decision and decision.get("undoable"):
+            return self._action_for_decision(decision, actions)
         action = next((a for a in actions if a.get("id") == identifier), None)
         return dict(action) if action else None
+
+    @staticmethod
+    def _action_for_decision(decision, actions):
+        payload = decision.get("undo")
+        if not isinstance(payload, dict):
+            return None
+        action_id = payload.get("action_id")
+        action = next((a for a in actions if a.get("id") == action_id), None)
+        if action:
+            return {
+                **action,
+                "decision_id": decision["id"],
+                "corr": decision.get("corr"),
+            }
+        return {
+            "id": action_id,
+            "decision_id": decision["id"],
+            "corr": decision.get("corr"),
+            "scope": payload.get("scope"),
+            "pairs": payload.get("pairs", []),
+            "apps": payload.get("apps", []),
+            "ts": payload.get("ts"),
+            "why": decision.get("why", ""),
+        }
+
+    def _record_legacy_action(self, action):
+        pairs = action.get("pairs")
+        owner = (
+            pairs[0][0]
+            if isinstance(pairs, list)
+            and pairs
+            and isinstance(pairs[0], (tuple, list))
+            and len(pairs[0]) == 2
+            else None
+        )
+        undo = {key: action.get(key) for key in ("id", "scope", "pairs", "apps", "ts")}
+        decision = self.record_decision(
+            "auto_stop",
+            scope=action.get("scope"),
+            owner=owner,
+            authority="mode",
+            mode="unknown",
+            why=action.get("why", "legacy automatic stop"),
+            undo={"action_id": action.get("id"), **undo},
+        )
+        action["decision_id"] = decision["id"]
+        action["corr"] = decision["corr"]
+        self.dirty = True
+        self.log(
+            event="auto_stop",
+            scope=action.get("scope"),
+            why=action.get("why", "legacy automatic stop"),
+            decision_id=decision["id"],
+            corr=decision["corr"],
+        )
+        return dict(action)
 
     def undo_auto_action(self, identifier=None, feedback_id=None):
         """Veto the apps from one automatic stop and add explicit keep evidence to its pairs."""
         action = self.auto_action(identifier)
         if not action:
+            with self.decision_context(
+                "refusal",
+                authority="user",
+                why="no retained automatic stop is available to undo",
+            ):
+                self.log(event="undo_refused")
             return None
+        if not action.get("decision_id") and not self.read_only:
+            action = self._record_legacy_action(action)
         apps = action.get("apps") or [
             pair[1]
             for pair in action.get("pairs", [])
@@ -581,29 +924,48 @@ class Store:
             targets = [("scope", action["scope"])]
         self._prune_vetoes()
         if len(self.data["vetoes"]) + len(targets) > MAX_VETOES:
+            with self.decision_context(
+                "refusal",
+                scope=action.get("scope"),
+                authority="user",
+                why="veto capacity prevents undo",
+            ):
+                self.log(event="undo_refused", action_id=action.get("id"))
             return None
-        vetoes = []
-        for index, (kind, value) in enumerate(targets):
-            veto = self.add_veto(
-                kind,
-                value,
-                identifier=("%s:%d" % (feedback_id, index)) if feedback_id else None,
-                reason="undo automatic stop",
-            )
-            if veto:
-                vetoes.append(veto)
-        for pair in action.get("pairs", []):
-            if isinstance(pair, list) and len(pair) == 2:
-                self.answer(pair[0], pair[1], "keep")
-        self.log(
-            event="undo",
-            action_id=action.get("id"),
+        target_id = action.get("decision_id")
+        with self.decision_context(
+            "undo",
             scope=action.get("scope"),
-            vetoes=[self._target(v) for v in vetoes],
-            pairs=action.get("pairs", [])[:8],
-        )
-        self.dirty = True
-        return {"action": action, "vetoes": vetoes}
+            authority="user",
+            why="undo automatic stop",
+            corr=action.get("corr"),
+        ):
+            vetoes = []
+            for index, (kind, value) in enumerate(targets):
+                veto = self.add_veto(
+                    kind,
+                    value,
+                    identifier=("%s:%d" % (feedback_id, index))
+                    if feedback_id
+                    else None,
+                    reason="undo automatic stop",
+                    corr=self._audit_context["corr"],
+                )
+                if veto:
+                    vetoes.append(veto)
+            for pair in action.get("pairs", []):
+                if isinstance(pair, list) and len(pair) == 2:
+                    self.answer(pair[0], pair[1], "keep")
+            self.log(
+                event="undo",
+                action_id=action.get("id"),
+                target_decision_id=target_id,
+                scope=action.get("scope"),
+                vetoes=[self._target(v) for v in vetoes],
+                pairs=action.get("pairs", [])[:8],
+            )
+            self.dirty = True
+            return {"action": action, "vetoes": vetoes}
 
     # ---- feedback ----
     def apply_op(self, op, key):
@@ -615,13 +977,16 @@ class Store:
             or len(key) > 256
         ):
             return False
-        if op == "keep":
-            self.bump(key, "user_keep", 3.0)
-        elif op == "kill":
-            self.bump(key, "user_kill", 1.0)
-        else:
-            self.forget(key)
-        self.log(event=op, exe=key)
+        with self.decision_context(
+            "answer", owner=key, authority="user", why="user answered %s" % op
+        ):
+            if op == "keep":
+                self.bump(key, "user_keep", 3.0)
+            elif op == "kill":
+                self.bump(key, "user_kill", 1.0)
+            else:
+                self.forget(key)
+            self.log(event=op, exe=key)
         return True
 
     def apply_feedback_command(self, msg):
@@ -670,7 +1035,13 @@ class Store:
             target, trigger = msg.get("target"), msg.get("trigger")
             if not isinstance(target, dict) or not isinstance(trigger, str):
                 return None
-            self.log(event="vetoed", target=target, trigger=trigger)
+            with self.decision_context(
+                "refusal",
+                scope=target.get("value") if target.get("kind") == "scope" else None,
+                authority="veto",
+                why="veto blocked %s" % trigger,
+            ):
+                self.log(event="vetoed", target=target, trigger=trigger)
             result = {"target": target}
         else:
             return None

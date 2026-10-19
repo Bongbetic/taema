@@ -55,7 +55,10 @@ class Daemon:
         self._in_tick = False
         self.deny = policy.owner_deny(cfg)
         self.store = knowledge.Store(
-            policy.state_dir(cfg), cfg.get("seeds"), deny=self.deny
+            policy.state_dir(cfg),
+            cfg.get("seeds"),
+            deny=self.deny,
+            mode=cfg.get("mode", "observe"),
         )
         self.store.apply_feedback()
         self.store.expire_reviews()
@@ -135,7 +138,14 @@ class Daemon:
         key = event + ":" + scope
         signature = (self.mode, members, reason)
         if self.store.changed(key, signature):
-            self.store.log(event=event, scope=scope, why=why, mode=self.mode)
+            with self.store.decision_context(
+                "would_stop",
+                scope=scope,
+                authority="mode",
+                mode=self.mode,
+                why=why,
+            ):
+                self.store.log(event=event, scope=scope, why=why, mode=self.mode)
 
     def authorize(self, trigger, facts=None):
         """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
@@ -158,12 +168,35 @@ class Daemon:
                 )
         dec = authorization.authorize(trigger, self.mode, f)
         if dec.slot == authorization.VETO:
-            self.store.log(
-                event="vetoed",
-                trigger=trigger,
+            with self.store.decision_context(
+                "refusal",
                 scope=f.scope or None,
-                target=dec.reason,
-            )
+                authority="veto",
+                mode=self.mode,
+                why=dec.reason,
+            ):
+                self.store.log(
+                    event="vetoed",
+                    trigger=trigger,
+                    scope=f.scope or None,
+                    target=dec.reason,
+                )
+        elif dec.verdict == authorization.KEEP and self.store.changed(
+            "authorization_refused:%s:%s" % (trigger, f.scope),
+            (self.mode, dec.slot, dec.reason),
+        ):
+            with self.store.decision_context(
+                "refusal",
+                scope=f.scope or None,
+                authority=dec.authority or dec.slot,
+                mode=self.mode,
+                why=dec.reason,
+            ):
+                self.store.log(
+                    event="authorization_refused",
+                    trigger=trigger,
+                    scope=f.scope or None,
+                )
         return dec
 
     # ---- owner watch ----
@@ -192,9 +225,9 @@ class Daemon:
         leaf, pid, _st = self.owners.pop(fd)
         self.sel.unregister(fd)
         os.close(fd)
-        self.stop_leaf(leaf, "owner %d exited" % pid)
+        self.stop_leaf(leaf, "owner %d exited" % pid, owner=pid)
 
-    def stop_leaf(self, leaf, why):
+    def stop_leaf(self, leaf, why, owner=None):
         path = "%s/%s" % (cgroup.base(), leaf)
         dec = self.authorize(authorization.OWNER_EXIT, authorization.Facts(scope=leaf))
         if dec.verdict == authorization.WOULD_ACT:
@@ -206,16 +239,33 @@ class Daemon:
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
         try:
-            rep = engine.stop(
-                path, self.cfg, self.store, unit, hook=policy.hook_for(self.cfg, leaf)
-            )
-            self.note_stop(rep)
-            stopped = [
-                d["key"] for d in rep.get("decisions", []) if d.get("action") == "kill"
-            ]
-            if stopped:
-                self.note_auto_stop(leaf, why, [], apps=stopped)
-            self.store.log(event="stopped", scope=leaf, why=why)
+            with self.store.decision_context(
+                "stop",
+                scope=leaf,
+                owner=owner,
+                authority=authorization.AUTHORITY_UNIT,
+                mode=self.mode,
+                why=why,
+            ) as decision:
+                rep = engine.stop(
+                    path,
+                    self.cfg,
+                    self.store,
+                    unit,
+                    hook=policy.hook_for(self.cfg, leaf),
+                    decision_authority=authorization.AUTHORITY_UNIT,
+                    decision_why=why,
+                    decision_owner=owner,
+                )
+                self.note_stop(rep)
+                stopped = [
+                    d["key"]
+                    for d in rep.get("decisions", [])
+                    if d.get("action") == "kill"
+                ]
+                if stopped:
+                    self.note_auto_stop(leaf, why, [], apps=stopped, decision=decision)
+                self.store.log(event="stopped", scope=leaf, why=why)
         except engine.Refused as e:
             self.store.log(event="stop_refused", scope=leaf, why=str(e))
         except Exception as e:  # never let one scope take the daemon down
@@ -263,7 +313,15 @@ class Daemon:
             ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(
                 self.cfg, self.units, pt
             )
-            done = engine.run_ops(self.cfg, self.store, ops, execute, cleanup=False)
+            done = engine.run_ops(
+                self.cfg,
+                self.store,
+                ops,
+                execute,
+                cleanup=False,
+                decision_kind="adopt_move",
+                authority=unit_decision.authority or "mode",
+            )
             for op in done:
                 owner_bound = (
                     op["op"] == "carve"
@@ -292,7 +350,10 @@ class Daemon:
             self.guarded(
                 lambda: auto_done.extend(
                     self.auto_adopt(
-                        pt, execute=decision.verdict == authorization.ACT, cleanup=False
+                        pt,
+                        execute=decision.verdict == authorization.ACT,
+                        cleanup=False,
+                        authority=decision.authority or "mode",
                     )
                 )
             )
@@ -302,13 +363,19 @@ class Daemon:
             "adopt_would:", {"adopt_would:" + s for s in would_scopes}
         )
 
-    def auto_adopt(self, pt, execute=True, cleanup=True):
+    def auto_adopt(self, pt, execute=True, cleanup=True, authority="mode"):
         """Give every app root its own scope (engine.auto_adopt_plan), at most 64 new ones per pass."""
         ops = engine.auto_adopt_plan(self.cfg, self.units, pt, self.lineage, self.store)
         if ops:
             try:
                 for op in engine.run_ops(
-                    self.cfg, self.store, ops, execute, cleanup=cleanup
+                    self.cfg,
+                    self.store,
+                    ops,
+                    execute,
+                    cleanup=cleanup,
+                    decision_kind="adopt_move",
+                    authority=authority,
                 ):
                     if execute and op["done"]:
                         self.auto_scopes.add(op["scope"])
@@ -373,7 +440,11 @@ class Daemon:
                 if left and not lin.ghosts.get(rid, {}).get("terminal"):
                     dec = self.authorize(authorization.GUI_CLOSE)
                     if dec.verdict == authorization.ACT:
-                        self.guarded(lambda: self.gui_close(rid, owner, left))
+                        self.guarded(
+                            lambda: self.gui_close(
+                                rid, owner, left, authority=dec.authority or "mode"
+                            )
+                        )
                     elif dec.verdict == authorization.WOULD_ACT:
                         self.guarded(
                             lambda: self.would_contain_gui_close(rid, owner, left)
@@ -395,13 +466,21 @@ class Daemon:
                 self.store.log(event="regret", owner=hit[0], leftover=e["key"])
                 del self.auto_recent[e["key"]]
 
-    def note_auto_stop(self, scope, why, pairs, apps=()):
+    def note_auto_stop(self, scope, why, pairs, apps=(), decision=None, owner=None):
         """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
         for o, k in pairs:
             self.store.auto_stopped(o, k)
             self.auto_recent[k] = (o, now)
-        self.store.record_auto_action(scope, why, pairs, apps)
+        self.store.record_auto_action(
+            scope,
+            why,
+            pairs,
+            apps,
+            decision=decision,
+            owner=owner,
+            authority=(decision or {}).get("authority", "mode"),
+        )
         self._save_if_idle()
         while len(self.auto_recent) > 256:
             del self.auto_recent[
@@ -418,11 +497,8 @@ class Daemon:
                 ][:6],
             }
         )
-        self.store.log(
-            event="auto_stop", scope=scope, why=why, pairs=[list(p) for p in pairs][:8]
-        )
 
-    def adopt_standalone(self, items):
+    def adopt_standalone(self, items, owner=None):
         """Leftovers the user declared standalone get their own app scope and are never stopped."""
         by_key = {}
         for l in items:
@@ -431,6 +507,7 @@ class Daemon:
             {
                 "op": "move",
                 "scope": engine.auto_scope_name(k, ls[0]["pid"], ls[0]["start"]),
+                "owner": owner,
                 "unit": None,
                 "auto": True,
                 "pids": [l["pid"] for l in ls],
@@ -438,19 +515,26 @@ class Daemon:
             for k, ls in by_key.items()
         ]
         try:
-            for op in engine.run_ops(self.cfg, self.store, ops, True):
+            for op in engine.run_ops(
+                self.cfg,
+                self.store,
+                ops,
+                True,
+                decision_kind="containment",
+                authority="user",
+            ):
                 if op["done"]:
                     self.auto_scopes.add(op["scope"])
         except engine.Refused as e:
             self.store.log(event="standalone_adopt_refused", error=str(e))
 
-    def gui_close(self, rid, owner, left):
+    def gui_close(self, rid, owner, left, authority="mode"):
         """A GUI root vanished (not a terminal job): standalone leftovers get their own scope, the rest
         go to leftover/<owner>-<id> with a pending review that holds the scope until answered or expiry."""
         standalone = [l for l in left if self.store.standalone(l["key"])]
         rest = [l for l in left if not self.store.standalone(l["key"])]
         if standalone:
-            self.adopt_standalone(standalone)
+            self.adopt_standalone(standalone, owner)
         if rest:
             name = "%s/%s" % (engine.LEFTOVER, engine.leaf_slug(owner, rid[0]))
             try:
@@ -461,12 +545,15 @@ class Daemon:
                         {
                             "op": "move",
                             "scope": name,
+                            "owner": owner,
                             "unit": None,
                             "auto": True,
                             "pids": [l["pid"] for l in rest],
                         }
                     ],
                     True,
+                    decision_kind="containment",
+                    authority=authority,
                 )
                 op = next((x for x in ops if x.get("done")), None)
                 if op:
@@ -476,6 +563,8 @@ class Daemon:
                     if review:
                         self.store.log(
                             event="review_created",
+                            decision_id=op.get("decision_id"),
+                            corr=op.get("corr"),
                             id=review["id"],
                             owner=owner,
                             scope=name,
@@ -493,13 +582,20 @@ class Daemon:
         signature = (owner, tuple(keys), tuple(pids))
         key = "would_contain:%d.%d" % rid
         if self.store.changed(key, signature):
-            self.store.log(
-                event="would_contain",
+            with self.store.decision_context(
+                "containment_would",
                 owner=owner,
-                root=rid[0],
-                survivors=keys,
-                pids=pids,
-            )
+                authority="mode",
+                mode=self.mode,
+                why="observe mode would contain GUI survivors",
+            ):
+                self.store.log(
+                    event="would_contain",
+                    owner=owner,
+                    root=rid[0],
+                    survivors=keys,
+                    pids=pids,
+                )
 
     def _infos(self, pids, origin=None):
         """member_info for each pid from one ss snapshot ('edges unknown' when ss failed)."""
@@ -548,13 +644,21 @@ class Daemon:
                 else:
                     w = "idle checks passed"
             if not ok:
-                self.store.log(
-                    event="auto_stop_refused",
+                with self.store.decision_context(
+                    "refusal",
                     scope=leaf,
-                    pid=i["pid"],
-                    key=i["key"],
+                    owner=i.get("origin"),
+                    authority="pair" if require_pair else "mode",
+                    mode=self.mode,
                     why=w,
-                )
+                ):
+                    self.store.log(
+                        event="auto_stop_refused",
+                        scope=leaf,
+                        pid=i["pid"],
+                        key=i["key"],
+                        why=w,
+                    )
                 return False
         pairs = [(i["origin"], i["key"]) for i in infos if i["origin"]]
         explicit = require_pair and all(
@@ -562,27 +666,40 @@ class Daemon:
         )
         grace = engine.auto_grace(self.store, {i["key"] for i in infos})
         unit = engine.unit_for_leaf(self.units, os.path.basename(path))
-        try:
-            rep = engine.stop(
-                path,
-                self.cfg,
-                self.store,
-                unit,
-                hook=policy.hook_for(self.cfg, os.path.basename(path)),
-                timeout=grace,
-                allow_sigkill=explicit,
+        with self.store.decision_context(
+            "stop",
+            scope=leaf,
+            owner=pairs[0][0] if pairs else None,
+            authority="pair" if require_pair else "mode",
+            mode=self.mode,
+            why=why,
+        ) as decision:
+            try:
+                rep = engine.stop(
+                    path,
+                    self.cfg,
+                    self.store,
+                    unit,
+                    hook=policy.hook_for(self.cfg, os.path.basename(path)),
+                    timeout=grace,
+                    allow_sigkill=explicit,
+                    decision_authority=decision["authority"],
+                    decision_why=why,
+                    decision_owner=decision["owner"],
+                )
+            except engine.Refused as e:
+                self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
+                return False
+            self.note_stop(rep)
+            self.note_auto_stop(
+                leaf,
+                why,
+                list(dict.fromkeys(pairs)),
+                apps=[d["key"] for d in rep["decisions"] if d.get("action") == "kill"],
+                decision=decision,
+                owner=decision["owner"],
             )
-        except engine.Refused as e:
-            self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
-            return False
-        self.note_stop(rep)
-        self.note_auto_stop(
-            leaf,
-            why,
-            list(dict.fromkeys(pairs)),
-            apps=[d["key"] for d in rep["decisions"] if d.get("action") == "kill"],
-        )
-        return rep["removed"]
+            return rep["removed"]
 
     def auto_stop_survivors(self, tag, owner, left, dec):
         """Survivors of a closed terminal job whose pair is decided stop: those that pass auto_stop_ok
@@ -597,13 +714,20 @@ class Daemon:
                 members=[{"pid": l["pid"], "start": l.get("start"), "apps": [l["key"]]}]
             )
             if veto:
-                self.store.log(
-                    event="vetoed",
-                    trigger=authorization.JOB_SURVIVORS,
-                    job=tag,
-                    pid=l["pid"],
-                    target=self.store._target(veto),
-                )
+                with self.store.decision_context(
+                    "refusal",
+                    owner=owner,
+                    authority="veto",
+                    mode=self.mode,
+                    why="veto blocked survivor stop",
+                ):
+                    self.store.log(
+                        event="vetoed",
+                        trigger=authorization.JOB_SURVIVORS,
+                        job=tag,
+                        pid=l["pid"],
+                        target=self.store._target(veto),
+                    )
             else:
                 allowed.append(l)
         want = allowed
@@ -618,13 +742,20 @@ class Daemon:
             if ok:
                 good.append(l)
             else:
-                self.store.log(
-                    event="auto_stop_refused",
-                    job=tag,
-                    pid=l["pid"],
-                    key=l["key"],
+                with self.store.decision_context(
+                    "refusal",
+                    owner=owner,
+                    authority="pair",
+                    mode=self.mode,
                     why=w,
-                )
+                ):
+                    self.store.log(
+                        event="auto_stop_refused",
+                        job=tag,
+                        pid=l["pid"],
+                        key=l["key"],
+                        why=w,
+                    )
         if not good:
             return
         pairs = list(dict.fromkeys((owner, l["key"]) for l in good))
@@ -644,33 +775,66 @@ class Daemon:
                 carved.setdefault(host, []).append(l["pid"])
             else:
                 loose.append(l)
-        for host, pids in carved.items():
-            dest = cgroup.mkleaf("%s/job-%s" % (host, slug))
-            for p in pids:
-                cgroup.move(p, dest)
-            try:
-                self.note_stop(
-                    engine.stop(
-                        dest,
-                        self.cfg,
-                        self.store,
-                        None,
-                        timeout=grace,
-                        allow_sigkill=explicit,
+        why = "closed job %s: %s" % (tag, self.store.pair_decision(*pairs[0])[2])
+        with self.store.decision_context(
+            "stop",
+            scope="job-" + slug,
+            owner=owner,
+            authority="pair",
+            mode=self.mode,
+            why=why,
+        ) as decision:
+            for host, pids in carved.items():
+                scope = "%s/job-%s" % (host, slug)
+                with self.store.decision_context(
+                    "containment",
+                    scope=scope,
+                    owner=owner,
+                    authority="pair",
+                    mode=self.mode,
+                    why="carve closed-job survivors into a private leaf",
+                ):
+                    dest = cgroup.mkleaf(scope)
+                    for p in pids:
+                        cgroup.move(p, dest)
+                    self.store.log(
+                        event="containment",
+                        scope=scope,
+                        pids=pids,
+                        owner=owner,
                     )
-                )
-            except engine.Refused as e:
+                try:
+                    self.note_stop(
+                        engine.stop(
+                            dest,
+                            self.cfg,
+                            self.store,
+                            None,
+                            timeout=grace,
+                            allow_sigkill=explicit,
+                            decision_kind="stop",
+                            decision_authority="pair",
+                            decision_why=why,
+                            decision_owner=owner,
+                        )
+                    )
+                except engine.Refused as e:
+                    self.store.log(
+                        event="auto_stop_refused", scope=cgroup.rel(dest), why=str(e)
+                    )
+            if loose:
+                engine.signal_survivors(self.cfg, loose, grace, explicit)
                 self.store.log(
-                    event="auto_stop_refused", scope=cgroup.rel(dest), why=str(e)
+                    event="stop", scope="job-" + slug, pids=[l["pid"] for l in loose]
                 )
-        if loose:
-            engine.signal_survivors(self.cfg, loose, grace, explicit)
-        self.note_auto_stop(
-            "job-" + slug,
-            "closed job %s: %s" % (tag, self.store.pair_decision(*pairs[0])[2]),
-            pairs,
-            apps=[l["key"] for l in good],
-        )
+            self.note_auto_stop(
+                "job-" + slug,
+                why,
+                pairs,
+                apps=[l["key"] for l in good],
+                decision=decision,
+                owner=owner,
+            )
 
     def attribute(self, owner, leftovers, root=None, job=None):
         """Log would_attribute / would_stop for each distinct leftover key. Returns {key: decision}."""
@@ -1072,19 +1236,46 @@ class Daemon:
         if q is None or time.time() - q["created"] >= PENDING_TTL:
             if q is not None:
                 self.drop_question(q["id"])
+            with self.store.decision_context(
+                "refusal",
+                owner=owner,
+                authority="user",
+                mode=self.mode,
+                why="answer did not match a live question",
+            ):
+                self.store.log(
+                    event="answer_refused", reason="unknown or expired nonce"
+                )
             return {"error": "unknown or expired nonce"}
         keys = [c["key"] for c in q["candidates"]]
         if owner is None:
             owner = q["owner"]
         elif owner not in keys:
+            with self.store.decision_context(
+                "refusal",
+                owner=owner,
+                authority="user",
+                mode=self.mode,
+                why="answer owner is not a candidate",
+            ):
+                self.store.log(
+                    event="answer_refused", reason="owner is not a candidate"
+                )
             return {"error": "owner is not a candidate"}
-        for k in q["ask_keys"]:
-            self.store.answer(owner, k, choice)
-        self.drop_question(q["id"])
-        self.store.log(
-            event="answer", choice=choice, owner=owner, leftovers=q["ask_keys"][:8]
-        )
-        self.store.save()
+        with self.store.decision_context(
+            "answer",
+            owner=owner,
+            authority="user",
+            mode=self.mode,
+            why="user answered %s" % choice,
+        ):
+            for k in q["ask_keys"]:
+                self.store.answer(owner, k, choice)
+            self.drop_question(q["id"])
+            self.store.log(
+                event="answer", choice=choice, owner=owner, leftovers=q["ask_keys"][:8]
+            )
+            self.store.save()
         return {
             "ok": True,
             "choice": choice,
@@ -1303,34 +1494,45 @@ class Daemon:
                 )
                 self.guarded(lambda: self.auto_stop_path(path, why, require_pair))
                 continue
-            try:
-                rep = engine.stop(
-                    path,
-                    self.cfg,
-                    self.store,
-                    engine.unit_for_leaf(self.units, os.path.basename(path)),
-                    hook=policy.hook_for(self.cfg, os.path.basename(path)),
-                )
-            except engine.Refused as e:
-                self.store.log(event="gc_refused", scope=leaf, why=str(e))
-                continue
-            self.note_stop(rep)
-            stopped = [
-                d["key"] for d in rep.get("decisions", []) if d.get("action") == "kill"
-            ]
-            if stopped:
-                self.note_auto_stop(leaf, why, [], apps=stopped)
-            if rep["removed"]:
-                self.store.log(event="gc_stopped", scope=leaf, why=why)
-            elif any(d["action"] == "skip" for d in rep["decisions"]):
-                self.gc_skip.add(leaf)
-                self.store.log(
-                    event="gc_kept", scope=leaf, why="kept: protected member"
-                )
-            else:
-                self.store.log(
-                    event="gc_incomplete", scope=leaf, why=rep.get("error", "busy")
-                )
+            with self.store.decision_context(
+                "stop",
+                scope=leaf,
+                authority=dec.authority or "mode",
+                mode=self.mode,
+                why=why,
+            ) as decision:
+                try:
+                    rep = engine.stop(
+                        path,
+                        self.cfg,
+                        self.store,
+                        engine.unit_for_leaf(self.units, os.path.basename(path)),
+                        hook=policy.hook_for(self.cfg, os.path.basename(path)),
+                        decision_authority=dec.authority,
+                        decision_why=why,
+                    )
+                except engine.Refused as e:
+                    self.store.log(event="gc_refused", scope=leaf, why=str(e))
+                    continue
+                self.note_stop(rep)
+                stopped = [
+                    d["key"]
+                    for d in rep.get("decisions", [])
+                    if d.get("action") == "kill"
+                ]
+                if stopped:
+                    self.note_auto_stop(leaf, why, [], apps=stopped, decision=decision)
+                if rep["removed"]:
+                    self.store.log(event="gc_stopped", scope=leaf, why=why)
+                elif any(d["action"] == "skip" for d in rep["decisions"]):
+                    self.gc_skip.add(leaf)
+                    self.store.log(
+                        event="gc_kept", scope=leaf, why="kept: protected member"
+                    )
+                else:
+                    self.store.log(
+                        event="gc_incomplete", scope=leaf, why=rep.get("error", "busy")
+                    )
         if not dry_run:
             self.empty_seen = now_empty
             self.store.forget_sigs(
@@ -1388,26 +1590,36 @@ class Daemon:
                 if not self.auto_stop_path(d, "session ended", True):
                     self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
-            try:
-                rep = engine.stop(
-                    d,
-                    self.cfg,
-                    self.store,
-                    unit,
-                    hook=policy.hook_for(self.cfg, os.path.basename(d)),
-                )
-                self.note_stop(rep)
-                stopped = [
-                    x["key"]
-                    for x in rep.get("decisions", [])
-                    if x.get("action") == "kill"
-                ]
-                if stopped:
-                    self.note_auto_stop(
-                        cgroup.rel(d), "session ended", [], apps=stopped
+            scope = cgroup.rel(d)
+            with self.store.decision_context(
+                "stop",
+                scope=scope,
+                authority=dec.authority or "mode",
+                mode=self.mode,
+                why="session ended",
+            ) as decision:
+                try:
+                    rep = engine.stop(
+                        d,
+                        self.cfg,
+                        self.store,
+                        unit,
+                        hook=policy.hook_for(self.cfg, os.path.basename(d)),
+                        decision_authority=dec.authority,
+                        decision_why="session ended",
                     )
-            except engine.Refused:
-                pass
+                    self.note_stop(rep)
+                    stopped = [
+                        x["key"]
+                        for x in rep.get("decisions", [])
+                        if x.get("action") == "kill"
+                    ]
+                    if stopped:
+                        self.note_auto_stop(
+                            scope, "session ended", [], apps=stopped, decision=decision
+                        )
+                except engine.Refused as error:
+                    self.store.log(event="stop_refused", scope=scope, why=str(error))
         self.session_seen = False  # wait for the next login before acting again
 
     def guarded(self, fn):
@@ -1454,6 +1666,7 @@ class Daemon:
                 "pending_questions": len(self.pending),
                 "reviews": self.store.review_count,
                 "recovery": self.store.recovery,
+                "latest_decision": self.store.latest_decision(),
                 "auto": self.auto_status(),
             }
         if c == "review":
@@ -1542,13 +1755,22 @@ class Daemon:
         if any(inspect.uid_of(p) != me for p in pids):
             return {"error": "pid gone or not yours"}
         done = []
-        for p in dict.fromkeys(pids):
-            try:
-                engine.helper_attach(self.cfg, p, name)
-            except engine.Refused as e:
-                return {"error": "attach failed: %s" % e, "attached": done}
-            done.append(p)
-        self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
+        with self.store.decision_context(
+            "containment",
+            scope="scope-" + name,
+            owner=pids[0] if pids else None,
+            authority="user",
+            mode=self.mode,
+            why="attach caller processes to an explicit scope",
+        ):
+            for p in dict.fromkeys(pids):
+                try:
+                    engine.helper_attach(self.cfg, p, name)
+                except engine.Refused as e:
+                    self.store.log(event="refusal", scope="scope-" + name, why=str(e))
+                    return {"error": "attach failed: %s" % e, "attached": done}
+                done.append(p)
+            self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
         return {"ok": True, "attached": done}
 
     def _read_request(self, conn):

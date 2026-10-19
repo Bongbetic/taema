@@ -1,5 +1,6 @@
 """Decision and action engine: plan_stop/stop, adopt_pass, gc_pass."""
 
+from contextlib import nullcontext
 import hashlib
 import os
 import signal
@@ -212,7 +213,7 @@ def veto_for_scope(store, path):
     return store.match_veto(scope=cgroup.rel(path), members=members)
 
 
-def stop(
+def _stop_impl(
     path,
     cfg,
     store,
@@ -258,19 +259,40 @@ def stop(
             for e in d["edges"]:
                 store.bump(d["key"], "shared_hits", 1.0)
         for r in roots:
-            dest = cgroup.mkleaf("shared/" + leaf_slug(r["comm"], r["pid"]))
-            moving = [p for p in pt.descendants([r["pid"]]) if p in shared_pids]
-            dest_cg = "/user/%d/%s" % (os.getuid(), cgroup.rel(dest))
-            for _i in range(3):
-                for p in moving:
-                    cgroup.move(p, dest)
-                moving = [
-                    p
-                    for p in inspect.ProcTable.scan().descendants([r["pid"]])
-                    if p in shared_pids and cgroup.proc_cgroup(p) != dest_cg
-                ]
-                if not moving:
-                    break
+            context = getattr(store, "decision_context", None)
+            trace = (
+                context(
+                    "containment",
+                    scope="shared/" + leaf_slug(r["comm"], r["pid"]),
+                    owner=r["pid"],
+                    authority="safety",
+                    mode=cfg.get("mode", "observe"),
+                    why="preserve a shared member during stop",
+                )
+                if callable(context)
+                else nullcontext()
+            )
+            with trace:
+                dest = cgroup.mkleaf("shared/" + leaf_slug(r["comm"], r["pid"]))
+                moving = [p for p in pt.descendants([r["pid"]]) if p in shared_pids]
+                dest_cg = "/user/%d/%s" % (os.getuid(), cgroup.rel(dest))
+                for _i in range(3):
+                    for p in moving:
+                        cgroup.move(p, dest)
+                    moving = [
+                        p
+                        for p in inspect.ProcTable.scan().descendants([r["pid"]])
+                        if p in shared_pids and cgroup.proc_cgroup(p) != dest_cg
+                    ]
+                    if not moving:
+                        break
+                store.log(
+                    event="containment",
+                    source=report["scope"],
+                    destination=cgroup.rel(dest),
+                    owner=r["pid"],
+                    pids=[r["pid"]],
+                )
         if not ran_hook:
             ran_hook = True
             hook = hook or ((unit or {}).get("kill", {}).get("hook"))
@@ -336,6 +358,66 @@ def stop(
     )
     store.save_if_dirty()
     return report
+
+
+def stop(
+    path,
+    cfg,
+    store,
+    unit=None,
+    timeout=None,
+    force=False,
+    hard=False,
+    keep=(),
+    dry_run=False,
+    hook=None,
+    passes=3,
+    allow_sigkill=True,
+    decision_kind="stop",
+    decision_authority=None,
+    decision_why=None,
+    decision_owner=None,
+):
+    """Trace a stop attempt unless its caller already established the decision context."""
+    context = getattr(store, "decision_context", None)
+    if not callable(context) or getattr(store, "_audit_context", None) is not None:
+        return _stop_impl(
+            path,
+            cfg,
+            store,
+            unit,
+            timeout,
+            force,
+            hard,
+            keep,
+            dry_run,
+            hook,
+            passes,
+            allow_sigkill,
+        )
+    authority = decision_authority or ("manual" if force or unit is None else "unit")
+    with context(
+        decision_kind,
+        scope=cgroup.rel(path),
+        owner=decision_owner,
+        authority=authority,
+        mode=cfg.get("mode", "observe"),
+        why=decision_why or "stop requested",
+    ):
+        return _stop_impl(
+            path,
+            cfg,
+            store,
+            unit,
+            timeout,
+            force,
+            hard,
+            keep,
+            dry_run,
+            hook,
+            passes,
+            allow_sigkill,
+        )
 
 
 def _slug(s):
@@ -479,7 +561,15 @@ def _inside_user(pid):
     return cg == me or cg.startswith(me + "/")
 
 
-def run_ops(cfg, store, ops, execute, cleanup=True):
+def run_ops(
+    cfg,
+    store,
+    ops,
+    execute,
+    cleanup=True,
+    decision_kind="adopt_move",
+    authority="mode",
+):
     """Log every op; perform it when `execute`. Returns the ops with a 'done' flag.
     Pids inside user/<uid> move directly; the sudo helper is used only for pids in a session
     cgroup. A repeated adopt_would for an identical op is not logged again. Callers batching
@@ -490,45 +580,74 @@ def run_ops(cfg, store, ops, execute, cleanup=True):
         pids = [p for p in op["pids"] if not policy.protected_reason(p, cfg)]
         op["skipped_protected"] = len(op["pids"]) - len(pids)
         op["pids"] = pids
-        if execute and pids:
-            cgroup.mkleaf(op["scope"])
-            dest = cgroup.base() + "/" + op["scope"]
-            outside = [p for p in pids if not _inside_user(p)]
-            if outside:
-                helper_move(cfg, op["scope"], outside)
-            inside = [p for p in pids if p not in set(outside)]
-            if op["op"] == "carve":
-                for _i in range(3):
-                    for p in inside:
-                        cgroup.move(p, dest)
-                    inside = [
-                        p
-                        for p in inspect.descendants([op["root"]])
-                        if p in set(op["pids"])
-                        and cgroup.proc_cgroup(p)
-                        != "/user/%d/%s" % (os.getuid(), op["scope"])
-                    ]
-                    if not inside:
-                        break
-            else:
-                for p in inside:
-                    cgroup.move(p, dest)
-            op["done"] = True
-        fields = dict(
-            op=op["op"],
-            scope=op["scope"],
-            count=len(op["pids"]),
-            skipped_protected=op["skipped_protected"],
-        )
-        if execute:
-            store.log(event="adopt", **fields)
-        else:
+        should_log = execute or not pids
+        if not execute:
             seen.add(op["scope"])
-            if store.changed(
+            should_log = store.changed(
                 "adopt_would:" + op["scope"],
                 (op["op"], tuple(sorted(op["pids"])), op["skipped_protected"]),
-            ):
+            )
+        if not should_log:
+            continue
+        kind = decision_kind if execute else "adopt_would"
+        context = getattr(store, "decision_context", None)
+        trace = (
+            context(
+                kind,
+                scope=op["scope"],
+                owner=op.get("owner", op.get("root")),
+                authority=authority,
+                mode=cfg.get("mode", "observe"),
+                why=op.get("why") or "%s %s" % (op["op"], op["scope"]),
+            )
+            if callable(context)
+            else nullcontext()
+        )
+        with trace as decision:
+            if execute and pids:
+                cgroup.mkleaf(op["scope"])
+                dest = cgroup.base() + "/" + op["scope"]
+                outside = [p for p in pids if not _inside_user(p)]
+                if outside:
+                    helper_move(cfg, op["scope"], outside)
+                inside = [p for p in pids if p not in set(outside)]
+                if op["op"] == "carve":
+                    for _i in range(3):
+                        for p in inside:
+                            cgroup.move(p, dest)
+                        inside = [
+                            p
+                            for p in inspect.descendants([op["root"]])
+                            if p in set(op["pids"])
+                            and cgroup.proc_cgroup(p)
+                            != "/user/%d/%s" % (os.getuid(), op["scope"])
+                        ]
+                        if not inside:
+                            break
+                else:
+                    for p in inside:
+                        cgroup.move(p, dest)
+                op["done"] = True
+            fields = dict(
+                op=op["op"],
+                scope=op["scope"],
+                count=len(op["pids"]),
+                skipped_protected=op["skipped_protected"],
+            )
+            if execute and pids:
+                store.log(event=decision_kind, **fields)
+            elif execute:
+                store.log(
+                    event="refusal",
+                    scope=op["scope"],
+                    why="all planned members were protected",
+                    **fields,
+                )
+            else:
                 store.log(event="adopt_would", **fields)
+            if isinstance(decision, dict):
+                op["decision_id"] = decision["id"]
+                op["corr"] = decision["corr"]
     if cleanup:
         store.forget_sigs("adopt_would:", {"adopt_would:" + x for x in seen})
     store.save_if_dirty()

@@ -1,0 +1,3 @@
+#!/bin/sh
+# taema disposable Void VM test harness entry point; see docs/vm-harness.md.
+exec python3 "$(dirname "$0")/vmh.py" "$@"

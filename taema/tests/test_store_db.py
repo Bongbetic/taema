@@ -2,6 +2,7 @@
 
 import os
 from contextlib import closing
+import json
 from pathlib import Path
 import stat
 import sqlite3
@@ -9,12 +10,15 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
+from taema.daemon import service as daemon
 from taema.store import db as store_db
 from taema.store.db import StateDB
 from taema.store.knowledge import Store
+from tests.test_phase0 import make_cfg
 
 
 class StoreDatabaseTests(unittest.TestCase):
@@ -395,6 +399,164 @@ class StoreDatabaseTests(unittest.TestCase):
                     {row[0] for row in connection.execute("SELECT id FROM vetoes")},
                     {"veto-app"},
                 )
+
+    def test_daily_exports_are_private_and_keep_three_rotations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            now = [1_800_000_000.0]
+            store = Store(temporary, {}, now=lambda: now[0])
+            exports = []
+            for _day in range(4):
+                store.bump("daily", "seen")
+                store.save()
+                self.assertTrue(store.export_daily_if_due())
+                exports.append(
+                    Path(temporary)
+                    / (
+                        "state-export-%s.json"
+                        % time.strftime("%Y%m%d", time.gmtime(now[0]))
+                    )
+                )
+                self.assertFalse(store.export_daily_if_due())
+                now[0] += store_db.DAY
+
+            kept = sorted(Path(temporary).glob("state-export-*.json"))
+            self.assertEqual(kept, sorted(exports[-3:]))
+            for expected_seen, path in zip(range(2, 5), kept):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(
+                    json.loads(path.read_text())["exes"]["daily"]["seen"],
+                    expected_seen,
+                )
+
+    def test_corrupt_database_is_quarantined_and_restored_from_daily_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            store.bump("durable", "seen", 7)
+            store.save()
+            self.assertTrue(store.export_daily_if_due())
+            with store.db.connection() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            Path(store.path).write_bytes(b"not a sqlite database")
+
+            recovered = Store(temporary, {})
+
+            self.assertEqual(recovered.peek("durable")["seen"], 7)
+            self.assertEqual(recovered.recovery["source"], "daily_export")
+            quarantined = list(Path(temporary).glob("state.db.corrupt-*"))
+            self.assertEqual(len(quarantined), 1)
+            events = [
+                json.loads(line)
+                for line in Path(recovered.log_path).read_text().splitlines()
+            ]
+            self.assertIn("store_recovered", [event["event"] for event in events])
+
+            status_daemon = daemon.Daemon(make_cfg(temporary))
+            self.assertEqual(
+                status_daemon.handle({"cmd": "status"})["recovery"]["source"],
+                "daily_export",
+            )
+            self.assertTrue(status_daemon.store.export_daily_if_due())
+            self.assertIsNone(status_daemon.handle({"cmd": "status"})["recovery"])
+
+    def test_missing_daily_export_recovers_from_legacy_backup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            legacy = {
+                "version": 2,
+                "created": 1_800_000_000,
+                "last_decay": 1_800_000_000,
+                "exes": {"backup-app": {"seen": 9}},
+                "pairs": {},
+                "standalone": {},
+            }
+            Path(temporary, "knowledge.json").write_text(json.dumps(legacy))
+            store = Store(temporary, {}, now=lambda: 1_800_000_000.0)
+            store.save()
+            with store.db.connection() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            Path(store.path).write_bytes(b"damaged")
+
+            recovered = Store(temporary, {}, now=lambda: 1_800_000_000.0)
+
+            self.assertEqual(recovered.peek("backup-app")["seen"], 9)
+            self.assertEqual(recovered.recovery["source"], "legacy_backup")
+
+    def test_restart_finishes_recovery_if_fresh_schema_lacks_import_marker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            store.bump("after-crash", "seen", 5)
+            store.save()
+            store.export_daily_if_due()
+            with store.db.connection() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            for suffix in ("", "-wal", "-shm"):
+                source = store.path + suffix
+                if os.path.exists(source):
+                    os.replace(
+                        source, store.path + ".corrupt-20000101T000000Z" + suffix
+                    )
+
+            with closing(sqlite3.connect(store.path)) as incomplete:
+                incomplete.execute(
+                    "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                incomplete.execute("PRAGMA user_version = 3")
+
+            recovered = Store(temporary, {})
+
+            self.assertEqual(recovered.peek("after-crash")["seen"], 5)
+            self.assertEqual(recovered.recovery["source"], "daily_export")
+            self.assertTrue(Path(store.path + ".corrupt-20000101T000000Z").exists())
+
+    def test_restart_after_quarantine_moves_orphaned_wal_sidecars(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            store.bump("after-quarantine", "seen", 3)
+            store.save()
+            store.export_daily_if_due()
+            with store.db.connection() as connection:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+            quarantined = store.path + ".corrupt-20000101T000000Z"
+            os.replace(store.path, quarantined)
+            Path(store.path + "-wal").write_bytes(b"orphaned wal")
+            Path(store.path + "-shm").write_bytes(b"orphaned shm")
+
+            recovered = Store(temporary, {})
+
+            self.assertEqual(recovered.peek("after-quarantine")["seen"], 3)
+            self.assertTrue(Path(quarantined + "-wal").exists())
+            self.assertTrue(Path(quarantined + "-shm").exists())
+
+    def test_locked_database_skips_tick_and_retries_after_unlock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            d = daemon.Daemon(make_cfg(temporary))
+            lock = sqlite3.connect(d.store.path, timeout=0.1)
+            lock.execute("BEGIN IMMEDIATE")
+            try:
+                with (
+                    mock.patch.object(d, "check_socket") as check_socket,
+                    mock.patch.object(d, "run_deadlines") as deadlines,
+                    mock.patch.object(d, "adopt_pass") as adopt,
+                    mock.patch.object(d, "gc_pass") as gc,
+                ):
+                    started = time.monotonic()
+                    d.tick()
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, store_db.BUSY_TIMEOUT_MS / 1000 + 1)
+                    for operation in (check_socket, deadlines, adopt, gc):
+                        operation.assert_not_called()
+            finally:
+                lock.rollback()
+                lock.close()
+
+            events = [
+                json.loads(line)
+                for line in Path(d.store.log_path).read_text().splitlines()
+            ]
+            self.assertEqual(events[-1]["event"], "store_busy")
+            with mock.patch.object(d, "check_socket") as check_socket:
+                d.tick()
+                check_socket.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ REVIEW_RETENTION = 30 * DAY
 LEGACY_BACKUP_RETENTION = 30 * DAY
 LEGACY_EVENT_LIMIT = 10_000
 _LEGACY_MARKER = "migration.legacy_import"
+_RECOVERY_MARKER = "store.recovery"
+_DAILY_EXPORT_RE = re.compile(r"^state-export-(\d{8})\.json$")
 
 _MIGRATIONS = {
     1: """
@@ -899,18 +901,201 @@ def _prune(connection, now):
 class StateDB:
     """One state database; read-only clients never create or migrate it."""
 
-    def __init__(self, path, read_only=False):
+    def __init__(self, path, read_only=False, deny=()):
         self.path = os.path.abspath(path)
         self.read_only = read_only
+        self.deny = tuple(deny)
         self.available = os.path.isfile(self.path)
+        self.recovery = None
         if read_only:
             return
         self._secure_dir()
+        corrupted = self.available and not self._integrity_ok()
+        quarantined = self._quarantine() if corrupted else None
+        if not self.available:
+            quarantined = self._latest_quarantine()
+            corrupted = quarantined is not None
+            if quarantined:
+                self._quarantine_orphaned_sidecars(quarantined)
         with self.connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             self._migrate(connection)
         os.chmod(self.path, 0o600)
         self.available = True
+        interrupted_recovery = self._latest_quarantine() if not corrupted else None
+        if interrupted_recovery and not self._has_legacy_import_marker():
+            # A crash may leave the fresh schema behind before the recovery transaction
+            # commits. Without the import marker it is safe to rebuild from the snapshot.
+            quarantined = interrupted_recovery
+            self._quarantine()
+            with self.connection() as connection:
+                connection.execute("PRAGMA journal_mode = WAL")
+                self._migrate(connection)
+            os.chmod(self.path, 0o600)
+            corrupted = True
+        if corrupted:
+            self._restore_after_corruption(quarantined)
+
+    def _latest_quarantine(self):
+        pattern = re.compile(
+            r"^%s\.corrupt-\d{8}T\d{6}Z(?:-\d+)?$"
+            % re.escape(os.path.basename(self.path))
+        )
+        candidates = [
+            os.path.join(os.path.dirname(self.path), name)
+            for name in os.listdir(os.path.dirname(self.path))
+            if pattern.fullmatch(name)
+        ]
+        return sorted(candidates, reverse=True)[0] if candidates else None
+
+    def _has_legacy_import_marker(self):
+        with self.connection() as connection:
+            return bool(
+                connection.execute(
+                    "SELECT 1 FROM meta WHERE key = ?", (_LEGACY_MARKER,)
+                ).fetchone()
+            )
+
+    def _integrity_ok(self):
+        try:
+            with self.connection() as connection:
+                rows = connection.execute("PRAGMA quick_check").fetchall()
+            return len(rows) == 1 and rows[0][0] == "ok"
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            if "locked" in message or "busy" in message:
+                raise
+            return False
+        except sqlite3.DatabaseError:
+            return False
+
+    def _quarantine(self):
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        suffix = stamp
+        index = 0
+        while os.path.exists("%s.corrupt-%s" % (self.path, suffix)):
+            index += 1
+            suffix = "%s-%d" % (stamp, index)
+        quarantined = "%s.corrupt-%s" % (self.path, suffix)
+        for source, destination in (
+            (self.path, quarantined),
+            (self.path + "-wal", quarantined + "-wal"),
+            (self.path + "-shm", quarantined + "-shm"),
+        ):
+            if os.path.exists(source):
+                os.replace(source, destination)
+        self._sync_directory()
+        return quarantined
+
+    def _quarantine_orphaned_sidecars(self, quarantined):
+        for suffix in ("-wal", "-shm"):
+            source = self.path + suffix
+            if os.path.exists(source):
+                destination = quarantined + suffix
+                if os.path.exists(destination):
+                    destination += ".orphan"
+                os.replace(source, destination)
+        self._sync_directory()
+
+    def _sync_directory(self):
+        directory_fd = os.open(os.path.dirname(self.path), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _restore_after_corruption(self, quarantined):
+        directory = os.path.dirname(self.path)
+        exports = []
+        for candidate in glob.glob(os.path.join(directory, "state-export-*.json")):
+            match = _DAILY_EXPORT_RE.fullmatch(os.path.basename(candidate))
+            if match:
+                exports.append((match.group(1), candidate))
+        exports.sort(reverse=True)
+
+        source, state = None, None
+        for _day, candidate in exports:
+            loaded, status = _read_legacy_state(candidate)
+            if loaded is not None:
+                source, state = "daily_export", loaded
+                break
+
+        if state is None:
+            legacy_path = os.path.join(directory, "knowledge.json")
+            backups = []
+            pattern = re.compile(r"^knowledge\.json\.backup-\d+(?:-\d+)?$")
+            for candidate in glob.glob(legacy_path + ".backup-*"):
+                if pattern.fullmatch(os.path.basename(candidate)):
+                    try:
+                        backups.append((os.stat(candidate).st_mtime, candidate))
+                    except OSError:
+                        continue
+            backups.sort(reverse=True)
+            for _modified, candidate in backups:
+                loaded, status = _read_legacy_state(candidate)
+                if loaded is not None:
+                    source, state = "legacy_backup", loaded
+                    break
+
+        source = source or "empty"
+        recovered_at = int(time.time())
+        recovery = {
+            "source": source,
+            "recovered_at": recovered_at,
+            "quarantined": os.path.basename(quarantined),
+        }
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                if state is not None:
+                    _write_legacy_state(connection, state, recovered_at, self.deny)
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    (_LEGACY_MARKER, _dump("recovered")),
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                    (_RECOVERY_MARKER, _dump(recovery)),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        self.recovery = recovery
+
+    def load_recovery(self):
+        if not self.available:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?", (_RECOVERY_MARKER,)
+            ).fetchone()
+        value = _load(row["value"], None) if row else None
+        return value if isinstance(value, dict) else None
+
+    def clear_recovery(self):
+        if self.read_only or not self.available:
+            return
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM meta WHERE key = ?", (_RECOVERY_MARKER,))
+            connection.commit()
+        self.recovery = None
+
+    def write_available(self):
+        """Return whether the single-writer slot can be acquired within busy_timeout."""
+        if self.read_only or not self.available:
+            return False
+        try:
+            with self.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+            return True
+        except sqlite3.OperationalError as error:
+            message = str(error).lower()
+            if "locked" in message or "busy" in message:
+                return False
+            raise
 
     def _secure_dir(self):
         directory = os.path.dirname(self.path)
@@ -1023,7 +1208,10 @@ class StateDB:
         with self.connection() as connection:
             connection.execute("BEGIN")
             for row in connection.execute("SELECT key, value FROM meta"):
-                if row["key"].startswith("migration."):
+                if (
+                    row["key"].startswith("migration.")
+                    or row["key"] == _RECOVERY_MARKER
+                ):
                     continue
                 data[row["key"]] = _load(row["value"], row["value"])
 

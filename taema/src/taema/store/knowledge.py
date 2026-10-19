@@ -8,6 +8,8 @@ uid rules, configured cgroup and environment exclusions (see policy.py). No mode
 import json
 import math
 import os
+import re
+import tempfile
 import time
 import uuid
 
@@ -32,6 +34,8 @@ STALE_DAYS = 90
 SCHEMA = 2
 MAX_VETOES = 512
 MAX_AUTO_ACTIONS = 10_000  # durable undo context; status exposes only a recent view
+DAILY_EXPORT_RE = re.compile(r"^state-export-(\d{8})\.json$")
+DAILY_EXPORTS_KEPT = 3
 
 # ---- pair model (Phase 2/4 thresholds; pure, see decide()) ----
 DAY = 86400.0
@@ -136,11 +140,18 @@ class Store:
         self.defer_writes = False
         self.last_save = 0.0
         self.sigs = {}  # change-detection signatures for log lines (see changed())
-        self.db = db.StateDB(self.path, read_only=self.read_only)
+        self.db = db.StateDB(self.path, read_only=self.read_only, deny=self.deny)
         self.db.import_legacy(self.legacy_path, now=self.now(), deny=self.deny)
+        self.recovery = self.db.load_recovery()
         self.data = self._fresh()
         self._load()
         self._decay()
+        if self.recovery:
+            self.log(
+                event="store_recovered",
+                source=self.recovery.get("source"),
+                quarantined=self.recovery.get("quarantined"),
+            )
 
     def _fresh(self):
         return {
@@ -184,6 +195,54 @@ class Store:
             "leftover_expiries",
         )
         return json.loads(json.dumps({field: self.data.get(field) for field in fields}))
+
+    def export_daily_if_due(self):
+        """Atomically write today's recovery export and retain the newest three days."""
+        if self.read_only or self.dirty:
+            return False
+        now = self.now()
+        day = time.strftime("%Y%m%d", time.gmtime(now))
+        destination = os.path.join(self.dir, "state-export-%s.json" % day)
+        if os.path.exists(destination) and not self.recovery:
+            return False
+
+        self._mkdir()
+        descriptor, temporary = tempfile.mkstemp(prefix=".state-export-", dir=self.dir)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                os.fchmod(output.fileno(), 0o600)
+                json.dump(
+                    self.export_legacy(), output, sort_keys=True, separators=(",", ":")
+                )
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, destination)
+            directory_fd = os.open(self.dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+        self.db.clear_recovery()
+        self.recovery = None
+        exports = []
+        for name in os.listdir(self.dir):
+            match = DAILY_EXPORT_RE.fullmatch(name)
+            if match:
+                exports.append((match.group(1), os.path.join(self.dir, name)))
+        for _date, path in sorted(exports, reverse=True)[DAILY_EXPORTS_KEPT:]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return True
 
     # ---- persistence ----
     def _mkdir(self):

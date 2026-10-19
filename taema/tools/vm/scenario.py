@@ -711,7 +711,7 @@ def scenario_m0(rec, args, tree_holder):
         veto = _run(["/usr/bin/taema", "do-not-kill", "app:sleep"], timeout=30)
         record("adopt-do-not-kill-app", veto.returncode == 0,
                (veto.stdout + veto.stderr).strip()[:400])
-        refused = _run(["/usr/bin/taema", "kill", leftover], timeout=30)
+        refused = _run(["/usr/bin/taema", "kill", leftover_leaf], timeout=30)
         record("adopt-manual-kill-refused-with-four",
                refused.returncode == 4 and all(_process_running(pid) for pid in tree["children"]),
                "rc=%d output=%s" % (refused.returncode,
@@ -843,7 +843,7 @@ def scenario_m0(rec, args, tree_holder):
         record("one-hour-idle-would-stop-is-deduplicated",
                real_elapsed >= 3600 and all(r.returncode == 0 for r in real_passes)
                and len(real_events) == 1 and _process_running(simulated_pid)
-               and scope_of(simulated_pid) == rel,
+               and daemon_scope(scope_of(simulated_pid)) == rel,
                "real_idle_seconds=%.1f gc_passes=3 would_stop_lines=%d last_gc=%s"
                % (real_elapsed, len(real_events), real_passes[-1].stdout[-500:]))
 
@@ -866,7 +866,7 @@ def scenario_m0(rec, args, tree_holder):
         record("one-hour-idle-and-simulated-day-deduplicate-would-stop",
                bool(result) and result[0][2] == "would" and len(first_event) == 1
                and len(all_events) == 1 and _process_running(simulated_pid)
-               and scope_of(simulated_pid) == rel,
+               and daemon_scope(scope_of(simulated_pid)) == rel,
                "simulated_result=%s minutes=1440 would_stop_lines=%d"
                % (result, len(all_events)))
         ok = all(step["ok"] for step in rec.steps)

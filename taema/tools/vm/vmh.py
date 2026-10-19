@@ -66,7 +66,11 @@ def load_config(path=None):
         raise HarnessError("config file not found: %s" % path)
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise HarnessError("cannot read config %s: %s" % (path, e))
-    return _validate(raw, path)
+    cfg = _validate(raw, path)
+    # Relative paths always resolve against the taema/ directory, never the cwd.
+    if not os.path.isabs(cfg["paths"]["state_dir"]):
+        cfg["paths"]["state_dir"] = os.path.join(TAEMA_ROOT, cfg["paths"]["state_dir"])
+    return cfg
 
 
 def _validate(raw, path="<config>"):

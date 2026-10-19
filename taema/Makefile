@@ -15,7 +15,7 @@ SHELLDIR  = $(DESTDIR)/usr/share/taema/shell
 BASHRCD   = $(DESTDIR)/etc/bash/bashrc.d
 FISHCONF  = $(DESTDIR)/usr/share/fish/vendor_conf.d
 
-.PHONY: all test check install
+.PHONY: all test check install vm-test vm-dry-run vm-doctor
 
 all:
 	@:
@@ -40,3 +40,15 @@ install:
 	install -m644 shell/taema.bash shell/taema.zsh shell/taema.fish $(SHELLDIR)/
 	install -m644 shell/taema.bash $(BASHRCD)/taema.sh
 	install -m644 shell/taema.fish $(FISHCONF)/taema.fish
+	install -m644 docs/vm-harness.md $(DOCDIR)/
+
+# Disposable Void VM test harness (docs/vm-harness.md).  Extra flags via
+# VMFLAGS, e.g. `make vm-test VMFLAGS="--allow-network --libc glibc"`.
+vm-test:
+	$(PYTHON) tools/vm/vmh.py run $(VMFLAGS)
+
+vm-dry-run:
+	$(PYTHON) tools/vm/vmh.py run --dry-run $(VMFLAGS)
+
+vm-doctor:
+	$(PYTHON) tools/vm/vmh.py doctor

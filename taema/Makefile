@@ -40,7 +40,7 @@ install:
 	install -m440 etc/sudoers.d/taema $(SUDOERS)/
 	install -m644 examples/units/*.toml $(EXAMPLES)/units/
 	install -m755 examples/hooks/* $(EXAMPLES)/hooks/
-	install -m644 README.md docs/design.md $(DOCDIR)/
+	install -m644 README.md docs/design.md ../docs/legacy-state-migration.md $(DOCDIR)/
 	install -m644 shell/taema.bash shell/taema.zsh shell/taema.fish $(SHELLDIR)/
 	install -m644 shell/taema.bash $(BASHRCD)/taema.sh
 	install -m644 shell/taema.fish $(FISHCONF)/taema.fish

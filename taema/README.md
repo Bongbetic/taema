@@ -445,8 +445,14 @@ These rules are fixed. Learning and unit files cannot change them:
 | `/var/service/taema` | link to the service, made and removed by the package scripts |
 | `/etc/taema/` | system configuration and units |
 | `~/.config/taema/` | your configuration, units and hooks |
-| `~/.local/state/taema/` | `knowledge.json` (learning) and `decisions.log` (audit) |
+| `~/.local/state/taema/` | `state.db` (current state), `knowledge.json` (preserved legacy/export), and `decisions.log` (audit) |
 | `/var/log/taema/` | service, per-user daemon and helper logs |
+
+## Upgrade and downgrade state
+
+The first daemon startup imports legacy 0.2 learning into SQLite and keeps a private
+30-day backup. To export state before a downgrade, use `taema learn export --format v2`.
+See the [state migration guide](../docs/legacy-state-migration.md) for the full sequence.
 
 ## Uninstall
 

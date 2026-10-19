@@ -447,7 +447,7 @@ class KnowledgeV2(unittest.TestCase):
     def fresh(self):
         return knowledge.Store(self.d, {}, self.c)
 
-    def test_legacy_json_waits_for_the_migration_ticket(self):
+    def test_legacy_json_is_imported_once_into_sqlite(self):
         d = tmp()
         v1 = {
             "last_decay": self.c(),
@@ -457,10 +457,13 @@ class KnowledgeV2(unittest.TestCase):
         with open(legacy_path, "w") as f:
             json.dump(v1, f)
         s = knowledge.Store(d, {}, self.c)
-        self.assertNotIn("adb", s.data["exes"])
+        self.assertEqual(s.data["exes"]["adb"]["user_keep"], 3.0)
         self.assertEqual(s.data["pairs"], {})
         self.assertEqual(s.data["standalone"], {})
         self.assertIn("asked", s.data)
+        self.assertEqual(
+            sum(name.startswith("knowledge.json.backup-") for name in os.listdir(d)), 1
+        )
         with open(legacy_path) as f:
             self.assertEqual(json.load(f), v1)
 

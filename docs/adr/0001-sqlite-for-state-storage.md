@@ -41,8 +41,14 @@ which a single JSON blob models well.
   evict active protection.
 - `decisions.log` stays outside the database as the append-only, greppable, rotated audit
   trail; the `events` table is a queryable index with retention on top of it.
-- Legacy `knowledge.json` state is migrated atomically and idempotently with a 30-day
-  backup; migration stops no processes.
+- On first writable startup, legacy `knowledge.json` state and up to 10,000 recent audit
+  lines are imported atomically and idempotently. SQLite remains authoritative when it
+  already has state; the JSON source is preserved, never written again, and copied to a
+  private backup retained for 30 days. Invalid legacy owners are quarantined from decisions,
+  and their explicit answers become reviews.
+- `taema learn export --format v2` writes a private, atomic 0.2-compatible state file for
+  downgrades; the upgrade and downgrade sequence is documented in
+  `docs/legacy-state-migration.md`.
 
 ## Consequences
 

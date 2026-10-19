@@ -558,6 +558,13 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
         self.assertEqual(vmh.read_version(ROOT), "0.3.0")
 
+    def test_release_workflow_combines_manual_and_generated_release_notes(self):
+        workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
+        self.assertIn('notes="$(cat "$RUNNER_TEMP/notes.md")"', workflow)
+        self.assertIn('--title "tæma ${VERSION}"', workflow)
+        self.assertIn('--notes "$notes" --generate-notes', workflow)
+        self.assertNotIn("--notes-file", workflow)
+
     def test_readme_mode_table_describes_adopt_lifecycle(self):
         readme = read_text(os.path.join(REPO, "README.md"))
         self.assertIn(

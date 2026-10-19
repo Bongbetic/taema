@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -584,6 +585,25 @@ class ScenarioApiTest(unittest.TestCase):
     def tearDown(self):
         if self.tree:
             scenario.kill_tree(self.tree, timeout=5)
+
+    def test_cli_runner_becomes_session_leader(self):
+        script = (
+            "import json, os, sys; "
+            "sys.path.insert(0, sys.argv[1]); import scenario; "
+            "before=open('/proc/self/cgroup').read(); "
+            "scenario.ensure_session_leader(); "
+            "after=open('/proc/self/cgroup').read(); "
+            "print(json.dumps({'pid': os.getpid(), 'sid': os.getsid(0), "
+            "'before': before, 'after': after}))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, os.path.dirname(scenario.__file__)],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(result.stdout)
+        self.assertEqual(state["sid"], state["pid"])
+        self.assertEqual(state["after"], state["before"],
+                         "session boundary must preserve login cgroup placement")
 
     def test_spawn_and_close_root_keeps_children(self):
         work = os.path.join(self.tmp, "work")

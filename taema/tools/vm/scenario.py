@@ -406,6 +406,12 @@ def scenario_smoke(rec, args, tree_holder):
     """Contain a GUI-like tree, close the root, verify survivor containment."""
     timeout = args.timeout
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+    runner_pid = os.getpid()
+    runner_sid = os.getsid(0)
+    runner_scope = scope_of(runner_pid)
+    rec.step("runner-session-leader", runner_sid == runner_pid,
+             "pid=%d sid=%d pgrp=%d scope=%s"
+             % (runner_pid, runner_sid, os.getpgrp(), runner_scope))
     rec.step("login-session-env", bool(runtime_dir),
              "XDG_RUNTIME_DIR=%s" % (runtime_dir or "<unset>"))
 
@@ -423,7 +429,6 @@ def scenario_smoke(rec, args, tree_holder):
     tree_holder.append(tree)
     rec.step("spawn", True, "root=%d children=%s"
              % (tree["root"], tree["children"]))
-    runner_sid = os.getsid(0)
     rec.step("fixture-session", tree["root"] != tree["session"]
              and tree["session"] != runner_sid,
              "root=%d session=%d runner_session=%d supervisor=%d"
@@ -431,7 +436,6 @@ def scenario_smoke(rec, args, tree_holder):
 
     rel = wait_for_scope(tree["root"], ["app-"], timeout=timeout)
     rec.step("root-contained", rel != "", "scope=%s" % rel)
-    runner_scope = scope_of(os.getpid())
     rec.step("root-distinct-scope", rel != runner_scope,
              "root=%s runner=%s" % (rel, runner_scope))
 
@@ -550,6 +554,22 @@ SCENARIOS = {"smoke": scenario_smoke, "upgrade": scenario_upgrade,
              "remove": scenario_remove}
 
 
+def ensure_session_leader():
+    """Exclude the CLI runner from app-root adoption without moving cgroups."""
+    pid = os.getpid()
+    if os.getsid(0) == pid:
+        return True
+    # setsid(2) rejects process-group leaders. In that unusual launch shape,
+    # leave the process in place and let the smoke assertion report the issue.
+    if os.getpgrp() == pid:
+        return False
+    try:
+        os.setsid()
+    except OSError:
+        return False
+    return os.getsid(0) == pid
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog="scenario.py",
                                      description="taema VM scenario runner")
@@ -603,4 +623,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    ensure_session_leader()
     sys.exit(main(sys.argv[1:]))

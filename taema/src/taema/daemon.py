@@ -169,32 +169,41 @@ class Daemon:
         pt = inspect.ProcTable.scan()
         self.lineage.observe(pt)
         self.guarded(self.after_observe)
-        execute = self.authorize(authorization.UNIT_ADOPT).verdict == authorization.ACT
+        unit_decision = self.authorize(authorization.UNIT_ADOPT)
+        execute = unit_decision.verdict == authorization.ACT
         done = []
         if self.units:
             ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
-            done = engine.run_ops(self.cfg, self.store, ops, execute)
+            done = engine.run_ops(self.cfg, self.store, ops, execute, cleanup=False)
             for op in done:
                 if op["op"] == "carve" and op["done"] and op.get("binds_to") == "root":
                     self.watch_owner(op["scope"], op["root"])
         self.last_result["adopt"] = [{"op": o["op"], "scope": o["scope"], "pids": len(o["pids"]),
                                       "done": o["done"]} for o in done]
-        if self.authorize(authorization.AUTO_ADOPT).verdict == authorization.ACT:
-            self.guarded(lambda: self.auto_adopt(pt))
+        decision = self.authorize(authorization.AUTO_ADOPT)
+        would_scopes = [op["scope"] for op in done] if unit_decision.verdict == authorization.WOULD_ACT else []
+        if decision.verdict in (authorization.ACT, authorization.WOULD_ACT):
+            auto_done = []
+            self.guarded(lambda: auto_done.extend(self.auto_adopt(
+                pt, execute=decision.verdict == authorization.ACT, cleanup=False)))
+            if decision.verdict == authorization.WOULD_ACT:
+                would_scopes.extend(op["scope"] for op in auto_done)
+        self.store.forget_sigs("adopt_would:", {"adopt_would:" + s for s in would_scopes})
 
-    def auto_adopt(self, pt):
+    def auto_adopt(self, pt, execute=True, cleanup=True):
         """Give every app root its own scope (engine.auto_adopt_plan), at most 64 new ones per pass."""
         ops = engine.auto_adopt_plan(self.cfg, self.units, pt, self.lineage, self.store)
         if ops:
             try:
-                for op in engine.run_ops(self.cfg, self.store, ops, True):
-                    if op["done"]:
+                for op in engine.run_ops(self.cfg, self.store, ops, execute, cleanup=cleanup):
+                    if execute and op["done"]:
                         self.auto_scopes.add(op["scope"])
             except engine.Refused as e:
                 if self.store.changed("auto_adopt_refused", str(e)):
                     self.store.log(event="auto_adopt_refused", error=str(e))
         base = cgroup.base()
         self.auto_scopes = {s for s in self.auto_scopes if os.path.isdir(base + "/" + s)}
+        return ops
 
     # ---- learning hooks (log only: nothing here kills) ----
     def note_stop(self, rep):

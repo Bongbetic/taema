@@ -130,9 +130,9 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
         "auto": (ACT, AUTHORITY_MODE, "unit adopt: auto moves unit-matched processes"),
     },
     AUTO_ADOPT: {
-        "observe": (KEEP, "", "auto adopt: only auto scopes every app root (0.2.1)"),
-        "adopt": (KEEP, "", "auto adopt: only auto scopes every app root (0.2.1)"),
-        "enforce": (KEEP, "", "auto adopt: only auto scopes every app root (0.2.1)"),
+        "observe": (WOULD_ACT, "", "app adopt: observe only logs adopt_would"),
+        "adopt": (ACT, AUTHORITY_MODE, "app adopt: adopt moves every eligible app root"),
+        "enforce": (ACT, AUTHORITY_MODE, "app adopt: enforce moves every eligible app root"),
         "auto": (ACT, AUTHORITY_MODE, "auto adopt: every eligible app root gets its own scope"),
     },
     GUI_CLOSE: {

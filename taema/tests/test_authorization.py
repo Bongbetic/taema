@@ -1,10 +1,8 @@
 """Authorization ladder tests (issue #5).
 
-A table pins the 0.2.1 behaviour of every lifecycle trigger in every mode -- exactly the behaviour
-issue #1 describes for today (would-actions in observe/adopt, auto-only containment, enforce stops,
-per-pair auto authority, the manual stop acting everywhere). Further tests pin the slot order of
-spec #1 Implementation Decisions 2 and prove that every daemon/CLI decision point asks the ladder
-instead of checking the mode itself.
+A table pins the M0 behaviour of every lifecycle trigger in every mode. Further tests pin the slot
+order of spec #1 Implementation Decisions 2 and prove that every daemon/CLI decision point asks
+the ladder instead of checking the mode itself.
 """
 import argparse
 import io
@@ -29,8 +27,8 @@ TRUTH = [
         "observe": ("would", ""), "adopt": ("act", "mode"),
         "enforce": ("act", "mode"), "auto": ("act", "mode")}),
     (authorization.AUTO_ADOPT, authorization.Facts(), {
-        "observe": ("keep", ""), "adopt": ("keep", ""),
-        "enforce": ("keep", ""), "auto": ("act", "mode")}),
+        "observe": ("would", ""), "adopt": ("act", "mode"),
+        "enforce": ("act", "mode"), "auto": ("act", "mode")}),
     (authorization.GUI_CLOSE, authorization.Facts(), {
         "observe": ("keep", ""), "adopt": ("keep", ""),
         "enforce": ("keep", ""), "auto": ("act", "mode")}),
@@ -65,7 +63,7 @@ TRUTH = [
 
 
 class TruthTable(unittest.TestCase):
-    """Every trigger x mode, as 0.2.1 behaves, decided by the ladder alone."""
+    """Every trigger x mode, as M0 behaves, decided by the ladder alone."""
 
     def test_every_trigger_in_every_mode(self):
         for trigger, facts, want in TRUTH:

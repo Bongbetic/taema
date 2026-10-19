@@ -178,6 +178,26 @@ class DaemonRouting(AutoCase):
         self.assertEqual(kept, ["app-x"])                    # auto: empty scope has no pair
 
 
+class ManualKillRouting(unittest.TestCase):
+    """AC 1: the manual `taema kill` asks the ladder and behaves exactly as before."""
+
+    def test_cmd_kill_asks_manual_stop_and_output_is_unchanged(self):
+        cfg = make_cfg(tmp(), mode="observe")
+        store = knowledge.Store(tmp(), {})
+        rep = {"scope": "scope-x", "decisions": [], "removed": True, "left": []}
+        a = argparse.Namespace(name="x", timeout=None, force=False, hard=False,
+                               keep=None, dry_run=False)
+        with mock.patch.object(cli, "_load", return_value=(cfg, store, [])), \
+                mock.patch.object(cgroup, "resolve", return_value="/cg/user/1/scope-x"), \
+                mock.patch.object(engine, "stop", return_value=rep), \
+                mock.patch.object(authorization, "authorize",
+                                  wraps=authorization.authorize) as m:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = cli.cmd_kill(a)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c.args[0] for c in m.call_args_list], [authorization.MANUAL_STOP])
+        self.assertEqual(out.getvalue(), "scope scope-x stopped\n")
 
 
 if __name__ == "__main__":

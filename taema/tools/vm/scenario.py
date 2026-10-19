@@ -33,7 +33,7 @@ PROCROOT = os.environ.get("TAEMA_PROCROOT", "/proc")
 #: session leader; its session-leader parent stays alive long enough for the
 #: lineage scanner to see the parent relationship and classify it separately.
 APP_ROOT = '''\
-import os, sys, time
+import json, os, signal, subprocess, sys, time
 
 def main():
     n = int(sys.argv[1])
@@ -53,38 +53,23 @@ def main():
             f.write(str(os.getpid()))
         os.waitpid(root, 0)
         return
-    os.execv("/bin/sh", ["/bin/sh", os.path.join(workdir, "app_root.sh"),
-                          str(n), workdir, str(os.getppid()), str(time.monotonic())])
+
+    children = []
+    for _ in range(n):
+        p = subprocess.Popen(["/bin/sleep", "3600"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        children.append(p.pid)
+    tmp = os.path.join(workdir, "tree.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump({"root": os.getpid(), "session": os.getsid(0),
+                   "supervisor": os.getppid(), "started": time.monotonic(),
+                   "children": children}, f)
+    os.replace(tmp, os.path.join(workdir, "tree.json"))
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    while True:
+        signal.pause()
 
 main()
-'''
-
-# Use a different executable for the app root and its sleeping children. The
-# lineage model treats same-executable survivors as a possible self-update and
-# re-roots them, even when the root has been observed for a full scan interval.
-APP_SHELL = '''\
-n=$1
-workdir=$2
-session=$3
-started=$4
-children=
-i=0
-while [ "$i" -lt "$n" ]; do
-    sleep 3600 &
-    pid=$!
-    if [ -n "$children" ]; then
-        children="$children,$pid"
-    else
-        children=$pid
-    fi
-    i=$((i + 1))
-done
-tmp="$workdir/tree.json.tmp"
-printf '{"root":%s,"session":%s,"supervisor":%s,"started":%s,"children":[%s]}\\n' \\
-    "$$" "$session" "$session" "$started" "$children" > "$tmp"
-mv "$tmp" "$workdir/tree.json"
-trap 'exit 0' TERM INT
-wait
 '''
 
 
@@ -133,8 +118,6 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
     app = os.path.join(workdir, "app_root.py")
     with open(app, "w") as f:
         f.write(APP_ROOT)
-    with open(os.path.join(workdir, "app_root.sh"), "w") as f:
-        f.write(APP_SHELL)
     log = open(os.path.join(workdir, "root.log"), "w")
     proc = subprocess.Popen([sys.executable, app, str(children), workdir],
                             cwd=workdir, stdout=log, stderr=subprocess.STDOUT,
@@ -494,6 +477,13 @@ def scenario_smoke(rec, args, tree_holder):
     both = [assert_scope_member(p, "leftover/") for p in tree["children"]]
     rec.step("assert-scope-membership", both[0] == both[1],
              "members=%s" % both)
+
+    review_event = wait_for_event(os.path.join(args.state_dir, "decisions.log"),
+                                  "review_created", timeout=timeout)
+    review = _run(["/usr/bin/taema", "review"], timeout=30)
+    rec.step("review-created", review.returncode == 0 and "review #" in review.stdout
+             and "survivors=" in review.stdout,
+             (review_event + "\n" + review.stdout + review.stderr)[:800])
 
     return all(s["ok"] for s in rec.steps)
 

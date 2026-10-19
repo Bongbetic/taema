@@ -595,6 +595,10 @@ class ScenarioApiTest(unittest.TestCase):
         self.assertNotEqual(self.tree["session"], os.getsid(0),
                             "fixture root must have a distinct session")
         self.assertEqual(self.tree["supervisor"], self.tree["session"])
+        root_exe = os.path.realpath("/proc/%d/exe" % root)
+        child_exe = os.path.realpath("/proc/%d/exe" % self.tree["children"][0])
+        self.assertNotEqual(root_exe, child_exe,
+                            "root and survivors must not trigger same-exe re-rooting")
         self.assertTrue(os.path.exists(os.path.join(work, "tree.json")))
         for pid in self.tree["children"]:
             self.assertTrue(process_alive(pid))
@@ -691,17 +695,60 @@ class ScenarioApiTest(unittest.TestCase):
     def test_capture_daemon_logs_copies_available_files(self):
         state = os.path.join(self.tmp, "state")
         os.makedirs(state)
-        with open(os.path.join(state, "decisions.log"), "w") as f:
+        decisions = os.path.join(state, "decisions.log")
+        with open(decisions, "w") as f:
             f.write('{"event": "daemon_start"}\n')
+        os.chmod(decisions, 0o600)
         dest = os.path.join(self.tmp, "artifacts")
         copied = scenario.capture_daemon_logs(dest, state_dir=state)
         names = [os.path.basename(p) for p in copied]
         self.assertIn("decisions.log", names)
+        self.assertEqual(os.stat(os.path.join(dest, "decisions.log")).st_mode & 0o777, 0o644)
         with open(os.path.join(dest, "decisions.log")) as f:
             self.assertIn("daemon_start", f.read())
         # missing files are tolerated
         shutil.rmtree(state)
         scenario.capture_daemon_logs(os.path.join(self.tmp, "artifacts2"), state_dir=state)
+
+    def test_capture_daemon_logs_copies_privileged_files_and_skips_locks(self):
+        state = os.path.join(self.tmp, "state")
+        extra = os.path.join(self.tmp, "logs")
+        os.makedirs(state)
+        os.makedirs(extra)
+        with open(os.path.join(state, "decisions.log"), "w") as f:
+            f.write('{"event": "daemon_start"}\n')
+        with open(os.path.join(extra, "current"), "w") as f:
+            f.write("daemon log\n")
+        with open(os.path.join(extra, "lock"), "w") as f:
+            f.write("not a useful log\n")
+
+        def privileged(argv, timeout=60):
+            if argv[0] == "find":
+                files = [os.path.join(extra, name) for name in ("current",)]
+                return subprocess.CompletedProcess(argv, 0, "\0".join(files) + "\0", "")
+            self.assertEqual(argv[:3], ["install", "-m", "0644"])
+            shutil.copyfile(argv[3], argv[4])
+            os.chmod(argv[4], 0o644)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        dest = os.path.join(self.tmp, "artifacts")
+        with mock.patch.object(scenario, "run_privileged", side_effect=privileged) as run:
+            copied = scenario.capture_daemon_logs(dest, state_dir=state,
+                                                  extra_dirs=(extra,))
+
+        self.assertIn(os.path.join(dest, "logs", "current"), copied)
+        self.assertFalse(os.path.exists(os.path.join(dest, "logs", "lock")))
+        self.assertEqual(os.stat(os.path.join(dest, "logs", "current")).st_mode & 0o777, 0o644)
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["find", "install"])
+
+    def test_wait_for_auto_status_retries_until_daemon_is_ready(self):
+        unavailable = subprocess.CompletedProcess([], 1, "", "daemon not running")
+        ready = subprocess.CompletedProcess([], 0, '{"mode": "auto"}', "")
+        with mock.patch.object(scenario, "_run", side_effect=[unavailable, ready]) as run:
+            result, attempts = scenario.wait_for_auto_status(timeout=1, poll=0)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(run.call_count, 2)
 
     def test_run_privileged_uses_sudo_n(self):
         stub = os.path.join(self.tmp, "bin")

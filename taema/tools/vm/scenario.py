@@ -18,6 +18,7 @@ Scenario API:
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -32,7 +33,7 @@ PROCROOT = os.environ.get("TAEMA_PROCROOT", "/proc")
 #: session leader; its session-leader parent stays alive long enough for the
 #: lineage scanner to see the parent relationship and classify it separately.
 APP_ROOT = '''\
-import json, os, signal, subprocess, sys, time
+import os, sys, time
 
 def main():
     n = int(sys.argv[1])
@@ -52,22 +53,38 @@ def main():
             f.write(str(os.getpid()))
         os.waitpid(root, 0)
         return
-
-    children = []
-    for _ in range(n):
-        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        children.append(p.pid)
-    tmp = os.path.join(workdir, "tree.json.tmp")
-    with open(tmp, "w") as f:
-        json.dump({"root": os.getpid(), "session": os.getsid(0),
-                   "supervisor": os.getppid(), "children": children}, f)
-    os.replace(tmp, os.path.join(workdir, "tree.json"))
-    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-    while True:
-        signal.pause()
+    os.execv("/bin/sh", ["/bin/sh", os.path.join(workdir, "app_root.sh"),
+                          str(n), workdir, str(os.getppid()), str(time.monotonic())])
 
 main()
+'''
+
+# Use a different executable for the app root and its sleeping children. The
+# lineage model treats same-executable survivors as a possible self-update and
+# re-roots them, even when the root has been observed for a full scan interval.
+APP_SHELL = '''\
+n=$1
+workdir=$2
+session=$3
+started=$4
+children=
+i=0
+while [ "$i" -lt "$n" ]; do
+    sleep 3600 &
+    pid=$!
+    if [ -n "$children" ]; then
+        children="$children,$pid"
+    else
+        children=$pid
+    fi
+    i=$((i + 1))
+done
+tmp="$workdir/tree.json.tmp"
+printf '{"root":%s,"session":%s,"supervisor":%s,"started":%s,"children":[%s]}\\n' \\
+    "$$" "$session" "$session" "$started" "$children" > "$tmp"
+mv "$tmp" "$workdir/tree.json"
+trap 'exit 0' TERM INT
+wait
 '''
 
 
@@ -79,6 +96,28 @@ def default_state_dir():
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(
         os.path.expanduser("~"), ".local", "state")
     return os.path.join(base, "taema")
+
+
+def configured_adopt_interval():
+    """Read the daemon's adopt cadence from system and user TOML config."""
+    interval = 15.0
+    paths = ("/etc/taema/taema.toml",
+             os.path.join(os.path.expanduser("~"), ".config", "taema", "taema.toml"))
+    for path in paths:
+        section = ""
+        try:
+            with open(path) as f:
+                for raw in f:
+                    line = raw.split("#", 1)[0].strip()
+                    if line.startswith("[") and line.endswith("]"):
+                        section = line[1:-1].strip()
+                    elif section == "timers":
+                        match = re.match(r"adopt_interval\s*=\s*([0-9]+(?:\.[0-9]+)?)$", line)
+                        if match:
+                            interval = max(0.1, float(match.group(1)))
+        except OSError:
+            continue
+    return interval
 
 
 # ---- process tree ----------------------------------------------------------
@@ -94,6 +133,8 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
     app = os.path.join(workdir, "app_root.py")
     with open(app, "w") as f:
         f.write(APP_ROOT)
+    with open(os.path.join(workdir, "app_root.sh"), "w") as f:
+        f.write(APP_SHELL)
     log = open(os.path.join(workdir, "root.log"), "w")
     proc = subprocess.Popen([sys.executable, app, str(children), workdir],
                             cwd=workdir, stdout=log, stderr=subprocess.STDOUT,
@@ -108,6 +149,7 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
             return {"root": int(data["root"]), "children": [int(p) for p in data["children"]],
                     "session": int(data["session"]),
                     "supervisor": int(data["supervisor"]),
+                    "started": float(data["started"]),
                     "workdir": workdir, "proc": proc}
         time.sleep(0.05)
     rc = proc.poll()
@@ -276,7 +318,7 @@ def wait_for_scope(pid, prefixes, timeout=90, poll=0.5, cgroot=None, procroot=No
 # ---- logs and privileged steps --------------------------------------------
 
 def capture_daemon_logs(dest_dir, state_dir=None, extra_dirs=()):
-    """Copy readable daemon logs into dest_dir; returns the copied file paths."""
+    """Copy user state and privileged daemon logs into dest_dir."""
     state = state_dir or default_state_dir()
     os.makedirs(dest_dir, exist_ok=True)
     copied = []
@@ -286,14 +328,27 @@ def capture_daemon_logs(dest_dir, state_dir=None, extra_dirs=()):
         if os.path.isfile(src):
             dst = os.path.join(dest_dir, name)
             shutil.copy2(src, dst)
+            os.chmod(dst, 0o644)
             copied.append(dst)
     for d in extra_dirs:
-        if os.path.isdir(d) and os.access(d, os.R_OK):
-            dst = os.path.join(dest_dir, os.path.basename(d.rstrip("/")) or "log")
-            shutil.copytree(d, dst, dirs_exist_ok=True)
-            for base, _dirs, files in os.walk(dst):
-                for name in files:
-                    copied.append(os.path.join(base, name))
+        if not os.path.exists(d):
+            continue
+        root_dst = os.path.join(dest_dir, os.path.basename(d.rstrip("/")) or "log")
+        listing = run_privileged(["find", d, "-type", "f", "!", "-name", "lock", "-print0"])
+        if listing.returncode != 0:
+            raise OSError("cannot list privileged logs under %s: %s"
+                          % (d, listing.stderr.strip()))
+        for src in listing.stdout.split("\0"):
+            if not src:
+                continue
+            rel = os.path.relpath(src, d)
+            dst = os.path.join(root_dst, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            copied_file = run_privileged(["install", "-m", "0644", src, dst])
+            if copied_file.returncode != 0:
+                raise OSError("cannot copy privileged log %s: %s"
+                              % (src, copied_file.stderr.strip()))
+            copied.append(dst)
     return copied
 
 
@@ -306,6 +361,31 @@ def run_privileged(argv, timeout=60):
 def _run(argv, timeout=60):
     return subprocess.run([str(a) for a in argv],
                           capture_output=True, text=True, timeout=timeout)
+
+
+def wait_for_auto_status(timeout=30, poll=0.5):
+    """Wait for the per-user daemon socket to appear and answer status."""
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    while True:
+        attempts += 1
+        result = _run(["/usr/bin/taema", "status"], timeout=10)
+        if result.returncode == 0 and '"mode": "auto"' in result.stdout:
+            return result, attempts
+        if time.monotonic() >= deadline:
+            return result, attempts
+        time.sleep(poll)
+
+
+def runtime_socket_detail():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    path = os.path.join(runtime_dir, "taema.sock")
+    try:
+        st = os.stat(path)
+        return "%s mode=%04o uid=%d gid=%d" % (
+            path, st.st_mode & 0o7777, st.st_uid, st.st_gid)
+    except OSError as e:
+        return "%s unavailable: %s" % (path, e)
 
 
 # ---- results ---------------------------------------------------------------
@@ -350,9 +430,11 @@ def scenario_smoke(rec, args, tree_holder):
     rec.step("service-status", service.returncode == 0,
              (service.stdout + service.stderr).strip()[:300])
 
-    status = _run(["/usr/bin/taema", "status"], timeout=30)
+    status, attempts = wait_for_auto_status(timeout=30)
     rec.step("daemon-status", status.returncode == 0 and '"mode": "auto"' in status.stdout,
-             (status.stdout or status.stderr)[:400])
+             "attempts=%d HOME=%s XDG_RUNTIME_DIR=%s socket={%s} %s"
+             % (attempts, os.environ.get("HOME", "<unset>"), runtime_dir or "<unset>",
+                runtime_socket_detail(), (status.stdout or status.stderr)[:600]))
 
     tree = spawn_gui_tree(os.path.join(args.artifacts, "work"), children=2)
     tree_holder.append(tree)
@@ -377,8 +459,25 @@ def scenario_smoke(rec, args, tree_holder):
                            timeout=timeout)
     rec.step("daemon-event", True, event[:300])
 
+    # The lineage model treats a root seen only once as a short-lived wrapper.
+    # Keep the app alive through one full configured interval after the first
+    # adoption event so the next pass records a second sighting before close.
+    adopt_interval = configured_adopt_interval()
+    observation_window = adopt_interval + 1.0
+    time.sleep(observation_window)
+    stable_scope = scope_of(tree["root"])
+    root_age = time.monotonic() - tree["started"]
+    second_sighting = (_alive(tree["root"]) and stable_scope == rel
+                       and root_age >= observation_window)
+    rec.step("root-observed-twice", second_sighting,
+             "first_adopt=%s held=%.3fs adopt_interval=%.3fs root_age=%.3fs scope=%s"
+             % (event[:200], observation_window, adopt_interval, root_age, stable_scope))
+
+    close_started = time.monotonic()
     close_root(tree["root"], timeout=15)
-    rec.step("close-root", True, "root=%d terminated" % tree["root"])
+    closed_at = time.monotonic()
+    rec.step("close-root", True, "root=%d terminated in %.3fs"
+             % (tree["root"], closed_at - close_started))
 
     alive = [p for p in tree["children"] if _alive(p)]
     rec.step("children-alive", len(alive) == len(tree["children"]),
@@ -386,7 +485,11 @@ def scenario_smoke(rec, args, tree_holder):
 
     first = tree["children"][0]
     leftover = wait_for_scope(first, ["leftover/"], timeout=timeout)
+    promotion_latency = time.monotonic() - closed_at
     rec.step("survivors-contained", leftover != "", "scope=%s" % leftover)
+    rec.step("survivor-promotion-latency", promotion_latency <= timeout,
+             "scope=%s seconds_after_root_close=%.3f timeout=%ds"
+             % (leftover, promotion_latency, timeout))
 
     both = [assert_scope_member(p, "leftover/") for p in tree["children"]]
     rec.step("assert-scope-membership", both[0] == both[1],

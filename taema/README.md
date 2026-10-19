@@ -214,7 +214,7 @@ What happens in other situations:
 
 | You do this | tæma does this |
 |---|---|
-| Close a GUI app | Moves what it left behind into a `leftover/` scope and learns from it, silently. No pop-up. It stops them only when the pair is already decided and they are idle. |
+| Close a GUI app | In `adopt`, `auto`, and `enforce`, moves survivors into a `leftover/` scope and queues a review; `taema review` lists pending reviews. Reviews expire to keep after 14 days. In `observe`, it logs the would-contain action without moving anything. |
 | Log out | Leaves scopes running, so tmux and `nohup` jobs survive. A scope stops only if every process in it is one tæma is sure about. |
 | Close an app with `kill`, `pkill` or `killall` | Matches the vanished processes to your command and asks whether that app belonged to its usual parent. |
 
@@ -309,6 +309,7 @@ taema kill --hard NAME            # ignore detected outside users
 
 ```sh
 taema status               # daemon mode, owner watches, idle scopes, last GC
+taema review               # pending GUI-close reviews
 taema explain NAME|PID     # decision per member, edges found, learned stats
 taema gc --dry-run         # what GC would stop now, and why
 taema adopt --dry-run      # what adopt would move now

@@ -24,6 +24,9 @@ SCHEMA = 2
 
 # ---- pair model (Phase 2/4 thresholds; pure, see decide()) ----
 DAY = 86400.0
+MAX_OPEN_REVIEWS = 128
+REVIEW_TTL = 14 * DAY
+REVIEW_RETENTION = 30 * DAY
 MAX_PAIRS = 256
 MAX_PER_OWNER = 32
 W_ANSWER = 3.0              # explicit answer weight; never decayed
@@ -96,7 +99,7 @@ class Store:
     def _fresh(self):
         return {"version": SCHEMA, "last_decay": self.now(), "created": self.now(), "closes": 0,
                 "exes": {}, "pairs": {}, "standalone": {}, "noise": {},
-                "asked": {"day": 0, "n": 0}}
+                "asked": {"day": 0, "n": 0}, "reviews": [], "review_seq": 0}
 
     def _migrate(self, data):
         """v1 (exes only) -> v2: add pairs, standalone, asked, noise; keep every exe record."""
@@ -106,6 +109,15 @@ class Store:
         for k in ("pairs", "standalone", "asked", "noise"):
             if not isinstance(data.get(k), dict):
                 data[k] = fresh[k]
+        if "reviews" not in data or not isinstance(data.get("reviews"), list):
+            data["reviews"] = []
+            self.dirty = True
+        seq = data.get("review_seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            seq = max((r.get("id", 0) for r in data["reviews"] if isinstance(r, dict)
+                       and isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool)), default=0)
+            data["review_seq"] = seq
+            self.dirty = True
         if not isinstance(data.get("closes"), int) or isinstance(data["closes"], bool):
             data["closes"] = 0
         if not isinstance(data.get("created"), (int, float)) or isinstance(data["created"], bool):
@@ -364,6 +376,80 @@ class Store:
             drop(mine, len(mine) - MAX_PER_OWNER)
         if len(pairs) > MAX_PAIRS:
             drop(list(pairs), len(pairs) - MAX_PAIRS)
+
+    # ---- close reviews ----------------------------------------------------------------------
+    def open_reviews(self):
+        """Pending GUI-close reviews, in creation order, excluding reviews past their expiry."""
+        now = self.now()
+        return [dict(r) for r in self.data.get("reviews", []) if isinstance(r, dict)
+                and r.get("state") == "open" and r.get("expires", now) > now]
+
+    @property
+    def review_count(self):
+        return len(self.open_reviews())
+
+    def review_holds_scope(self, scope):
+        """Open and expired close reviews keep their contained scope out of automatic GC."""
+        return any(isinstance(r, dict) and r.get("scope") == scope
+                   and r.get("state") in ("open", "expired") for r in self.data.get("reviews", []))
+
+    def _resolve_review(self, review, now, reason):
+        review["state"] = "expired"
+        review["closed"] = now
+        review["reason"] = reason
+        for key in review.get("survivors", []):
+            self.answer(review.get("owner"), key, "keep")
+        self.dirty = True
+
+    def expire_reviews(self):
+        """Resolve expired or over-cap reviews to keep, then prune closed records after 30 days."""
+        now = self.now()
+        reviews = self.data.setdefault("reviews", [])
+        expired = 0
+        for review in reviews:
+            if isinstance(review, dict) and review.get("state") == "open" \
+                    and review.get("expires", now + 1) <= now:
+                self._resolve_review(review, now, "expired")
+                expired += 1
+                self.log(event="review_expired", id=review.get("id"), owner=review.get("owner"))
+        closed = [r for r in reviews if isinstance(r, dict) and r.get("state") != "open"
+                  and r.get("closed", now) <= now - REVIEW_RETENTION]
+        if closed:
+            self.data["reviews"] = [r for r in reviews if r not in closed]
+            self.dirty = True
+        return expired
+
+    def add_review(self, owner, members, scope):
+        """Record one durable review for members moved to a leftover scope."""
+        if not isinstance(owner, str) or not owner or len(owner) > 256 or not isinstance(scope, str) or not scope:
+            return None
+        by_key = {}
+        for member in members:
+            if not isinstance(member, dict) or not isinstance(member.get("key"), str) \
+                    or not isinstance(member.get("pid"), int) or isinstance(member.get("pid"), bool):
+                continue
+            by_key.setdefault(member["key"], set()).add(member["pid"])
+        if not by_key:
+            return None
+        self.expire_reviews()
+        reviews = self.data.setdefault("reviews", [])
+        opens = [r for r in reviews if isinstance(r, dict) and r.get("state") == "open"]
+        while len(opens) >= MAX_OPEN_REVIEWS:
+            oldest = min(opens, key=lambda r: (r.get("created", 0), r.get("id", 0)))
+            now = self.now()
+            self._resolve_review(oldest, now, "queue cap")
+            self.log(event="review_expired", id=oldest.get("id"), owner=oldest.get("owner"),
+                     reason="queue cap")
+            opens.remove(oldest)
+        now = self.now()
+        review_id = self.data.get("review_seq", 0) + 1
+        review = {"id": review_id, "owner": owner, "survivors": sorted(by_key),
+                  "pids": sorted({p for pids in by_key.values() for p in pids}), "scope": scope,
+                  "created": now, "expires": now + REVIEW_TTL, "state": "open"}
+        reviews.append(review)
+        self.data["review_seq"] = review_id
+        self.dirty = True
+        return dict(review)
 
     def answer(self, owner, leftover, choice):
         """One explicit answer: weight 3, kept in ex_* counters that decay never touches. A fresh

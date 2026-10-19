@@ -172,11 +172,12 @@ logout unless their pair is confidently "stop on close". Unknown is never "no": 
 
 ## Leftover scopes
 
-When an app closes (a GUI close is silent, no prompt), its survivors move to
-`leftover/<owner>-<id>`. GC stops such a scope when it is idle (no edges, flat CPU in
-`cpu.stat`, no ptmx) after the learned grace, and only when the pair allows it. Pairs
-answered in a terminal apply to GUI closes too. Persist seeds and share seeds are never
-drained. The scope is removed when empty (`cgroup.events` shows `populated 0`).
+When a GUI app closes, its non-standalone survivors move to `leftover/<owner>-<id>` and a
+review is queued. Pending reviews hold their scope; expiry records a keep answer and never
+authorizes a stop. `taema review` lists each open review's owner, survivor keys, and age.
+Standalone survivors get their own app scope. Terminal-job roots do not create leftover scopes.
+Persist seeds and share seeds are never drained. The scope is removed when empty
+(`cgroup.events` shows `populated 0`).
 
 ## Resource budget
 

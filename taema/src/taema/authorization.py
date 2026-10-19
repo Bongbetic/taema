@@ -121,7 +121,7 @@ class Decision:
 _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
     OWNER_EXIT: {
         "observe": (WOULD_ACT, "", "owner exit: observe only logs would_stop"),
-        "adopt": (WOULD_ACT, "", "owner exit: adopt suppresses owner-bound stops (0.2.1)"),
+        "adopt": (ACT, AUTHORITY_UNIT, "owner exit: adopt honors explicit owner binding"),
         "enforce": (ACT, AUTHORITY_UNIT, "owner exit: enforce stops the bound scope"),
         "auto": (ACT, AUTHORITY_UNIT, "owner exit: an owner-bound scope is the user's own request"),
     },

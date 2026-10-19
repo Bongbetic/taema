@@ -365,10 +365,11 @@ def _inside_user(pid):
     return cg == me or cg.startswith(me + "/")
 
 
-def run_ops(cfg, store, ops, execute):
+def run_ops(cfg, store, ops, execute, cleanup=True):
     """Log every op; perform it when `execute`. Returns the ops with a 'done' flag.
     Pids inside user/<uid> move directly; the sudo helper is used only for pids in a session
-    cgroup. A repeated adopt_would for an identical op is not logged again."""
+    cgroup. A repeated adopt_would for an identical op is not logged again. Callers batching
+    multiple plans can defer stale-signature cleanup until the batch is complete."""
     seen = set()
     for op in ops:
         op["done"] = False
@@ -403,7 +404,8 @@ def run_ops(cfg, store, ops, execute):
             if store.changed("adopt_would:" + op["scope"], (op["op"], tuple(sorted(op["pids"])),
                                                            op["skipped_protected"])):
                 store.log(event="adopt_would", **fields)
-    store.forget_sigs("adopt_would:", {"adopt_would:" + x for x in seen})
+    if cleanup:
+        store.forget_sigs("adopt_would:", {"adopt_would:" + x for x in seen})
     store.save_if_dirty(knowledge.SAVE_INTERVAL)
     return ops
 

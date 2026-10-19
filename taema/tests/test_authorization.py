@@ -1,9 +1,9 @@
 """Authorization ladder tests (issue #5).
 
 A table pins the current mode behavior for every lifecycle trigger, including GUI survivor
-containment in adopt, auto, and enforce. Further tests pin the slot order of spec #1 Implementation
-Decisions 2 and prove that every daemon/CLI decision point asks the ladder instead of checking the
-mode itself.
+containment and adoption in adopt, auto, and enforce. Further tests pin the slot order of spec #1
+Implementation Decisions 2 and prove that every daemon/CLI decision point asks the ladder instead
+of checking the mode itself.
 """
 import argparse
 import io
@@ -28,8 +28,8 @@ TRUTH = [
         "observe": ("would", ""), "adopt": ("act", "mode"),
         "enforce": ("act", "mode"), "auto": ("act", "mode")}),
     (authorization.AUTO_ADOPT, authorization.Facts(), {
-        "observe": ("keep", ""), "adopt": ("keep", ""),
-        "enforce": ("keep", ""), "auto": ("act", "mode")}),
+        "observe": ("would", ""), "adopt": ("act", "mode"),
+        "enforce": ("act", "mode"), "auto": ("act", "mode")}),
     (authorization.GUI_CLOSE, authorization.Facts(), {
         "observe": ("would", ""), "adopt": ("act", "mode"),
         "enforce": ("act", "mode"), "auto": ("act", "mode")}),

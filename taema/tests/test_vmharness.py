@@ -589,6 +589,8 @@ class ScenarioApiTest(unittest.TestCase):
         work = os.path.join(self.tmp, "work")
         self.tree = scenario.spawn_gui_tree(work, children=2)
         root = self.tree["root"]
+        self.assertEqual(os.getsid(root), os.getsid(0),
+                         "fixture root must stay in the caller's login session")
         self.assertTrue(os.path.exists(os.path.join(work, "tree.json")))
         for pid in self.tree["children"]:
             self.assertTrue(process_alive(pid))

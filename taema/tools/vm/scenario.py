@@ -27,13 +27,32 @@ import time
 CGROOT = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
 PROCROOT = os.environ.get("TAEMA_PROCROOT", "/proc")
 
-#: The fake application root: spawns children, records the tree, idles.
+#: The fake application root: forks out of the SSH session, spawns children,
+#: records the tree, and idles. The final process is deliberately not a
+#: session leader; its session-leader parent stays alive long enough for the
+#: lineage scanner to see the parent relationship and classify it separately.
 APP_ROOT = '''\
 import json, os, signal, subprocess, sys, time
 
 def main():
     n = int(sys.argv[1])
     workdir = sys.argv[2]
+
+    # Popen starts this launcher as a session leader. Its child can therefore
+    # create a distinct session with setsid(), then fork a non-session-leader
+    # app root. Keep that session leader as the root's parent until it exits so
+    # the daemon can observe the relationship instead of seeing a ppid-1
+    # newcomer.
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+    root = os.fork()
+    if root:
+        with open(os.path.join(workdir, "supervisor.pid"), "w") as f:
+            f.write(str(os.getpid()))
+        os.waitpid(root, 0)
+        return
+
     children = []
     for _ in range(n):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"],
@@ -41,7 +60,8 @@ def main():
         children.append(p.pid)
     tmp = os.path.join(workdir, "tree.json.tmp")
     with open(tmp, "w") as f:
-        json.dump({"root": os.getpid(), "children": children}, f)
+        json.dump({"root": os.getpid(), "session": os.getsid(0),
+                   "supervisor": os.getppid(), "children": children}, f)
     os.replace(tmp, os.path.join(workdir, "tree.json"))
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     while True:
@@ -64,11 +84,11 @@ def default_state_dir():
 # ---- process tree ----------------------------------------------------------
 
 def spawn_gui_tree(workdir, children=2, timeout=10):
-    """Start a fake GUI app: a root process that spawns `children` sleepers.
+    """Start a detached fake GUI app with `children` sleeping descendants.
 
-    Returns {"root": pid, "children": [pids], "workdir": ..., "proc": Popen}.
-    The root stays in the caller's login session so the daemon can adopt it;
-    the smoke scenario keeps that session open until after the root is closed.
+    Returns root/child/supervisor pids, session id, workdir, and launcher Popen.
+    The root has its own session but is not a session leader; the smoke scenario
+    keeps the SSH login session open until after the root is closed.
     """
     os.makedirs(workdir, exist_ok=True)
     app = os.path.join(workdir, "app_root.py")
@@ -76,7 +96,8 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
         f.write(APP_ROOT)
     log = open(os.path.join(workdir, "root.log"), "w")
     proc = subprocess.Popen([sys.executable, app, str(children), workdir],
-                            cwd=workdir, stdout=log, stderr=subprocess.STDOUT)
+                            cwd=workdir, stdout=log, stderr=subprocess.STDOUT,
+                            start_new_session=True)
     log.close()
     treefile = os.path.join(workdir, "tree.json")
     deadline = time.monotonic() + timeout
@@ -85,11 +106,13 @@ def spawn_gui_tree(workdir, children=2, timeout=10):
             with open(treefile) as f:
                 data = json.load(f)
             return {"root": int(data["root"]), "children": [int(p) for p in data["children"]],
+                    "session": int(data["session"]),
+                    "supervisor": int(data["supervisor"]),
                     "workdir": workdir, "proc": proc}
-        if proc.poll() is not None:
-            raise ScenarioError("app root exited during spawn (rc=%s)" % proc.returncode)
         time.sleep(0.05)
-    raise ScenarioError("app root did not report its tree within %ss" % timeout)
+    rc = proc.poll()
+    raise ScenarioError("app root did not report its tree within %ss (launcher rc=%s)"
+                        % (timeout, rc))
 
 
 def _reaped(pid):
@@ -154,6 +177,12 @@ def kill_tree(tree, timeout=5):
         try:
             proc.wait(timeout=timeout)
         except Exception:
+            pass
+    supervisor = tree.get("supervisor")
+    if supervisor:
+        try:
+            os.kill(supervisor, signal.SIGKILL)
+        except OSError:
             pass
 
 
@@ -313,6 +342,14 @@ class ResultRecorder:
 def scenario_smoke(rec, args, tree_holder):
     """Contain a GUI-like tree, close the root, verify survivor containment."""
     timeout = args.timeout
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+    rec.step("login-session-env", bool(runtime_dir),
+             "XDG_RUNTIME_DIR=%s" % (runtime_dir or "<unset>"))
+
+    service = run_privileged(["sv", "status", "/var/service/taema"])
+    rec.step("service-status", service.returncode == 0,
+             (service.stdout + service.stderr).strip()[:300])
+
     status = _run(["/usr/bin/taema", "status"], timeout=30)
     rec.step("daemon-status", status.returncode == 0 and '"mode": "auto"' in status.stdout,
              (status.stdout or status.stderr)[:400])
@@ -321,11 +358,22 @@ def scenario_smoke(rec, args, tree_holder):
     tree_holder.append(tree)
     rec.step("spawn", True, "root=%d children=%s"
              % (tree["root"], tree["children"]))
+    runner_sid = os.getsid(0)
+    rec.step("fixture-session", tree["root"] != tree["session"]
+             and tree["session"] != runner_sid,
+             "root=%d session=%d runner_session=%d supervisor=%d"
+             % (tree["root"], tree["session"], runner_sid, tree["supervisor"]))
 
     rel = wait_for_scope(tree["root"], ["app-"], timeout=timeout)
     rec.step("root-contained", rel != "", "scope=%s" % rel)
+    runner_scope = scope_of(os.getpid())
+    rec.step("root-distinct-scope", rel != runner_scope,
+             "root=%s runner=%s" % (rel, runner_scope))
 
-    event = wait_for_event(os.path.join(args.state_dir, "decisions.log"), rel,
+    # decisions.log records the scope leaf (app-...), while cgroup paths
+    # include the user/session prefix (user/<uid>/...).
+    event = wait_for_event(os.path.join(args.state_dir, "decisions.log"),
+                           os.path.basename(rel),
                            timeout=timeout)
     rec.step("daemon-event", True, event[:300])
 
@@ -344,10 +392,6 @@ def scenario_smoke(rec, args, tree_holder):
     rec.step("assert-scope-membership", both[0] == both[1],
              "members=%s" % both)
 
-    copied = capture_daemon_logs(os.path.join(args.artifacts, "daemon-logs"),
-                                 state_dir=args.state_dir,
-                                 extra_dirs=("/var/log/taema",))
-    rec.step("capture-daemon-logs", bool(copied), "files=%d" % len(copied))
     return all(s["ok"] for s in rec.steps)
 
 
@@ -447,6 +491,17 @@ def main(argv):
     finally:
         for tree in tree_holder:
             kill_tree(tree, timeout=10)
+        try:
+            copied = capture_daemon_logs(
+                os.path.join(args.artifacts, "daemon-logs"),
+                state_dir=args.state_dir, extra_dirs=("/var/log/taema",))
+            captured = bool(copied)
+            detail = "files=%d" % len(copied)
+        except OSError as e:
+            captured = False
+            detail = "%s: %s" % (type(e).__name__, e)
+        rec.step("capture-daemon-logs", captured, detail)
+        ok = ok and captured
         rec.finish(ok)
     print("%s: %s" % (args.name, "PASS" if ok else "FAIL"))
     for step in rec.steps:

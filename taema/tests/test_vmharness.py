@@ -692,6 +692,18 @@ class ScenarioApiTest(unittest.TestCase):
         with self.assertRaises(scenario.ScenarioError):
             scenario.wait_for_event(log, "auto_stop", timeout=0.3, poll=0.05)
 
+    def test_wait_for_audit_event_matches_scope_and_trigger(self):
+        log = os.path.join(self.tmp, "decisions.log")
+        with open(log, "w") as f:
+            f.write('{"event":"vetoed","trigger":"manual_stop",'
+                    '"scope":"scope-x"}\n')
+            f.write('{"event":"vetoed","trigger":"owner_exit",'
+                    '"scope":"scope-x"}\n')
+        event = scenario.wait_for_audit_event(
+            log, "vetoed", "scope-x", trigger="owner_exit", timeout=5, poll=0.05)
+        self.assertEqual((event["event"], event["scope"], event["trigger"]),
+                         ("vetoed", "scope-x", "owner_exit"))
+
     def _fake_scope(self, rel, pids):
         d = os.path.join(self.cgroot, rel)
         os.makedirs(d, exist_ok=True)

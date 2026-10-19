@@ -651,6 +651,20 @@ def _event_lines(path, event, scope=None):
             and (scope is None or item.get("scope") == scope)]
 
 
+def wait_for_audit_event(path, event, scope, trigger=None, timeout=60, poll=0.25):
+    """Wait for one audit event matching its event name, exact scope, and optional trigger."""
+    deadline = time.monotonic() + timeout
+    while True:
+        matches = _event_lines(path, event, scope)
+        for item in matches:
+            if trigger is None or item.get("trigger") == trigger:
+                return item
+        if time.monotonic() >= deadline:
+            raise ScenarioError("no %s audit event for %s (trigger=%s) within %ss"
+                                % (event, scope, trigger, timeout))
+        time.sleep(poll)
+
+
 def scenario_m0(rec, args, tree_holder):
     """Exercise the 0.3.0 adopt, auto, owner-exit and observe acceptance in a live guest."""
     config_paths = _m0_config_paths()
@@ -713,7 +727,8 @@ def scenario_m0(rec, args, tree_holder):
                (veto.stdout + veto.stderr).strip()[:400])
         refused = _run(["/usr/bin/taema", "kill", leftover_leaf], timeout=30)
         record("adopt-manual-kill-refused-with-four",
-               refused.returncode == 4 and all(_process_running(pid) for pid in tree["children"]),
+               refused.returncode == 4 and "app sleep" in (refused.stdout + refused.stderr)
+               and all(_process_running(pid) for pid in tree["children"]),
                "rc=%d output=%s" % (refused.returncode,
                                     (refused.stdout + refused.stderr).strip()[:500]))
 
@@ -730,22 +745,23 @@ def scenario_m0(rec, args, tree_holder):
         bound_veto = track(_spawn_bound_tree("m0-veto", os.path.join(args.artifacts, "m0-veto"),
                                               ["/bin/sleep", "3600"]))
         veto_scope = wait_for_scope(bound_veto["root"], ["scope-m0-veto"], timeout=30)
-        veto_cmd = _run(["/usr/bin/taema", "do-not-kill", "scope:" + veto_scope], timeout=30)
-        record("owner-exit-veto-registered", veto_cmd.returncode == 0,
-               (veto_cmd.stdout + veto_cmd.stderr).strip()[:400])
+        veto_leaf = daemon_scope(veto_scope)
         refused = _run(["/usr/bin/taema", "kill", "m0-veto"], timeout=30)
-        record("vetoed-manual-scope-kill-refused-with-four",
-               refused.returncode == 4 and _process_running(bound_veto["children"][0]),
+        record("app-vetoed-bound-manual-kill-refused-with-four",
+               refused.returncode == 4 and "app sleep" in (refused.stdout + refused.stderr)
+               and _process_running(bound_veto["children"][0]),
                "rc=%d output=%s" % (refused.returncode,
                                     (refused.stdout + refused.stderr).strip()[:500]))
         open(bound_veto["gate"], "w").close()
         bound_veto["proc"].wait(timeout=20)
-        wait_for_event(log_path, '"trigger": "owner_exit"', timeout=30)
-        record("vetoed-owner-close-stops-nothing",
+        owner_veto_event = wait_for_audit_event(
+            log_path, "vetoed", veto_leaf, trigger="owner_exit", timeout=30)
+        record("app-vetoed-owner-close-stops-nothing",
                _process_running(bound_veto["children"][0])
-               and scope_of(bound_veto["children"][0]) == veto_scope,
-               "scope=%s child=%d remains running" %
-               (veto_scope, bound_veto["children"][0]))
+               and scope_of(bound_veto["children"][0]) == veto_scope
+               and "app sleep" in owner_veto_event.get("target", ""),
+               "scope=%s child=%d event=%s" %
+               (veto_scope, bound_veto["children"][0], owner_veto_event))
 
         status = _m0_write_mode("observe", idle_grace=3600, adopt_interval=2)
         record("observe-mode-ready", status.returncode == 0, status.stdout[:300])
@@ -794,8 +810,9 @@ def scenario_m0(rec, args, tree_holder):
             os.path.join(args.artifacts, "runtime-vetoed")))
         eligible_scope = wait_for_scope(eligible["root"], ["app-m0pause-"], timeout=30)
         vetoed_scope = wait_for_scope(vetoed["root"], ["app-m0pause-"], timeout=30)
+        vetoed_leaf = daemon_scope(vetoed_scope)
         time.sleep(35)
-        scope_veto = _run(["/usr/bin/taema", "do-not-kill", "scope:" + vetoed_scope], timeout=30)
+        scope_veto = _run(["/usr/bin/taema", "do-not-kill", "scope:" + vetoed_leaf], timeout=30)
         record("auto-pause-veto-registered", scope_veto.returncode == 0,
                (scope_veto.stdout + scope_veto.stderr).strip()[:400])
         os.rmdir(eligible["runtime_dir"])
@@ -807,11 +824,13 @@ def scenario_m0(rec, args, tree_holder):
                "scope=%s gc=%s" % (eligible_scope, eligible_gc.stdout[-700:]))
         os.rmdir(vetoed["runtime_dir"])
         vetoed_gc = _run(["/usr/bin/taema", "gc"], timeout=30)
-        wait_for_event(log_path, '"trigger": "gc_stop"', timeout=30)
+        gc_veto_event = wait_for_audit_event(
+            log_path, "vetoed", vetoed_leaf, trigger="gc_stop", timeout=30)
         record("auto-gc-veto-keeps-pause-scope",
                vetoed_gc.returncode == 0 and _process_running(vetoed["root"])
                and scope_of(vetoed["root"]) == vetoed_scope,
-               "scope=%s gc=%s" % (vetoed_scope, vetoed_gc.stdout[-700:]))
+               "scope=%s gc=%s event=%s" %
+               (vetoed_scope, vetoed_gc.stdout[-700:], gc_veto_event))
 
         status = _m0_write_mode("observe", idle_grace=3600, adopt_interval=2)
         record("simulated-gc-observe-mode-ready", status.returncode == 0, status.stdout[:300])

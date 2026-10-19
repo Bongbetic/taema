@@ -447,32 +447,33 @@ class KnowledgeV2(unittest.TestCase):
     def fresh(self):
         return knowledge.Store(self.d, {}, self.c)
 
-    def test_v1_file_migrates_keeping_exes(self):
+    def test_legacy_json_waits_for_the_migration_ticket(self):
         d = tmp()
         v1 = {
             "last_decay": self.c(),
             "exes": {"adb": {"user_keep": 3.0, "seen": 2.0, "term_exit_ms": [5]}},
         }
-        with open(d + "/knowledge.json", "w") as f:
+        legacy_path = d + "/knowledge.json"
+        with open(legacy_path, "w") as f:
             json.dump(v1, f)
         s = knowledge.Store(d, {}, self.c)
-        self.assertEqual(s.data["version"], 2)
-        self.assertEqual(s.data["exes"]["adb"]["user_keep"], 3.0)
+        self.assertNotIn("adb", s.data["exes"])
         self.assertEqual(s.data["pairs"], {})
         self.assertEqual(s.data["standalone"], {})
         self.assertIn("asked", s.data)
-        self.assertTrue(s.dirty)
-        s.save()
-        with open(d + "/knowledge.json") as f:
-            self.assertEqual(json.load(f)["version"], 2)
-        self.assertEqual(knowledge.Store(d, {}, self.c).peek("adb")["user_keep"], 3.0)
+        with open(legacy_path) as f:
+            self.assertEqual(json.load(f), v1)
 
-    def test_bad_section_shapes_are_reset(self):
+    def test_existing_database_state_takes_precedence_over_legacy_json(self):
         d = tmp()
+        store = knowledge.Store(d, {}, self.c)
+        store.bump("sqlite-app", "seen", 4)
+        store.save()
         with open(d + "/knowledge.json", "w") as f:
-            json.dump({"exes": {}, "pairs": [], "standalone": 3, "version": 2}, f)
-        s = knowledge.Store(d, {}, self.c)
-        self.assertEqual((s.data["pairs"], s.data["standalone"]), ({}, {}))
+            json.dump({"exes": {"legacy-app": {"seen": 99}}}, f)
+        reopened = knowledge.Store(d, {}, self.c)
+        self.assertEqual(reopened.peek("sqlite-app")["seen"], 4)
+        self.assertEqual(reopened.peek("legacy-app")["seen"], 0)
 
     def test_explicit_answer_weight_and_no_decay(self):
         self.s.answer("npm", "vite", "stop")
@@ -593,14 +594,14 @@ class KnowledgeV2(unittest.TestCase):
         self.assertEqual(self.s.peek("k")["respawned"], 1)
 
     def test_caps(self):
-        for i in range(40):
+        for i in range(knowledge.MAX_PER_OWNER + 5):
             self.s.observe_close("o", "l%d" % i)
         self.assertEqual(
             sum(1 for k in self.s.data["pairs"] if k.startswith("o\0")),
             knowledge.MAX_PER_OWNER,
         )
         self.s.answer("o", "keepme", "keep")
-        for i in range(40):
+        for i in range(knowledge.MAX_PER_OWNER + 5):
             self.s.observe_close("o", "z%d" % i)
         self.assertIn(
             self.s.pkey("o", "keepme"), self.s.data["pairs"]
@@ -663,7 +664,7 @@ class KnowledgeV2(unittest.TestCase):
         self.assertFalse(s.observe_kill_inferred("gpu-render", "y"))
         self.assertEqual(s.data["pairs"], {})
 
-    def test_noise_survives_save_and_migration(self):
+    def test_noise_survives_save_while_legacy_json_is_ignored(self):
         self.s.observe_close("sleep", "vite")
         self.s.save()
         self.assertEqual(knowledge.Store(self.d, {}, self.c).data["noise"], {"vite": 1})

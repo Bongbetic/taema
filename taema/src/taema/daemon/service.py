@@ -51,6 +51,7 @@ MAX_GATE_SKIPS = 4  # fork gate: at most 4 skipped adopt passes, so every 5th on
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
+        self._in_tick = False
         self.deny = policy.owner_deny(cfg)
         self.store = knowledge.Store(
             policy.state_dir(cfg), cfg.get("seeds"), deny=self.deny
@@ -238,7 +239,7 @@ class Daemon:
 
     def adopt_pass(self):
         self.store.expire_reviews()
-        self.store.save_if_dirty()
+        self._save_if_idle()
         self.expire_respawns()
         sig = self._fork_sig()
         if (
@@ -400,7 +401,7 @@ class Daemon:
             self.store.auto_stopped(o, k)
             self.auto_recent[k] = (o, now)
         self.store.record_auto_action(scope, why, pairs, apps)
-        self.store.save_if_dirty()
+        self._save_if_idle()
         while len(self.auto_recent) > 256:
             del self.auto_recent[
                 min(self.auto_recent, key=lambda k: self.auto_recent[k][1])
@@ -480,7 +481,7 @@ class Daemon:
                             survivors=review["survivors"],
                             pids=review["pids"],
                         )
-                        self.store.save_if_dirty()
+                        self._save_if_idle()
             except engine.Refused as e:
                 self.store.log(event="leftover_move_refused", scope=name, error=str(e))
 
@@ -1220,14 +1221,14 @@ class Daemon:
                 self.store.log(
                     event="gc_review_created", id=review["id"], scope=leaf, why=why
                 )
-        self.store.save_if_dirty()
+        self._save_if_idle()
         return self.store.review_holds_scope(leaf)
 
     def gc_pass(self, dry_run=False):
         self.store.expire_reviews()
-        self.store.save_if_dirty()
+        self._save_if_idle()
         if self.store.apply_feedback():
-            self.store.save_if_dirty()
+            self._save_if_idle()
         self.store.decay()
         self.store.enforce_caps()
         # candidate selection: leftover/* leaves are stop candidates only where the ladder allows
@@ -1418,6 +1419,11 @@ class Daemon:
                 error="%s: %s" % (type(e).__name__, e),
             )
 
+    def _save_if_idle(self):
+        """Defer routine writes until the end of a daemon pass."""
+        if not self._in_tick:
+            self.store.save_if_dirty()
+
     # ---- socket API ----
     def handle(self, msg):
         if not isinstance(msg, dict):
@@ -1425,7 +1431,7 @@ class Daemon:
         c = msg.get("cmd")
         if c == "status":
             self.store.expire_reviews()
-            self.store.save_if_dirty()
+            self._save_if_idle()
             return {
                 "mode": self.mode,
                 "uptime_s": int(time.time() - self.started),
@@ -1450,7 +1456,7 @@ class Daemon:
             }
         if c == "review":
             self.store.expire_reviews()
-            self.store.save_if_dirty()
+            self._save_if_idle()
             return {"reviews": self.store.open_reviews()}
         if c == "register":
             leaf, owner = msg.get("scope"), msg.get("owner")
@@ -1475,17 +1481,29 @@ class Daemon:
         if c == "answer":
             return self.answer_question(msg)
         if c == "gc":
-            return {"candidates": self.gc_pass(dry_run=msg.get("dry_run") is True)}
+            was_in_tick = self._in_tick
+            was_deferred = self.store.defer_writes
+            self._in_tick = True
+            self.store.defer_writes = True
+            try:
+                candidates = self.gc_pass(dry_run=msg.get("dry_run") is True)
+            finally:
+                self._in_tick = was_in_tick
+                self.store.defer_writes = was_deferred
+            if not was_deferred:
+                self.store.save_if_dirty()
+            return {"candidates": candidates}
         if c == "feedback":
             if msg.get("v") == 1:
                 result = self.store.apply_feedback_command(msg)
                 if result is None:
                     return {"error": "bad request"}
-                self.store.save_if_dirty()
+                if not result.get("duplicate"):
+                    self.store.save()
                 return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):
                 return {"error": "bad request"}
-            self.store.save_if_dirty()
+            self.store.save()
             return {"ok": True}
         return {"error": "unknown command"}
 
@@ -1643,18 +1661,24 @@ class Daemon:
 
     def tick(self):
         """Run what is due: socket check, adopt (+ session end), GC, routine save."""
-        self.guarded(self.check_socket)
-        self.run_deadlines()
-        now = time.time()
-        if now - self.last["adopt"] >= self.iv_adopt:
-            self.last["adopt"] = now
-            self.guarded(self.adopt_pass)
-            if self.session_ended():
-                self.guarded(self.end_session)
-        if now - self.last["gc"] >= self.iv_gc:
-            self.last["gc"] = now
-            self.guarded(self.gc_pass)
-        self.guarded(lambda: self.store.save_if_dirty(knowledge.SAVE_INTERVAL))
+        self._in_tick = True
+        self.store.defer_writes = True
+        try:
+            self.guarded(self.check_socket)
+            self.run_deadlines()
+            now = time.time()
+            if now - self.last["adopt"] >= self.iv_adopt:
+                self.last["adopt"] = now
+                self.guarded(self.adopt_pass)
+                if self.session_ended():
+                    self.guarded(self.end_session)
+            if now - self.last["gc"] >= self.iv_gc:
+                self.last["gc"] = now
+                self.guarded(self.gc_pass)
+        finally:
+            self._in_tick = False
+            self.store.defer_writes = False
+            self.guarded(self.store.save_if_dirty)
 
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)

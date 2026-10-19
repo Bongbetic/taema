@@ -128,10 +128,18 @@ class VetoCommands(unittest.TestCase):
             "op": "veto",
             "target": {"kind": "app", "value": "firefox", "start": None},
         }
+        d.store.defer_writes = True
         self.assertTrue(d.handle(msg)["ok"])
         self.assertTrue(d.handle(msg)["duplicate"])
         self.assertEqual(
             d.store.match_veto(members=[{"pid": 9, "start": 10, "apps": ["firefox"]}])[
+                "value"
+            ],
+            "firefox",
+        )
+        reopened = knowledge.Store(d.store.dir, {}, read_only=True)
+        self.assertEqual(
+            reopened.match_veto(members=[{"pid": 9, "start": 10, "apps": ["firefox"]}])[
                 "value"
             ],
             "firefox",

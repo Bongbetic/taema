@@ -8,7 +8,6 @@ import sys
 import time
 
 from ..core import cgroup, process as inspect
-from ..store import knowledge
 from ..config import policy
 
 
@@ -335,7 +334,7 @@ def stop(
             for d in report["decisions"]
         ],
     )
-    store.save_if_dirty(knowledge.SAVE_INTERVAL)
+    store.save_if_dirty()
     return report
 
 
@@ -532,7 +531,7 @@ def run_ops(cfg, store, ops, execute, cleanup=True):
                 store.log(event="adopt_would", **fields)
     if cleanup:
         store.forget_sigs("adopt_would:", {"adopt_would:" + x for x in seen})
-    store.save_if_dirty(knowledge.SAVE_INTERVAL)
+    store.save_if_dirty()
     return ops
 
 

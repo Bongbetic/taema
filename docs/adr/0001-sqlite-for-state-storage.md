@@ -33,6 +33,12 @@ which a single JSON blob models well.
 - There is exactly one writer, the daemon, committing one transaction per pass and
   immediately after answers, vetoes, and undo. Readers (CLI, dashboard, agent, bar) open
   `file:…?mode=ro` URIs.
+- Enforce the v2 storage bounds: 50,000 instances/90 days; 200,000 events/90 days; 10,000
+  decisions/180 days unless veto- or undo-referenced; 7-day raw and 365-day rolled-up memory
+  samples; 2,000 LRU apps while preserving answered/vetoed identities; 1,000 pairs with
+  zero-weight pruning after 30 days; 256 signatures per owner; 512 vetoes until expiry; and
+  128 open reviews with closed rows kept 30 days. Refuse new vetoes at capacity rather than
+  evict active protection.
 - `decisions.log` stays outside the database as the append-only, greppable, rotated audit
   trail; the `events` table is a queryable index with retention on top of it.
 - Legacy `knowledge.json` state is migrated atomically and idempotently with a 30-day

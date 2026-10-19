@@ -1452,6 +1452,7 @@ class Daemon:
                 },
                 "pending_questions": len(self.pending),
                 "reviews": self.store.review_count,
+                "recovery": self.store.recovery,
                 "auto": self.auto_status(),
             }
         if c == "review":
@@ -1660,10 +1661,15 @@ class Daemon:
         return max(0.0, min(MAX_SLEEP, due - now))
 
     def tick(self):
-        """Run what is due: socket check, adopt (+ session end), GC, routine save."""
+        """Run what is due, skipping the pass when SQLite's writer slot is busy."""
         self._in_tick = True
         self.store.defer_writes = True
+        skip_pass = False
         try:
+            if not self.store.db.write_available():
+                skip_pass = True
+                self.store.log(event="store_busy", where="tick", retry=True)
+                return
             self.guarded(self.check_socket)
             self.run_deadlines()
             now = time.time()
@@ -1678,7 +1684,9 @@ class Daemon:
         finally:
             self._in_tick = False
             self.store.defer_writes = False
-            self.guarded(self.store.save_if_dirty)
+            if not skip_pass:
+                self.guarded(self.store.save_if_dirty)
+                self.guarded(self.store.export_daily_if_due)
 
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)

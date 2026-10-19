@@ -95,6 +95,17 @@ class Authority(unittest.TestCase):
         self.assertFalse(engine.auto_stop_ok(s, "npm", "vite", mi())[0])
         self.assertFalse(s.regret("npm", "vite"))       # only once per auto stop
 
+    def test_invalid_owner_pair_never_authorizes_a_stop(self):
+        """The reference machine's explicit MainThread > sh/sort/head answer stays inert."""
+        s = store()
+        for k in ("sh", "sort", "head"):
+            s.data["pairs"][s.pkey("MainThread", k)] = {
+                "first_seen": 1000.0, "ex_stop": knowledge.W_ANSWER, "ex_last": "stop"}
+            self.assertEqual(s.pair_decision("MainThread", k)[0], "invalid")
+            self.assertFalse(s.pair_explicit("MainThread", k))
+            self.assertFalse(engine.auto_stop_ok(s, "MainThread", k, mi())[0])
+            self.assertFalse(engine.auto_stop_ok(s, "MainThread", k, dict(mi(cpu=None)))[0])
+
     def test_grace_bounds(self):
         s = store()
         self.assertEqual(engine.auto_grace(s, {"x"}), 5.0)
@@ -373,10 +384,10 @@ class JobSurvivors(AutoCase):
 
 
 class GuiClose(AutoCase):
-    def close_gui(self, **root_kw):
+    def close_gui(self, comm="firefox", **root_kw):
         up = self.fp.up
         self.fp.add(100, 1, comm="niri", sid=100, born=100.0)       # parent: roots need a parent entry
-        self.fp.add(200, 100, comm="firefox", born=up - 100, **root_kw)
+        self.fp.add(200, 100, comm=comm, born=up - 100, **root_kw)
         self.fp.add(201, 200, comm="helper", born=up - 90)
         self.d.lineage.observe(self.fp.table())
         self.fp.remove(200)
@@ -392,6 +403,13 @@ class GuiClose(AutoCase):
         p = self.d.store.data["pairs"][knowledge.Store.pkey("firefox", "helper")]
         self.assertEqual((p["closes"], p["launches"]), (1, 0))
         self.assertEqual(self.d.handle({"cmd": "status"})["auto"]["leftover_leaves"], 1)
+
+    def test_junk_root_close_counts_noise_and_never_pairs(self):
+        self.close_gui(comm="MainThread")
+        self.d.after_observe()
+        self.assertEqual(self.d.store.data["pairs"], {})
+        self.assertEqual(self.d.store.data["noise"], {"helper": 1})
+        self.assertFalse([e for e in self.log() if e["event"] == "would_stop"])
 
     def test_other_modes_do_not_carve(self):
         self.d.cfg["mode"] = "adopt"
@@ -658,6 +676,21 @@ class StatusAndModes(ProcCase):
         for mode, (mv, kl) in want.items():
             d = daemon.Daemon(make_cfg(tmp(), mode=mode))
             self.assertEqual((d.may_move(), d.may_kill()), (mv, kl), mode)
+
+    def test_status_marks_invalid_owner_pairs(self):
+        d = daemon.Daemon(make_cfg(tmp(), mode="auto"))
+        for k in ("sh", "sort", "head"):
+            d.store.data["pairs"][d.store.pkey("MainThread", k)] = {
+                "first_seen": 1000.0, "ex_stop": knowledge.W_ANSWER, "ex_last": "stop"}
+        r = d.handle({"cmd": "status"})
+        rows = {(p["owner"], p["leftover"]): p for p in r["pairs"]}
+        for k in ("sh", "sort", "head"):
+            self.assertEqual(rows[("MainThread", k)]["action"], "invalid", k)
+            self.assertIn("invalid owner", rows[("MainThread", k)]["why"], k)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cli.print_pairs(r["pairs"])
+        self.assertIn("invalid", out.getvalue())
 
     def test_load_config_accepts_auto_and_default_stays_observe(self):
         p = tmp() + "/c.toml"

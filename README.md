@@ -208,9 +208,22 @@ program.
 
 ```sh
 taema run emulator emulator -avd Pixel_8 -no-window   # start a program in a scope
-taema ls                                              # scopes and process counts
+taema ls                                              # scopes, counts, memory, pressure
 taema kill emulator                                   # empty the scope
 ```
+
+```
+name                         procs       MEM    PSI  comms
+scope-emulator                 12      1.5G   0.42  emulator,qemu-system-x86
+  qemu-9                        1      1.4G   0.42  qemu-system-x86
+scope-web                       3     24.7M   1.20  firefox,WebExtensions
+scope-fresh                     1         -      -  sleep
+shared                          0         -      -
+  adb-1                         1    768.0K   0.00  adb
+```
+
+`MEM` is the scope's current memory in human-readable bytes, `PSI` its recent memory
+pressure (`some avg10`); a scope without readable memory files shows `-`.
 
 ```
 kill    41210 qemu-system-x86    no outside users
@@ -282,6 +295,22 @@ Once the template is merged into void-packages, `srcpkgs/taema/update` lets
 Maintainer setup, once: the repository is signed with an RSA key. Store the private key as
 the Actions secret `XBPS_PRIVKEY`. Nothing else is needed. If the key ever changes, every
 user has to accept the new fingerprint.
+
+## Checks
+
+The `ci` workflow runs on every push and pull request: the unit and packaging test
+suites and the package build, as an unprivileged user, in the Void glibc and Void musl
+containers with the distribution Python, plus Python 3.11, the supported floor. Run the
+same checks locally from the repository root:
+
+```sh
+make -C taema test        # the test suites (unit and packaging)
+taema/tools/build-xbps.sh # the package build; runs the suites first, needs xbps-create/xbps-rindex
+```
+
+The test suites need only Python 3.11+ and `make`. A failing step fails the workflow
+run, which marks the commit and the pull request as failed. The tag-triggered `release`
+workflow is separate and unchanged.
 
 ## Layout
 

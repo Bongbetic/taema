@@ -1,8 +1,9 @@
 """taemad: owner watch (pidfd), adopt loop, GC loop, session-end watch, unix socket API.
 
-Single threaded. Mode gates every action: observe logs only, adopt moves, enforce also kills,
-auto moves and gives every app root its own scope; it stops only what a learned or answered pair
-authorises (engine.auto_stop_ok).
+Single threaded. Every lifecycle decision point asks the one authorization ladder
+(taema.authorization.authorize) instead of checking the mode itself: observe logs only, adopt
+moves, enforce also kills, auto moves and gives every app root its own scope; auto stops only what
+a learned or answered pair authorises (engine.auto_stop_ok, re-checked at actuation).
 """
 import collections
 import hmac
@@ -18,13 +19,13 @@ import stat
 import struct
 import time
 
-from . import cgroup, engine, inspect, knowledge, lineage, policy
+from . import authorization, cgroup, engine, inspect, knowledge, lineage, policy
 
 MAX_OWNERS = 256        # pidfd owner watches
 MAX_LEAF_WATCH = 256    # cgroup.events watches (EPOLLPRI)
 MAX_SLEEP = 60.0        # longest select() sleep
 JOB_SETTLE = 1.5        # seconds between job_done and the decision (survivors must outlive it)
-JOB_LAUNCHER = 2.0      # a job shorter than this is a launcher: survivors are learned silently
+JOB_LAUNCHER = 2.0      # a job shorter than this is a launcher: its close is noise, never a pair
 STOPPED_JOB = (148, 149, 150)   # 128 + SIGTSTP/SIGTTIN/SIGTTOU: Ctrl-Z is not a close
 MAX_PENDING = 64
 PENDING_TTL = 60.0
@@ -40,7 +41,8 @@ MAX_GATE_SKIPS = 4      # fork gate: at most 4 skipped adopt passes, so every 5t
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"))
+        self.deny = policy.owner_deny(cfg)
+        self.store = knowledge.Store(policy.state_dir(cfg), cfg.get("seeds"), deny=self.deny)
         self.store.apply_feedback()
         self.units = policy.load_units(cfg)
         self.sel = selectors.DefaultSelector()
@@ -78,6 +80,8 @@ class Daemon:
         self.session_seen = False
 
     # ---- mode gates ----
+    # Predicates for code and tests that ask what a mode means; the decision points themselves
+    # ask the authorization ladder via self.authorize() (taema.authorization).
     @property
     def mode(self):
         return self.cfg["mode"]
@@ -91,6 +95,11 @@ class Daemon:
     def may_kill(self):
         """Global kill switch: enforce only. Auto stops go through engine.auto_stop_ok per pair."""
         return self.mode == "enforce"
+
+    def authorize(self, trigger, facts=None):
+        """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
+        mode; every lifecycle decision point below routes through it instead of checking the mode."""
+        return authorization.authorize(trigger, self.mode, facts)
 
     # ---- owner watch ----
     def watch_owner(self, leaf, pid):
@@ -124,8 +133,11 @@ class Daemon:
         path = "%s/%s" % (cgroup.base(), leaf)
         if not os.path.isdir(path):
             return
-        if not (self.may_kill() or self.auto()):    # auto: owner-bound scopes are the user's own request
+        dec = self.authorize(authorization.OWNER_EXIT)
+        if dec.verdict == authorization.WOULD_ACT:
             self.store.log(event="would_stop", scope=leaf, why=why, mode=self.mode)
+            return
+        if dec.verdict != authorization.ACT:   # keep: a future veto/hold blocks silently here
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
         try:
@@ -157,16 +169,17 @@ class Daemon:
         pt = inspect.ProcTable.scan()
         self.lineage.observe(pt)
         self.guarded(self.after_observe)
+        execute = self.authorize(authorization.UNIT_ADOPT).verdict == authorization.ACT
         done = []
         if self.units:
             ops = engine.adopt_plan(self.cfg, self.units, pt) + engine.carve_plan(self.cfg, self.units, pt)
-            done = engine.run_ops(self.cfg, self.store, ops, self.may_move())
+            done = engine.run_ops(self.cfg, self.store, ops, execute)
             for op in done:
                 if op["op"] == "carve" and op["done"] and op.get("binds_to") == "root":
                     self.watch_owner(op["scope"], op["root"])
         self.last_result["adopt"] = [{"op": o["op"], "scope": o["scope"], "pids": len(o["pids"]),
                                       "done": o["done"]} for o in done]
-        if self.auto():
+        if self.authorize(authorization.AUTO_ADOPT).verdict == authorization.ACT:
             self.guarded(lambda: self.auto_adopt(pt))
 
     def auto_adopt(self, pt):
@@ -226,7 +239,8 @@ class Daemon:
                 for key in dict.fromkeys(l["key"] for l in left):
                     self.store.observe_close(owner, key, launcher=False)       # weight 0: only counts closes
                 self.attribute(owner, left, root=rid[0])
-                if self.auto() and left and not lin.ghosts.get(rid, {}).get("terminal"):
+                if self.authorize(authorization.GUI_CLOSE).verdict == authorization.ACT \
+                        and left and not lin.ghosts.get(rid, {}).get("terminal"):
                     self.guarded(lambda: self.gui_close(rid, owner, left))
 
     # ---- auto mode: silent GUI closes, survivors of closed jobs, regret ----
@@ -404,6 +418,22 @@ class Daemon:
         self.add_deadline(time.time() + JOB_SETTLE, "job", tag)
         return {"ok": True}
 
+    def resolve_owner(self, info, left):
+        """Real application ancestor for a terminal job: the job root, a leftover's root, or the
+        first valid ancestor in a leftover's chain. Generic/digit/shell/trivial/scriptless names
+        are skipped; '' means nothing real owned the job and the close is launcher noise."""
+        cands = [info.get("root_key")]
+        for l in left:
+            cands.append(l.get("root_key"))
+            cands.extend(l.get("chain") or ())
+        for c in cands:
+            if not c:
+                continue
+            c = c.replace(knowledge.SEP, "")[:256]
+            if c and not policy.bad_owner(c, self.deny):
+                return c
+        return ""
+
     def decide_job(self, tag):
         """After the settle: who survived the job, whose are they, and is a question due."""
         j = self.jobs.pop(tag, None)
@@ -415,35 +445,35 @@ class Daemon:
         if not left:
             return
         info = self.lineage.job_info(tag) or {}
-        owner = info.get("root_key") or next((l["root_key"] for l in left if l["root_key"]), "") or j["word"]
-        owner = owner.replace(knowledge.SEP, "")[:256]
-        if not owner:
-            return
+        owner = self.resolve_owner(info, left)
         launcher = not info or j["t"] - info["first"] < JOB_LAUNCHER
         keys = list(dict.fromkeys(l["key"] for l in left))
         for k in keys:
-            self.store.observe_close(owner, k, launcher=launcher)
-        if self.auto():
+            self.store.observe_close(owner, k, launcher=launcher)   # noise for launchers and bad owners
+        if self.authorize(authorization.JOB_SURVIVORS).verdict == authorization.ACT:
             standalone = [l for l in left if self.store.standalone(l["key"])]
             if standalone:
                 self.guarded(lambda: self.adopt_standalone(standalone))
-        if launcher:
-            self.store.log(event="launcher_learned", job=tag, owner=owner, leftovers=keys[:8])
+        if not owner or launcher:
+            self.store.log(event="launcher_learned", job=tag, owner=owner, leftovers=keys[:8],
+                           why="no application ancestor" if not owner else "launcher")
             return
         dec = self.attribute(owner, left, job=tag)
-        if self.auto():
+        if self.authorize(authorization.JOB_SURVIVORS).verdict == authorization.ACT:
             self.guarded(lambda: self.auto_stop_survivors(tag, owner, left, dec))
         ask = [k for k in keys if dec[k][0] == "ask" and self.store.can_ask((owner, k))]
         if ask:
             self.make_question(j, tag, owner, left, ask)
 
     def candidates(self, owner, left):
-        """Owners to offer, job root first, then recorded ancestors, then historical owners."""
+        """Owners to offer, job root first, then recorded ancestors, then historical owners.
+        Invalid owners (policy.bad_owner) are never offered."""
         prot = self.cfg["protected"].get("comm", [])
         out, seen = [], set()
 
         def add(kind, key):
-            if key and key not in seen and len(out) < MAX_CANDIDATES:
+            if key and key not in seen and len(out) < MAX_CANDIDATES \
+                    and not policy.bad_owner(key, self.deny):
                 seen.add(key)
                 out.append({"id": len(out) + 1, "kind": kind, "key": key, "label": lineage.clean(key, 48)})
         add("job", owner)
@@ -492,7 +522,7 @@ class Daemon:
             # the recorded owner: the app root it was a member of, else the nearest real ancestor
             owner = next((c for c in [r["root_key"], r["parent_key"]] + list(r["chain"])
                           if c and c != key and c not in SHELL_KEYS and not policy.comm_protected(c, prot)
-                          and not self.store.is_persistent(c)), None)
+                          and not self.store.is_persistent(c) and not policy.bad_owner(c, self.deny)), None)
             if owner is None:
                 continue
             owner = owner.replace(knowledge.SEP, "")[:256]
@@ -665,6 +695,8 @@ class Daemon:
                 self._drop_leaf_watch(fd)
 
     def remove_leaf(self, path, why):
+        if self.authorize(authorization.GC_REMOVE_EMPTY).verdict != authorization.ACT:
+            return False
         leaf = cgroup.rel(path)
         if engine.remove_empty(path):
             self.empty_seen.discard(leaf)
@@ -675,7 +707,8 @@ class Daemon:
     def _gc_empty(self, path, leaf, dry_run, res, now_empty):
         """Empty leaf: removed on the second consecutive GC pass that sees it empty (a scope that
         was just created is empty until its first process arrives)."""
-        if dry_run or not self.may_move():
+        dec = self.authorize(authorization.GC_REMOVE_EMPTY)
+        if dry_run or dec.verdict != authorization.ACT:
             res.append([leaf, "empty", "would"])
             if not dry_run and self.store.changed("gc_empty:" + leaf, True):
                 self.store.log(event="gc_would_remove_empty", scope=leaf, mode=self.mode)
@@ -691,42 +724,48 @@ class Daemon:
             self.store.save_if_dirty()
         self.store.decay()
         self.store.enforce_caps()
+        # candidate selection: leftover/* leaves are stop candidates only where the ladder allows
+        leftover_leaves = self.authorize(authorization.LEFTOVER_LEAVES).verdict == authorization.ACT
         cands = engine.gc_candidates(self.cfg, self.units, self.store, self.idle_since,
                                      usage=self.gc_usage, skip=self.gc_skip, noted=self.gc_noted,
-                                     lin=self.lineage, auto=self.auto())
+                                     lin=self.lineage, auto=leftover_leaves)
         res, now_empty = [], set()
-        if not dry_run and self.may_move():
+        remove_empty = self.authorize(authorization.GC_REMOVE_EMPTY).verdict == authorization.ACT
+        if not dry_run and remove_empty:
             self.sync_leaf_watches()
         for path, why in cands:
             leaf = cgroup.rel(path)
             if why == "empty":
                 self._gc_empty(path, leaf, dry_run, res, now_empty)
                 continue
-            auto_leaf = self.auto() and leaf.startswith(engine.LEFTOVER + "/")
-            res.append([leaf, why, "would" if (dry_run or not (self.may_kill() or auto_leaf)) else "stop"])
+            dec = self.authorize(authorization.GC_STOP, authorization.Facts(
+                scope=leaf, leftover=leaf.startswith(engine.LEFTOVER + "/")))
+            res.append([leaf, why, "would" if (dry_run or dec.verdict != authorization.ACT) else "stop"])
             if dry_run:
                 continue
-            if auto_leaf:
+            if dec.verdict == authorization.WOULD_ACT:
+                self.store.log(event="gc_would_stop", scope=leaf, why=why, mode=self.mode)
+                continue
+            if dec.verdict != authorization.ACT:   # keep: a future veto/hold blocks silently here
+                continue
+            if dec.authority == authorization.AUTHORITY_PAIR:
                 self.guarded(lambda: self.auto_stop_path(path, why, why.startswith("pair stop")))
                 continue
-            if self.may_kill():
-                try:
-                    rep = engine.stop(path, self.cfg, self.store,
-                                      engine.unit_for_leaf(self.units, os.path.basename(path)),
-                                      hook=policy.hook_for(self.cfg, os.path.basename(path)))
-                except engine.Refused as e:
-                    self.store.log(event="gc_refused", scope=leaf, why=str(e))
-                    continue
-                self.note_stop(rep)
-                if rep["removed"]:
-                    self.store.log(event="gc_stopped", scope=leaf, why=why)
-                elif any(d["action"] == "skip" for d in rep["decisions"]):
-                    self.gc_skip.add(leaf)
-                    self.store.log(event="gc_kept", scope=leaf, why="kept: protected member")
-                else:
-                    self.store.log(event="gc_incomplete", scope=leaf, why=rep.get("error", "busy"))
+            try:
+                rep = engine.stop(path, self.cfg, self.store,
+                                  engine.unit_for_leaf(self.units, os.path.basename(path)),
+                                  hook=policy.hook_for(self.cfg, os.path.basename(path)))
+            except engine.Refused as e:
+                self.store.log(event="gc_refused", scope=leaf, why=str(e))
+                continue
+            self.note_stop(rep)
+            if rep["removed"]:
+                self.store.log(event="gc_stopped", scope=leaf, why=why)
+            elif any(d["action"] == "skip" for d in rep["decisions"]):
+                self.gc_skip.add(leaf)
+                self.store.log(event="gc_kept", scope=leaf, why="kept: protected member")
             else:
-                self.store.log(event="gc_would_stop", scope=leaf, why=why, mode=self.mode)
+                self.store.log(event="gc_incomplete", scope=leaf, why=rep.get("error", "busy"))
         if not dry_run:
             self.empty_seen = now_empty
             self.store.forget_sigs("gc_empty:", {"gc_empty:" + r[0] for r in res if r[1] == "empty"})
@@ -752,28 +791,35 @@ class Daemon:
     def end_session(self):
         self.store.log(event="session_end", mode=self.mode)
         top = cgroup.subdirs(cgroup.base())
-        if self.auto():     # leftover/* leaves count as scopes of their own; shared/ is never stopped
+        # leftover/* leaves count as scopes of their own; shared/ is never stopped (auto only)
+        if self.authorize(authorization.LEFTOVER_LEAVES).verdict == authorization.ACT:
             top = [d for d in top if os.path.basename(d) != engine.LEFTOVER] + \
                 cgroup.subdirs(cgroup.base() + "/" + engine.LEFTOVER)
         for d in top:
             if os.path.basename(d) == "manager":
                 continue
             unit = engine.unit_for_leaf(self.units, os.path.basename(d))
-            if unit and unit.get("kill", {}).get("survive_logout"):
+            dec = self.authorize(authorization.SESSION_END, authorization.Facts(
+                scope=cgroup.rel(d),
+                shared=os.path.basename(d) == "shared",
+                unit_survive_logout=bool(unit and unit.get("kill", {}).get("survive_logout"))))
+            if dec.verdict == authorization.KEEP:
                 self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
-            if self.auto():     # keep everything unless every member's pair is confidently "stop"
-                if os.path.basename(d) == "shared" or not self.auto_stop_path(d, "session ended", True):
+            if dec.verdict == authorization.WOULD_ACT:
+                self.store.log(event="would_stop", scope=cgroup.rel(d), why="session ended",
+                               mode=self.mode)
+                continue
+            if dec.authority == authorization.AUTHORITY_PAIR:
+                # keep everything unless every member's pair is confidently "stop"
+                if not self.auto_stop_path(d, "session ended", True):
                     self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
-            if self.may_kill():
-                try:
-                    self.note_stop(engine.stop(d, self.cfg, self.store, unit,
-                                               hook=policy.hook_for(self.cfg, os.path.basename(d))))
-                except engine.Refused:
-                    pass
-            else:
-                self.store.log(event="would_stop", scope=cgroup.rel(d), why="session ended", mode=self.mode)
+            try:
+                self.note_stop(engine.stop(d, self.cfg, self.store, unit,
+                                           hook=policy.hook_for(self.cfg, os.path.basename(d))))
+            except engine.Refused:
+                pass
         self.session_seen = False   # wait for the next login before acting again
 
     def guarded(self, fn):

@@ -109,6 +109,56 @@ class ConfigTests(unittest.TestCase):
         finally:
             os.unlink(f.name)
 
+    def test_load_config_defaults_the_learner_section(self):
+        cfg = self.cfg()
+        self.assertEqual(cfg["learner"]["deny_owners"], [])
+
+    def test_user_layer_extends_learner_deny_owners(self):
+        system = {"learner": {"deny_owners": ["a"]}}
+        user = {"learner": {"deny_owners": ["b", "a"]}}
+        m = policy.merge(system, user)
+        self.assertEqual(m["learner"]["deny_owners"], ["a", "b"])
+        # an empty user list never clears the system list
+        self.assertEqual(policy.merge(system, {"learner": {"deny_owners": []}})["learner"]["deny_owners"], ["a"])
+
+
+class OwnerDenylist(unittest.TestCase):
+    """Names that must never own a learned pair (ticket #6, acceptance criteria 1 and 2)."""
+
+    def test_each_rejected_class(self):
+        cases = [
+            ("MainThread", "generic"), ("Thread-1", "generic"), ("pool-3", "generic"),
+            ("GC", "generic"), ("Finalizer", "generic"),
+            ("3.12", "digit"), ("2024.1", "digit"),
+            ("sh", "shell"), ("bash", "shell"), ("dash", "shell"), ("zsh", "shell"),
+            ("fish", "shell"), ("bash:deploy.sh", "shell"),
+            ("sleep", "trivial"), ("cat", "trivial"), ("head", "trivial"),
+            ("sort", "trivial"), ("grep", "trivial"), ("true", "trivial"),
+            ("python3", "script"), ("python3.12", "script"), ("node", "script"),
+            ("java", "script"), ("perl", "script"), ("", "empty"), (None, "empty"),
+        ]
+        for key, why in cases:
+            reason = policy.bad_owner(key)
+            self.assertIsNotNone(reason, repr(key))
+            self.assertIn(why, reason, repr(key))
+
+    def test_plausible_application_names_pass(self):
+        for ok in ("npm", "firefox", "code", "own0", "vite", "MainThreadly",
+                   "node:vite.js", "python3:http.server", "java:com.Main", "zsh-job"):
+            self.assertIsNone(policy.bad_owner(ok), ok)
+
+    def test_configured_entries_extend_the_defaults(self):
+        self.assertIsNone(policy.bad_owner("gpu-render"))
+        self.assertIn("denied", policy.bad_owner("gpu-render", ["gpu-*"]))
+        self.assertIsNone(policy.bad_owner("gpurender", ["gpu-*"]))     # only matching entries reject
+        self.assertIsNotNone(policy.bad_owner("MainThread", ["gpu-*"])) # the defaults still apply
+        self.assertIsNotNone(policy.bad_owner("Thread-1", ["gpu-*"]))
+
+    def test_owner_deny_reads_the_learner_section(self):
+        self.assertEqual(policy.owner_deny(None), [])
+        self.assertEqual(policy.owner_deny({}), [])
+        self.assertEqual(policy.owner_deny({"learner": {"deny_owners": ["gpu-*"]}}), ["gpu-*"])
+
 
 class PolicyTests(unittest.TestCase):
     def cfg(self, **protected):

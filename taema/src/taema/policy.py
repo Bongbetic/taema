@@ -61,6 +61,14 @@ def merge(system, user):
                     for var, prefixes in pv.items():
                         env[var] = list(dict.fromkeys(list(env.get(var, [])) + list(prefixes)))
             continue
+        if k == "learner" and isinstance(v, dict):
+            out_l = out.setdefault("learner", {})
+            for lk, lv in v.items():
+                if lk == "deny_owners" and isinstance(lv, list):
+                    out_l[lk] = list(dict.fromkeys(list(out_l.get(lk, [])) + list(lv)))
+                else:
+                    out_l[lk] = copy.deepcopy(lv)
+            continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = merge(out[k], v)
         else:
@@ -82,8 +90,9 @@ def load_config(path=None):
     cfg.setdefault("mode", "observe")
     if cfg["mode"] not in MODES:
         raise ValueError("mode must be one of %s" % (MODES,))
-    for k in ("paths", "timers", "protected", "seeds"):
+    for k in ("paths", "timers", "protected", "seeds", "learner"):
         cfg.setdefault(k, {})
+    cfg["learner"].setdefault("deny_owners", [])
     p = cfg["paths"]
     p.setdefault("session_cgroup", "auto")
     p.setdefault("state_dir", user_state_dir())
@@ -288,3 +297,41 @@ def env_excluded(env, rules):
         if fnmatch.fnmatch(env.get(k, ""), pat):
             return True
     return False
+
+
+# ---- learner hygiene: names that must never own a pair ----
+OWNER_NAMES = ("MainThread", "GC", "Finalizer")       # generic thread names
+OWNER_GLOBS = ("Thread-*", "pool-*")
+OWNER_SHELLS = ("sh", "bash", "dash", "zsh", "fish")
+OWNER_TRIVIAL = ("sleep", "cat", "head", "sort", "grep", "true")
+
+
+def owner_deny(cfg):
+    """Configured extra owner-deny entries ([learner] deny_owners). They extend the built-in
+    classes rejected by bad_owner(); a missing or malformed section is just no extras."""
+    deny = ((cfg or {}).get("learner") or {}).get("deny_owners") or []
+    return [e for e in deny if isinstance(e, str) and e] if isinstance(deny, list) else []
+
+
+def bad_owner(key, deny=()):
+    """Why `key` must never own a learned pair, or None when it is a plausible application.
+    Rejected outright: generic thread names, digit-led (version-like) names, shells, trivial
+    commands and interpreters running no script. `deny` holds configured glob entries that
+    extend those defaults."""
+    if not isinstance(key, str) or not key:
+        return "empty name"
+    base = key.split(":", 1)[0]
+    if key in OWNER_NAMES or any(fnmatch.fnmatchcase(key, g) for g in OWNER_GLOBS):
+        return "generic thread name %s" % key
+    if key[0].isdigit():
+        return "name starts with a digit"
+    if base in OWNER_SHELLS:
+        return "shell %s" % base
+    if base in OWNER_TRIVIAL:
+        return "trivial command %s" % base
+    if interp_name(key) is not None:
+        return "interpreter %s without a script" % key
+    for pat in deny:
+        if fnmatch.fnmatchcase(key, pat):
+            return "denied by config %s" % pat
+    return None

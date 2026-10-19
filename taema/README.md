@@ -262,8 +262,22 @@ what tæma would do.
 
 ```sh
 taema run emulator emulator -avd Pixel_8 -no-window   # scope-emulator
-taema ls                                              # scopes, process counts, names
+taema ls                                              # scopes, counts, memory, pressure
 taema kill emulator                                   # stop the scope and everything in it
+```
+
+`taema ls` prints one row per scope with `procs` (process count), `MEM` (current memory,
+human-readable, from `memory.current`) and `PSI` (recent memory pressure, `some avg10`,
+from `memory.pressure`). A scope whose memory files are missing or unreadable shows `-`:
+
+```
+name                         procs       MEM    PSI  comms
+scope-emulator                 12      1.5G   0.42  emulator,qemu-system-x86
+  qemu-9                        1      1.4G   0.42  qemu-system-x86
+scope-web                       3     24.7M   1.20  firefox,WebExtensions
+scope-fresh                     1         -      -  sleep
+shared                          0         -      -
+  adb-1                         1    768.0K   0.00  adb
 ```
 
 `taema kill` prints one line per process: `kill`, `share` (moved to `shared/` because

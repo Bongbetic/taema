@@ -10,6 +10,8 @@ import math
 import os
 import time
 
+from . import policy
+
 DECAY_DAYS = 7
 DECAY_FACTOR = 0.9
 COUNTERS = ("seen", "shared_hits", "killed", "sigkill_needed", "respawned", "user_keep", "user_kill")
@@ -75,7 +77,7 @@ def decide(p, now, created, closes_total):
 
 
 class Store:
-    def __init__(self, state_dir, seeds=None, now=time.time, read_only=False):
+    def __init__(self, state_dir, seeds=None, now=time.time, read_only=False, deny=()):
         self.dir = state_dir
         self.path = os.path.join(state_dir, "knowledge.json")
         self.log_path = os.path.join(state_dir, "decisions.log")
@@ -83,6 +85,7 @@ class Store:
         self.now = now
         self.seeds = seeds or {}
         self.read_only = read_only      # CLI: the daemon is the single writer
+        self.deny = tuple(deny)         # configured owner-deny entries (extend the defaults)
         self.dirty = False
         self.last_save = 0.0
         self.sigs = {}          # change-detection signatures for log lines (see changed())
@@ -92,14 +95,15 @@ class Store:
 
     def _fresh(self):
         return {"version": SCHEMA, "last_decay": self.now(), "created": self.now(), "closes": 0,
-                "exes": {}, "pairs": {}, "standalone": {}, "asked": {"day": 0, "n": 0}}
+                "exes": {}, "pairs": {}, "standalone": {}, "noise": {},
+                "asked": {"day": 0, "n": 0}}
 
     def _migrate(self, data):
-        """v1 (exes only) -> v2: add pairs, standalone, asked; keep every exe record."""
+        """v1 (exes only) -> v2: add pairs, standalone, asked, noise; keep every exe record."""
         fresh = self._fresh()
         if data.get("version") != SCHEMA:
             self.dirty = True
-        for k in ("pairs", "standalone", "asked"):
+        for k in ("pairs", "standalone", "asked", "noise"):
             if not isinstance(data.get(k), dict):
                 data[k] = fresh[k]
         if not isinstance(data.get("closes"), int) or isinstance(data["closes"], bool):
@@ -372,6 +376,8 @@ class Store:
             e["ts"] = self.now()
             self.dirty = True
             return True
+        if policy.bad_owner(owner, self.deny):
+            return False        # an explicit answer never lands on a bad key
         p = self._pair(owner, leftover)
         p["ex_" + choice] += W_ANSWER
         p["ex_last"] = choice
@@ -382,22 +388,34 @@ class Store:
             p["last_keep"] = self.now()
         return True
 
+    def note_noise(self, leftover):
+        """One close classified as launcher/invalid-owner noise: counted per leftover key in
+        data["noise"], never turned into a pair. Bad owners earn no evidence at all."""
+        if not self._ok(leftover):
+            return False
+        n = self.data.setdefault("noise", {})
+        n[leftover] = n.get(leftover, 0) + 1
+        self.dirty = True
+        return True
+
     def observe_close(self, owner, leftover, day=None, launcher=False):
         """A close was seen with `leftover` still running. Weight 0 evidence: counts only toward
-        the burn-in. launcher=True marks a short job whose survivors are what the user launched."""
-        if not self._ok(owner, leftover):
+        the burn-in. A launcher close, or a close whose owner is not a real application (see
+        policy.bad_owner), is noise instead: it increments the noise counter and creates no pair."""
+        if not self._ok(leftover):
             return False
+        if launcher or policy.bad_owner(owner, self.deny) or not self._ok(owner):
+            return self.note_noise(leftover)
         p = self._pair(owner, leftover)
         p["closes"] += 1
         p["last_close_day"] = int(self.now() // DAY) if day is None else int(day)
-        if launcher:
-            p["launches"] += 1
         self.data["closes"] += 1
         return True
 
     def observe_kill_inferred(self, owner, leftover, day=None):
-        """The user killed `leftover` in the shell (pid vanished, kill args matched): weight 0.25."""
-        if not self._ok(owner, leftover):
+        """The user killed `leftover` in the shell (pid vanished, kill args matched): weight 0.25.
+        An invalid owner never gains pair evidence."""
+        if not self._ok(owner, leftover) or policy.bad_owner(owner, self.deny):
             return False
         p = self._pair(owner, leftover)
         p["stop"] += W_INFERRED
@@ -416,7 +434,7 @@ class Store:
         return True
 
     def auto_stopped(self, owner, leftover):
-        if self._ok(owner, leftover):
+        if self._ok(owner, leftover) and not policy.bad_owner(owner, self.deny):
             self._pair(owner, leftover)["last_auto_stop"] = self.now()
 
     def regret(self, owner, leftover):
@@ -442,22 +460,31 @@ class Store:
                 for k, p in self.data["pairs"].items() if k.endswith(suffix)]
         return [o for _w, o in sorted(rows, reverse=True)[:limit]]
 
+    def _decide(self, owner, p):
+        """decide() behind the owner-hygiene gate: an invalid owner never asks, stops or keeps."""
+        why = policy.bad_owner(owner, self.deny)
+        if why:
+            return "invalid", 0.0, "invalid owner: %s" % why
+        return decide(p, self.now(), self.data["created"], self.data["closes"])
+
     def pair_decision(self, owner, leftover):
-        """(action, confidence, why); action in ask|stop|keep|standalone."""
+        """(action, confidence, why); action in ask|stop|keep|standalone|invalid."""
         if self.standalone(leftover):
             return "standalone", 1.0, "answered: standalone app"
         p = self.data["pairs"].get(self.pkey(owner, leftover))
-        d = self.data
-        return decide(p, self.now(), d["created"], d["closes"])
+        return self._decide(owner, p)
 
     def pair_explicit(self, owner, leftover):
         """True when the pair decision is "stop" because the user answered it (SIGKILL is allowed
-        only then)."""
+        only then). An invalid owner is never explicit."""
         action, _conf, why = self.pair_decision(owner, leftover)
         return action == "stop" and why.startswith("answered stop")
 
     def can_ask(self, pair, now=None):
-        """pair = (owner, leftover). At most 3 questions per day, each pair once per 7 days."""
+        """pair = (owner, leftover). At most 3 questions per day, each pair once per 7 days.
+        A pair with an invalid owner is never asked about."""
+        if not pair or policy.bad_owner(pair[0], self.deny):
+            return False
         now = self.now() if now is None else now
         a = self.data["asked"]
         if a.get("day") == int(now // DAY) and a.get("n", 0) >= ASK_PER_DAY:
@@ -474,7 +501,7 @@ class Store:
             a["day"], a["n"] = day, 0
         a["n"] += 1
         for o, l in pairs:
-            if self._ok(o, l):
+            if self._ok(o, l) and not policy.bad_owner(o, self.deny):
                 self._pair(o, l)["last_asked"] = now
         self.dirty = True
 
@@ -482,7 +509,7 @@ class Store:
         out = []
         for k, p in self.data["pairs"].items():
             owner, _, leftover = k.partition(SEP)
-            action, conf, why = decide(p, self.now(), self.data["created"], self.data["closes"])
+            action, conf, why = self._decide(owner, p)
             out.append({"owner": owner, "leftover": leftover, "action": action, "confidence": round(conf, 2),
                         "stop": round(p.get("stop", 0) + p.get("ex_stop", 0), 2),
                         "keep": round(p.get("keep", 0) + p.get("ex_keep", 0), 2),

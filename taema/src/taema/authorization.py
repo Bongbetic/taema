@@ -161,7 +161,7 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
         "observe": (WOULD_ACT, "", "gc stop: observe only logs gc_would_stop"),
         "adopt": (WOULD_ACT, "", "gc stop: adopt only logs gc_would_stop (0.2.1)"),
         "enforce": (ACT, AUTHORITY_UNIT, "gc stop: enforce stops idle candidates"),
-        "auto": (WOULD_ACT, "", "gc stop: auto stops only leftover/* candidates (0.2.1)"),
+        "auto": (ACT, AUTHORITY_MODE, "gc stop: auto collects eligible idle shared/unit scopes"),
     },
     GC_REMOVE_EMPTY: {
         "observe": (WOULD_ACT, "", "empty leaf: observe only logs gc_would_remove_empty"),
@@ -189,7 +189,7 @@ def _capability(trigger: str, mode: str, facts: Facts) -> tuple[Verdict, Authori
     if trigger == GC_STOP and mode == "auto":
         if facts.leftover:
             return ACT, AUTHORITY_PAIR, "gc stop: auto stops leftover/* under pair/idle authority"
-        return WOULD_ACT, "", "gc stop: auto stops only leftover/* candidates (0.2.1)"
+        return ACT, AUTHORITY_MODE, "gc stop: auto collects eligible idle shared/unit scopes"
     if trigger == SESSION_END and mode == "auto" and facts.shared:
         return KEEP, "", "session end: shared/ is never stopped in auto"
     row = _CAPABILITY.get(trigger)

@@ -474,6 +474,8 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
         leaves += left_dirs         # empty ones only
     leaves += [d for d in top if d not in gc_set and os.path.basename(d).startswith(EMPTY_PREFIXES)]
     live = {cgroup.rel(d) for d in leaves}
+    store.prune_leftover_expiries(live)
+    store.prune_scope_reviews(live)
     for table in (idle_since, usage, skip, noted):
         for k in [k for k in table if k not in live]:
             table.discard(k) if isinstance(table, set) else table.pop(k)
@@ -491,6 +493,12 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
             continue
         if d not in gc_set:
             continue
+        if not (auto and rel.startswith(LEFTOVER + "/")) and store.review_holds_scope(rel):
+            if rel not in noted:
+                noted.add(rel)
+                store.log(event="gc_skip", scope=rel, why="GC review pending")
+            idle_since.pop(rel, None)
+            continue
         if rel.startswith("shared/"):
             pt = pt or inspect.ProcTable.scan()
             roots = [p for p in pids if not any(a in pids for a in pt.ancestors(p))]
@@ -503,13 +511,16 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
                 idle_since.pop(rel, None)
                 continue
         if auto and rel.startswith(LEFTOVER + "/"):
-            if store.review_holds_scope(rel):
+            expiry_days = policy.timer(cfg, "leftover_expire_days", 0)
+            expiry_due = store.leftover_expiry_due(rel, expiry_days, now=now())
+            if store.review_holds_scope(rel) and not expiry_due:
                 if rel not in noted:
                     noted.add(rel)
                     store.log(event="gc_skip", scope=rel, why="close review pending")
                 idle_since.pop(rel, None)
                 continue
-            verdict = _leftover_verdict(cfg, store, lin, pids, snap, protect)
+            verdict = _leftover_verdict(cfg, store, lin, pids, snap, protect,
+                                        scope=rel, expiry_days=expiry_days, at=now())
             if verdict[0] == "held":
                 if rel not in noted:
                     noted.add(rel)
@@ -522,13 +533,13 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
         u = next((v for k, v in unit_by_prefix.items() if os.path.basename(d).startswith(k)), None)
         gc = (u or {}).get("gc", {})
         # detector: pause process whose runtime directory is gone
+        env_reason = None
         var = gc.get("env_dir_missing")
         if var:
             dirs = {inspect.environ(p).get(var) for p in pids}
             dirs.discard(None)
             if dirs and all(not os.path.isdir(x) for x in dirs):
-                out.append((d, "%s gone: %s" % (var, sorted(dirs)[0])))
-                continue
+                env_reason = "%s gone: %s" % (var, sorted(dirs)[0])
         s = snap.get()
         edge_map = inspect.edges(set(pids), s)
         busy = bool(edge_map) or not getattr(s, "ok", True)
@@ -540,19 +551,28 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
             usage.pop(rel, None)
             continue
         cpu = _cpu_usage(d)
+        cpu_moved = False
         if rel in idle_since and cpu is not None and usage.get(rel) is not None and cpu != usage[rel]:
             idle_since[rel] = now()   # CPU moved: not idle, restart the window
+            cpu_moved = True
         first = idle_since.setdefault(rel, now())
         if cpu is not None:
             usage[rel] = cpu
+        if env_reason:
+            if not cpu_moved:
+                out.append((d, env_reason))
+            continue
         key = policy.exe_key(pids[0])
         grace = store.idle_grace(key, policy.timer(cfg, "idle_grace", 600))
         if now() - first >= grace:
-            out.append((d, "idle %ds >= grace %ds" % (now() - first, grace)))
+            if auto and rel.startswith(LEFTOVER + "/") and expiry_due:
+                out.append((d, "leftover expired after %s days" % expiry_days))
+            else:
+                out.append((d, "idle %ds >= grace %ds" % (now() - first, grace)))
     return out
 
 
-def _leftover_verdict(cfg, store, lin, pids, snap, protect):
+def _leftover_verdict(cfg, store, lin, pids, snap, protect, scope="", expiry_days=0, at=None):
     """("stop", why) when every member passes auto_stop_ok, ("held", why) when a member must not be
     stopped by the idle rule, else ("idle", "")."""
     s = snap.get()
@@ -567,7 +587,9 @@ def _leftover_verdict(cfg, store, lin, pids, snap, protect):
         if i["key"] in protect and (store.is_persistent(i["key"]) or store.peek(i["key"])["user_keep"] > 0):
             return "held", "persist/share seed " + i["key"]
         if i["origin"] and store.pair_decision(i["origin"], i["key"])[0] == "keep":
-            return "held", "pair decided keep: %s>%s" % (i["origin"], i["key"])
+            if not store.leftover_expiry_overrides_keep(i["origin"], i["key"], scope,
+                                                        expiry_days, now=at):
+                return "held", "pair decided keep: %s>%s" % (i["origin"], i["key"])
     res = [auto_stop_ok(store, i["origin"], i["key"], i) for i in infos]
     if infos and all(r[0] for r in res):
         return "stop", res[0][1]

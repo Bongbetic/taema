@@ -671,13 +671,232 @@ class LeftoverGc(AutoCase):
         self.assertEqual(len(self.d.auto_stops), 1)
         self.assertFalse(self.d.may_kill())
 
-    def test_gc_pass_idle_stop_never_sigkills(self):
+    def test_gc_keeps_and_reviews_unlearned_idle_leftover(self):
+        self.leaf()
+        self.d.idle_since["leftover/x"] = time.time() - 5000
+        self.d.gc_usage["leftover/x"] = 100
+        res = self.d.gc_pass()
+        self.stopm.assert_not_called()
+        self.assertEqual(res[0][2], "review")
+        (review,) = self.d.store.open_reviews()
+        self.assertEqual(review["scope"], "leftover/x")
+        self.assertEqual(review["owner"], "foo")
+        self.assertTrue(self.d.store.review_holds_scope("leftover/x"))
+        self.assertEqual(policy.timer(self.d.cfg, "leftover_expire_days", 0), 0)
+        self.age_review("leftover/x", 30)
+        self.d.gc_pass()
+        self.stopm.assert_not_called()
+        self.assertEqual(self.d.store.pair_decision("foo", "vite")[0], "keep")
+
+    def age_review(self, scope, days):
+        review = next(r for r in self.d.store.data["reviews"] if r.get("scope") == scope)
+        review["created"] = time.time() - days * knowledge.DAY
+        review["expires"] = time.time() - 1
+
+    def test_leftover_expiry_setting_stops_only_after_expired_review_age(self):
+        self.leaf()
+        self.d.idle_since["leftover/x"] = time.time() - 5000
+        self.d.gc_usage["leftover/x"] = 100
+        self.d.gc_pass()  # First records an unanswered review.
+        self.age_review("leftover/x", 30)
+        self.d.cfg.setdefault("timers", {})["leftover_expire_days"] = 20
+
+        self.d.gc_pass()
+
+        self.stopm.assert_called_once()
+
+    def test_leftover_expiry_applies_to_ownerless_scope_review(self):
+        self.leaf()
+        self.d.lineage.entry(301)["root_key"] = ""
+        self.d.idle_since["leftover/x"] = time.time() - 5000
+        self.d.gc_usage["leftover/x"] = 100
+
+        result = self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+        self.assertEqual(result[0][2], "review")
+        (review,) = self.d.store.open_reviews()
+        self.assertEqual((review["kind"], review["scope"]), ("scope", "leftover/x"))
+        self.age_review("leftover/x", 30)
+        self.d.cfg.setdefault("timers", {})["leftover_expire_days"] = 20
+
+        self.d.gc_pass()
+
+        self.stopm.assert_called_once()
+
+    def test_leftover_expiry_never_overrides_answered_keep(self):
         self.leaf()
         self.d.idle_since["leftover/x"] = time.time() - 5000
         self.d.gc_usage["leftover/x"] = 100
         self.d.gc_pass()
-        self.stopm.assert_called_once()
-        self.assertFalse(self.stopm.call_args[1]["allow_sigkill"])
+        self.d.store.answer("foo", "vite", "keep")
+        self.age_review("leftover/x", 30)
+        self.d.cfg.setdefault("timers", {})["leftover_expire_days"] = 20
+
+        self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+
+    def test_leftover_expiry_never_overrides_scope_veto(self):
+        self.leaf()
+        self.d.idle_since["leftover/x"] = time.time() - 5000
+        self.d.gc_usage["leftover/x"] = 100
+        self.d.gc_pass()
+        self.age_review("leftover/x", 30)
+        self.d.cfg.setdefault("timers", {})["leftover_expire_days"] = 20
+        self.d.store.add_veto("scope", "leftover/x")
+
+        self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+        self.assertTrue(any(e.get("event") == "vetoed" and e.get("trigger") == "gc_stop"
+                            for e in self.log()))
+
+    def test_auto_collects_idle_shared_and_missing_runtime_unit_after_safety_checks(self):
+        self.fp.add(301, 1, comm="helper", born=self.fp.up - 100)
+        self.fp.add(302, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": self.rt + "/gone"},
+                    born=self.fp.up - 100)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(301, 302)
+        self.cg.leaf("shared/helper-301", [301], cpu=100)
+        self.cg.leaf("app-podman-deadbeef", [302], cpu=100)
+        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
+                         "match": {"comm": "catatonit"},
+                         "gc": {"env_dir_missing": "XDG_RUNTIME_DIR", "keep_while_children": True}}]
+        self.d.idle_since["shared/helper-301"] = time.time() - 601
+        self.d.gc_usage["shared/helper-301"] = 100
+
+        result = self.d.gc_pass()
+
+        self.assertEqual({row[0] for row in result}, {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertEqual(self.stopm.call_count, 2)
+        self.assertEqual({os.path.relpath(call.args[0], self.cg.base) for call in self.stopm.call_args_list},
+                         {"shared/helper-301", "app-podman-deadbeef"})
+
+    def test_adopt_queues_scope_reviews_for_idle_shared_and_unit_scopes(self):
+        self.d.cfg["mode"] = "adopt"
+        self.fp.add(301, 1, comm="helper", born=self.fp.up - 100)
+        self.fp.add(302, 1, comm="catatonit", born=self.fp.up - 100)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(301, 302)
+        self.cg.leaf("shared/helper-301", [301], cpu=100)
+        self.cg.leaf("app-podman-deadbeef", [302], cpu=100)
+        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
+                         "match": {"comm": "catatonit"}}]
+        self.d.idle_since.update({"shared/helper-301": time.time() - 601,
+                                  "app-podman-deadbeef": time.time() - 601})
+        self.d.gc_usage.update({"shared/helper-301": 100, "app-podman-deadbeef": 100})
+
+        result = self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+        self.assertEqual({row[0] for row in result}, {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertEqual({r["scope"] for r in self.d.store.open_reviews()},
+                         {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertTrue(all(r["kind"] == "scope" for r in self.d.store.open_reviews()))
+        restarted = knowledge.Store(self.d.store.dir, seeds=self.d.store.seeds)
+        self.assertEqual({r["scope"] for r in restarted.open_reviews()},
+                         {"shared/helper-301", "app-podman-deadbeef"})
+        self.assertTrue(restarted.review_holds_scope("shared/helper-301"))
+        self.assertTrue(restarted.review_holds_scope("app-podman-deadbeef"))
+        for review in restarted.data["reviews"]:
+            review["created"] = time.time() - 45 * knowledge.DAY
+            review["expires"] = time.time() - 31 * knowledge.DAY
+        restarted.save()
+        expired = knowledge.Store(self.d.store.dir, seeds=self.d.store.seeds)
+        self.assertEqual(expired.open_reviews(), [])
+        self.assertTrue(expired.review_holds_scope("shared/helper-301"))
+        self.assertTrue(expired.review_holds_scope("app-podman-deadbeef"))
+        out = io.StringIO()
+        with mock.patch.object(cli, "_load", return_value=(self.d.cfg, self.d.store, self.d.units)), \
+                redirect_stdout(out):
+            cli.cmd_review(argparse.Namespace())
+        self.assertIn("scope=shared/helper-301", out.getvalue())
+        self.assertIn("scope=app-podman-deadbeef", out.getvalue())
+        self.d.store = expired
+        self.d.cfg["mode"] = "auto"
+        self.assertEqual(self.d.gc_pass(), [])  # unanswered review timeout remains a persisted keep
+        self.assertTrue(self.d.store.review_holds_scope("shared/helper-301"))
+        self.assertTrue(self.d.store.review_holds_scope("app-podman-deadbeef"))
+        self.stopm.assert_not_called()
+
+    def test_missing_runtime_dir_does_not_override_live_unit_children(self):
+        gone = self.rt + "/gone"
+        self.fp.add(302, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": gone}, born=self.fp.up - 100)
+        self.fp.add(303, 302, comm="conmon", env={"XDG_RUNTIME_DIR": gone}, born=self.fp.up - 90)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(302, 303)
+        self.cg.leaf("app-podman-deadbeef", [302, 303], cpu=100)
+        self.d.units = [{"unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
+                         "match": {"comm": "catatonit"},
+                         "gc": {"env_dir_missing": "XDG_RUNTIME_DIR", "keep_while_children": True}}]
+
+        self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+
+    def test_auto_gc_veto_keeps_an_idle_shared_scope(self):
+        self.fp.add(301, 1, comm="helper", born=self.fp.up - 100)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(301)
+        self.cg.leaf("shared/helper-301", [301], cpu=100)
+        self.d.idle_since["shared/helper-301"] = time.time() - 601
+        self.d.gc_usage["shared/helper-301"] = 100
+        self.d.store.add_veto("scope", "shared/helper-301")
+
+        result = self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+        self.assertEqual(result[0][2], "would")
+        self.assertTrue(any(e.get("event") == "vetoed" and e.get("trigger") == "gc_stop"
+                            for e in self.log()))
+
+    def test_auto_gc_protection_check_keeps_an_idle_shared_scope(self):
+        self.fp.add(301, 1, comm="niri", born=self.fp.up - 100)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(301)
+        self.cg.leaf("shared/niri-301", [301], cpu=100)
+        self.d.idle_since["shared/niri-301"] = time.time() - 601
+        self.d.gc_usage["shared/niri-301"] = 100
+
+        self.d.gc_pass()
+
+        self.stopm.assert_not_called()
+
+    def test_gc_would_stop_is_deduplicated_for_a_day_of_passes(self):
+        self.d.cfg["mode"] = "adopt"
+        path = self.cg.leaf("shared/helper-301", [301], cpu=100)
+        start = time.time()
+        now = [start]
+        self.d.store.now = lambda: now[0]
+        with mock.patch.object(engine, "gc_candidates", return_value=[(path, "idle 600s >= grace 600s")]):
+            for minute in range(24 * 60):
+                now[0] = start + minute * 60
+                self.d.gc_pass()
+            now[0] = start + knowledge.DAY
+            self.d.gc_pass()
+
+        events = [e for e in self.log() if e.get("event") == "gc_would_stop"]
+        self.assertEqual(len(events), 1)
+
+    def test_would_stop_is_deduplicated_for_an_unchanged_scope(self):
+        self.d.cfg["mode"] = "observe"
+        self.cg.leaf("scope-foo", [301])
+        start = time.time()
+        now = [start]
+        self.d.store.now = lambda: now[0]
+        for minute in range(24 * 60):
+            now[0] = start + minute * 60
+            self.d.stop_leaf("scope-foo", "owner exited")
+
+        events = [e for e in self.log() if e.get("event") == "would_stop"
+                  and e.get("scope") == "scope-foo"]
+        self.assertEqual(len(events), 1)
+        now[0] = start + knowledge.DAY
+        self.d.stop_leaf("scope-foo", "owner exited")
+        events = [e for e in self.log() if e.get("event") == "would_stop"
+                  and e.get("scope") == "scope-foo"]
+        self.assertEqual(len(events), 1)
 
     def test_gc_pass_dry_run_stops_nothing(self):
         self.leaf()

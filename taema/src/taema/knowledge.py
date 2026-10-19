@@ -101,7 +101,7 @@ class Store:
         return {"version": SCHEMA, "last_decay": self.now(), "created": self.now(), "closes": 0,
                 "exes": {}, "pairs": {}, "standalone": {}, "noise": {},
                 "asked": {"day": 0, "n": 0}, "reviews": [], "review_seq": 0,
-                "vetoes": [], "auto_actions": [], "feedback_ids": []}
+                "vetoes": [], "auto_actions": [], "feedback_ids": [], "leftover_expiries": {}}
 
     def _migrate(self, data):
         """v1 (exes only) -> v2: add pairs, standalone, asked, noise; keep every exe record."""
@@ -118,6 +118,9 @@ class Store:
             if not isinstance(data.get(field), list):
                 data[field] = []
                 self.dirty = True
+        if not isinstance(data.get("leftover_expiries"), dict):
+            data["leftover_expiries"] = {}
+            self.dirty = True
         seq = data.get("review_seq")
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
             seq = max((r.get("id", 0) for r in data["reviews"] if isinstance(r, dict)
@@ -629,7 +632,7 @@ class Store:
 
     # ---- close reviews ----------------------------------------------------------------------
     def open_reviews(self):
-        """Pending GUI-close reviews, in creation order, excluding reviews past their expiry."""
+        """Pending reviews, in creation order, excluding reviews past their expiry."""
         now = self.now()
         return [dict(r) for r in self.data.get("reviews", []) if isinstance(r, dict)
                 and r.get("state") == "open" and r.get("expires", now) > now]
@@ -639,7 +642,7 @@ class Store:
         return len(self.open_reviews())
 
     def review_holds_scope(self, scope):
-        """Open and expired close reviews keep their contained scope out of automatic GC."""
+        """Open or unanswered expired reviews keep their scope out of automatic GC."""
         return any(isinstance(r, dict) and r.get("scope") == scope
                    and r.get("state") in ("open", "expired") for r in self.data.get("reviews", []))
 
@@ -648,7 +651,17 @@ class Store:
         review["closed"] = now
         review["reason"] = reason
         for key in review.get("survivors", []):
-            self.answer(review.get("owner"), key, "keep")
+            owner = review.get("owner")
+            pair = self.data.get("pairs", {}).get(self.pkey(owner, key)) if owner else None
+            # A user's explicit keep stays authoritative; a fresh unanswered review can replace
+            # an older stop answer with the safe default keep.
+            if pair and pair.get("ex_keep", 0) and pair.get("ex_last") == "keep" \
+                    and pair.get("ex_source") != "review_expiry":
+                continue
+            if self.answer(owner, key, "keep", source="review_expiry"):
+                pair = self._pair(owner, key)
+                if review.get("scope"):
+                    pair.setdefault("review_expiries", {})[review["scope"]] = review.get("created", now)
         self.dirty = True
 
     def expire_reviews(self):
@@ -663,6 +676,7 @@ class Store:
                 expired += 1
                 self.log(event="review_expired", id=review.get("id"), owner=review.get("owner"))
         closed = [r for r in reviews if isinstance(r, dict) and r.get("state") != "open"
+                  and r.get("kind") != "scope"
                   and r.get("closed", now) <= now - REVIEW_RETENTION]
         if closed:
             self.data["reviews"] = [r for r in reviews if r not in closed]
@@ -693,7 +707,7 @@ class Store:
             opens.remove(oldest)
         now = self.now()
         review_id = self.data.get("review_seq", 0) + 1
-        review = {"id": review_id, "owner": owner, "survivors": sorted(by_key),
+        review = {"id": review_id, "kind": "close", "owner": owner, "survivors": sorted(by_key),
                   "pids": sorted({p for pids in by_key.values() for p in pids}), "scope": scope,
                   "created": now, "expires": now + REVIEW_TTL, "state": "open"}
         reviews.append(review)
@@ -701,9 +715,104 @@ class Store:
         self.dirty = True
         return dict(review)
 
-    def answer(self, owner, leftover, choice):
-        """One explicit answer: weight 3, kept in ex_* counters that decay never touches. A fresh
-        answer clears contrary inferred evidence and any regret suspension for the pair."""
+    def add_scope_review(self, scope, reason):
+        """Queue a durable GC review without inventing an owner/member pair."""
+        if not isinstance(scope, str) or not scope or len(scope) > 512 \
+                or not isinstance(reason, str) or not reason:
+            return None
+        self.expire_reviews()
+        existing = next((r for r in self.data.get("reviews", []) if isinstance(r, dict)
+                         and r.get("kind") == "scope" and r.get("scope") == scope
+                         and r.get("state") == "open"), None)
+        if existing:
+            return dict(existing)
+        reviews = self.data.setdefault("reviews", [])
+        opens = [r for r in reviews if isinstance(r, dict) and r.get("state") == "open"]
+        while len(opens) >= MAX_OPEN_REVIEWS:
+            oldest = min(opens, key=lambda r: (r.get("created", 0), r.get("id", 0)))
+            now = self.now()
+            self._resolve_review(oldest, now, "queue cap")
+            self.log(event="review_expired", id=oldest.get("id"), owner=oldest.get("owner"),
+                     reason="queue cap")
+            opens.remove(oldest)
+        now = self.now()
+        review_id = self.data.get("review_seq", 0) + 1
+        review = {"id": review_id, "kind": "scope", "scope": scope, "reason": reason[:256],
+                  "created": now, "expires": now + REVIEW_TTL, "state": "open"}
+        reviews.append(review)
+        self.data["review_seq"] = review_id
+        self.dirty = True
+        return dict(review)
+
+    def leftover_expiry_due(self, scope, days, now=None):
+        """Whether explicit leftover expiry has reached the age of its first review."""
+        try:
+            days = float(days)
+        except (TypeError, ValueError):
+            return False
+        if not scope or days <= 0:
+            return False
+        now = self.now() if now is None else now
+        expiries = self.data.setdefault("leftover_expiries", {})
+        created = expiries.get(scope)
+        if not isinstance(created, (int, float)) or isinstance(created, bool):
+            reviews = [r for r in self.data.get("reviews", []) if isinstance(r, dict)
+                       and r.get("scope") == scope
+                       and isinstance(r.get("created"), (int, float))]
+            starts = [r["created"] for r in reviews]
+            starts.extend(p.get("review_expiries", {}).get(scope)
+                          for p in self.data.get("pairs", {}).values()
+                          if isinstance(p, dict) and isinstance(p.get("review_expiries"), dict)
+                          and isinstance(p["review_expiries"].get(scope), (int, float)))
+            if not starts:
+                return False
+            created = min(starts)
+        if now - created < days * DAY:
+            return False
+        if expiries.get(scope) != created:
+            expiries[scope] = created
+            self.dirty = True
+            self.log(event="leftover_expiry_authorized", scope=scope, days=days)
+        for review in self.data.get("reviews", []):
+            if isinstance(review, dict) and review.get("scope") == scope \
+                    and review.get("state") == "open":
+                review.update(state="leftover_expired", closed=now, reason="leftover_expire_days")
+                self.dirty = True
+        return True
+
+    def leftover_expiry_overrides_keep(self, owner, leftover, scope, days, now=None):
+        """Configured expiry can override only a keep created by unanswered-review expiry."""
+        if not self.leftover_expiry_due(scope, days, now=now):
+            return False
+        pair = self.data.get("pairs", {}).get(self.pkey(owner, leftover))
+        if not pair or pair.get("ex_source") != "review_expiry":
+            return False
+        return pair.get("review_expiries", {}).get(scope) == self.data["leftover_expiries"].get(scope)
+
+    def prune_leftover_expiries(self, live_scopes):
+        """Bound persisted expiry markers once their leftover scope has disappeared."""
+        expiries = self.data.get("leftover_expiries", {})
+        stale = set(expiries) - set(live_scopes)
+        if stale:
+            for scope in stale:
+                del expiries[scope]
+            self.dirty = True
+
+    def prune_scope_reviews(self, live_scopes):
+        """Drop GC review holds only after their scopes no longer exist."""
+        reviews = self.data.get("reviews", [])
+        kept = [r for r in reviews if not (isinstance(r, dict) and r.get("kind") == "scope"
+                                           and r.get("scope") not in live_scopes)]
+        if len(kept) != len(reviews):
+            self.data["reviews"] = kept
+            self.dirty = True
+
+    def answer(self, owner, leftover, choice, source="explicit"):
+        """Record an answer at weight 3, kept in ex_* counters that decay never touches.
+
+        Explicit answers clear contrary inferred evidence and regret suspension; review-expiry
+        keeps use the same safe default while retaining their source for configured expiry policy.
+        """
         if choice not in CHOICES or not self._ok(owner, leftover):
             return False
         if choice == "standalone":
@@ -718,6 +827,9 @@ class Store:
         p["ex_" + choice] += W_ANSWER
         p["ex_last"] = choice
         p["ex_ts"] = self.now()
+        p["ex_source"] = source
+        if source != "review_expiry":
+            p["review_expiries"] = {}
         p["keep" if choice == "stop" else "stop"] = 0.0
         p["suspended_until"] = 0.0
         if choice == "keep":

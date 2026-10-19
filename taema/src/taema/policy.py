@@ -92,6 +92,7 @@ def load_config(path=None):
         raise ValueError("mode must be one of %s" % (MODES,))
     for k in ("paths", "timers", "protected", "seeds", "learner"):
         cfg.setdefault(k, {})
+    cfg["timers"].setdefault("leftover_expire_days", 0)
     cfg["learner"].setdefault("deny_owners", [])
     p = cfg["paths"]
     p.setdefault("session_cgroup", "auto")

@@ -112,6 +112,7 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_defaults_the_learner_section(self):
         cfg = self.cfg()
         self.assertEqual(cfg["learner"]["deny_owners"], [])
+        self.assertEqual(policy.timer(cfg, "leftover_expire_days", 0), 0)
 
     def test_user_layer_extends_learner_deny_owners(self):
         system = {"learner": {"deny_owners": ["a"]}}

@@ -98,6 +98,21 @@ class Daemon:
         """Global kill switch: enforce only. Auto stops go through engine.auto_stop_ok per pair."""
         return self.mode == "enforce"
 
+    def log_would_stop(self, event, scope, why):
+        """Log a would-stop decision only when its scope, mode, or reason signature changes."""
+        path = scope if os.path.isabs(scope) else os.path.join(cgroup.base(), scope)
+        members = tuple((pid, inspect.starttime(pid)) for pid in cgroup.tree_procs(path))
+        if why.startswith("idle "):
+            reason = "idle"
+        elif " gone:" in why:
+            reason = why.split(" gone:", 1)[0] + " gone"
+        else:
+            reason = why
+        key = event + ":" + scope
+        signature = (self.mode, members, reason)
+        if self.store.changed(key, signature):
+            self.store.log(event=event, scope=scope, why=why, mode=self.mode)
+
     def authorize(self, trigger, facts=None):
         """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
@@ -146,7 +161,7 @@ class Daemon:
         path = "%s/%s" % (cgroup.base(), leaf)
         dec = self.authorize(authorization.OWNER_EXIT, authorization.Facts(scope=leaf))
         if dec.verdict == authorization.WOULD_ACT:
-            self.store.log(event="would_stop", scope=leaf, why=why, mode=self.mode)
+            self.log_would_stop("would_stop", leaf, why)
             return
         if dec.verdict != authorization.ACT or not os.path.isdir(path):
             # keep: a future veto/hold blocks silently here. An absent leaf can still be
@@ -358,23 +373,44 @@ class Daemon:
 
     def auto_stop_path(self, path, why, require_pair):
         """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
-        decided stop); otherwise only the idle checks (no edges, no pty host, not protected) apply.
+        decided stop); otherwise only the idle checks (known CPU, no edges, no pty host, not protected) apply.
         SIGKILL only when every pair was answered explicitly. Returns True when the scope was removed."""
         leaf = cgroup.rel(path)
         infos = self._infos(cgroup.tree_procs(path))
         if not infos:
             return False
         for i in infos:
-            ok, w = engine.auto_stop_ok(self.store, i["origin"], i["key"], i) if require_pair else \
-                (not (i["edges"] is None or i["edges"] or i["protected"] or i["ptmx"]), "idle member busy")
+            if require_pair:
+                ok, w = engine.auto_stop_ok(self.store, i["origin"], i["key"], i)
+            else:
+                cpu = i.get("cpu")
+                ok = not (i["edges"] is None or i["edges"] or i["protected"] or i["ptmx"]
+                          or cpu is None or cpu > engine.AUTO_MAX_CPU)
+                if i["edges"] is None:
+                    w = "edges unknown"
+                elif i["edges"]:
+                    w = "has edges"
+                elif i["protected"]:
+                    w = "protected: %s" % i["protected"]
+                elif i["ptmx"]:
+                    w = "pty host"
+                elif cpu is None:
+                    w = "cpu unknown"
+                elif cpu > engine.AUTO_MAX_CPU:
+                    w = "cpu %.1f%% > %.0f%%" % (cpu, engine.AUTO_MAX_CPU)
+                else:
+                    w = "idle checks passed"
             if not ok:
                 self.store.log(event="auto_stop_refused", scope=leaf, pid=i["pid"], key=i["key"], why=w)
                 return False
         pairs = [(i["origin"], i["key"]) for i in infos if i["origin"]]
         explicit = require_pair and all(self.store.pair_explicit(o, k) for o, k in pairs)
         grace = engine.auto_grace(self.store, {i["key"] for i in infos})
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
         try:
-            rep = engine.stop(path, self.cfg, self.store, None, timeout=grace, allow_sigkill=explicit)
+            rep = engine.stop(path, self.cfg, self.store, unit,
+                              hook=policy.hook_for(self.cfg, os.path.basename(path)),
+                              timeout=grace, allow_sigkill=explicit)
         except engine.Refused as e:
             self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
             return False
@@ -788,6 +824,31 @@ class Daemon:
         else:
             now_empty.add(leaf)
 
+    def _queue_gc_review(self, path, leaf, why):
+        """Queue a pair review for known leftover ownership, otherwise a scope-level GC review."""
+        before = self.store.data.get("review_seq", 0)
+        pids = cgroup.tree_procs(path)
+        infos = self._infos(pids)
+        owners = {}
+        for info in infos:
+            owner = info.get("origin")
+            if owner and not policy.bad_owner(owner, self.store.deny):
+                owners.setdefault(owner, []).append({"pid": info["pid"], "key": info["key"]})
+        if owners and leaf.startswith(engine.LEFTOVER + "/"):
+            for owner, members in owners.items():
+                review = self.store.add_review(owner, members, leaf)
+                if review and review["id"] > before:
+                    self.store.log(event="review_created", id=review["id"], owner=owner,
+                                   scope=leaf, survivors=review["survivors"], pids=review["pids"],
+                                   source="gc")
+                    before = review["id"]
+        else:
+            review = self.store.add_scope_review(leaf, why)
+            if review and review["id"] > before:
+                self.store.log(event="gc_review_created", id=review["id"], scope=leaf, why=why)
+        self.store.save_if_dirty()
+        return self.store.review_holds_scope(leaf)
+
     def gc_pass(self, dry_run=False):
         self.store.expire_reviews()
         self.store.save_if_dirty()
@@ -815,12 +876,22 @@ class Daemon:
             if dry_run:
                 continue
             if dec.verdict == authorization.WOULD_ACT:
-                self.store.log(event="gc_would_stop", scope=leaf, why=why, mode=self.mode)
+                self.log_would_stop("gc_would_stop", leaf, why)
+                if self.mode == "adopt" and (leaf.startswith("shared/")
+                                              or engine.unit_for_leaf(self.units, os.path.basename(path))):
+                    res[-1][2] = "review"
+                    self._queue_gc_review(path, leaf, why)
                 continue
             if dec.verdict != authorization.ACT:   # keep: a future veto/hold blocks silently here
                 continue
-            if dec.authority == authorization.AUTHORITY_PAIR:
-                self.guarded(lambda: self.auto_stop_path(path, why, why.startswith("pair stop")))
+            if self.mode == "auto" and leaf.startswith(engine.LEFTOVER + "/") \
+                    and why.startswith("idle"):
+                res[-1][2] = "review"
+                self._queue_gc_review(path, leaf, why)
+                continue
+            if self.mode == "auto":
+                require_pair = dec.authority == authorization.AUTHORITY_PAIR and why.startswith("pair stop")
+                self.guarded(lambda: self.auto_stop_path(path, why, require_pair))
                 continue
             try:
                 rep = engine.stop(path, self.cfg, self.store,
@@ -881,8 +952,7 @@ class Daemon:
                 self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
             if dec.verdict == authorization.WOULD_ACT:
-                self.store.log(event="would_stop", scope=cgroup.rel(d), why="session ended",
-                               mode=self.mode)
+                self.log_would_stop("would_stop", cgroup.rel(d), "session ended")
                 continue
             if dec.authority == authorization.AUTHORITY_PAIR:
                 # keep everything unless every member's pair is confidently "stop"

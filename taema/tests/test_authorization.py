@@ -42,7 +42,7 @@ TRUTH = [
         "enforce": ("keep", ""), "auto": ("act", "mode")}),
     (authorization.GC_STOP, authorization.Facts(), {
         "observe": ("would", ""), "adopt": ("would", ""),
-        "enforce": ("act", "unit"), "auto": ("would", "")}),
+        "enforce": ("act", "unit"), "auto": ("act", "mode")}),
     (authorization.GC_STOP, authorization.Facts(leftover=True), {
         "observe": ("would", ""), "adopt": ("would", ""),
         "enforce": ("act", "unit"), "auto": ("act", "pair")}),

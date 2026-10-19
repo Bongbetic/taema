@@ -422,6 +422,12 @@ def cmd_review(a):
     print("open reviews: %d" % len(reviews))
     now = time.time()
     for review in reviews:
+        if review.get("kind") == "scope":
+            age = max(0, int(now - review.get("created", now)))
+            print("review #%s scope=%s reason=%s age=%ds" % (
+                review.get("id", "?"), lineage.clean(review.get("scope", "?"), 80),
+                lineage.clean(review.get("reason", "GC candidate"), 80), age))
+            continue
         survivors = ", ".join(lineage.clean(k, 40) for k in review.get("survivors", [])) or "none"
         age = max(0, int(now - review.get("created", now)))
         print("review #%s owner=%s survivors=%s age=%ds" % (

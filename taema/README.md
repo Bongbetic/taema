@@ -239,10 +239,20 @@ for 7 days and asks you again. You never need a command to undo it.
 
 | Mode | What happens |
 |---|---|
-| `auto` | Adopts, learns and cleans up as described above. |
-| `adopt` | Gives apps their own scopes. Never stops anything. |
-| `observe` | Only writes what it *would* do to the log. Changes nothing. |
-| `enforce` | Manual mode for advanced use: stops scopes by unit rules (garbage collection, owner watch, logout). |
+| `auto` | Learns from app closes, reviews unlearned idle leftovers, and stops eligible idle shared or `stop_when_unneeded` scopes after safety and veto checks. |
+| `adopt` | Gives apps their own scopes and reviews idle shared or `stop_when_unneeded` scopes; it does not stop them. |
+| `observe` | Logs what it *would* do and leaves scopes and processes in place. |
+| `enforce` | Applies unit and lifecycle rules, including GC for `stop_when_unneeded` scopes, with safety and veto checks. |
+
+Leftover expiry is opt-in. `leftover_expire_days = 0` (the default) keeps unlearned
+leftovers indefinitely. A positive value allows an aged, idle leftover to expire after that many
+days, subject to the usual safety checks; an explicit keep or veto still wins. Review timeouts
+resolve to keep and do not enable expiry.
+
+```toml
+[timers]
+leftover_expire_days = 30 # optional; default 0 disables expiry
+```
 
 ```toml
 # ~/.config/taema/taema.toml

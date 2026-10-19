@@ -49,7 +49,7 @@ chroot "$R" env -u TMPDIR -u XBPS_ROOT -u XBPS_ARCH -u XBPS_TARGET_ARCH \
 chroot "$R" env -u TMPDIR -u XBPS_ROOT -u XBPS_ARCH -u XBPS_TARGET_ARCH \
     /usr/bin/xbps-install -Syu
 chroot "$R" env -u TMPDIR -u XBPS_ROOT -u XBPS_ARCH -u XBPS_TARGET_ARCH \
-    /usr/bin/xbps-install -S -y linux openssh dhcpcd python3 iproute2 sudo
+    /usr/bin/xbps-install -S -y linux openssh dhcpcd python3 iproute2 sudo dbus elogind
 
 # Void's kernel packages build the initramfs with dracut, whose host-only
 # detection inside this chroot sees the builder's hardware (and previously
@@ -94,6 +94,8 @@ chmod 600 "$R/home/vmadmin/.ssh/authorized_keys"
 mkdir -p "$R/etc/runit/runsvdir/default"
 ln -sf /etc/sv/sshd "$R/etc/runit/runsvdir/default/sshd"
 ln -sf /etc/sv/dhcpcd "$R/etc/runit/runsvdir/default/dhcpcd"
+ln -sf /etc/sv/dbus "$R/etc/runit/runsvdir/default/dbus"
+ln -sf /etc/sv/elogind "$R/etc/runit/runsvdir/default/elogind"
 
 printf 'taema-vm\n' > "$R/etc/hostname"
 grep -q '[[:space:]]taema-vm$' "$R/etc/hosts" 2>/dev/null ||

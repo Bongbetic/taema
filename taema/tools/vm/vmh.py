@@ -348,7 +348,7 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     else:
         accel = "kvm" if kvm else "tcg"
 
-    key, _pub = ssh_key_paths(cfg)
+    key, pub = ssh_key_paths(cfg)
     vmadmin = "vmadmin"
     repo_name = os.path.basename(cfg["paths"]["package_repo"].rstrip("/"))
     pkg = package_path(cfg)
@@ -359,6 +359,7 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
 
     sources = [os.path.join(VM_DIR, "provision.sh"),
                os.path.join(VM_DIR, "scenario.py"),
+               pub,
                package_repo_dir(cfg)]
     if "upgrade" in scenarios:
         sources.append(prev)
@@ -380,7 +381,9 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
             {"name": "provision",
              "argv": ssh_argv(cfg, port, key, known, vmadmin,
                               "sudo -n sh %s/provision.sh --package-dir %s/%s --user %s"
-                              % (GUEST_TMP, GUEST_TMP, repo_name, cfg["test_user"]))},
+                              " --authorized-key %s/%s"
+                              % (GUEST_TMP, GUEST_TMP, repo_name, cfg["test_user"],
+                                 GUEST_TMP, os.path.basename(pub)))},
         ]
         for s in scenarios:
             remote = "python3 %s/scenario.py %s --artifacts %s/artifacts" % (
@@ -399,10 +402,11 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
                                        os.path.join(run_dir, "artifacts") + "/")})
         steps.append({"name": "teardown"})
         vms.append({"libc": libc, "run_dir": run_dir, "port": port, "key": key,
-                    "qemu": qemu, "steps": steps})
+                    "pub": pub, "qemu": qemu, "steps": steps})
 
     return {"accel": accel, "kvm": kvm, "scenarios": scenarios, "libcs": libcs,
-            "package": {"path": pkg, "argv": ["sh", BUILD_XBPS]},
+            "package": {"path": pkg,
+                        "argv": ["sh", BUILD_XBPS, package_repo_dir(cfg)]},
             "network": {"urls": network_urls},
             "vms": vms}
 
@@ -568,7 +572,7 @@ def build_image(cfg, libc, log=None):
 # ---- package build ---------------------------------------------------------
 
 def build_package(cfg):
-    r = subprocess.run(["sh", BUILD_XBPS], cwd=TAEMA_ROOT,
+    r = subprocess.run(["sh", BUILD_XBPS, package_repo_dir(cfg)], cwd=TAEMA_ROOT,
                        capture_output=True, text=True)
     if r.returncode != 0:
         raise RunError("package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:]))
@@ -660,6 +664,7 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     """Boot one VM, provision it, run scenarios, collect artifacts."""
     libc = plan_vm["libc"]
     key = plan_vm["key"]
+    pub = plan_vm["pub"]
     port = free_port()  # plan port is a preview; pick again for the real run
     known = os.path.join(run_dir, "known_hosts")
     run_dir_abs = run_dir
@@ -688,7 +693,7 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
                  ssh_argv(cfg, port, key, known, admin,
                           "mkdir -p %s/previous-repo" % GUEST_TMP), run_dir)
         sources = [os.path.join(VM_DIR, "provision.sh"),
-                   os.path.join(VM_DIR, "scenario.py"), pkg_src]
+                   os.path.join(VM_DIR, "scenario.py"), pub, pkg_src]
         if "upgrade" in scenarios:
             sources.append(prev)
         run_step("scp-bootstrap",
@@ -697,7 +702,9 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
         run_step("provision",
                  ssh_argv(cfg, port, key, known, admin,
                           "sudo -n sh %s/provision.sh --package-dir %s/%s --user %s"
-                          % (GUEST_TMP, GUEST_TMP, repo_name, user)),
+                          " --authorized-key %s/%s"
+                          % (GUEST_TMP, GUEST_TMP, repo_name, user,
+                             GUEST_TMP, os.path.basename(pub))),
                  run_dir, timeout=300)
         results = {}
         for s in scenarios:

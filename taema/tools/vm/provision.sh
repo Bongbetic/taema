@@ -6,21 +6,28 @@
 # Usage: provision.sh --package-dir DIR --user NAME
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
+GUEST_TMP=/tmp/taema-vm
 PKGDIR=
 USER_NAME=
+AUTHORIZED_KEY=
 while [ $# -gt 0 ]; do
     case $1 in
         --package-dir) PKGDIR=$2; shift 2 ;;
         --user) USER_NAME=$2; shift 2 ;;
+        --authorized-key) AUTHORIZED_KEY=$2; shift 2 ;;
         *) echo "provision.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-if [ -z "$PKGDIR" ] || [ -z "$USER_NAME" ]; then
-    echo "usage: provision.sh --package-dir DIR --user NAME" >&2
+if [ -z "$PKGDIR" ] || [ -z "$USER_NAME" ] || [ -z "$AUTHORIZED_KEY" ]; then
+    echo "usage: provision.sh --package-dir DIR --user NAME --authorized-key FILE" >&2
     exit 2
 fi
 if [ ! -d "$PKGDIR" ]; then
     echo "provision.sh: no such package dir: $PKGDIR" >&2
+    exit 1
+fi
+if [ ! -f "$AUTHORIZED_KEY" ]; then
+    echo "provision.sh: no such authorized key: $AUTHORIZED_KEY" >&2
     exit 1
 fi
 
@@ -43,7 +50,21 @@ xbps-install -y -i --repository="$PKGDIR" taema || {
 usermod -aG taema "$USER_NAME" || exit 1
 uid=$(id -u "$USER_NAME")
 gid=$(id -g "$USER_NAME")
+user_home=
+while IFS=: read -r entry _ _ _ _ home _; do
+    if [ "$entry" = "$USER_NAME" ]; then
+        user_home=$home
+        break
+    fi
+done < /etc/passwd
+if [ -z "$user_home" ] || [ ! -d "$user_home" ]; then
+    echo "provision.sh: no home directory for $USER_NAME" >&2
+    exit 1
+fi
+install -d -m 700 -o "$uid" -g "$gid" "$user_home/.ssh"
+install -m 600 -o "$uid" -g "$gid" "$AUTHORIZED_KEY" "$user_home/.ssh/authorized_keys"
 install -d -m 700 -o "$uid" -g "$gid" "/run/user/$uid"
+install -d -m 755 -o "$uid" -g "$gid" "$GUEST_TMP/artifacts"
 printf '%s ALL=(root) NOPASSWD: ALL\n' "$USER_NAME" > /etc/sudoers.d/taema-vm
 chmod 440 /etc/sudoers.d/taema-vm
 

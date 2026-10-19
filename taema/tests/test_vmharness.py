@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(ROOT)
@@ -277,7 +278,26 @@ class PlanTest(VmTestCase):
         self.assertEqual(plan["package"]["path"],
                          os.path.join(ROOT, "build", "repo",
                                       "taema-%s_1.noarch.xbps" % vmh.read_version(ROOT)))
-        self.assertTrue(plan["package"]["argv"][-1].endswith("build-xbps.sh"))
+        self.assertEqual(plan["package"]["argv"],
+                         ["sh", vmh.BUILD_XBPS, vmh.package_repo_dir(self.cfg)])
+
+    def test_plan_package_repo_can_be_outside_the_worktree(self):
+        repo = os.path.join(self.tmp, "external-package-repo")
+        self.cfg["paths"]["package_repo"] = repo
+        plan = vmh.build_plan(self.cfg, kvm=False)
+        self.assertEqual(plan["package"]["path"],
+                         os.path.join(repo, "taema-%s_1.noarch.xbps"
+                                      % vmh.read_version(ROOT)))
+        self.assertEqual(plan["package"]["argv"], ["sh", vmh.BUILD_XBPS, repo])
+
+    def test_plan_bootstraps_test_user_ssh_key(self):
+        pub = vmh.ssh_key_paths(self.cfg)[1]
+        steps = vmh.build_plan(self.cfg, libcs=["glibc"], kvm=False)["vms"][0]["steps"]
+        bootstrap = next(step for step in steps if step["name"] == "scp-bootstrap")
+        provision = next(step for step in steps if step["name"] == "provision")
+        self.assertIn(pub, bootstrap["argv"])
+        self.assertIn("--authorized-key /tmp/taema-vm/id_ed25519.pub",
+                      provision["argv"][-1])
 
     def test_plan_step_order(self):
         plan = vmh.build_plan(self.cfg, libcs=["glibc"],
@@ -313,6 +333,26 @@ class DryRunTest(VmTestCase):
         self.assertFalse(os.path.exists(self.state), "dry run must not create the state dir")
 
 
+class PackageBuildTest(VmTestCase):
+    def test_build_uses_configured_package_repo(self):
+        cfg = vmh.load_config(self.write_config())
+        repo = os.path.join(self.tmp, "external-package-repo")
+        cfg["paths"]["package_repo"] = repo
+        package = vmh.package_path(cfg)
+
+        def fake_run(argv, **kwargs):
+            self.assertEqual(argv, ["sh", vmh.BUILD_XBPS, repo])
+            self.assertEqual(kwargs["cwd"], vmh.TAEMA_ROOT)
+            os.makedirs(repo, exist_ok=True)
+            with open(package, "wb") as f:
+                f.write(b"package")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(vmh.subprocess, "run", side_effect=fake_run) as run:
+            self.assertEqual(vmh.build_package(cfg), package)
+        run.assert_called_once()
+
+
 class ImageBuildScriptTest(VmTestCase):
     """Rootless image-build script generation (no live extraction or boot)."""
 
@@ -343,6 +383,12 @@ class ImageBuildScriptTest(VmTestCase):
         self.assertIn('ln -sf /etc/sv/sshd "$R/etc/runit/runsvdir/default/sshd"',
                       self.script)
         self.assertIn('ln -sf /etc/sv/dhcpcd "$R/etc/runit/runsvdir/default/dhcpcd"',
+                      self.script)
+        self.assertIn("openssh dhcpcd python3 iproute2 sudo dbus elogind",
+                      self.script)
+        self.assertIn('ln -sf /etc/sv/dbus "$R/etc/runit/runsvdir/default/dbus"',
+                      self.script)
+        self.assertIn('ln -sf /etc/sv/elogind "$R/etc/runit/runsvdir/default/elogind"',
                       self.script)
 
     def test_mkimage_fixup_reads_guest_file_and_is_idempotent(self):
@@ -507,6 +553,12 @@ class HarnessSurfacesTest(unittest.TestCase):
         for target in ("vm-test", "vm-dry-run", "vm-doctor"):
             self.assertIn(target + ":", mk)
         self.assertIn("tools/vm/vmh.py run", mk)
+
+    def test_package_builder_indexes_for_host_and_musl_guests(self):
+        script = read_text(os.path.join(ROOT, "tools", "build-xbps.sh"))
+        self.assertIn('xbps-rindex -f -a "$repo/$pkg.noarch.xbps"', script)
+        self.assertIn('XBPS_ARCH=x86_64-musl xbps-rindex -f -a '
+                      '"$repo/$pkg.noarch.xbps"', script)
 
     def test_workflow_is_opt_in_kvm_only_and_uploads_artifacts(self):
         wf = read_text(os.path.join(REPO, ".github", "workflows", "vm-harness.yml"))
@@ -699,13 +751,24 @@ class ProvisionScriptTest(unittest.TestCase):
     def test_missing_package_dir_fails_before_any_setup(self):
         user = "taemavmprovnobody"
         r = self.run_provision("--package-dir", "/nonexistent/taema-repo",
-                               "--user", user)
+                               "--user", user, "--authorized-key",
+                               "/nonexistent/taema-authorized-key")
         self.assertEqual(r.returncode, 1)
         self.assertIn("no such package dir", r.stderr)
         # the refusal happens before useradd: the host user list is untouched
         probe = subprocess.run(["id", "-u", user], capture_output=True, text=True)
         self.assertNotEqual(probe.returncode, 0,
                             "provision.sh must refuse before creating users")
+
+    def test_script_installs_the_test_user_key_with_strict_permissions(self):
+        script = read_text(os.path.join(VM_DIR, "provision.sh"))
+        self.assertIn('install -d -m 700 -o "$uid" -g "$gid" "$user_home/.ssh"',
+                      script)
+        self.assertIn('install -m 600 -o "$uid" -g "$gid" "$AUTHORIZED_KEY"',
+                      script)
+        self.assertIn('"$user_home/.ssh/authorized_keys"', script)
+        self.assertIn('install -d -m 755 -o "$uid" -g "$gid" '
+                      '"$GUEST_TMP/artifacts"', script)
 
 
 class ScenarioCliParsingTest(unittest.TestCase):

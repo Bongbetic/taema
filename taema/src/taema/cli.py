@@ -287,6 +287,19 @@ def cmd_status(a):
     return 0
 
 
+def cmd_review(a):
+    _cfg, store, _units = _load()
+    reviews = store.open_reviews()
+    print("open reviews: %d" % len(reviews))
+    now = time.time()
+    for review in reviews:
+        survivors = ", ".join(lineage.clean(k, 40) for k in review.get("survivors", [])) or "none"
+        age = max(0, int(now - review.get("created", now)))
+        print("review #%s owner=%s survivors=%s age=%ds" % (
+            review.get("id", "?"), lineage.clean(review.get("owner", "?"), 40), survivors, age))
+    return 0
+
+
 def cmd_gc(a):
     cfg, store, units = _load()
     reply = ask(cfg, {"cmd": "gc", "dry_run": a.dry_run}, timeout=60)
@@ -339,6 +352,7 @@ def main(argv):
     s = sub.add_parser("keep"); s.add_argument("exe"); s.set_defaults(f=cmd_keep)
     s = sub.add_parser("forget"); s.add_argument("exe"); s.set_defaults(f=cmd_forget)
     s = sub.add_parser("status"); s.set_defaults(f=cmd_status)
+    s = sub.add_parser("review", help="list pending close reviews"); s.set_defaults(f=cmd_review)
     s = sub.add_parser("gc"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_gc)
     s = sub.add_parser("adopt"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(f=cmd_adopt)
     s = sub.add_parser("daemon"); s.set_defaults(f=cmd_daemon)

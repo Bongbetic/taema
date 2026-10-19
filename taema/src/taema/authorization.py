@@ -136,10 +136,10 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
         "auto": (ACT, AUTHORITY_MODE, "auto adopt: every eligible app root gets its own scope"),
     },
     GUI_CLOSE: {
-        "observe": (KEEP, "", "gui close: only auto contains GUI survivors (0.2.1)"),
-        "adopt": (KEEP, "", "gui close: only auto contains GUI survivors (0.2.1)"),
-        "enforce": (KEEP, "", "gui close: only auto contains GUI survivors (0.2.1)"),
-        "auto": (ACT, AUTHORITY_MODE, "gui close: auto moves survivors to leftover/<owner>-<id>"),
+        "observe": (WOULD_ACT, "", "gui close: observe logs survivors it would contain"),
+        "adopt": (ACT, AUTHORITY_MODE, "gui close: adopt contains survivors in leftover/<owner>-<id>"),
+        "enforce": (ACT, AUTHORITY_MODE, "gui close: enforce contains survivors in leftover/<owner>-<id>"),
+        "auto": (ACT, AUTHORITY_MODE, "gui close: auto contains survivors in leftover/<owner>-<id>"),
     },
     JOB_SURVIVORS: {
         "observe": (KEEP, "", "job survivors: only auto acts on closed-job survivors (0.2.1)"),

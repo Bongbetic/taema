@@ -431,8 +431,8 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
     pt: the pass's ProcTable, scanned lazily. Empty app-*/scope-*/shared/* leaves come back
     with reason "empty" (never 'manager'). The ss snapshot is built only when a leaf needs it.
     auto (with lin, the Lineage): leftover/* leaves are candidates too, "pair stop ..." when every
-    member passes auto_stop_ok, else by the idle rule unless a member is held (protected, persist
-    seed, share seed with user_keep, pair decided keep, pty host)."""
+    member passes auto_stop_ok, else by the idle rule unless a member is held (open review, protected,
+    persist seed, share seed with user_keep, pair decided keep, pty host)."""
     usage = {} if usage is None else usage
     skip = set() if skip is None else skip
     noted = set() if noted is None else noted
@@ -482,6 +482,12 @@ def gc_candidates(cfg, units, store, idle_since, now=time.time, usage=None, skip
                 idle_since.pop(rel, None)
                 continue
         if auto and rel.startswith(LEFTOVER + "/"):
+            if store.review_holds_scope(rel):
+                if rel not in noted:
+                    noted.add(rel)
+                    store.log(event="gc_skip", scope=rel, why="close review pending")
+                idle_since.pop(rel, None)
+                continue
             verdict = _leftover_verdict(cfg, store, lin, pids, snap, protect)
             if verdict[0] == "held":
                 if rel not in noted:

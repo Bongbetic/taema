@@ -384,13 +384,13 @@ class JobSurvivors(AutoCase):
 
 
 class GuiClose(AutoCase):
-    def close_gui(self, comm="firefox", **root_kw):
+    def close_gui(self, comm="firefox", root_pid=200, survivor_pid=201, **root_kw):
         up = self.fp.up
         self.fp.add(100, 1, comm="niri", sid=100, born=100.0)       # parent: roots need a parent entry
-        self.fp.add(200, 100, comm=comm, born=up - 100, **root_kw)
-        self.fp.add(201, 200, comm="helper", born=up - 90)
+        self.fp.add(root_pid, 100, comm=comm, born=up - 100, **root_kw)
+        self.fp.add(survivor_pid, root_pid, comm="helper", born=up - 90)
         self.d.lineage.observe(self.fp.table())
-        self.fp.remove(200)
+        self.fp.remove(root_pid)
         self.d.lineage.observe(self.fp.table())
         self.assertEqual(len(self.d.lineage.closed), 1)
 
@@ -411,11 +411,97 @@ class GuiClose(AutoCase):
         self.assertEqual(self.d.store.data["noise"], {"helper": 1})
         self.assertFalse([e for e in self.log() if e["event"] == "would_stop"])
 
-    def test_other_modes_do_not_carve(self):
+    def test_adopt_mode_contains_gui_survivors_in_one_pass(self):
         self.d.cfg["mode"] = "adopt"
         self.close_gui()
         self.d.after_observe()
+        dest = self.cg.base + "/leftover/firefox-200"
+        with open(dest + "/cgroup.procs") as f:
+            self.assertEqual(f.read().split(), ["201"])
+
+    def test_enforce_mode_contains_gui_survivors_in_one_pass(self):
+        self.d.cfg["mode"] = "enforce"
+        self.close_gui()
+        self.d.after_observe()
+        dest = self.cg.base + "/leftover/firefox-200"
+        with open(dest + "/cgroup.procs") as f:
+            self.assertEqual(f.read().split(), ["201"])
+
+    def test_observe_logs_would_contain_without_moving(self):
+        self.d.cfg["mode"] = "observe"
+        self.close_gui()
+        self.d.after_observe()
         self.assertFalse(os.path.exists(self.cg.base + "/leftover"))
+        would = [e for e in self.log() if e["event"] == "would_contain"]
+        self.assertEqual(len(would), 1)
+        self.assertEqual((would[0]["owner"], would[0]["survivors"], would[0]["pids"]),
+                         ("firefox", ["helper"], [201]))
+
+    def test_containment_records_a_persistent_review(self):
+        self.d.cfg["mode"] = "adopt"
+        self.close_gui()
+        self.d.after_observe()
+        status = self.d.handle({"cmd": "status"})
+        self.assertEqual(status["reviews"], 1)
+        reviews = self.d.handle({"cmd": "review"})["reviews"]
+        self.assertEqual(len(reviews), 1)
+        review = reviews[0]
+        self.assertEqual((review["id"], review["owner"], review["survivors"], review["pids"]),
+                         (1, "firefox", ["helper"], [201]))
+        self.assertEqual(review["expires"] - review["created"], 14 * DAY)
+        out = io.StringIO()
+        readonly = knowledge.Store(self.d.store.dir, read_only=True)
+        with mock.patch.object(cli, "_load", return_value=(self.d.cfg, readonly, [])), \
+                redirect_stdout(out):
+            cli.main(["review"])
+        self.assertIn("review #1", out.getvalue())
+        self.assertIn("owner=firefox", out.getvalue())
+        self.assertIn("survivors=helper", out.getvalue())
+        self.assertIn("age=", out.getvalue())
+
+        restarted = daemon.Daemon(make_cfg(self.d.store.dir, mode="adopt"))
+        self.assertEqual(restarted.handle({"cmd": "status"})["reviews"], 1)
+        self.assertEqual(restarted.handle({"cmd": "review"})["reviews"], reviews)
+
+    def test_open_review_holds_a_previously_authorized_leftover(self):
+        self.d.store.answer("firefox", "helper", "stop")
+        self.close_gui()
+        self.d.after_observe()
+        scope = "leftover/firefox-200"
+        self.cg.set_cpu(scope, 100)
+        self.d.gc_usage[scope] = 100
+        self.d.idle_since[scope] = time.time() - 2000
+        self.d.gc_pass()
+        self.stopm.assert_not_called()
+
+    def test_expired_review_resolves_to_keep_and_never_stops(self):
+        self.d.store.answer("firefox", "helper", "stop")
+        self.close_gui()
+        self.d.after_observe()
+        review = self.d.store.data["reviews"][0]
+        review["expires"] = time.time() - 1
+        scope = "leftover/firefox-200"
+        self.cg.set_cpu(scope, 100)
+        self.d.gc_usage[scope] = 100
+        self.d.idle_since[scope] = time.time() - 2000
+        self.d.gc_pass()
+        self.assertEqual(review["state"], "expired")
+        self.assertEqual(self.d.store.pair_decision("firefox", "helper")[0], "keep")
+        self.stopm.assert_not_called()
+
+    def test_expired_review_keeps_survivors_even_with_invalid_owner(self):
+        self.close_gui(comm="MainThread")
+        self.d.after_observe()
+        review = self.d.store.data["reviews"][0]
+        review["expires"] = time.time() - 1
+        scope = review["scope"]
+        self.cg.set_cpu(scope, 100)
+        self.d.gc_usage[scope] = 100
+        self.d.idle_since[scope] = time.time() - 2000
+        self.d.gc_pass()
+        self.assertEqual(review["state"], "expired")
+        self.assertTrue(self.d.store.review_holds_scope(scope))
+        self.stopm.assert_not_called()
 
     def test_terminal_job_root_gets_no_leftover_leaf(self):
         self.close_gui(tty=34816)
@@ -430,6 +516,20 @@ class GuiClose(AutoCase):
             self.d.after_observe()
         self.assertRegex(hm.call_args[0][1], r"^app-helper-[0-9a-f]{6}$")
         self.assertFalse(os.path.exists(self.cg.base + "/leftover"))
+
+    def test_standalone_survivors_get_app_scopes_in_adopt_and_enforce(self):
+        self.d.store.answer("firefox", "helper", "standalone")
+        for i, mode in enumerate(("adopt", "enforce")):
+            root_pid, survivor_pid = 300 + i * 10, 301 + i * 10
+            self.d.cfg["mode"] = mode
+            self.cgmap[survivor_pid] = "/2"
+            with mock.patch.object(engine, "helper_move") as hm:
+                self.close_gui(root_pid=root_pid, survivor_pid=survivor_pid)
+                self.d.after_observe()
+            self.assertEqual(hm.call_args[0][2], [survivor_pid])
+            self.assertRegex(hm.call_args[0][1], r"^app-helper-[0-9a-f]{6}$")
+        self.assertFalse(os.path.exists(self.cg.base + "/leftover"))
+        self.assertEqual(self.d.handle({"cmd": "status"})["reviews"], 0)
 
 
 # ---- 5. GC rules for leftover/* --------------------------------------------------------------

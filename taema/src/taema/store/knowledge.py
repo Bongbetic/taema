@@ -1697,13 +1697,15 @@ class Store:
         return None
 
     # ---- feedback ----
-    def apply_op(self, op, key):
+    def apply_op(self, op, key, all_records=False):
         """One explicit user answer: keep | forget | kill. Returns False for a bad op or key."""
         if (
             op not in ("keep", "forget", "kill")
             or not isinstance(key, str)
             or not key
             or len(key) > 256
+            or not isinstance(all_records, bool)
+            or (all_records and op != "forget")
         ):
             return False
         with self.decision_context(
@@ -1714,7 +1716,7 @@ class Store:
             elif op == "kill":
                 self.bump(key, "user_kill", 1.0)
             else:
-                self.forget(key)
+                self.forget(key, all_records=all_records)
             self.log(event=op, exe=key)
         return True
 
@@ -1799,7 +1801,7 @@ class Store:
                 self.log(event="vetoed", target=target, trigger=trigger)
             result = {"target": target}
         elif msg["v"] == 2 and op in ("keep", "forget", "kill"):
-            if not self.apply_op(op, msg["key"]):
+            if not self.apply_op(op, msg["key"], all_records=msg.get("all", False)):
                 return None
             result = {}
         elif msg["v"] == 2 and op in ("answer", "teach"):
@@ -2002,9 +2004,66 @@ class Store:
         r = self.rec(key)
         r["term_exit_ms"] = (r["term_exit_ms"] + [int(ms)])[-20:]
 
-    def forget(self, key):
+    def forget(self, key, all_records=False):
+        """Forget one app counter, or all of its learned records while retaining vetoes."""
         self.dirty = True
-        return self.data["exes"].pop(key, None) is not None
+        known = self.data["exes"].pop(key, None) is not None
+        if not all_records:
+            return known
+
+        pairs = self.data.setdefault("pairs", {})
+        related_pair_keys = []
+        related_signature_ids = set()
+        for pair_key, pair in pairs.items():
+            owner, separator, leftover = pair_key.partition(SEP)
+            if separator and key in (owner, leftover):
+                related_pair_keys.append(pair_key)
+                if isinstance(pair, dict) and isinstance(pair.get("sig"), str):
+                    related_signature_ids.add(pair["sig"])
+        for pair_key in related_pair_keys:
+            del pairs[pair_key]
+        known = known or bool(related_pair_keys)
+
+        for collection in ("standalone", "noise"):
+            values = self.data.setdefault(collection, {})
+            known = values.pop(key, None) is not None or known
+
+        signature_vetoes = {
+            veto.get("value")
+            for veto in self.data.get("vetoes", [])
+            if veto.get("kind") == "signature" and isinstance(veto.get("value"), str)
+        }
+        signature_ids = set(
+            self.db.forget_signatures_for_key(
+                key,
+                preserve=signature_vetoes,
+                include=related_signature_ids,
+            )
+        )
+        known = bool(signature_ids) or known
+        asked = self.data.get("signature_asked", {})
+        if isinstance(asked, dict):
+            for identifier in signature_ids:
+                asked.pop(identifier, None)
+
+        reviews = self.data.setdefault("reviews", [])
+        kept_reviews = []
+        for review in reviews:
+            survivors = review.get("survivors", [])
+            related = (
+                review.get("state", "open") == "open"
+                and (
+                    review.get("owner") == key
+                    or (isinstance(survivors, (list, tuple, set)) and key in survivors)
+                    or review.get("sig") in signature_ids
+                )
+            )
+            if related:
+                known = True
+            else:
+                kept_reviews.append(review)
+        self.data["reviews"] = kept_reviews
+        return known
 
     def is_persistent(self, key):
         """True for [seeds] persist keys (tmux, gpg-agent ...): never a GC candidate."""
@@ -3149,6 +3208,113 @@ class Store:
             )
         return result
 
+    def signatures_summary(self, limit=2000):
+        """List signature records with the same evidence names used by ``why``."""
+        result = []
+        for item in self.db.signatures(limit=limit):
+            decision = self.signature_decision(item)
+            if decision is None:
+                action, confidence, reason = "ask", 0.0, "no recorded signature answer"
+            else:
+                action, confidence, reason = decision
+            answer = item.get("ex_last")
+            answer = answer if answer in ("stop", "keep") else "none"
+            outcome = (
+                {"decision": answer, "outcome": "answered", "at": None}
+                if answer != "none"
+                else None
+            )
+            result.append(
+                {
+                    "id": item["id"],
+                    "owner": item["owner"],
+                    "members": item["members"],
+                    "answer": answer,
+                    "decision": action,
+                    "confidence": round(float(confidence), 2),
+                    "why": reason,
+                    "closes": item.get("closes", 0),
+                    "stop_ok": item.get("stop_ok", 0),
+                    "respawn": item.get("respawn", 0),
+                    "probation": item.get("probation", 0),
+                    "veto": item.get("veto", 0),
+                    "evidence": {
+                        "closes": item.get("closes", 0),
+                        "stop_ok": item.get("stop_ok", 0),
+                        "respawn": item.get("respawn", 0),
+                        "veto": item.get("veto", 0),
+                        "probation": item.get("probation", 0),
+                    },
+                    "last_outcome": outcome,
+                }
+            )
+        return result
+
+    def apps_summary(self, limit=2000):
+        """List app identities and learned evidence in the shared CLI/dashboard shape."""
+        identities = {item["key"]: item for item in self.db.app_identities(limit)}
+        keys = set(identities)
+        keys.update(self.data.get("exes", {}))
+        keys.update(self.data.get("standalone", {}))
+        keys.update(self.data.get("noise", {}))
+        for pair_key in self.data.get("pairs", {}):
+            owner, separator, leftover = pair_key.partition(SEP)
+            if separator:
+                keys.update((owner, leftover))
+
+        pairs_by_key = {}
+        for pair in self.pairs_summary(limit=MAX_PAIRS):
+            pairs_by_key.setdefault(pair["owner"], []).append(pair)
+            pairs_by_key.setdefault(pair["leftover"], []).append(pair)
+
+        records = []
+        for key in sorted(keys):
+            identity = identities.get(key) or {}
+            counters = self.peek(key)
+            keep_weight = (
+                counters["user_keep"]
+                + counters["shared_hits"]
+                + 0.5 * counters["respawned"]
+            )
+            kill_weight = counters["user_kill"]
+            total_weight = keep_weight + kill_weight
+            confidence = (
+                abs(keep_weight - kill_weight) / total_weight if total_weight else 0.0
+            )
+            related_pairs = pairs_by_key.get(key, [])
+            outcomes = [
+                {"owner": pair["owner"], "leftover": pair["leftover"], **pair["last_outcome"]}
+                for pair in related_pairs
+                if isinstance(pair.get("last_outcome"), dict)
+                and pair["last_outcome"].get("outcome")
+            ]
+            outcomes.sort(key=lambda item: item.get("at") or 0, reverse=True)
+            decision, why = self.default_action(key)
+            records.append(
+                {
+                    "key": key,
+                    "display": identity.get("display") or key,
+                    "kind": identity.get("kind") or key.partition(":")[0],
+                    "identity_confidence": identity.get("confidence"),
+                    "decision": decision,
+                    "confidence": round(confidence, 2),
+                    "why": why,
+                    "evidence": {
+                        "instances": int(identity.get("instances") or 0),
+                        "pairs": len(related_pairs),
+                        "signatures": len(self.signature_summaries(key, limit=100)),
+                        "closes": sum(int(pair.get("closes", 0) or 0) for pair in related_pairs),
+                        "stop_ok": sum(int(pair.get("stop_ok", 0) or 0) for pair in related_pairs),
+                        "respawn": sum(int(pair.get("respawn", 0) or 0) for pair in related_pairs),
+                        "shared_hits": round(counters["shared_hits"], 2),
+                        "user_keep": round(counters["user_keep"], 2),
+                        "user_kill": round(counters["user_kill"], 2),
+                    },
+                    "last_outcome": outcomes[0] if outcomes else None,
+                }
+            )
+        return records[: max(1, min(db.MAX_APPS, int(limit)))]
+
     def note_noise(self, leftover):
         """One close classified as launcher/invalid-owner noise: counted per leftover key in
         data["noise"], never turned into a pair. Bad owners earn no evidence at all."""
@@ -3541,6 +3707,7 @@ class Store:
                     "owner": owner,
                     "leftover": leftover,
                     "action": inherited or action,
+                    "decision": inherited or action,
                     "pair_action": action,
                     "inherited": inherited,
                     "signature": p.get("sig"),
@@ -3561,6 +3728,25 @@ class Store:
                     "respawn": p.get("respawn", 0),
                     "probation": p.get("probation", 0),
                     "why": display_why,
+                    "evidence": {
+                        "closes": p.get("closes", 0),
+                        "stop": round(
+                            p.get("stop", 0)
+                            + p.get("self_stop", 0)
+                            + p.get("ex_stop", 0),
+                            2,
+                        ),
+                        "keep": round(
+                            p.get("keep", 0)
+                            + p.get("regret_keep", 0)
+                            + p.get("ex_keep", 0),
+                            2,
+                        ),
+                        "stop_ok": p.get("stop_ok", 0),
+                        "respawn": p.get("respawn", 0),
+                        "probation": p.get("probation", 0),
+                    },
+                    "last_outcome": self._pair_last_outcome(p),
                 }
             )
         out.sort(
@@ -3572,6 +3758,31 @@ class Store:
             )
         )
         return out[:limit]
+
+    @staticmethod
+    def _pair_last_outcome(pair):
+        pending = pair.get("pending_stop")
+        if isinstance(pending, dict):
+            outcome = (
+                "respawn"
+                if pending.get("respawn_recorded")
+                else "stop_ok"
+                if pending.get("stop_ok_recorded")
+                else "pending"
+            )
+            return {"decision": "stop", "outcome": outcome, "at": pending.get("ts")}
+        answer = pair.get("ex_last")
+        if answer in ("stop", "keep"):
+            return {
+                "decision": answer,
+                "outcome": "answered",
+                "at": pair.get("ex_ts"),
+            }
+        if pair.get("respawn", 0):
+            return {"decision": "keep", "outcome": "respawn", "at": pair.get("last_keep")}
+        if pair.get("stop_ok", 0):
+            return {"decision": "stop", "outcome": "stop_ok", "at": pair.get("last_auto_stop")}
+        return {"decision": "ask", "outcome": None, "at": None}
 
     # ---- derived defaults ----
     def default_action(self, key):

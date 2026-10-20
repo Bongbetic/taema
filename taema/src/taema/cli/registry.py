@@ -111,7 +111,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
             (("--dry-run",), {"action": "store_true"}),
             (
                 ("--all",),
-                {"action": "store_true", "help": "apply to every matching target"},
+                {"action": "store_true", "help": "remove all learned records for APP"},
             ),
             (("--scope",), {"metavar": "SCOPE"}),
             (("--pid",), {"metavar": "PID"}),
@@ -370,7 +370,33 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "aliases": (),
         "help": "inspect or export learned state",
         "handler": None,
+        "read": True,
         "children": (
+            {
+                "name": "show",
+                "help": "show learned apps, pairs, and signatures",
+                "handler": "cmd_learn",
+                "arguments": ((("--legacy",), {"action": "store_true"}),),
+                "read": True,
+            },
+            {
+                "name": "apps",
+                "help": "list learned app records",
+                "handler": "cmd_learn",
+                "read": True,
+            },
+            {
+                "name": "pairs",
+                "help": "list learned owner and leftover pairs",
+                "handler": "cmd_learn",
+                "read": True,
+            },
+            {
+                "name": "signatures",
+                "help": "list learned survivor signatures",
+                "handler": "cmd_learn",
+                "read": True,
+            },
             {
                 "name": "export",
                 "help": "export state for a 0.2 downgrade",

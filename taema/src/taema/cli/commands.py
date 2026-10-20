@@ -2017,6 +2017,8 @@ def cmd_snooze(a):
 
 def cmd_forget(a):
     cfg, store, units = _load(a)
+    if getattr(a, "all", False) and getattr(a, "veto", False):
+        return die("--all cannot be combined with --veto", 2)
     if getattr(a, "veto", False):
         try:
             selected = resolve_veto_targets(a, store, units, removal=True)
@@ -2056,7 +2058,18 @@ def cmd_forget(a):
             "forget requires an executable; use --veto TARGET to remove a veto", 2
         )
     if getattr(a, "dry_run", False):
-        print("dry run: forget %s" % a.exe)
+        action = "forget all learned records for" if getattr(a, "all", False) else "forget"
+        print("dry run: %s %s" % (action, a.exe))
+        return 0
+    if getattr(a, "all", False):
+        known = store.forget(a.exe, all_records=True)
+        how, reply = feedback_action(cfg, store, "forget", key=a.exe, all=True)
+        if not reply or not reply.get("ok"):
+            return die((reply or {}).get("error", "could not forget learned records"))
+        if known:
+            print("forgot all learned records for %s (%s); vetoes preserved" % (a.exe, how))
+        else:
+            print("no learned records for %s (%s); vetoes preserved" % (a.exe, how))
         return 0
     known = store.forget(a.exe)
     feedback(cfg, store, "forget", a.exe)
@@ -2772,6 +2785,251 @@ def cmd_learn_export(a):
             except OSError:
                 pass
         return die("could not write export: %s" % error)
+    return 0
+
+
+def cmd_learn(a):
+    """Show the read-only learning views shared with status and why."""
+    from . import view
+
+    _cfg, store, _units = _load(a)
+    selected = getattr(a, "_command", "learn show").partition(" ")[2] or "show"
+    if selected == "show" and getattr(a, "legacy", False):
+        reviews = [
+            review
+            for review in store.open_reviews()
+            if review.get("kind") == "legacy-invalid"
+        ]
+        reviews = store.review_details(reviews)
+        reviews_by_pair = {
+            (review.get("owner"), survivor): review
+            for review in reviews
+            for survivor in review.get("survivors", [])
+        }
+        records = []
+        for pair in store.pairs_summary(limit=1000):
+            raw = store.data.get("pairs", {}).get(
+                store.pkey(pair["owner"], pair["leftover"]), {}
+            )
+            if raw.get("source") != "legacy-invalid":
+                continue
+            review = reviews_by_pair.get((pair["owner"], pair["leftover"]))
+            records.append(
+                {
+                    **pair,
+                    "source": "legacy-invalid",
+                    "legacy_answer": (review or {}).get("answer"),
+                    "review_id": (review or {}).get("id"),
+                }
+            )
+        human_lines = ["legacy-invalid pairs: %d" % len(records)]
+        for pair in records:
+            human_lines.append(
+                "  %s -> %s  previous=%s  review=%s"
+                % (
+                    lineage.clean(pair["owner"], 30),
+                    lineage.clean(pair["leftover"], 30),
+                    pair.get("legacy_answer") or "none",
+                    pair.get("review_id") or "none",
+                )
+            )
+        human_lines.extend(
+            "  review #%s owner=%s survivor=%s answer=%s"
+            % (
+                review.get("id", "?"),
+                lineage.clean(review.get("owner", "?"), 30),
+                lineage.clean(", ".join(review.get("survivors", [])), 30),
+                review.get("answer", "?"),
+            )
+            for review in reviews
+        )
+        human = "\n".join(human_lines)
+        fields = {
+            "view": "show",
+            "legacy": True,
+            "records": records,
+            "reviews": reviews,
+            "count": len(records),
+        }
+    elif selected == "show":
+        apps = store.apps_summary(limit=2000)
+        pairs = store.pairs_summary(limit=1000)
+        signatures = store.signatures_summary(limit=2000)
+
+        def evidence_text(record):
+            evidence = record.get("evidence") or {}
+            return ", ".join(
+                "%s=%s" % (name, evidence[name])
+                for name in sorted(evidence)
+            ) or "none"
+
+        def outcome_text(record):
+            outcome = record.get("last_outcome") or {}
+            if not outcome:
+                return "none"
+            decision = outcome.get("decision")
+            label = outcome.get("outcome") or "unknown"
+            return "%s (%s)" % (label, decision) if decision else label
+
+        human_lines = ["apps: %d" % len(apps), "  app  decision  confidence  evidence  last outcome"]
+        for app in apps:
+            human_lines.append(
+                "  %s (%s)  %s  %.2f  %s  %s"
+                % (
+                    lineage.clean(app["display"], 32),
+                    lineage.clean(app["key"], 32),
+                    app["decision"],
+                    app["confidence"],
+                    evidence_text(app),
+                    outcome_text(app),
+                )
+            )
+        human_lines.extend(
+            ["pairs: %d" % len(pairs), "  owner -> leftover  decision  confidence  evidence  last outcome"]
+        )
+        for pair in pairs:
+            human_lines.append(
+                "  %s -> %s  %s  %.2f  %s  %s"
+                % (
+                    lineage.clean(pair["owner"], 32),
+                    lineage.clean(pair["leftover"], 32),
+                    pair.get("decision", pair.get("action", "ask")),
+                    pair.get("confidence", 0.0),
+                    evidence_text(pair),
+                    outcome_text(pair),
+                )
+            )
+        human_lines.extend(
+            [
+                "signatures: %d" % len(signatures),
+                "  signature  owner  decision  confidence  evidence  last outcome",
+            ]
+        )
+        for signature in signatures:
+            human_lines.append(
+                "  %s  %s  %s  %.2f  %s  %s"
+                % (
+                    lineage.clean(signature["id"], 32),
+                    lineage.clean(signature["owner"], 32),
+                    signature["decision"],
+                    signature["confidence"],
+                    evidence_text(signature),
+                    outcome_text(signature),
+                )
+            )
+        human = "\n".join(human_lines)
+        fields = {
+            "view": "show",
+            "legacy": False,
+            "apps": apps,
+            "pairs": pairs,
+            "signatures": signatures,
+            "counts": {
+                "apps": len(apps),
+                "pairs": len(pairs),
+                "signatures": len(signatures),
+            },
+        }
+    elif selected == "apps":
+        records = store.apps_summary(limit=2000)
+        lines = [
+            "%-28s %-8s %10s %-56s  %s"
+            % (
+                "app",
+                "decision",
+                "confidence",
+                "evidence",
+                "last outcome",
+            )
+        ]
+        for app in records:
+            evidence = app["evidence"]
+            last = app.get("last_outcome") or {}
+            outcome = last.get("outcome") or "none"
+            lines.append(
+                "%-28s %-8s %10.2f %-56s  %s"
+                % (
+                    lineage.clean(app["display"], 28),
+                    app["decision"],
+                    app["confidence"],
+                    ", ".join(
+                        "%s=%s" % (name, evidence[name]) for name in sorted(evidence)
+                    ),
+                    outcome,
+                )
+            )
+        human = "\n".join(lines) if records else "apps: none learned yet"
+    elif selected == "signatures":
+        records = store.signatures_summary(limit=2000)
+        lines = [
+            "%-32s %-32s %-8s %10s %7s %7s %7s  %s"
+            % (
+                "signature",
+                "owner",
+                "decision",
+                "confidence",
+                "closes",
+                "stop_ok",
+                "respawn",
+                "last outcome",
+            )
+        ]
+        for signature in records:
+            evidence = signature["evidence"]
+            last = signature.get("last_outcome") or {}
+            lines.append(
+                "%-32s %-32s %-8s %10.2f %7d %7d %7d  %s"
+                % (
+                    lineage.clean(signature["id"], 32),
+                    lineage.clean(signature["owner"], 32),
+                    signature["decision"],
+                    signature["confidence"],
+                    evidence["closes"],
+                    evidence["stop_ok"],
+                    evidence["respawn"],
+                    last.get("outcome") or "none",
+                )
+            )
+        human = "\n".join(lines) if records else "signatures: none learned yet"
+    elif selected == "pairs":
+        records = store.pairs_summary(limit=1000)
+        lines = [
+            "%-22s %-22s %-10s %10s %7s %7s %7s  %s"
+            % (
+                "owner",
+                "leftover",
+                "decision",
+                "confidence",
+                "closes",
+                "stop",
+                "keep",
+                "last outcome",
+            )
+        ]
+        for pair in records:
+            outcome = pair.get("last_outcome") or {}
+            last = outcome.get("outcome") or "none"
+            lines.append(
+                "%-22s %-22s %-10s %10.2f %7d %7.2f %7.2f  %s"
+                % (
+                    lineage.clean(pair.get("owner", ""), 22),
+                    lineage.clean(pair.get("leftover", ""), 22),
+                    pair.get("decision", pair.get("action", "ask")),
+                    pair.get("confidence", 0.0),
+                    pair.get("closes", 0),
+                    pair.get("stop", 0.0),
+                    pair.get("keep", 0.0),
+                    last,
+                )
+            )
+        human = "\n".join(lines) if records else "pairs: none learned yet"
+    else:
+        return die("learn %s is not available yet" % selected, 2)
+
+    if selected != "show":
+        fields = {"view": selected, "records": records, "count": len(records)}
+    model = view.record("learn", fields)
+    view.emit(model, a, human)
     return 0
 
 

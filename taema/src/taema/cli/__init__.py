@@ -60,6 +60,7 @@ __all__ = (
     "cmd_review",
     "cmd_answer",
     "cmd_teach",
+    "cmd_learn",
     "cmd_learn_export",
     "cmd_gc",
     "cmd_adopt",

@@ -1335,6 +1335,19 @@ class StateDB:
             ).fetchone()
         return dict(row) if row else None
 
+    def app_identities(self, limit=MAX_APPS):
+        """Read the bounded application identity catalogue for learner views."""
+        if not self.available:
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT key, kind, display, exe, dev, ino, desktop_id, unit, "
+                "first_seen, last_seen, instances, confidence FROM apps "
+                "ORDER BY key LIMIT ?",
+                (max(1, min(MAX_APPS, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_app_instance(self, key):
         """Read the most recently observed pid/start provenance row for one app key."""
         if not self.available or not isinstance(key, str) or not key:
@@ -1784,6 +1797,18 @@ class StateDB:
             ).fetchone()
         return self._signature(row)
 
+    def signatures(self, limit=2000):
+        """Read recent signatures for the bounded learner view."""
+        if not self.available:
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM signatures ORDER BY "
+                "coalesce(last_seen, first_seen, 0) DESC, id LIMIT ?",
+                (max(1, min(10_000, int(limit))),),
+            ).fetchall()
+        return [self._signature(row) for row in rows]
+
     def signatures_for_owner(self, owner):
         """Read the bounded signature history for an owner, newest first."""
         if not self.available or not isinstance(owner, str):
@@ -1809,6 +1834,45 @@ class StateDB:
                 (key, key, max(1, min(100, int(limit)))),
             ).fetchall()
         return [self._signature(row) for row in rows]
+
+    def forget_signatures_for_key(self, key, preserve=(), include=()):
+        """Drop signature learning for an app, retaining signatures protected by vetoes."""
+        if not self.available or not isinstance(key, str):
+            return []
+        with self.connection() as connection:
+            if connection is None:
+                return []
+            if not self.read_only:
+                connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT id FROM signatures WHERE owner = ? OR EXISTS ("
+                    "SELECT 1 FROM json_each(signatures.members) AS member "
+                    "WHERE json_extract(member.value, '$.key') = ?) ",
+                    (key, key),
+                ).fetchall()
+                identifiers = list(dict.fromkeys([row["id"] for row in rows] + list(include)))
+                if not self.read_only:
+                    protected = set(preserve)
+                    for identifier in identifiers:
+                        if identifier in protected:
+                            connection.execute(
+                                "UPDATE signatures SET closes = 0, stop_ok = 0, "
+                                "respawn = 0, ex_stop = 0, ex_keep = 0, ex_last = NULL, "
+                                "probation = 0, veto = 0, suspended_until = 0, "
+                                "suspended_at = 0 WHERE id = ?",
+                                (identifier,),
+                            )
+                        else:
+                            connection.execute(
+                                "DELETE FROM signatures WHERE id = ?", (identifier,)
+                            )
+                    connection.commit()
+            except Exception:
+                if not self.read_only:
+                    connection.rollback()
+                raise
+        return identifiers
 
     def answer_signature(self, identifier, choice, weight, now=None):
         """Add no-decay explicit answer weight to a signature."""

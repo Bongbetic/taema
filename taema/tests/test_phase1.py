@@ -5,6 +5,8 @@ import json
 import os
 import select
 import shutil
+import subprocess
+import sys
 import time
 import unittest
 from unittest import mock
@@ -302,7 +304,7 @@ class DeadlineLoop(unittest.TestCase):
     def test_collector_event_queue_has_a_fixed_bound(self):
         d = daemon.Daemon(make_cfg(tmp()))
         accepted = [
-            d.queue_collector_event(daemon.LeafFrozen(i, "leaf-%d" % i, True))
+            d.queue_collector_event(daemon.LeafFrozen(i, "leaf-%d" % i))
             for i in range(daemon.MAX_COLLECTOR_EVENTS + 1)
         ]
         self.assertEqual(len(d.collector_events), daemon.MAX_COLLECTOR_EVENTS)
@@ -319,6 +321,81 @@ class DeadlineLoop(unittest.TestCase):
         ):
             d.tick()
         adopt.assert_called_once_with()
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "pidfds are unavailable")
+    def test_periodic_reconciliation_recovers_missed_pidfd_readiness(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+        )
+        pidfd = os.pidfd_open(child.pid)
+        self.assertIsNotNone(child.stdin)
+        child.stdin.close()
+        child.wait(timeout=5)
+
+        def close_if_open():
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+
+        self.addCleanup(close_if_open)
+        watch = ("scope-owned", child.pid, 42)
+        d.owners[pidfd] = watch
+        d.last = {"adopt": time.time() - d.iv_adopt - 1, "gc": time.time()}
+        with (
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "adopt_pass"),
+            mock.patch.object(d, "session_ended", return_value=False),
+            mock.patch.object(d.sel, "unregister"),
+            mock.patch.object(d, "stop_leaf") as stop,
+        ):
+            d.tick()
+        stop.assert_called_once_with(
+            "scope-owned", "owner %d exited" % child.pid, owner=child.pid
+        )
+        self.assertNotIn(pidfd, d.owners)
+
+    def test_idle_run_uses_only_bounded_selector_wakeups(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        now = [1000.0]
+        d.last = {"adopt": now[0], "gc": now[0]}
+        d.iv_adopt = d.iv_gc = 10**9
+        waits = []
+
+        class IdleSelector:
+            def register(self, *_args, **_kwargs):
+                pass
+
+            def select(self, timeout):
+                waits.append(timeout)
+                now[0] += timeout
+                if len(waits) == 3:
+                    d.stopping = True
+                return []
+
+        d.sel = IdleSelector()
+        wake_r, wake_w = daemon.socket.socketpair()
+        self.addCleanup(wake_r.close)
+        self.addCleanup(wake_w.close)
+        d.stopping = False
+        with (
+            mock.patch.object(daemon.signal, "signal"),
+            mock.patch.object(daemon.signal, "set_wakeup_fd"),
+            mock.patch.object(daemon.time, "time", side_effect=lambda: now[0]),
+            mock.patch.object(
+                daemon.socket, "socketpair", return_value=(wake_r, wake_w)
+            ),
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "tick"),
+            mock.patch.object(d.store, "log"),
+            mock.patch.object(d.store, "save"),
+            mock.patch.object(d, "_write_summary_if_dirty"),
+        ):
+            self.assertEqual(d.run(), 0)
+        self.assertEqual(waits, [daemon.MAX_SLEEP] * 3)
+        self.assertFalse(d.collector_events)
 
     def test_session_state_file(self):
         root = tmp()
@@ -475,7 +552,8 @@ class EmptyLeaves(unittest.TestCase):
         self.addCleanup(f.close)
         d.leaf_ep = mock.Mock()
         d.leaf_watch[f.fileno()] = ("app-busy", f)
-        d.queue_collector_event(daemon.LeafFrozen(f.fileno(), "app-busy", False))
+        d.leaf_frozen["app-busy"] = False
+        d.queue_collector_event(daemon.LeafFrozen(f.fileno(), "app-busy"))
         d.drain_collector_events()
         self.assertIs(d.leaf_frozen["app-busy"], True)
         self.assertIn(f.fileno(), d.leaf_watch)
@@ -500,9 +578,14 @@ class EmptyLeaves(unittest.TestCase):
         d = self.daemon("adopt")
         ev = self.cg.base + "/app-gone/cgroup.events"
         write(ev, "populated 0\nfrozen 0\n")
+        # The watch cannot deliver the transition, so reconciliation records one empty
+        # observation; only the following confirmation pass may remove the leaf.
         d.gc_pass()
+        self.assertTrue(self.exists("app-gone"))
+        self.assertIn("app-gone", d.empty_seen)
         d.gc_pass()
         self.assertFalse(self.exists("app-gone"))
+        self.assertNotIn("app-gone", d.empty_seen)
 
     def test_regular_file_cannot_be_epolled_falls_back(self):
         """cgroupfs files accept EPOLLPRI; a regular file does not (EPERM) and must fall back."""

@@ -63,12 +63,24 @@
     },
     "status-data": {
       "type": "object",
-      "required": ["daemon", "mode", "feedback_invalid", "hold", "config", "details"],
+      "required": ["daemon", "mode", "feedback_invalid", "hold", "hold_state", "config", "details"],
       "properties": {
         "daemon": { "enum": ["running", "unavailable"] },
         "mode": { "type": "string" },
         "feedback_invalid": { "type": "integer", "minimum": 0 },
         "hold": { "type": "string" },
+        "hold_state": {
+          "type": "object",
+          "required": ["global", "scopes", "snooze_until", "snooze_remaining_s", "reason"],
+          "properties": {
+            "global": { "type": "boolean" },
+            "scopes": { "type": "array", "items": { "type": "string" } },
+            "snooze_until": { "type": ["number", "null"] },
+            "snooze_remaining_s": { "type": "integer", "minimum": 0 },
+            "reason": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
         "config": { "type": "array", "items": { "type": "string" } },
         "details": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
       },

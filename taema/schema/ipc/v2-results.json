@@ -20,7 +20,7 @@
       "additionalProperties": true
     },
     "status": {
-      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews", "latest_decision", "feedback_invalid", "hold"],
+      "type": "object", "required": ["mode", "uptime_s", "owners", "pairs", "reviews", "latest_decision", "feedback_invalid", "hold", "hold_state"],
       "properties": {
         "mode": {"type": "string"}, "uptime_s": {"type": "integer", "minimum": 0},
         "owners": {"type": "array", "items": {"type": "object", "required": ["scope", "owner"], "properties": {"scope": {"type": "string"}, "owner": {"type": "integer"}}}},
@@ -28,7 +28,19 @@
         "reviews": {"type": "integer", "minimum": 0}, "auto": {"type": "object"},
         "latest_decision": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/decision"}]},
         "feedback_invalid": {"type": "integer", "minimum": 0},
-        "hold": {"type": "string"}
+        "hold": {"type": "string"},
+        "hold_state": {
+          "type": "object",
+          "required": ["global", "scopes", "snooze_until", "snooze_remaining_s", "reason"],
+          "properties": {
+            "global": {"type": "boolean"},
+            "scopes": {"type": "array", "items": {"type": "string"}},
+            "snooze_until": {"type": ["number", "null"]},
+            "snooze_remaining_s": {"type": "integer", "minimum": 0},
+            "reason": {"type": "string"}
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": true
     },

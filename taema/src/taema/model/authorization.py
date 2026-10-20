@@ -11,7 +11,7 @@ The ladder evaluates five slots, in spec order (``SLOTS``):
    carries hard-safety facts in 0.2.1 (engine.stop/plan_stop still revalidate at actuation), so
    the slot passes through.
 2. ``veto`` -- a user-created veto blocks matching stop targets in every mode.
-3. ``hold`` -- a global hold, scope hold, or active snooze blocks stop actions.
+3. ``hold`` -- a global hold, scope hold, or active snooze blocks stop and reclaim actions.
 4. ``mode_capability`` -- per-trigger, per-mode **table** (``_CAPABILITY``, with two fact rules for
    the auto-mode special cases). This is the one table the M0 tickets edit instead of scattered
    call sites: e.g. issue #11 flips ``OWNER_EXIT``'s ``adopt`` cell from ``would`` to ``act``.
@@ -75,6 +75,7 @@ Trigger = Literal[
     "session_end",
     "manual_stop",
 ]
+GovernorAction = Literal["adopt", "contain", "remove", "reclaim", "stop"]
 SlotFn = Callable[[str, str, "Facts"], tuple[Vote, str]]
 
 # verdicts
@@ -109,6 +110,22 @@ GC_REMOVE_EMPTY: Final[Trigger] = (
 )
 SESSION_END: Final[Trigger] = "session_end"  # Daemon.end_session
 MANUAL_STOP: Final[Trigger] = "manual_stop"  # cli.cmd_kill (`taema kill`)
+
+# Every lifecycle trigger declares its governor action. New actions such as reclaim must be
+# classified here so the hold-slot contract test proves that the ladder blocks them.
+TRIGGER_ACTIONS: Final[dict[str, GovernorAction]] = {
+    OWNER_EXIT: "stop",
+    UNIT_ADOPT: "adopt",
+    AUTO_ADOPT: "adopt",
+    GUI_CLOSE: "contain",
+    JOB_SURVIVORS: "stop",
+    LEFTOVER_LEAVES: "stop",
+    GC_STOP: "stop",
+    GC_REMOVE_EMPTY: "remove",
+    SESSION_END: "stop",
+    MANUAL_STOP: "stop",
+}
+HOLD_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(("stop", "reclaim"))
 
 # authority values an `act` carries to its actuation
 AUTHORITY_MODE: Final[Authority] = "mode"
@@ -364,11 +381,9 @@ def _veto(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
 
 
 def _hold(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
-    """Slot 3: a global or target hold and a timed snooze deny stop actions."""
-    if (
-        trigger in (OWNER_EXIT, JOB_SURVIVORS, GC_STOP, SESSION_END, MANUAL_STOP)
-        and facts.held
-    ):
+    """Slot 3: a hold denies every stop/reclaim trigger declared in TRIGGER_ACTIONS."""
+    action = TRIGGER_ACTIONS.get(trigger)  # unknown triggers still fail in _capability
+    if action in HOLD_BLOCKED_ACTIONS and facts.held:
         return "deny", "held: " + facts.held
     return "pass", ""
 

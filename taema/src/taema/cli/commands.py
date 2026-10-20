@@ -1,10 +1,14 @@
 """`taema` command line. scoperun / scopekill / scopels are thin aliases (see bin/)."""
 
 from contextlib import nullcontext
+from datetime import datetime as _datetime
+from datetime import time as _local_time
+from datetime import timedelta as _timedelta
 from itertools import count
 import json
 import os
 import sys
+import time
 
 
 class _LazyModule:
@@ -188,6 +192,8 @@ def feedback_action(cfg, store, op, **fields):
     fd = os.open(store.feedback_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as f:
         f.write(json.dumps(msg) + "\n")
+    if op in ("hold", "snooze"):
+        store.sync_runtime_hold(reason=fields.get("reason"))
     return "queued", {"ok": True, "queued": True}
 
 
@@ -899,6 +905,94 @@ def cmd_undo(a):
     return 0
 
 
+def _cmd_hold(a, held):
+    cfg, store, _units = _load(a)
+    scope = None
+    target = getattr(a, "target", None)
+    if target:
+        from . import targets
+
+        selected = _choose_target(
+            target,
+            _target_candidates(target, store),
+            pick=getattr(a, "pick", False),
+        )
+        if not isinstance(selected, targets.Target):
+            return selected
+        scope = selected.scope or (selected.value if selected.kind == "scope" else None)
+        if not scope:
+            return die("target is not inside a managed scope", 2)
+    action = "hold" if held else "resume"
+    reason = getattr(a, "reason", "") or "user requested %s for %s" % (
+        action,
+        scope or "all actions",
+    )
+    if len(reason) > 256:
+        return die("reason must be at most 256 characters", 2)
+    if getattr(a, "dry_run", False):
+        print("dry run: %s taema actions for %s" % (action, scope or "all scopes"))
+        return 0
+    fields = {"held": held, "reason": reason}
+    if scope is not None:
+        fields["scope"] = scope
+    how, reply = feedback_action(cfg, store, "hold", **fields)
+    if not reply or not reply.get("ok"):
+        return die(reply.get("error", "could not %s taema actions" % action))
+    print("%s taema actions for %s (%s)" % (action, scope or "all scopes", how))
+    return 0
+
+
+def cmd_hold(a):
+    return _cmd_hold(a, True)
+
+
+def cmd_resume(a):
+    return _cmd_hold(a, False)
+
+
+def _snooze_deadline(values):
+    text = " ".join(values).strip()
+    if text.lower().startswith("until "):
+        clock_text = text[6:].strip()
+        try:
+            clock = _local_time.fromisoformat(clock_text)
+        except ValueError:
+            raise ValueError("snooze time must look like `until 18:00`") from None
+        if len(clock_text) != 5 or clock.second or clock.microsecond:
+            raise ValueError("snooze time must look like `until 18:00`")
+        now = _datetime.now().astimezone()
+        deadline = _datetime.combine(now.date(), clock, tzinfo=now.tzinfo)
+        if deadline <= now:
+            deadline += _timedelta(days=1)
+        return deadline.timestamp()
+    from .inputs import parse_duration
+
+    seconds = parse_duration(text)
+    if seconds <= 0:
+        raise ValueError("snooze duration must be greater than zero")
+    return time.time() + seconds
+
+
+def cmd_snooze(a):
+    cfg, store, _units = _load(a)
+    try:
+        until = _snooze_deadline(a.when)
+    except ValueError as error:
+        return die(str(error))
+    if getattr(a, "dry_run", False):
+        print("dry run: snooze all taema actions until %s" % until)
+        return 0
+    display_until = (
+        _datetime.fromtimestamp(until).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    )
+    reason = "user snoozed actions until %s" % display_until
+    how, reply = feedback_action(cfg, store, "snooze", until=until, reason=reason)
+    if not reply or not reply.get("ok"):
+        return die(reply.get("error", "could not snooze taema actions"))
+    print("snoozed all taema actions until %s (%s)" % (display_until, how))
+    return 0
+
+
 def cmd_forget(a):
     cfg, store, units = _load(a)
     if getattr(a, "veto", False):
@@ -1022,17 +1116,26 @@ def cmd_status(a):
 
     cfg, store = _load_status(a)
     reply = ask(cfg, {"cmd": "status"})
+    empty_hold_state = {
+        "global": False,
+        "scopes": [],
+        "snooze_until": None,
+        "snooze_remaining_s": 0,
+        "reason": "",
+    }
     if store is None:
         store = _status_store(cfg, pending_only=reply is not None)
     if reply is None:
         invalid = int(store.data.get("feedback_invalid", 0)) if store else 0
         hold = store.hold_reason() if store else ""
+        hold_state = store.hold_status() if store else empty_hold_state
         status = {
             "daemon": "unavailable",
             "mode": cfg["mode"],
             "feedback_invalid": invalid
             + (store.pending_feedback_invalid() if store else 0),
             "hold": hold or "",
+            "hold_state": hold_state,
             "config": list(cfg["_sources"]),
             "details": {
                 "reviews": len(store.open_reviews()) if store else 0,
@@ -1048,11 +1151,15 @@ def cmd_status(a):
             )
         ) + (store.pending_feedback_invalid() if store else 0)
         reply["hold"] = store.hold_reason() if store else reply.get("hold", "")
+        reply["hold_state"] = (
+            store.hold_status() if store else reply.get("hold_state", empty_hold_state)
+        )
         status = {
             "daemon": "running",
             "mode": reply.get("mode", cfg["mode"]),
             "feedback_invalid": int(reply["feedback_invalid"]),
             "hold": reply["hold"] or "",
+            "hold_state": reply["hold_state"],
             "config": list(cfg["_sources"]),
             "details": reply,
         }

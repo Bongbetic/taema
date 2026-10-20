@@ -61,6 +61,7 @@ class Daemon:
             mode=cfg.get("mode", "observe"),
         )
         self.store.apply_feedback()
+        self.restore_runtime_hold()
         self.store.expire_reviews()
         self.store.save_if_dirty()
         self.units = policy.load_units(cfg)
@@ -104,7 +105,54 @@ class Daemon:
         self.auto_recent = {}  # leftover key -> (owner key, ts) of an auto stop, for regret
         self.started = time.time()
         self.stopping = False
+        self.toggle_hold_requested = False
         self.session_seen = False
+
+    def restore_runtime_hold(self):
+        """Import an offline runtime marker and honor the cautious service boot setting."""
+        runtime = self.store._read_runtime_hold()
+        state = self.store.hold_status(include_pending=False, include_runtime=False)
+        runtime_until = runtime.get("snooze_until")
+        if (
+            isinstance(runtime_until, (int, float))
+            and not isinstance(runtime_until, bool)
+            and time.time() < runtime_until
+            and runtime_until > (state["snooze_until"] or 0)
+        ):
+            self.store.apply_feedback_command(
+                {
+                    "v": 2,
+                    "id": secrets.token_hex(16),
+                    "op": "snooze",
+                    "until": runtime_until,
+                    "reason": runtime.get("reason")
+                    or "restored runtime snooze after daemon restart",
+                }
+            )
+            state = self.store.hold_status(include_pending=False, include_runtime=False)
+        if runtime.get("held") is True and not state["global"]:
+            self.store.apply_feedback_command(
+                {
+                    "v": 2,
+                    "id": secrets.token_hex(16),
+                    "op": "hold",
+                    "held": True,
+                    "reason": runtime.get("reason")
+                    or "restored runtime hold after daemon restart",
+                }
+            )
+            state = self.store.hold_status(include_pending=False, include_runtime=False)
+        if os.environ.get("TAEMA_HOLD") == "1" and not state["global"]:
+            self.store.apply_feedback_command(
+                {
+                    "v": 2,
+                    "id": secrets.token_hex(16),
+                    "op": "hold",
+                    "held": True,
+                    "reason": "TAEMA_HOLD=1 service setting",
+                }
+            )
+        self.store.sync_runtime_hold()
 
     # ---- mode gates ----
     # Predicates for code and tests that ask what a mode means; the decision points themselves
@@ -182,6 +230,23 @@ class Daemon:
                     trigger=trigger,
                     scope=f.scope or None,
                     target=dec.reason,
+                )
+        elif dec.slot == authorization.HOLD and self.store.changed(
+            "action_held:%s:%s" % (trigger, f.scope),
+            (self.mode, dec.reason),
+        ):
+            with self.store.decision_context(
+                "hold",
+                scope=f.scope or None,
+                authority="hold",
+                mode=self.mode,
+                why=dec.reason,
+            ):
+                self.store.log(
+                    event="action_held",
+                    trigger=trigger,
+                    scope=f.scope or None,
+                    reason=dec.reason,
                 )
         elif dec.verdict == authorization.KEEP and self.store.changed(
             "authorization_refused:%s:%s" % (trigger, f.scope),
@@ -1675,6 +1740,7 @@ class Daemon:
                 "latest_decision": self.store.latest_decision(),
                 "feedback_invalid": self.store.data.get("feedback_invalid", 0),
                 "hold": self.store.hold_reason(),
+                "hold_state": self.store.hold_status(),
                 "auto": self.auto_status(),
             }
         if c == "review":
@@ -1899,8 +1965,71 @@ class Daemon:
             self.bind(want)
             self.store.log(event="socket_bound", path=want)
 
+    def thaw_held_scopes(self):
+        """Thaw frozen managed scopes covered by a global, snooze, or scope hold."""
+        state = self.store.hold_status()
+        global_hold = state["global"] or state["snooze_until"] is not None
+        held_scopes = state["scopes"]
+        if not global_hold and not held_scopes:
+            return
+        stack = list(cgroup.subdirs(cgroup.base()))
+        while stack:
+            path = stack.pop()
+            if os.path.basename(path) == "manager":
+                continue
+            scope = cgroup.rel(path)
+            stack.extend(cgroup.subdirs(path))
+            if not global_hold and not any(
+                scope == held or scope.startswith(held + "/") for held in held_scopes
+            ):
+                continue
+            freeze = os.path.join(path, "cgroup.freeze")
+            try:
+                with open(freeze, encoding="ascii") as source:
+                    frozen = source.read().strip() == "1"
+                if not frozen:
+                    continue
+                reason = self.store.hold_reason(scope) or "runtime hold"
+                with self.store.decision_context(
+                    "thaw",
+                    scope=scope,
+                    authority="hold",
+                    mode=self.mode,
+                    why="hold thawed a managed freeze: %s" % reason,
+                ):
+                    with open(freeze, "w", encoding="ascii") as target:
+                        target.write("0\n")
+                    self.store.log(event="thaw", scope=scope, reason=reason)
+            except OSError as error:
+                self.store.log(
+                    event="thaw_failed",
+                    scope=scope,
+                    reason="%s: %s" % (self.store.hold_reason(scope) or "hold", error),
+                )
+
     def _on_signal(self, signum, _frame):
-        self.stopping = True
+        if signum == getattr(signal, "SIGUSR1", None):
+            self.toggle_hold_requested = True
+        else:
+            self.stopping = True
+
+    def toggle_hold(self):
+        """Apply a queued SIGUSR1 toggle between daemon actions."""
+        if not self.toggle_hold_requested:
+            return
+        self.toggle_hold_requested = False
+        state = self.store.hold_status(include_runtime=False)
+        active = state["global"] or state["snooze_until"] is not None
+        self.store.apply_feedback_command(
+            {
+                "v": 2,
+                "id": secrets.token_hex(16),
+                "op": "hold",
+                "held": not active,
+                "reason": "SIGUSR1 toggled actions %s"
+                % ("on hold" if not active else "back on"),
+            }
+        )
 
     def next_timeout(self, now=None):
         """Seconds until the next timer is due (adopt, gc), capped at MAX_SLEEP."""
@@ -1923,9 +2052,13 @@ class Daemon:
         try:
             if not self.store.db.write_available():
                 skip_pass = True
+                self.guarded(self.thaw_held_scopes)
                 self.store.log(event="store_busy", where="tick", retry=True)
                 return
             self.guarded(self.check_socket)
+            self.guarded(self.store.apply_feedback)
+            self.guarded(self.toggle_hold)
+            self.guarded(self.thaw_held_scopes)
             self.run_deadlines()
             now = time.time()
             if now - self.last["adopt"] >= self.iv_adopt:
@@ -1946,6 +2079,7 @@ class Daemon:
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGUSR1, self._on_signal)
         wake_r, wake_w = socket.socketpair()  # a signal wakes select() at once
         wake_r.setblocking(False)
         wake_w.setblocking(False)

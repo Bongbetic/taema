@@ -796,10 +796,31 @@ class Store:
                         known_ids.add(op_id)
         return invalid
 
-    def hold_reason(self, scope=None, include_pending=True):
-        """Explain a global hold, matching scope hold, or active global snooze."""
+    def _runtime_hold_path(self):
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+        return os.path.join(runtime, "taema", "HOLD")
+
+    def _read_runtime_hold(self):
+        try:
+            with open(self._runtime_hold_path(), encoding="utf-8") as stream:
+                value = json.load(stream)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            # An unreadable marker must fail safe while the daemon is unavailable.
+            return {"held": True}
+        return value if isinstance(value, dict) else {"held": True}
+
+    def hold_status(self, include_pending=True, include_runtime=None):
+        """Return the active global/scope holds and snooze deadline."""
+        if include_runtime is None:
+            include_runtime = self.read_only
         held = self.data.get("held") is True
-        scopes = set(self.data.get("held_scopes", []))
+        scopes = {
+            scope
+            for scope in self.data.get("held_scopes", [])
+            if isinstance(scope, str) and scope
+        }
         snooze_until = self.data.get("snooze_until", 0)
         if include_pending:
             for op in self._pending_feedback_ops():
@@ -807,17 +828,104 @@ class Store:
                     target = op.get("scope")
                     if target is None:
                         held = op["held"]
+                        if not op["held"]:
+                            snooze_until = 0.0
                     elif op["held"]:
                         scopes.add(target)
                     else:
                         scopes.discard(target)
                 elif op.get("op") == "snooze":
                     snooze_until = op["until"]
-        if held:
+        reason = ""
+        if include_runtime:
+            runtime = self._read_runtime_hold()
+            held = held or runtime.get("held") is True
+            runtime_until = runtime.get("snooze_until")
+            if (
+                isinstance(runtime_until, (int, float))
+                and not isinstance(runtime_until, bool)
+                and math.isfinite(runtime_until)
+                and runtime_until > snooze_until
+            ):
+                snooze_until = runtime_until
+            reason = runtime.get("reason", "")
+        now = self.now()
+        active_until = (
+            snooze_until
+            if isinstance(snooze_until, (int, float))
+            and not isinstance(snooze_until, bool)
+            and math.isfinite(snooze_until)
+            and snooze_until > now
+            else None
+        )
+        return {
+            "global": held,
+            "scopes": sorted(scopes),
+            "snooze_until": active_until,
+            "snooze_remaining_s": max(0, int(math.ceil(active_until - now)))
+            if active_until is not None
+            else 0,
+            "reason": reason if isinstance(reason, str) else "",
+        }
+
+    def sync_runtime_hold(self, reason=None):
+        """Mirror a global hold or snooze to the private runtime marker."""
+        path = self._runtime_hold_path()
+        parent = os.path.dirname(path)
+        state = self.hold_status(include_runtime=False)
+        if not state["global"] and state["snooze_until"] is None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+            return True
+        try:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+            info = os.stat(parent)
+            if info.st_uid != os.getuid():
+                return False
+            os.chmod(parent, 0o700)
+            descriptor, temporary = tempfile.mkstemp(prefix=".HOLD.", dir=parent)
+            try:
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    os.fchmod(stream.fileno(), 0o600)
+                    json.dump(
+                        {
+                            "held": state["global"],
+                            "snooze_until": state["snooze_until"],
+                            "reason": reason or state["reason"],
+                        },
+                        stream,
+                        sort_keys=True,
+                    )
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                os.chmod(path, 0o600)
+            except Exception:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            return False
+        return True
+
+    def hold_reason(self, scope=None, include_pending=True):
+        """Explain a global hold, matching scope hold, or active global snooze."""
+        state = self.hold_status(include_pending=include_pending)
+        if state["global"]:
             return "global hold"
-        if isinstance(snooze_until, (int, float)) and snooze_until > self.now():
+        if state["snooze_until"] is not None:
             return "snoozed"
-        if scope is not None and scope in scopes:
+        if scope is not None and any(
+            scope == held_scope or scope.startswith(held_scope + "/")
+            for held_scope in state["scopes"]
+        ):
             return "scope hold"
         return ""
 
@@ -1213,8 +1321,14 @@ class Store:
             result = {"app": msg["app"], "muted": msg["muted"]}
         elif msg["v"] == 2 and op == "hold":
             scope, held = msg.get("scope"), msg["held"]
+            reason = msg.get("reason") or "user %s %s" % (
+                "held" if held else "released",
+                scope or "all actions",
+            )
             if scope is None:
                 self.data["held"] = held
+                if not held:
+                    self.data["snooze_until"] = 0.0
             else:
                 scopes = set(self.data.get("held_scopes", []))
                 if held:
@@ -1227,21 +1341,25 @@ class Store:
                 "hold" if held else "resume",
                 scope=scope,
                 authority="user",
-                why="user %s %s"
-                % ("held" if held else "released", scope or "all actions"),
+                why=reason,
             ):
-                self.log(event="hold", scope=scope, held=held)
+                self.log(event="hold", scope=scope, held=held, reason=reason)
             result = {"scope": scope, "held": held}
         elif msg["v"] == 2 and op == "snooze":
             until = msg["until"]
             self.data["snooze_until"] = until if until > self.now() else 0.0
             self.dirty = True
+            reason = msg.get("reason") or "user snoozed actions until %.3f" % until
             with self.decision_context(
                 "snooze",
                 authority="user",
-                why="user snoozed actions until %.3f" % self.data["snooze_until"],
+                why=reason,
             ):
-                self.log(event="snooze", until=self.data["snooze_until"])
+                self.log(
+                    event="snooze",
+                    until=self.data["snooze_until"],
+                    reason=reason,
+                )
             result = {"until": self.data["snooze_until"]}
         else:
             return None
@@ -1249,6 +1367,8 @@ class Store:
         if not self._feedback_replaying:
             del ids[:-MAX_FEEDBACK_IDS]
         self.dirty = True
+        if op in ("hold", "snooze"):
+            self.sync_runtime_hold(reason=reason)
         return {"ok": True, **result}
 
     def apply_feedback(self, path=None):

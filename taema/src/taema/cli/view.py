@@ -124,6 +124,18 @@ def _format_memory(value):
         amount /= 1024.0
 
 
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        amount, seconds = divmod(seconds, size)
+        if amount:
+            parts.append("%d%s" % (amount, unit))
+    if seconds or not parts:
+        parts.append("%ds" % seconds)
+    return " ".join(parts)
+
+
 def render_status(model, args, summary=False):
     status = model["status"] or {}
     details = status.get("details") or {}
@@ -138,7 +150,17 @@ def render_status(model, args, summary=False):
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),
     ]
-    if status.get("hold"):
+    hold_state = status.get("hold_state") or {}
+    hold_parts = []
+    if hold_state.get("global"):
+        hold_parts.append("global")
+    hold_parts.extend("scope " + scope for scope in hold_state.get("scopes", []))
+    remaining = hold_state.get("snooze_remaining_s", 0)
+    if remaining:
+        hold_parts.append("snooze " + _format_duration(remaining))
+    if hold_parts:
+        lines.append("hold: %s" % ", ".join(hold_parts))
+    elif status.get("hold"):
         lines.append("hold: %s" % status["hold"])
     latest = details.get("latest_decision")
     if latest:

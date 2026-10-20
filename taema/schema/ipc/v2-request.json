@@ -161,7 +161,8 @@
             "id": {"type": "string", "minLength": 1, "maxLength": 128},
             "op": {"const": "hold"},
             "scope": {"type": "string", "minLength": 1, "maxLength": 256},
-            "held": {"type": "boolean"}
+            "held": {"type": "boolean"},
+            "reason": {"type": "string", "maxLength": 256}
           },
           "additionalProperties": false
         },
@@ -172,7 +173,8 @@
             "v": {"const": 2},
             "id": {"type": "string", "minLength": 1, "maxLength": 128},
             "op": {"const": "snooze"},
-            "until": {"type": "number", "minimum": 0}
+            "until": {"type": "number", "minimum": 0},
+            "reason": {"type": "string", "maxLength": 256}
           },
           "additionalProperties": false
         }

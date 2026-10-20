@@ -30,6 +30,7 @@ class SyntaxTest(unittest.TestCase):
             "srcpkgs/taema/REMOVE",
             "sv/taema/run",
             "sv/taema/finish",
+            "libexec/taemad-user",
             "tools/build-xbps.sh",
         ):
             with self.subTest(script=rel):
@@ -39,6 +40,16 @@ class SyntaxTest(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_hold_service_setting_reaches_the_user_daemon(self):
+        with open(os.path.join(ROOT, "sv/taema/run"), encoding="utf-8") as stream:
+            service_run = stream.read()
+        with open(
+            os.path.join(ROOT, "libexec/taemad-user"), encoding="utf-8"
+        ) as stream:
+            user_run = stream.read()
+        self.assertIn("export TAEMA_HOLD", service_run)
+        self.assertIn('TAEMA_HOLD="${TAEMA_HOLD:-0}"', user_run)
 
 
 class ScriptTest(unittest.TestCase):

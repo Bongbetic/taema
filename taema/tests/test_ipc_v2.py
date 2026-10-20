@@ -372,6 +372,23 @@ class IpcV2Tests(unittest.TestCase):
             self.assertEqual(reply["error"]["code"], code)
             self.assertTrue(matches(reply, self.reply_schema, self.reply_schema))
 
+    def test_hold_and_snooze_feedback_reasons_are_bounded_strings(self):
+        operations = (
+            {"op": "hold", "held": True},
+            {"op": "snooze", "until": time.time() + 60},
+        )
+        for index, operation in enumerate(operations):
+            valid = {"v": 2, "id": "hold-reason-%d" % index, **operation}
+            valid["reason"] = "m" * 256
+            protocol.validate_feedback(valid)
+            for reason in ("m" * 257, 12):
+                invalid = {**valid, "reason": reason}
+                with self.subTest(
+                    op=operation["op"], reason_type=type(reason).__name__
+                ):
+                    with self.assertRaises(protocol.ProtocolError):
+                        protocol.validate_feedback(invalid)
+
     def test_fuzz_inputs_get_errors_without_state_change(self):
         valid = json.dumps(self.request(9, "status", {})).encode()
         too_large = valid + b" " * (65538 - len(valid)) + b"\n"

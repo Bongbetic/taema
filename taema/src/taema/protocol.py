@@ -123,6 +123,7 @@ def _validate_feedback(args):
         "scope",
         "held",
         "until",
+        "reason",
     }
     if "v" not in args:
         if set(args) != legacy_fields:
@@ -163,8 +164,8 @@ def _validate_feedback(args):
             "answer": common | {"owner", "leftovers", "choice"},
             "teach": common | {"owner", "leftovers", "choice"},
             "mute": common | {"app", "muted"},
-            "hold": common | {"scope", "held"},
-            "snooze": common | {"until"},
+            "hold": common | {"scope", "held", "reason"},
+            "snooze": common | {"until", "reason"},
         }
     )
     if op not in operation_fields:
@@ -223,6 +224,10 @@ def _validate_feedback(args):
             _fail("feedback scope must be a non-empty string")
         if not _is_type(args.get("held"), "boolean"):
             _fail("feedback held must be a boolean")
+        if "reason" in args and (
+            not _is_type(args["reason"], "string") or len(args["reason"]) > 256
+        ):
+            _fail("feedback reason must be a string of at most 256 characters")
     if op == "snooze":
         until = args.get("until")
         if (
@@ -232,6 +237,10 @@ def _validate_feedback(args):
             or until < 0
         ):
             _fail("feedback snooze expiry must be a finite timestamp")
+        if "reason" in args and (
+            not _is_type(args["reason"], "string") or len(args["reason"]) > 256
+        ):
+            _fail("feedback reason must be a string of at most 256 characters")
     if op == "vetoed" and not _is_type(args.get("trigger"), "string"):
         _fail("vetoed feedback requires a trigger")
 

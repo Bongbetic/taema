@@ -123,6 +123,38 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "read": True,
     },
     {
+        "name": "hold",
+        "aliases": (),
+        "help": "pause taema actions without changing mode",
+        "handler": "cmd_hold",
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (("--reason",), {"default": "", "help": "why actions are being held"}),
+            (("target",), {"nargs": "?"}),
+        ),
+    },
+    {
+        "name": "resume",
+        "aliases": (),
+        "help": "resume taema actions",
+        "handler": "cmd_resume",
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (("--reason",), {"default": "", "help": "why actions are resuming"}),
+            (("target",), {"nargs": "?"}),
+        ),
+    },
+    {
+        "name": "snooze",
+        "aliases": (),
+        "help": "hold all taema actions for a duration or until a local time",
+        "handler": "cmd_snooze",
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (("when",), {"nargs": "+", "metavar": "DURATION|until TIME"}),
+        ),
+    },
+    {
         "name": "status",
         "aliases": (),
         "help": "show daemon and policy status",

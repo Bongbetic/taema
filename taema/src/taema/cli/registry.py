@@ -75,10 +75,13 @@ COMMANDS: tuple[dict[str, Any], ...] = (
     {
         "name": "explain",
         "aliases": ("why",),
-        "help": "explain a process, scope, or app",
+        "help": "explain a process, scope, app, pair, or latest decision",
         "handler": "cmd_explain",
         "read": True,
-        "arguments": ((("target",), {}),),
+        "arguments": (
+            (("--pair",), {"nargs": 2, "metavar": ("OWNER", "LEFTOVER")}),
+            (("target",), {"nargs": "?"}),
+        ),
     },
     {
         "name": "keep",

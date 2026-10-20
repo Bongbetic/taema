@@ -292,3 +292,127 @@ def render_reviews(reviews):
             % (item.get("id", "?"), owner, survivors, age)
         )
     return "\n".join(lines) + "\n"
+
+
+def render_explanation(target, explanation):
+    """Render the same structured explanation used by JSON consumers."""
+    identity = explanation.get("identity") or {}
+    scope = explanation.get("scope") or {}
+    decision = explanation.get("current_decision") or {}
+    protected = explanation.get("protected") or {}
+    hold = explanation.get("hold") or {}
+    lines = ["explain: %s" % target]
+    if identity:
+        lines.append(
+            "identity: %s (%s; %s)"
+            % (
+                identity.get("key", "unknown"),
+                identity.get("display", "unknown"),
+                "validated" if identity.get("validated") else "unvalidated",
+            )
+        )
+        if identity.get("reason"):
+            lines.append("identity reason: %s" % identity["reason"])
+    else:
+        lines.append("identity: unknown")
+    lines.append(
+        "scope: %s (%s)"
+        % (
+            scope.get("name") or "unknown",
+            "live" if scope.get("live") else "not verified live",
+        )
+    )
+    confidence = decision.get("confidence")
+    confidence_text = "" if confidence is None else " confidence=%.2f" % confidence
+    lines.append(
+        "decision: %s%s — %s"
+        % (
+            decision.get("action", "unknown"),
+            confidence_text,
+            decision.get("reason") or "reason unknown",
+        )
+    )
+    lines.append("authority: %s" % explanation.get("authority_source", "unknown"))
+    lines.append(
+        "protection: %s%s"
+        % (
+            "blocked" if protected.get("blocked") else "not blocked",
+            ": " + protected["reason"] if protected.get("reason") else "",
+        )
+    )
+    lines.append("hold: %s" % (hold.get("reason") if hold.get("active") else "none"))
+    vetoes = explanation.get("vetoes") or []
+    lines.append(
+        "vetoes: %s"
+        % (
+            ", ".join(
+                "%s %s" % (item.get("kind"), item.get("value")) for item in vetoes[:5]
+            )
+            + (" (+%d more)" % (len(vetoes) - 5) if len(vetoes) > 5 else "")
+            if vetoes
+            else "none"
+        )
+    )
+    learning = explanation.get("learning") or {}
+    if "owner" in learning and "leftover" in learning:
+        lines.append(
+            "learned pair: %s -> %s (%s; %s)"
+            % (
+                learning["owner"],
+                learning["leftover"],
+                decision.get("action", "unknown"),
+                explanation.get("authority_source", "unknown"),
+            )
+        )
+    elif "default_action" in learning:
+        lines.append(
+            "learning: default=%s; pairs=%d; standalone=%s"
+            % (
+                learning.get("default_action", "unknown"),
+                len(learning.get("pairs") or []),
+                learning.get("standalone", "unknown"),
+            )
+        )
+    elif "kind" in learning:
+        lines.append(
+            "recorded context: kind=%s; mode=%s; authority=%s"
+            % (
+                learning.get("kind", "unknown"),
+                learning.get("mode", "unknown"),
+                learning.get("authority", "unknown"),
+            )
+        )
+    elif learning:
+        lines.append("learning: recorded data")
+    else:
+        lines.append("learning: unknown")
+    outcomes = explanation.get("mode_outcomes") or {}
+    lines.append("authorization (%s):" % outcomes.get("trigger", "unknown"))
+    for item in outcomes.get("modes", []):
+        lines.append(
+            "  %-7s %-5s %-16s %s"
+            % (
+                item.get("mode", "?"),
+                item.get("verdict", "?"),
+                item.get("slot", ""),
+                item.get("reason", ""),
+            )
+        )
+    plan = explanation.get("plan") or []
+    for item in plan[:8]:
+        lines.append(
+            "plan: %-5s pid=%s %s — %s"
+            % (
+                item.get("action", "?"),
+                item.get("pid", "?"),
+                item.get("comm", ""),
+                item.get("why", ""),
+            )
+        )
+    if len(plan) > 8:
+        lines.append("plan: %d more members in --json" % (len(plan) - 8))
+    for item in explanation.get("unknown") or []:
+        lines.append(
+            "unknown %s: %s" % (item.get("fact", "fact"), item.get("reason", ""))
+        )
+    return "\n".join(lines) + "\n"

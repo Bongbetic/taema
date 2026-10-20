@@ -302,11 +302,16 @@ class IdentityPersistence(unittest.TestCase):
                 instances = connection.execute(
                     "SELECT app, pid, start FROM instances ORDER BY pid"
                 ).fetchall()
+            app = store.app_identity("exe:app2:1:3")
+            instance = store.latest_app_instance("exe:app2:1:3")
 
         self.assertEqual(len(apps), 2)
         self.assertEqual(len(instances), 2)
         self.assertNotIn("exe:app0:1:1", {row["key"] for row in apps})
         self.assertEqual(instances[-1]["app"], "exe:app2:1:3")
+        self.assertEqual(app["display"], "app2")
+        self.assertEqual(instance["pid"], 102)
+        self.assertEqual(instance["scope"], "/user/1000/app-example")
 
     def test_lineage_persists_resolved_identities_at_end_of_observe_pass(self):
         app = identity.AppIdentity("exe:editor:1:2", "editor", "exe", "editor", 1, 2)

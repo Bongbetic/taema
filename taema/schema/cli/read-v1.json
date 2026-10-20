@@ -153,7 +153,105 @@
       "properties": {
         "schema": { "const": "taema.explain.v1" },
         "target": { "type": "string" },
-        "explanation": {}
+        "explanation": { "$ref": "#/$defs/explanation-data" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-data": {
+      "type": "object",
+      "required": ["identity", "scope", "provenance", "current_decision", "authority_source", "vetoes", "hold", "protected", "mode_outcomes", "learning", "plan", "unknown"],
+      "properties": {
+        "identity": { "anyOf": [{ "$ref": "#/$defs/explanation-identity" }, { "type": "null" }] },
+        "scope": { "$ref": "#/$defs/explanation-scope" },
+        "provenance": { "type": "object" },
+        "current_decision": { "$ref": "#/$defs/explanation-decision" },
+        "authority_source": { "type": "string" },
+        "vetoes": { "type": "array", "items": { "type": "object" } },
+        "hold": { "$ref": "#/$defs/explanation-hold" },
+        "protected": { "$ref": "#/$defs/explanation-protected" },
+        "mode_outcomes": { "$ref": "#/$defs/explanation-outcomes" },
+        "learning": { "type": "object" },
+        "plan": { "type": "array", "items": { "type": "object" } },
+        "unknown": { "type": "array", "items": { "$ref": "#/$defs/explanation-unknown" } }
+      },
+      "additionalProperties": false
+    },
+    "explanation-identity": {
+      "type": "object",
+      "required": ["key", "display", "kind", "validated", "reason"],
+      "properties": {
+        "key": { "type": "string" },
+        "display": { "type": "string" },
+        "kind": { "type": "string" },
+        "validated": { "type": "boolean" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-scope": {
+      "type": "object",
+      "required": ["name", "live"],
+      "properties": {
+        "name": { "type": "string" },
+        "live": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-decision": {
+      "type": "object",
+      "required": ["action", "confidence", "reason"],
+      "properties": {
+        "action": { "type": "string" },
+        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-hold": {
+      "type": "object",
+      "required": ["active", "reason"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-protected": {
+      "type": "object",
+      "required": ["blocked", "reason"],
+      "properties": {
+        "blocked": { "type": "boolean" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-outcomes": {
+      "type": "object",
+      "required": ["trigger", "modes"],
+      "properties": {
+        "trigger": { "type": "string" },
+        "modes": { "type": "array", "items": { "$ref": "#/$defs/explanation-mode" } }
+      },
+      "additionalProperties": false
+    },
+    "explanation-mode": {
+      "type": "object",
+      "required": ["mode", "verdict", "slot", "authority", "reason"],
+      "properties": {
+        "mode": { "enum": ["observe", "adopt", "enforce", "auto"] },
+        "verdict": { "enum": ["act", "would", "keep"] },
+        "slot": { "type": "string" },
+        "authority": { "type": "string" },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "explanation-unknown": {
+      "type": "object",
+      "required": ["fact", "reason"],
+      "properties": {
+        "fact": { "type": "string" },
+        "reason": { "type": "string" }
       },
       "additionalProperties": false
     },

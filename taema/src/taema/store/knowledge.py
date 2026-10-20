@@ -215,6 +215,12 @@ class Store:
             return 0
         return self.db.record_app_identities(records, now=self.now())
 
+    def app_identity(self, key):
+        return self.db.app_identity(key)
+
+    def latest_app_instance(self, key):
+        return self.db.latest_app_instance(key)
+
     def export_legacy(self):
         """Return the state fields understood by the 0.2 JSON store."""
         fields = (
@@ -993,6 +999,17 @@ class Store:
 
     def match_veto(self, scope=None, members=(), include_pending=True):
         """Return the first veto matching a scope or observed member identities."""
+        matches = self.matching_vetoes(scope, members, include_pending)
+        return matches[0] if matches else None
+
+    def matching_vetoes(self, scope=None, members=(), include_pending=True):
+        """Return all active vetoes matching a scope or observed member identities."""
+        matches = []
+
+        def add(veto):
+            if veto not in matches:
+                matches.append(dict(veto))
+
         for veto in self._active_vetoes(include_pending):
             kind, value = veto.get("kind"), veto.get("value")
             if (
@@ -1000,12 +1017,14 @@ class Store:
                 and isinstance(scope, str)
                 and (scope == value or scope.startswith(value.rstrip("/") + "/"))
             ):
-                return dict(veto)
+                add(veto)
+                continue
             for member in members or ():
                 if not isinstance(member, dict):
                     continue
                 if kind == "app" and value in member.get("apps", ()):
-                    return dict(veto)
+                    add(veto)
+                    break
                 if (
                     kind == "pid"
                     and str(member.get("pid")) == value
@@ -1014,8 +1033,9 @@ class Store:
                         or member.get("start") == veto.get("start")
                     )
                 ):
-                    return dict(veto)
-        return None
+                    add(veto)
+                    break
+        return matches
 
     def record_auto_action(
         self, scope, why, pairs=(), apps=(), decision=None, owner=None, authority="mode"

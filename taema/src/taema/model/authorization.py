@@ -7,9 +7,9 @@ trigger, the mode, and the known facts, and returns act, would-act, or keep, wit
 
 The ladder evaluates five slots, in spec order (``SLOTS``):
 
-1. ``hard_safety`` -- never root/other users/protected/self, dependencies, PID reuse. No trigger
-   carries hard-safety facts in 0.2.1 (engine.stop/plan_stop still revalidate at actuation), so
-   the slot passes through.
+1. ``hard_safety`` -- never root/other users/protected/self, dependencies, PID reuse. Read-only
+   explanation callers may supply a resolved blocker; engine.stop/plan_stop still revalidate at
+   actuation.
 2. ``veto`` -- a user-created veto blocks matching stop targets in every mode.
 3. ``hold`` -- a global hold, scope hold, or active snooze blocks stop and reclaim actions.
 4. ``mode_capability`` -- per-trigger, per-mode **table** (``_CAPABILITY``, with two fact rules for
@@ -28,8 +28,9 @@ A deny in slots 1-3 short-circuits to ``keep``; a deny in slot 5 overrides ``act
 outcome. Unknown triggers or modes raise ``ValueError`` (a programming error, not a runtime fact).
 
 Member-level pair authority (auto_stop_ok, the explicit-answer SIGKILL rule) stays where it runs
-today -- at actuation inside engine/daemon -- and is re-checked there after the ladder says ``act``;
-the authority slot is the trigger-level home for it as the M0 tickets land.
+today -- at actuation inside engine/daemon -- and is re-checked there after the ladder says ``act``.
+Read-only pair explanations supply the selected pair result to the same trigger-level authority
+slot.
 """
 
 from __future__ import annotations
@@ -146,6 +147,7 @@ class Facts:
     leftover: target sits under leftover/* (GC stop candidates).
     shared: target is the shared/ helper tree (session end).
     unit_survive_logout: the target's unit sets kill.survive_logout (session end).
+    hard_safety and pair_action: resolved facts supplied by read-only explanation callers.
     """
 
     scope: str = ""
@@ -155,6 +157,9 @@ class Facts:
     vetoed: str = ""
     held: str = ""
     suppress_stops: bool = False
+    hard_safety: str = ""
+    pair_action: str = ""
+    pair_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -365,9 +370,11 @@ def _capability(
 # ---- slots 1-3: blocking, pass through in 0.2.1 -------------------------------------------------
 
 
-def _hard_safety(_trigger: str, _mode: str, _facts: Facts) -> tuple[Vote, str]:
+def _hard_safety(_trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
     """Slot 1: hard safety/dependencies (never root/other users/protected/self, revalidated at
-    actuation by engine.stop/plan_stop). No trigger supplies hard-safety facts in 0.2.1."""
+    actuation by engine.stop/plan_stop). Read-only explain callers can supply a resolved blocker."""
+    if facts.hard_safety:
+        return "deny", facts.hard_safety
     return "pass", ""
 
 
@@ -392,11 +399,22 @@ def _hold(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
 # ---- slot 5: pair/signature/unit authority ------------------------------------------------------
 
 
-def _authority(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
-    """Slot 5: trigger-level authority. Only unit kill.survive_logout denies in 0.2.1 (session
-    end); per-member pair authority is re-checked at actuation after an `act` verdict."""
+def _authority(trigger: str, mode: str, facts: Facts) -> tuple[Vote, str]:
+    """Slot 5: trigger-level authority. Unit and resolved pair rules can deny; each member's
+    pair authority is still re-checked at actuation after an `act` verdict."""
     if trigger == SESSION_END and facts.unit_survive_logout:
         return "deny", "unit authority: unit sets kill.survive_logout"
+    if (
+        trigger == GC_STOP
+        and mode == "auto"
+        and facts.leftover
+        and facts.pair_action
+        and facts.pair_action != "stop"
+    ):
+        return (
+            "deny",
+            facts.pair_reason or "pair authority: pair does not authorize stop",
+        )
     return "pass", ""
 
 

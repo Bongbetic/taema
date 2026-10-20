@@ -99,6 +99,14 @@ class CliRegistry(unittest.TestCase):
         self.assertEqual(after.socket, "/tmp/other.sock")
         self.assertTrue(after.plain and after.wide and after.json)
 
+    def test_why_accepts_a_latest_decision_or_an_explicit_pair(self):
+        parser = framework._parser()
+        latest = parser.parse_args(["why"])
+        pair = parser.parse_args(["explain", "--pair", "npm", "vite"])
+        self.assertIsNone(latest.target)
+        self.assertIsNone(latest.pair)
+        self.assertEqual(pair.pair, ["npm", "vite"])
+
     def test_fast_status_parser_accepts_values_and_rejects_other_commands(self):
         args = framework._fast_status_args(
             ["--socket=/tmp/taema.sock", "status", "--config", "/tmp/config.toml"]

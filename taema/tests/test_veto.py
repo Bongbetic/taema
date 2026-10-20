@@ -31,6 +31,29 @@ class VetoCommands(unittest.TestCase):
         with open(store.feedback_path) as f:
             return [json.loads(line) for line in f]
 
+    def test_matching_vetoes_reports_every_active_scope_and_member_match(self):
+        store = knowledge.Store(tmp(), {})
+        store.add_veto("scope", "scope-x")
+        store.add_veto("app", "firefox")
+        store.add_veto("pid", "42", start=100)
+
+        matches = store.matching_vetoes(
+            scope="scope-x/child",
+            members=[{"pid": 42, "start": 100, "apps": ["firefox"]}],
+        )
+
+        self.assertEqual(
+            [(item["kind"], item["value"]) for item in matches],
+            [("scope", "scope-x"), ("app", "firefox"), ("pid", "42")],
+        )
+        self.assertEqual(
+            store.match_veto(
+                scope="scope-x/child",
+                members=[{"pid": 42, "start": 100, "apps": ["firefox"]}],
+            ),
+            matches[0],
+        )
+
     def test_do_not_kill_alias_queues_a_matching_app_veto(self):
         for argv in (
             ["dnk", "firefox"],
@@ -68,7 +91,7 @@ class VetoCommands(unittest.TestCase):
         self.assertEqual(
             s.match_veto(members=[{"pid": 7, "apps": ["vite"]}])["value"], "vite"
         )
-        rc, out, _err = self.run_cli_offline(["forget", "--veto", "vite"], s)
+        rc, out, _err = self.run_cli_offline(["forget", "--veto", "app:vite"], s)
         self.assertEqual(rc, 0)
         self.assertIn("forgot veto", out)
         self.assertEqual(self.queued(s)[1]["op"], "unveto")

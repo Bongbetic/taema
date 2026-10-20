@@ -766,98 +766,476 @@ def cmd_ls(a):
     return 0
 
 
+def _why_identity(key, cfg, store, live=None):
+    if not key:
+        return None
+    if live is not None:
+        return {
+            "key": key,
+            "display": live.display,
+            "kind": live.kind,
+            "validated": bool(live.validated),
+            "reason": live.reason or "",
+        }
+    persisted = store.app_identity(key) or {}
+    invalid = policy.bad_owner(key, policy.owner_deny(cfg))
+    return {
+        "key": key,
+        "display": persisted.get("display") or key,
+        "kind": persisted.get("kind") or key.split(":", 1)[0],
+        "validated": invalid is None,
+        "reason": invalid or "",
+    }
+
+
+def _why_outcomes(trigger, facts):
+    if not trigger:
+        return {"trigger": "unknown", "modes": []}
+    return {
+        "trigger": trigger,
+        "modes": [
+            {
+                "mode": mode,
+                "verdict": (
+                    decision := authorization.authorize(trigger, mode, facts)
+                ).verdict,
+                "slot": decision.slot,
+                "authority": decision.authority,
+                "reason": decision.reason,
+            }
+            for mode in authorization.MODES
+        ],
+    }
+
+
+def _why_report(
+    cfg,
+    store,
+    *,
+    key=None,
+    live_identity=None,
+    target_scope=None,
+    scope_live=False,
+    provenance=None,
+    members=(),
+    trigger="",
+    facts=None,
+    action="unknown",
+    confidence=None,
+    reason="",
+    authority_source="unknown",
+    learning=None,
+    plan=(),
+    protected_reason="",
+    extra_unknown=(),
+):
+    unknown = list(extra_unknown)
+    identity = _why_identity(key, cfg, store, live_identity)
+    stored_provenance = store.latest_app_instance(key) if key else None
+    if provenance is None:
+        provenance = stored_provenance or {}
+    if identity is None and not any(item.get("fact") == "identity" for item in unknown):
+        unknown.append(
+            {
+                "fact": "identity",
+                "reason": "no single application identity is available",
+            }
+        )
+    if key and not provenance:
+        unknown.append(
+            {"fact": "provenance", "reason": "no process instance has been recorded"}
+        )
+    if target_scope and not scope_live:
+        unknown.append(
+            {"fact": "scope", "reason": "stored scope was not verified as live"}
+        )
+    elif not target_scope:
+        unknown.append({"fact": "scope", "reason": "target has no known managed scope"})
+    if not trigger:
+        unknown.append(
+            {
+                "fact": "mode_outcomes",
+                "reason": "the retained decision does not identify a lifecycle trigger",
+            }
+        )
+    if confidence is None:
+        unknown.append(
+            {
+                "fact": "confidence",
+                "reason": "this decision source does not provide a normalized confidence value",
+            }
+        )
+    hold = store.hold_reason(target_scope if scope_live else None)
+    vetoes = store.matching_vetoes(
+        scope=target_scope if scope_live else None, members=members
+    )
+    return {
+        "identity": identity,
+        "scope": {"name": target_scope or "", "live": bool(scope_live)},
+        "provenance": provenance or {},
+        "current_decision": {
+            "action": action,
+            "confidence": confidence,
+            "reason": reason,
+        },
+        "authority_source": authority_source or "unknown",
+        "vetoes": vetoes,
+        "hold": {"active": bool(hold), "reason": hold},
+        "protected": {"blocked": bool(protected_reason), "reason": protected_reason},
+        "mode_outcomes": _why_outcomes(trigger, facts or authorization.Facts()),
+        "learning": learning or {},
+        "plan": list(plan),
+        "unknown": unknown,
+    }
+
+
+def _why_pair_authority(store, key):
+    owners = store.owners_of(key, limit=1)
+    if not owners:
+        return "ask", "pair authority: no owner decision is recorded"
+    return store.pair_decision(owners[0], key)[0], store.pair_decision(owners[0], key)[
+        2
+    ]
+
+
+def _why_pair_report(owner, leftover, cfg, store):
+    action, confidence, reason = store.pair_decision(owner, leftover)
+    pair_key = store.pkey(owner, leftover)
+    pair = store.data.get("pairs", {}).get(pair_key, {})
+    source = pair.get("ex_source") or pair.get("source")
+    if not source:
+        if action == "standalone":
+            source = "standalone"
+        elif action == "invalid":
+            source = "owner validation"
+        elif pair:
+            source = "learned pair evidence"
+        else:
+            source = "no stored pair authority"
+    facts = authorization.Facts(
+        leftover=True,
+        pair_action=action,
+        pair_reason=reason,
+        suppress_stops=bool(cfg.get("_profile_suppress_stops")),
+    )
+    members = ({"apps": [owner]}, {"apps": [leftover]})
+    explanation = _why_report(
+        cfg,
+        store,
+        key=owner,
+        members=members,
+        trigger=authorization.GC_STOP,
+        facts=facts,
+        action=action,
+        confidence=confidence,
+        reason=reason,
+        authority_source=source,
+        learning={
+            "owner": owner,
+            "leftover": leftover,
+            "pair": pair,
+            "owner_learning": store.explain(owner),
+        },
+    )
+    return explanation
+
+
 def cmd_explain(a):
-    from . import view
-    from . import targets
+    from . import targets, view
 
     cfg, store, units = _load(a)
-    candidates = _target_candidates(a.target, store)
-    matches = targets.matching_targets(a.target, candidates)
-    explicit_kind = a.target.split(":", 1)[0] if ":" in a.target else None
-    if not matches and (
-        explicit_kind in ("scope", "app", "pid", "desktop") or a.target.isdigit()
-    ):
-        return die("no target matches %r" % a.target, 2)
-    if matches:
-        selected = _choose_target(a.target, candidates, pick=getattr(a, "pick", False))
-        if not isinstance(selected, targets.Target):
-            return selected
-    else:
-        selected = None
+    target_query = getattr(a, "target", None)
+    pair = getattr(a, "pair", None)
+    if pair and target_query:
+        return die("choose either a target or --pair", 2)
 
-    if selected is None:
-        explanation = store.explain(a.target)
-        human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
-    elif selected.kind == "pid":
-        pid = selected.pid
-        if pid is None or inspect.starttime(pid) != selected.start:
-            return die("pid target changed; resolve it again", 2)
-        pp = inspect.ppid_map()
-        members = set(inspect.descendants([pid], pp))
-        edges = inspect.edges(members, inspect.Snapshot()).get(pid, [])
-        identity = policy.app_identity(pid, units=policy.load_units(cfg))
-        key = identity.key
-        info = store.explain(key)
-        explanation = {
-            "pid": pid,
-            "comm": inspect.comm(pid),
-            "identity": {
-                "key": key,
-                "display": identity.display,
-                "kind": identity.kind,
-                "validated": identity.validated,
-                "reason": identity.reason,
-            },
-            "cgroup": cgroup.proc_cgroup(pid),
-            "protected": policy.protected_reason(pid, cfg),
-            "outside_users": edges,
-            "learning": info,
-        }
-        human = (
-            "pid %d comm=%s identity=%s display=%s validated=%s\n"
-            "cgroup: %s\nprotected: %s\n"
-            "edges (outside users of this pid and its descendants): %s\n%s\n"
-            % (
-                pid,
-                explanation["comm"],
-                key,
-                identity.display,
-                identity.validated,
-                explanation["cgroup"],
-                explanation["protected"] or "no",
-                json.dumps(edges) if edges else "none",
-                json.dumps(info, indent=1),
-            )
-        )
-    elif selected.kind == "scope":
-        path = _target_scope_path(selected)
-        if path is None:
-            return 2
-        unit = engine.unit_for_leaf(units, os.path.basename(path))
-        decisions = engine.plan_stop(path, cfg, store, unit)
-        explanation = {"plan": decisions}
-        human = (
-            "".join(
-                "%-5s %7d %-18s %s\n"
-                % (d["action"], d["pid"], d["comm"][:18], d["why"][:140])
-                for d in decisions
-            )
-            or "no planned actions\n"
-        )
-    else:
-        key = selected.app_key or selected.value
-        explanation = store.explain(key)
-        if selected.kind == "desktop":
-            explanation = {
-                "desktop_id": selected.value,
-                "app_key": key,
-                "learning": explanation,
+    if pair:
+        owner, leftover = pair
+        explanation = _why_pair_report(owner, leftover, cfg, store)
+        label = "pair:%s -> %s" % (owner, leftover)
+    elif not target_query:
+        latest = store.latest_decision()
+        if latest:
+            current = {
+                "action": latest.get("outcome") or latest.get("kind") or "recorded",
+                "confidence": None,
+                "reason": latest.get("why") or "recorded decision",
             }
-            human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
+            key = latest.get("key") or latest.get("owner")
+            explanation = _why_report(
+                cfg,
+                store,
+                key=key,
+                target_scope=latest.get("scope"),
+                scope_live=False,
+                provenance={},
+                action=current["action"],
+                reason=current["reason"],
+                authority_source=latest.get("authority") or "recorded decision",
+                learning=latest,
+                extra_unknown=(
+                    {
+                        "fact": "trigger",
+                        "reason": "the retained decision has no trigger field",
+                    },
+                ),
+            )
         else:
-            human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
-    model = view.record("explain", {"target": a.target, "explanation": explanation})
-    view.emit(model, a, human)
+            explanation = _why_report(
+                cfg,
+                store,
+                action="unknown",
+                reason="no decision has been recorded",
+                extra_unknown=(
+                    {
+                        "fact": "latest_decision",
+                        "reason": "the decision ledger is empty",
+                    },
+                ),
+            )
+        label = "latest decision"
+    else:
+        candidates = _target_candidates(target_query, store)
+        matches = targets.matching_targets(target_query, candidates)
+        explicit_kind = target_query.split(":", 1)[0] if ":" in target_query else None
+        if not matches and (
+            explicit_kind in ("scope", "app", "pid", "desktop")
+            or target_query.isdigit()
+        ):
+            return die("no target matches %r" % target_query, 2)
+        if matches:
+            selected = _choose_target(
+                target_query, candidates, pick=getattr(a, "pick", False)
+            )
+            if not isinstance(selected, targets.Target):
+                return selected
+        else:
+            selected = None
+
+        if selected is None:
+            info = store.explain(target_query)
+            action, reason = info.get("default_action", "unknown"), info.get("why", "")
+            explanation = _why_report(
+                cfg,
+                store,
+                key=target_query,
+                action=action,
+                confidence=None,
+                reason=reason,
+                authority_source="learned default",
+                learning=info,
+            )
+            label = target_query
+        elif selected.kind == "scope":
+            path = _target_scope_path(selected)
+            if path is None:
+                return 2
+            scope = cgroup.rel(path)
+            unit = engine.unit_for_leaf(units, os.path.basename(path))
+            plan = engine.plan_stop(path, cfg, store, unit)
+            members = []
+            for item in plan:
+                member = {"pid": item["pid"], "apps": [item["key"]]}
+                start = inspect.starttime(item["pid"])
+                if start is not None:
+                    member["start"] = start
+                members.append(member)
+            vetoes = store.matching_vetoes(scope=scope, members=members)
+            hold = store.hold_reason(scope)
+            protected_rows = [item for item in plan if item["action"] == "skip"]
+            protected_reason = "; ".join(
+                "%s: %s" % (item["pid"], item["why"]) for item in protected_rows
+            )
+            leftover = scope.startswith("leftover/")
+            pair_actions = [
+                _why_pair_authority(store, item["key"])
+                for item in plan
+                if leftover and item.get("key")
+            ]
+            pair_action, pair_reason = "", ""
+            if pair_actions:
+                denied = next(
+                    (item for item in pair_actions if item[0] != "stop"), None
+                )
+                pair_action, pair_reason = denied or (
+                    "stop",
+                    "all member pairs authorize stop",
+                )
+            elif leftover:
+                pair_action, pair_reason = (
+                    "ask",
+                    "pair authority: no member pair is available to authorize this scope",
+                )
+            facts = authorization.Facts(
+                scope=scope,
+                leftover=leftover,
+                vetoed=("%s %s" % (vetoes[0]["kind"], vetoes[0]["value"]))
+                if vetoes
+                else "",
+                held=hold,
+                pair_action=pair_action,
+                pair_reason=pair_reason,
+                suppress_stops=bool(cfg.get("_profile_suppress_stops")),
+            )
+            kill_count = sum(item["action"] == "kill" for item in plan)
+            action = "stop" if kill_count else "keep"
+            reason = "%d of %d members eligible to stop" % (kill_count, len(plan))
+            explanation = _why_report(
+                cfg,
+                store,
+                target_scope=scope,
+                scope_live=True,
+                members=members,
+                trigger=authorization.GC_STOP,
+                facts=facts,
+                action=action,
+                reason=reason,
+                authority_source="authorization ladder",
+                plan=plan,
+                protected_reason=protected_reason,
+                extra_unknown=(
+                    {
+                        "fact": "identity",
+                        "reason": "scope contains multiple process identities",
+                    },
+                ),
+            )
+            label = target_query
+        elif selected.kind == "pid":
+            pid = selected.pid
+            if pid is None or inspect.starttime(pid) != selected.start:
+                return die("pid target changed; resolve it again", 2)
+            live_identity = policy.app_identity(pid, units=units)
+            key = live_identity.key
+            scope = ""
+            if selected.scope:
+                scope_path = _target_scope_path(selected)
+                if scope_path is None:
+                    return 2
+                scope = cgroup.rel(scope_path)
+            protected_reason = policy.protected_reason(pid, cfg) or ""
+            info = store.explain(key)
+            member = {"pid": pid, "start": selected.start, "apps": [key]}
+            members = [member]
+            leftover = scope.startswith("leftover/")
+            trigger = authorization.GC_STOP if leftover else authorization.GUI_CLOSE
+            pair_action, pair_reason = (
+                _why_pair_authority(store, key) if leftover else ("", "")
+            )
+            vetoes = store.matching_vetoes(
+                scope=scope if scope else None, members=members
+            )
+            hold = store.hold_reason(scope if scope else None)
+            facts = authorization.Facts(
+                scope=scope,
+                leftover=leftover,
+                vetoed=("%s %s" % (vetoes[0]["kind"], vetoes[0]["value"]))
+                if vetoes
+                else "",
+                held=hold,
+                hard_safety=protected_reason,
+                pair_action=pair_action,
+                pair_reason=pair_reason,
+                suppress_stops=bool(cfg.get("_profile_suppress_stops")),
+            )
+            provenance = {
+                "pid": pid,
+                "start": selected.start,
+                "scope": scope,
+                "comm": inspect.comm(pid),
+                "cgroup": cgroup.proc_cgroup(pid) or "",
+            }
+            explanation = _why_report(
+                cfg,
+                store,
+                key=key,
+                live_identity=live_identity,
+                target_scope=scope,
+                scope_live=bool(scope),
+                provenance=provenance,
+                members=members,
+                trigger=trigger,
+                facts=facts,
+                action=info.get("default_action", "unknown"),
+                reason=info.get("why", ""),
+                authority_source="learned default",
+                learning=info,
+                protected_reason=protected_reason,
+            )
+            label = target_query
+        else:
+            key = selected.app_key or selected.value
+            info = store.explain(key)
+            persisted = store.latest_app_instance(key) or {}
+            scope = selected.scope or persisted.get("scope") or ""
+            live_scope = bool(selected.scope and cgroup.resolve(selected.scope))
+            live_identity = None
+            members = [{"apps": [key]}]
+            protected_reasons = []
+            for process_target in candidates:
+                if process_target.kind != "pid" or process_target.app_key != key:
+                    continue
+                member = {
+                    "pid": process_target.pid,
+                    "apps": [key],
+                    "start": process_target.start,
+                }
+                members.append(member)
+                if process_target.pid is not None:
+                    reason = policy.protected_reason(process_target.pid, cfg)
+                    if reason:
+                        protected_reasons.append(
+                            "%s: %s" % (process_target.pid, reason)
+                        )
+            leftover = scope.startswith("leftover/")
+            trigger = authorization.GC_STOP if leftover else authorization.GUI_CLOSE
+            pair_action, pair_reason = (
+                _why_pair_authority(store, key) if leftover else ("", "")
+            )
+            vetoes = store.matching_vetoes(
+                scope=scope if live_scope else None, members=members
+            )
+            hold = store.hold_reason(scope if live_scope else None)
+            facts = authorization.Facts(
+                scope=scope,
+                leftover=leftover,
+                vetoed=("%s %s" % (vetoes[0]["kind"], vetoes[0]["value"]))
+                if vetoes
+                else "",
+                held=hold,
+                hard_safety=(
+                    protected_reasons[0]
+                    if protected_reasons and len(members) == 2
+                    else ""
+                ),
+                pair_action=pair_action,
+                pair_reason=pair_reason,
+                suppress_stops=bool(cfg.get("_profile_suppress_stops")),
+            )
+            explanation = _why_report(
+                cfg,
+                store,
+                key=key,
+                live_identity=live_identity,
+                target_scope=scope,
+                scope_live=live_scope,
+                members=members,
+                trigger=trigger,
+                facts=facts,
+                action=info.get("default_action", "unknown"),
+                confidence=None,
+                reason=info.get("why", ""),
+                authority_source="learned default",
+                learning=info,
+                provenance=persisted,
+                protected_reason="; ".join(protected_reasons),
+            )
+            if selected.kind == "desktop":
+                explanation["learning"]["desktop_id"] = selected.value
+            label = target_query
+
+    model = view.record("explain", {"target": label, "explanation": explanation})
+    view.emit(model, a, view.render_explanation(label, explanation))
     return 0
 
 

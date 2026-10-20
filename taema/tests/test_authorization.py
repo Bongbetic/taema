@@ -206,6 +206,38 @@ class TruthTable(unittest.TestCase):
         self.assertEqual(dec.verdict, "keep")
         self.assertIn("survive_logout", dec.reason)
 
+    def test_explanation_facts_show_safety_and_pair_authority_in_the_ladder(self):
+        protected = authorization.authorize(
+            authorization.GC_STOP,
+            "auto",
+            authorization.Facts(hard_safety="protected comm systemd"),
+        )
+        self.assertEqual((protected.verdict, protected.slot), ("keep", "hard_safety"))
+        self.assertIn("protected comm", protected.reason)
+
+        unresolved_pair = authorization.authorize(
+            authorization.GC_STOP,
+            "auto",
+            authorization.Facts(
+                leftover=True,
+                pair_action="ask",
+                pair_reason="pair authority: no answer",
+            ),
+        )
+        self.assertEqual(
+            (unresolved_pair.verdict, unresolved_pair.slot), ("keep", "authority")
+        )
+        self.assertEqual(unresolved_pair.reason, "pair authority: no answer")
+
+        answered_pair = authorization.authorize(
+            authorization.GC_STOP,
+            "auto",
+            authorization.Facts(leftover=True, pair_action="stop"),
+        )
+        self.assertEqual(
+            (answered_pair.verdict, answered_pair.authority), ("act", "pair")
+        )
+
     def test_veto_denies_every_stop_trigger_before_mode_authority(self):
         facts = authorization.Facts(scope="leftover/firefox", vetoed="app firefox")
         for mode in authorization.MODES:

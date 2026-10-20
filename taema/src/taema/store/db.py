@@ -1179,6 +1179,31 @@ class StateDB:
         """Persist one identity and pid/start instance."""
         return self.record_app_identities(((identity, instance),), now=now)
 
+    def app_identity(self, key):
+        """Read the bounded presentation and executable evidence for one app key."""
+        if not self.available or not isinstance(key, str) or not key:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT key, kind, display, exe, dev, ino, desktop_id, unit, "
+                "first_seen, last_seen, instances, confidence FROM apps WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_app_instance(self, key):
+        """Read the most recently observed pid/start provenance row for one app key."""
+        if not self.available or not isinstance(key, str) or not key:
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT id, app, pid, start, born, parent_app, scope, terminal, "
+                "class, runtime, launched_by FROM instances WHERE app = ? "
+                "ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def record_app_identities(self, identities, now=None):
         """Persist one observe pass of identities in a single bounded transaction."""
         if self.read_only or not self.available:

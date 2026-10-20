@@ -19,3 +19,10 @@ Configuration now layers system and user TOML drop-ins in lexical order, with pr
 entries remaining union-only. `taema config` edits only its managed `50-cli.toml` drop-in,
 validates changes before reload, and preserves the last good daemon configuration after an
 invalid edit. The daemon also reloads on SIGHUP and config or unit file changes.
+
+### runtime modes and manual profiles
+
+`taema mode` changes lifecycle policy in the managed drop-in and reports changed authorization
+capabilities. `taema profile` applies built-in or user-defined overlays without changing
+learned feedback; status reports the active profile and reason, and mode/profile changes are
+recorded in the audit log.

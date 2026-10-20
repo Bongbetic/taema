@@ -326,6 +326,7 @@ class CliViews(unittest.TestCase):
             "tæma status\n"
             "daemon: unavailable\n"
             "mode: observe\n"
+            "profile: auto (automatic profile selection)\n"
             "scopes: 0\n"
             "reviews: 0\n"
             "feedback_invalid: 0\n",

@@ -10,7 +10,14 @@ from .config import policy
 from .core import cgroup, process
 from .store import db
 
-_CONFIG_KEYS = set(policy._DEFAULTS) | {"_sources", "_source_map", "_unit_errors"}
+_CONFIG_KEYS = set(policy._DEFAULTS) | {
+    "_sources",
+    "_source_map",
+    "_unit_errors",
+    "_profile_name",
+    "_profile_reason",
+    "_profile_suppress_stops",
+}
 _PATH_KEYS = {
     "session_cgroup",
     "state_dir",
@@ -96,7 +103,7 @@ def _unknown_config(cfg):
         for key, child in value.items():
             path = section + "." + key
             if section == "profile":
-                if key == "active":
+                if key in {"active", "runtime_mode"}:
                     continue
                 if key == "auto":
                     if not isinstance(child, dict):

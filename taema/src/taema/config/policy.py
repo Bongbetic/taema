@@ -146,8 +146,26 @@ _DEFAULTS = {
     },
     "profile": {
         "active": "auto",
+        "runtime_mode": "",
         "auto": {"on_battery": "battery", "when_running": {"gamescope": "game"}},
-        "game": {"notify": {"enabled": False}, "freeze": {"after": 0}},
+        "default": {},
+        "focus": {"qos": {"focus_boost": True}},
+        "battery": {
+            "timers": {"adopt_interval": 60, "gc_interval": 300},
+            "freeze": {"after": 30},
+        },
+        "game": {
+            "protected": {"comm": ["gamescope", "steam"]},
+            "notify": {"enabled": False},
+            "freeze": {"after": 30},
+            "timers": {"adopt_interval": 5, "gc_interval": 15},
+        },
+        "quiet": {"notify": {"enabled": False}},
+        "server": {
+            "agent": {"enabled": False},
+            "notify": {"enabled": False},
+            "experimental": {"window_close": False, "launch_wrap": False},
+        },
     },
 }
 
@@ -296,6 +314,30 @@ def _validate_config(cfg, sources):
         raise ValueError(
             "%s:1:1: protected.env_prefix must be a table of arrays" % source
         )
+    profiles = cfg.get("profile")
+    profile_source = sources.get("profile.active", "built-in defaults")
+    if not isinstance(profiles, dict):
+        raise ValueError("%s:1:1: profile must be a table" % profile_source)
+    active = profiles.get("active", "auto")
+    if not isinstance(active, str) or not active:
+        raise ValueError(
+            "%s:1:1: profile.active must be a non-empty string" % profile_source
+        )
+    if active != "auto":
+        overlay = profiles.get(active)
+        if not isinstance(overlay, dict):
+            raise ValueError(
+                "%s:1:1: profile.active names no profile: %s" % (profile_source, active)
+            )
+    runtime_mode = profiles.get("runtime_mode", "")
+    if not isinstance(runtime_mode, str):
+        source = sources.get("profile.runtime_mode", profile_source)
+        raise ValueError("%s:1:1: profile.runtime_mode must be a string" % source)
+    if runtime_mode and runtime_mode not in MODES:
+        source = sources.get("profile.runtime_mode", profile_source)
+        raise ValueError(
+            "%s:1:1: profile.runtime_mode must be one of %s" % (source, MODES)
+        )
 
 
 def _load_files(files, required=()):
@@ -312,6 +354,26 @@ def _load_files(files, required=()):
         source_map.update(_flatten_sources(layer, filename))
         sources.append(filename)
     cfg["_sources"] = sources
+    cfg["_source_map"] = source_map
+    _validate_config(cfg, source_map)
+    active_profile = cfg["profile"].get("active", "auto")
+    if active_profile != "auto":
+        overlay = cfg["profile"][active_profile]
+        cfg = merge(copy.deepcopy(cfg), copy.deepcopy(overlay))
+        source_map.update(_flatten_sources(overlay, "profile %s" % active_profile))
+    runtime_mode = cfg.get("profile", {}).get("runtime_mode", "")
+    if runtime_mode:
+        cfg["mode"] = runtime_mode
+        source_map["mode"] = source_map.get(
+            "profile.runtime_mode", "runtime mode override"
+        )
+    cfg["_profile_name"] = active_profile
+    cfg["_profile_reason"] = (
+        "automatic profile selection"
+        if active_profile == "auto"
+        else "manual profile selection"
+    )
+    cfg["_profile_suppress_stops"] = active_profile == "quiet"
     cfg["_source_map"] = source_map
     _validate_config(cfg, source_map)
     p = cfg["paths"]

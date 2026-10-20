@@ -1144,6 +1144,8 @@ def cmd_status(a):
         status = {
             "daemon": "unavailable",
             "mode": cfg["mode"],
+            "profile": cfg.get("_profile_name", "auto"),
+            "profile_reason": cfg.get("_profile_reason", "automatic profile selection"),
             "feedback_invalid": invalid
             + (store.pending_feedback_invalid() if store else 0),
             "hold": hold or "",
@@ -1170,6 +1172,11 @@ def cmd_status(a):
         status = {
             "daemon": "running",
             "mode": reply.get("mode", cfg["mode"]),
+            "profile": reply.get("profile", cfg.get("_profile_name", "auto")),
+            "profile_reason": reply.get(
+                "profile_reason",
+                cfg.get("_profile_reason", "automatic profile selection"),
+            ),
             "feedback_invalid": int(reply["feedback_invalid"]),
             "hold": reply["hold"] or "",
             "hold_state": reply["hold_state"],
@@ -1256,8 +1263,8 @@ def _config_error(error):
     return 1
 
 
-def _reload_after_config(cfg):
-    reply = ask(cfg, {"cmd": "reload"})
+def _reload_after_config(cfg, reason="configuration change"):
+    reply = ask(cfg, {"cmd": "reload", "reason": reason})
     if reply is None:
         print(
             "saved; daemon is unavailable and will load this configuration at startup"
@@ -1308,7 +1315,7 @@ def cmd_config_set(a):
         cfg = policy.load_config()
     except Exception as error:
         return _config_error(error)
-    return _reload_after_config(cfg)
+    return _reload_after_config(cfg, "taema config set")
 
 
 def cmd_config_unset(a):
@@ -1319,7 +1326,7 @@ def cmd_config_unset(a):
         cfg = policy.load_config()
     except Exception as error:
         return _config_error(error)
-    return _reload_after_config(cfg)
+    return _reload_after_config(cfg, "taema config unset")
 
 
 def cmd_config_edit(a):
@@ -1330,7 +1337,7 @@ def cmd_config_edit(a):
         cfg = policy.load_config()
     except Exception as error:
         return _config_error(error)
-    return _reload_after_config(cfg)
+    return _reload_after_config(cfg, "taema config edit")
 
 
 def cmd_config_diff(a):
@@ -1349,7 +1356,7 @@ def cmd_reload(a):
         cfg = policy.load_config(path=getattr(a, "config", None))
     except Exception as error:
         return _config_error(error)
-    reply = ask(cfg, {"cmd": "reload"})
+    reply = ask(cfg, {"cmd": "reload", "reason": "taema reload command"})
     if reply is None:
         print("taema: daemon is unavailable", file=sys.stderr)
         return 3
@@ -1361,6 +1368,109 @@ def cmd_reload(a):
         )
         return _config_error(daemon_error)
     print("configuration and units reloaded")
+    return 0
+
+
+def _capability_changes(old_mode, new_mode):
+    from .. import authorization
+
+    changes = []
+    for trigger in authorization.TRIGGER_ACTIONS:
+        before = authorization.authorize(trigger, old_mode)
+        after = authorization.authorize(trigger, new_mode)
+        before_value = before.verdict
+        after_value = after.verdict
+        if before.authority:
+            before_value += "/" + before.authority
+        if after.authority:
+            after_value += "/" + after.authority
+        if before_value != after_value:
+            changes.append("  %s: %s -> %s" % (trigger, before_value, after_value))
+    return changes
+
+
+def cmd_mode(a):
+    from ..config import management
+
+    try:
+        if os.environ.get("TAEMA_CONFIG"):
+            raise ValueError(
+                "TAEMA_CONFIG overrides mode changes in the managed drop-in"
+            )
+        old_cfg = policy.load_config()
+        if a.mode not in policy.MODES:
+            raise ValueError("mode must be one of %s" % (policy.MODES,))
+        management.set_value("profile.runtime_mode", management.format_value(a.mode))
+        cfg = policy.load_config()
+    except Exception as error:
+        return _config_error(error)
+    result = _reload_after_config(cfg, "taema mode command")
+    if result:
+        return result
+    print("mode: %s -> %s" % (old_cfg["mode"], cfg["mode"]))
+    changes = _capability_changes(old_cfg["mode"], cfg["mode"])
+    print("capability matrix changes:")
+    print("\n".join(changes) if changes else "  no lifecycle capability changes")
+    if cfg.get("_profile_suppress_stops"):
+        print("active quiet profile continues to suppress automatic stops")
+    return 0
+
+
+def cmd_profile(a):
+    from ..config import management
+
+    try:
+        if os.environ.get("TAEMA_CONFIG"):
+            raise ValueError(
+                "TAEMA_CONFIG overrides profile changes in the managed drop-in"
+            )
+        old_cfg = policy.load_config()
+        profile_name = a.name
+        profile_table = old_cfg.get("profile", {})
+        if profile_name != "auto" and not isinstance(
+            profile_table.get(profile_name), dict
+        ):
+            raise ValueError(
+                "unknown profile %r; available profiles: %s"
+                % (
+                    profile_name,
+                    ", ".join(
+                        sorted(
+                            key
+                            for key, value in profile_table.items()
+                            if key != "auto" and isinstance(value, dict)
+                        )
+                    ),
+                )
+            )
+        management.set_value("profile.active", management.format_value(profile_name))
+        cfg = policy.load_config()
+    except Exception as error:
+        return _config_error(error)
+    reason = (
+        "automatic profile selection requested"
+        if profile_name == "auto"
+        else "selected manually with taema profile"
+    )
+    result = _reload_after_config(cfg, reason)
+    if result:
+        return result
+    print(
+        "profile: %s -> %s (%s)"
+        % (old_cfg.get("_profile_name", "auto"), profile_name, reason)
+    )
+    if profile_name == "quiet":
+        print("quiet suppresses automatic stops and notifications")
+    elif profile_name == "server":
+        print(
+            "server disables desktop agent, window-close, launch-wrap, and notifications"
+        )
+    elif profile_name == "battery":
+        print("battery reduces wakeups and shortens the configured freeze delay")
+    elif profile_name == "game":
+        print(
+            "game protects gamescope and Steam processes, with notifications disabled"
+        )
     return 0
 
 

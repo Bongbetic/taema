@@ -188,7 +188,7 @@
     },
     "reload": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
-      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "reload"}, "args": {"$ref": "#/$defs/empty"}},
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "reload"}, "args": {"type": "object", "properties": {"reason": {"type": "string", "maxLength": 256}}, "additionalProperties": false}},
       "additionalProperties": false
     },
     "review": {

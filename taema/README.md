@@ -428,6 +428,22 @@ compares the effective config with system defaults. Successful edits ask the dae
 reload automatically. An invalid change leaves the last good config active; `taema status` and
 `taema doctor` show the file and TOML line/column to fix.
 
+Switch lifecycle policy with `taema mode observe|adopt|enforce|auto`. It writes the managed
+drop-in, reloads the daemon, and lists the authorization capabilities that changed. Select
+`taema profile default|focus|battery|game|quiet|server` to apply a named overlay; a profile
+selection persists until `taema profile auto`. User overlays use `[profile.NAME]` tables and
+the same dotted configuration keys as the base files. `status` shows the active profile and
+the reason for its selection. The mode command stores `profile.runtime_mode`, which overrides
+the base mode and any profile mode; `taema config unset profile.runtime_mode` returns to the
+configured mode. `TAEMA_CONFIG` continues to take precedence over managed changes.
+
+The built-in `focus` profile enables the focus QoS flag. `battery` lengthens adopt and GC
+intervals and shortens the configured freeze delay. `game` protects `gamescope` and Steam,
+disables notifications, and shortens adopt/GC intervals. `quiet` suppresses automatic stops
+and notifications. `server` disables the agent, notifications, window-close handling, and
+desktop launch wrapping. Configuration keys for features that are not available yet remain
+valid so profile files can describe the intended policy ahead of those features.
+
 ## Safety rules
 
 These rules are fixed. Learning and unit files cannot change them:

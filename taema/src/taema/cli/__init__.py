@@ -49,6 +49,8 @@ __all__ = (
     "cmd_config_edit",
     "cmd_config_diff",
     "cmd_reload",
+    "cmd_mode",
+    "cmd_profile",
     "cmd_review",
     "cmd_learn_export",
     "cmd_gc",

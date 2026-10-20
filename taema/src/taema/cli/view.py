@@ -146,6 +146,11 @@ def render_status(model, args, summary=False):
         _styled("tæma status", "1", color),
         "daemon: %s" % daemon,
         "mode: %s" % status.get("mode", "unknown"),
+        "profile: %s (%s)"
+        % (
+            status.get("profile", "auto"),
+            status.get("profile_reason", "unknown"),
+        ),
         "scopes: %d" % model.get("scope_count", len(model["scopes"])),
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),

@@ -7,7 +7,7 @@ MAX_REQUEST_ID = (1 << 53) - 1
 _COMMANDS = {
     "status": ({}, ()),
     "doctor": ({}, ()),
-    "reload": ({}, ()),
+    "reload": ({"reason": "string"}, ()),
     "review": ({}, ()),
     "register": ({"scope": "string", "owner": "integer"}, ("scope", "owner")),
     "attach": ({"scope": "string", "pids": "array"}, ("scope", "pids")),
@@ -270,6 +270,8 @@ def _validate_args(command, args):
     for key, value in args.items():
         if not _is_type(value, fields[key]):
             _fail("argument %s has the wrong type" % key)
+    if command == "reload" and len(args.get("reason", "")) > 256:
+        _fail("reload reason must be at most 256 characters")
     if command in ("register", "attach", "job_done", "kill_done", "ask"):
         pid = args.get("owner") if command == "register" else args.get("shell_pid")
         if pid is not None and pid <= 1:

@@ -120,7 +120,7 @@ class ConfigLayering(unittest.TestCase):
         self.assertEqual(cfg["learn"]["remember_argv"], False)
         self.assertEqual(cfg["mem"]["manage"], "soft")
         self.assertEqual(cfg["agent"]["window_backend"], "auto")
-        self.assertEqual(cfg["profile"]["game"]["freeze"]["after"], 0)
+        self.assertEqual(cfg["profile"]["game"]["freeze"]["after"], 30)
         self.assertEqual(doctor._unknown_config(cfg), [])
         values = {
             "enabled": True,
@@ -361,7 +361,10 @@ class ManagedConfigCli(unittest.TestCase):
             mock.patch.object(commands, "ask", return_value={"reloaded": True}) as ask,
         ):
             self.assertEqual(commands.main(["reload"]), 0)
-        self.assertEqual(ask.call_args.args[1], {"cmd": "reload"})
+        self.assertEqual(
+            ask.call_args.args[1],
+            {"cmd": "reload", "reason": "taema reload command"},
+        )
         self.assertIn("reloaded", output.getvalue())
 
     def test_invalid_cli_value_restores_previous_dropin(self):

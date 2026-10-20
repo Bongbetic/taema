@@ -171,6 +171,30 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_reload",
     },
     {
+        "name": "mode",
+        "aliases": (),
+        "help": "switch lifecycle mode without restarting the daemon",
+        "handler": "cmd_mode",
+        "arguments": (
+            (
+                ("mode",),
+                {"choices": ("observe", "adopt", "enforce", "auto")},
+            ),
+        ),
+    },
+    {
+        "name": "profile",
+        "aliases": (),
+        "help": "select a configuration profile or return to automatic selection",
+        "handler": "cmd_profile",
+        "arguments": (
+            (
+                ("name",),
+                {},
+            ),
+        ),
+    },
+    {
         "name": "hold",
         "aliases": (),
         "help": "pause taema actions without changing mode",

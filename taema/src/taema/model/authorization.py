@@ -154,6 +154,7 @@ class Facts:
     unit_survive_logout: bool = False
     vetoed: str = ""
     held: str = ""
+    suppress_stops: bool = False
 
 
 @dataclass(frozen=True)
@@ -418,6 +419,14 @@ def authorize(trigger: str, mode: str, facts: Facts | None = None) -> Decision:
         vote, why = fn(trigger, mode, f)
         if vote == "deny":
             return Decision(KEEP, name, why)
+    if (
+        f.suppress_stops
+        and trigger != MANUAL_STOP
+        and TRIGGER_ACTIONS.get(trigger) == "stop"
+    ):
+        return Decision(
+            KEEP, MODE_CAPABILITY, "quiet profile suppresses automatic stops"
+        )
     verdict, authority, why = _capability(trigger, mode, f)
     if verdict == KEEP:
         return Decision(KEEP, MODE_CAPABILITY, why)

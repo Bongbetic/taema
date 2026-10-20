@@ -66,6 +66,7 @@ class Daemon:
         self.store.save_if_dirty()
         self.units = policy.load_units(cfg)
         self.config_error = None
+        self.profile_reason = cfg.get("_profile_reason", "automatic profile selection")
         self.reload_requested = False
         self._config_watch_paths = policy.config_watch_paths(cfg)
         self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
@@ -203,6 +204,17 @@ class Daemon:
         """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
         f = facts or authorization.Facts()
+        suppress_stops = bool(self.cfg.get("_profile_suppress_stops"))
+        if f.suppress_stops != suppress_stops:
+            f = authorization.Facts(
+                scope=f.scope,
+                leftover=f.leftover,
+                shared=f.shared,
+                unit_survive_logout=f.unit_survive_logout,
+                vetoed=f.vetoed,
+                held=f.held,
+                suppress_stops=suppress_stops,
+            )
         if f.scope:
             path = (
                 f.scope
@@ -219,6 +231,7 @@ class Daemon:
                     unit_survive_logout=f.unit_survive_logout,
                     vetoed=f.vetoed or (self.store.describe_veto(veto) if veto else ""),
                     held=f.held or held,
+                    suppress_stops=f.suppress_stops,
                 )
         dec = authorization.authorize(trigger, self.mode, f)
         if dec.slot == authorization.VETO:
@@ -1725,13 +1738,18 @@ class Daemon:
                 )
             return diagnose(self.cfg, self.store, self.units)
         if c == "reload":
-            result = self.reload_config()
+            reason = msg.get("reason", "reload command")
+            if not isinstance(reason, str) or len(reason) > 256:
+                return {"error": "bad request"}
+            result = self.reload_config(reason)
             return result
         if c == "status":
             self.store.expire_reviews()
             self._save_if_idle()
             return {
                 "mode": self.mode,
+                "profile": self.cfg.get("_profile_name", "auto"),
+                "profile_reason": self.profile_reason,
                 "uptime_s": int(time.time() - self.started),
                 "owners": [
                     {"scope": l, "owner": p} for l, p, _s in self.owners.values()
@@ -2032,7 +2050,7 @@ class Daemon:
         else:
             self.stopping = True
 
-    def reload_config(self):
+    def reload_config(self, reason="configuration reload"):
         """Install a validated config and units snapshot, retaining the current one on error."""
         old_cfg, old_units, old_store = self.cfg, self.units, self.store
         try:
@@ -2083,6 +2101,8 @@ class Daemon:
                 "config_error": self.config_error,
             }
 
+        previous_mode = old_cfg.get("mode", "observe")
+        previous_profile = old_cfg.get("_profile_name", "auto")
         self.cfg = cfg
         self.units = units
         self.deny = policy.owner_deny(cfg)
@@ -2094,6 +2114,26 @@ class Daemon:
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
         self.config_error = None
+        active_profile = cfg.get("_profile_name", "auto")
+        if active_profile != previous_profile:
+            self.profile_reason = reason or cfg.get(
+                "_profile_reason", "profile changed"
+            )
+            self.store.log(
+                event="profile_changed",
+                old=previous_profile,
+                new=active_profile,
+                reason=self.profile_reason,
+                profile=active_profile,
+            )
+        if cfg.get("mode", "observe") != previous_mode:
+            self.store.log(
+                event="mode_changed",
+                old=previous_mode,
+                new=cfg.get("mode", "observe"),
+                reason=reason or "configuration reload",
+                profile=active_profile,
+            )
         self._config_watch_paths = policy.config_watch_paths(cfg)
         self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
         self.store.log(
@@ -2111,7 +2151,9 @@ class Daemon:
         requested = self.reload_requested
         self.reload_requested = False
         if requested or fingerprint != self._config_fingerprint:
-            return self.reload_config()
+            return self.reload_config(
+                "SIGHUP" if requested else "configuration file change"
+            )
         return None
 
     def toggle_hold(self):

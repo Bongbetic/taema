@@ -160,6 +160,22 @@ class IpcV2Tests(unittest.TestCase):
         self.assertTrue(reply["ok"])
         self.assertNotIn("v", reply)
 
+    def test_reload_reason_is_bounded_and_reaches_daemon(self):
+        envelope = self.request(9, "reload", {"reason": "manual profile selection"})
+        self.assertTrue(matches(envelope, self.request_schema, self.request_schema))
+        with mock.patch.object(
+            self.daemon,
+            "reload_config",
+            return_value={"reloaded": True, "sources": []},
+        ) as reload_config:
+            reply, _ = self.converse(json.dumps(envelope).encode() + b"\n")
+        self.assertTrue(reply["ok"])
+        reload_config.assert_called_once_with("manual profile selection")
+
+        invalid = self.request(10, "reload", {"reason": "x" * 257})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode_v2(invalid)
+
     def test_every_current_command_reply_matches_its_schema(self):
         pid = os.getpid()
         requests = [

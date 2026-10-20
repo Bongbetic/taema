@@ -10,15 +10,7 @@ from .config import policy
 from .core import cgroup, process
 from .store import db
 
-_CONFIG_KEYS = {
-    "mode",
-    "paths",
-    "timers",
-    "protected",
-    "seeds",
-    "learner",
-    "_sources",
-}
+_CONFIG_KEYS = set(policy._DEFAULTS) | {"_sources", "_source_map", "_unit_errors"}
 _PATH_KEYS = {
     "session_cgroup",
     "state_dir",
@@ -84,29 +76,85 @@ def _tokens(path):
 
 def _unknown_config(cfg):
     unknown = sorted(set(cfg) - _CONFIG_KEYS)
-    sections = (
+
+    def check_table(section, value, schema):
+        if not isinstance(value, dict):
+            unknown.append(section + " (expected a table)")
+            return
+        base_section = section.rsplit(".", 1)[-1]
+        allowed = dict(schema)
+        if base_section == "paths":
+            allowed.update(dict.fromkeys(_PATH_KEYS))
+        elif base_section == "timers":
+            allowed.update(dict.fromkeys(_TIMER_KEYS))
+        elif base_section == "protected":
+            allowed.update(dict.fromkeys(_PROTECTED_KEYS))
+        elif base_section == "seeds":
+            allowed.update(dict.fromkeys(_SEED_KEYS))
+        elif base_section == "learner":
+            allowed["deny_owners"] = []
+        for key, child in value.items():
+            path = section + "." + key
+            if section == "profile":
+                if key == "active":
+                    continue
+                if key == "auto":
+                    if not isinstance(child, dict):
+                        unknown.append(path + " (expected a table)")
+                    else:
+                        unknown.extend(
+                            path + "." + item
+                            for item in child
+                            if item not in {"on_battery", "when_running"}
+                        )
+                        if "when_running" in child and not isinstance(
+                            child["when_running"], dict
+                        ):
+                            unknown.append(path + ".when_running (expected a table)")
+                    continue
+                if not isinstance(child, dict):
+                    unknown.append(path + " (expected a table)")
+                    continue
+                for setting, override in child.items():
+                    setting_schema = policy._DEFAULTS.get(setting)
+                    setting_path = path + "." + setting
+                    if setting == "mode":
+                        continue
+                    if not isinstance(setting_schema, dict):
+                        unknown.append(setting_path)
+                    else:
+                        check_table(setting_path, override, setting_schema)
+                continue
+            if section == "protected" and key == "env_prefix":
+                if not isinstance(child, dict):
+                    unknown.append(path + " (expected a table)")
+                continue
+            if key not in allowed:
+                unknown.append(path)
+            elif isinstance(allowed[key], dict):
+                check_table(path, child, allowed[key])
+
+    for section, schema in policy._DEFAULTS.items():
+        value = cfg.get(section, schema)
+        if isinstance(schema, dict):
+            check_table(section, value, schema)
+    # Legacy keys remain accepted while the old learner section is phased out.
+    for section, allowed in (
         ("paths", _PATH_KEYS),
         ("timers", _TIMER_KEYS),
         ("protected", _PROTECTED_KEYS),
         ("seeds", _SEED_KEYS),
         ("learner", {"deny_owners"}),
-    )
-    for section, allowed in sections:
+    ):
         value = cfg.get(section, {})
-        if not isinstance(value, dict):
-            unknown.append(section + " (expected a table)")
-        else:
+        if isinstance(value, dict):
             unknown.extend(
                 section + "." + key
                 for key in value
                 if key not in allowed
+                and key not in policy._DEFAULTS.get(section, {})
                 and not (section == "protected" and key == "env_prefix")
             )
-            if section == "protected" and isinstance(value.get("env_prefix"), dict):
-                # Environment variable names are intentionally user-defined.
-                pass
-            elif section == "protected" and "env_prefix" in value:
-                unknown.append("protected.env_prefix (expected a table)")
     return sorted(set(unknown))
 
 
@@ -642,6 +690,15 @@ def diagnose(
                 "warn",
                 "unit files were not checked because configuration is unavailable",
                 "Fix configuration first, then run taema doctor again.",
+            )
+        )
+    elif cfg.get("_unit_errors"):
+        checks.append(
+            _check(
+                "unit files",
+                "warn",
+                "invalid unit files were skipped: %s" % "; ".join(cfg["_unit_errors"]),
+                "Fix the malformed unit files, then run taema doctor again.",
             )
         )
     else:

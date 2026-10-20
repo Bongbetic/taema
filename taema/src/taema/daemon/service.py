@@ -65,6 +65,10 @@ class Daemon:
         self.store.expire_reviews()
         self.store.save_if_dirty()
         self.units = policy.load_units(cfg)
+        self.config_error = None
+        self.reload_requested = False
+        self._config_watch_paths = policy.config_watch_paths(cfg)
+        self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
         self.sel = selectors.DefaultSelector()
         self.owners = {}  # pidfd -> (scope leaf name, owner pid, owner starttime)
         self.idle_since = {}
@@ -1712,7 +1716,17 @@ class Daemon:
         if c == "doctor":
             from ..doctor import diagnose
 
+            if self.config_error:
+                return diagnose(
+                    self.cfg,
+                    self.store,
+                    self.units,
+                    config_error=self.config_error,
+                )
             return diagnose(self.cfg, self.store, self.units)
+        if c == "reload":
+            result = self.reload_config()
+            return result
         if c == "status":
             self.store.expire_reviews()
             self._save_if_idle()
@@ -1741,6 +1755,9 @@ class Daemon:
                 "feedback_invalid": self.store.data.get("feedback_invalid", 0),
                 "hold": self.store.hold_reason(),
                 "hold_state": self.store.hold_status(),
+                "config_error": self.config_error,
+                "config": list(self.cfg.get("_sources", [])),
+                "unit_errors": list(self.cfg.get("_unit_errors", [])),
                 "auto": self.auto_status(),
             }
         if c == "review":
@@ -2010,8 +2027,92 @@ class Daemon:
     def _on_signal(self, signum, _frame):
         if signum == getattr(signal, "SIGUSR1", None):
             self.toggle_hold_requested = True
+        elif signum == getattr(signal, "SIGHUP", None):
+            self.reload_requested = True
         else:
             self.stopping = True
+
+    def reload_config(self):
+        """Install a validated config and units snapshot, retaining the current one on error."""
+        old_cfg, old_units, old_store = self.cfg, self.units, self.store
+        try:
+            cfg = policy.load_config()
+            units = policy.load_units(cfg)
+            old_state_dir = old_cfg.get("paths", {}).get("state_dir")
+            new_state_dir = cfg.get("paths", {}).get("state_dir")
+            if policy.expand(old_state_dir) != policy.expand(new_state_dir):
+                old_holds = old_store.hold_status(
+                    include_pending=True, include_runtime=False
+                )
+                old_store.apply_feedback()
+                new_store = knowledge.Store(
+                    policy.state_dir(cfg),
+                    cfg.get("seeds"),
+                    deny=policy.owner_deny(cfg),
+                    mode=cfg.get("mode", "observe"),
+                )
+                new_store.apply_feedback()
+                new_store.expire_reviews()
+                new_holds = new_store.hold_status(
+                    include_pending=False, include_runtime=False
+                )
+                new_store.data["held"] = old_holds["global"] or new_holds["global"]
+                new_store.data["held_scopes"] = sorted(
+                    set(old_holds["scopes"]) | set(new_holds["scopes"])
+                )
+                snoozes = [
+                    until
+                    for until in (old_holds["snooze_until"], new_holds["snooze_until"])
+                    if until is not None
+                ]
+                new_store.data["snooze_until"] = max(snoozes, default=0)
+                new_store.dirty = True
+                new_store.save_if_dirty()
+                old_store.save()
+                self.store = new_store
+                self.restore_runtime_hold()
+        except Exception as error:
+            self.cfg, self.units, self.store = old_cfg, old_units, old_store
+            self.config_error = str(error)
+            self._config_watch_paths = policy.config_watch_paths(self.cfg)
+            self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
+            self.store.log(event="config_invalid", error=self.config_error)
+            self._save_if_idle()
+            return {
+                "error": "configuration reload failed",
+                "config_error": self.config_error,
+            }
+
+        self.cfg = cfg
+        self.units = units
+        self.deny = policy.owner_deny(cfg)
+        self.store.seeds = cfg.get("seeds") or {}
+        self.store.deny = tuple(self.deny)
+        self.store.db.deny = tuple(self.deny)
+        self.store.mode = cfg.get("mode", "observe")
+        self.lineage.cfg = cfg
+        self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
+        self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.config_error = None
+        self._config_watch_paths = policy.config_watch_paths(cfg)
+        self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
+        self.store.log(
+            event="config_reloaded",
+            mode=self.mode,
+            sources=list(cfg.get("_sources", [])),
+        )
+        self._save_if_idle()
+        return {"reloaded": True, "sources": list(cfg.get("_sources", []))}
+
+    def poll_config_reload(self):
+        """Reload on SIGHUP or a changed config, drop-in, unit, or watched directory mtime."""
+        paths = policy.config_watch_paths(self.cfg)
+        fingerprint = policy.file_fingerprint(paths)
+        requested = self.reload_requested
+        self.reload_requested = False
+        if requested or fingerprint != self._config_fingerprint:
+            return self.reload_config()
+        return None
 
     def toggle_hold(self):
         """Apply a queued SIGUSR1 toggle between daemon actions."""
@@ -2050,6 +2151,7 @@ class Daemon:
         self.store.defer_writes = True
         skip_pass = False
         try:
+            self.guarded(self.poll_config_reload)
             if not self.store.db.write_available():
                 skip_pass = True
                 self.guarded(self.thaw_held_scopes)
@@ -2079,6 +2181,7 @@ class Daemon:
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGHUP, self._on_signal)
         signal.signal(signal.SIGUSR1, self._on_signal)
         wake_r, wake_w = socket.socketpair()  # a signal wakes select() at once
         wake_r.setblocking(False)

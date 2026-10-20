@@ -123,6 +123,54 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "read": True,
     },
     {
+        "name": "config",
+        "aliases": (),
+        "help": "show or edit layered configuration",
+        "handler": None,
+        "children": (
+            {
+                "name": "show",
+                "help": "show effective configuration",
+                "handler": "cmd_config_show",
+                "arguments": ((("--sources",), {"action": "store_true"}),),
+            },
+            {
+                "name": "get",
+                "help": "print one effective value",
+                "handler": "cmd_config_get",
+                "arguments": ((("key",), {}),),
+            },
+            {
+                "name": "set",
+                "help": "set a value in the managed drop-in",
+                "handler": "cmd_config_set",
+                "arguments": ((("key",), {}), (("value",), {})),
+            },
+            {
+                "name": "unset",
+                "help": "remove a value from the managed drop-in",
+                "handler": "cmd_config_unset",
+                "arguments": ((("key",), {}),),
+            },
+            {
+                "name": "edit",
+                "help": "edit and validate the managed drop-in",
+                "handler": "cmd_config_edit",
+            },
+            {
+                "name": "diff",
+                "help": "compare effective config with system defaults",
+                "handler": "cmd_config_diff",
+            },
+        ),
+    },
+    {
+        "name": "reload",
+        "aliases": (),
+        "help": "reload configuration and units in the daemon",
+        "handler": "cmd_reload",
+    },
+    {
         "name": "hold",
         "aliases": (),
         "help": "pause taema actions without changing mode",

@@ -164,6 +164,7 @@ class IpcV2Tests(unittest.TestCase):
         pid = os.getpid()
         requests = [
             ("status", {}),
+            ("reload", {}),
             ("review", {}),
             ("register", {"scope": "scope-ipc", "owner": pid}),
             ("attach", {"scope": "scope-ipc", "pids": [pid]}),
@@ -206,6 +207,12 @@ class IpcV2Tests(unittest.TestCase):
                 if command == "register":
                     operation = mock.patch.object(
                         self.daemon, "watch_owner", return_value=True
+                    )
+                elif command == "reload":
+                    operation = mock.patch.object(
+                        self.daemon,
+                        "reload_config",
+                        return_value={"reloaded": True, "sources": []},
                     )
                 elif command == "attach":
                     operation = mock.patch.object(daemon.engine, "helper_attach")

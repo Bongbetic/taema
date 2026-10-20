@@ -254,12 +254,11 @@ resolve to keep and do not enable expiry.
 leftover_expire_days = 30 # optional; default 0 disables expiry
 ```
 
-```toml
-# ~/.config/taema/taema.toml
-mode = "adopt"
+```sh
+taema config set mode '"adopt"'
 ```
 
-Then run `sudo sv restart taema`. To switch the shell question off, put
+Configuration changes reload the daemon automatically. To switch the shell question off, put
 `TAEMA_NO_PROMPT=1` in your shell environment. `taema forget NAME` makes tæma unlearn one
 program.
 
@@ -393,9 +392,12 @@ before `scope-NAME` is signalled, for example to let an emulator save its state.
 
 ## Configuration
 
-`/etc/taema/taema.toml` holds system defaults and the hard rules. `~/.config/taema/taema.toml`
-holds your overrides. Your file may change the mode, timers and seeds, and may add
-protected entries. It can never remove a protected entry from the system file.
+Configuration layers apply in this order: built-in defaults, `/etc/taema/taema.toml`,
+`/etc/taema/taema.d/*.toml`, `~/.config/taema/taema.toml`, then
+`~/.config/taema/taema.d/*.toml`, with drop-ins sorted by filename. Later values override
+earlier ones. `[protected]` entries always union, so a user file cannot remove a protected
+entry from the system configuration. `TAEMA_CONFIG=/path/to/file.toml` replaces the file
+layers and is useful for isolated runs.
 
 ```toml
 [timers]
@@ -414,6 +416,17 @@ XDG_RUNTIME_DIR = ["/run/mytool"]      # e.g. a tool with its own rootless podma
 
 The root helper reads only the system file, and refuses it unless it is root owned and
 not group or world writable.
+
+Use `taema config show --sources` to inspect effective values and their source files.
+`taema config get KEY`, `set KEY VALUE`, and `unset KEY` read or edit only the CLI-managed
+`~/.config/taema/taema.d/50-cli.toml`; hand-written configuration files are left alone. Values
+for `set` use TOML syntax, for example `taema config set timers.idle_grace 300` or
+`taema config set mode '"adopt"'`. `taema config edit` opens the managed drop-in in `$EDITOR`,
+validates it on save, and restores the previous file if validation fails. `taema config diff`
+compares the effective config with system defaults. Successful edits ask the daemon to reload;
+`taema reload` requests the same reload directly, and SIGHUP or config/unit file changes also
+reload automatically. An invalid change leaves the last good config active; `taema status` and
+`taema doctor` show the file and TOML line/column to fix.
 
 ## Safety rules
 

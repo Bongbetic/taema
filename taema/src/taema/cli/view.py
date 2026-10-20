@@ -162,6 +162,8 @@ def render_status(model, args, summary=False):
         lines.append("hold: %s" % ", ".join(hold_parts))
     elif status.get("hold"):
         lines.append("hold: %s" % status["hold"])
+    if status.get("config_error"):
+        lines.append("config error: %s" % status["config_error"])
     latest = details.get("latest_decision")
     if latest:
         lines.append(

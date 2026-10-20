@@ -1,11 +1,9 @@
 """Configuration and hard rules. Nothing in here is learnable.
 
-Configuration is layered:
-  /etc/taema/taema.toml              system defaults and hard rules (root owned)
-  $XDG_CONFIG_HOME/taema/taema.toml  per-user overrides
-A user file may change the mode, timers and seeds, and may add protected entries; it can
-never remove a protected entry set by the system file. TAEMA_CONFIG names a single file
-that replaces both layers (used by tests and isolated runs).
+Configuration is layered from built-in defaults, system files and per-user files. Drop-ins
+are read in lexical order. A user file may change settings and add protected entries; it can
+never remove protected entries from an earlier layer. TAEMA_CONFIG names a single file that
+replaces all file layers (used by tests and isolated runs).
 """
 
 import copy
@@ -13,6 +11,7 @@ import fnmatch
 import os
 import re
 import tomllib
+import glob
 
 SYSTEM_CONFIG = os.environ.get("TAEMA_SYSTEM_CONFIG", "/etc/taema/taema.toml")
 SYSTEM_UNITS = "/etc/taema/units"
@@ -20,6 +19,137 @@ USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
 MODES = ("observe", "adopt", "enforce", "auto")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
+
+_DEFAULTS = {
+    "mode": "observe",
+    "paths": {},
+    "timers": {"leftover_expire_days": 0},
+    "protected": {"comm": [], "cgroup_prefix": [], "env_prefix": {}},
+    "seeds": {},
+    "learner": {"deny_owners": []},
+    "learn": {
+        "enabled": True,
+        "authority": "learned",
+        "silent_kills": 5,
+        "silent_days": 3,
+        "silent_ratio": 0.9,
+        "burn_in_days": 7,
+        "burn_in_closes": 20,
+        "probation_stops": 3,
+        "allow_self_authority": False,
+        "respawn_window": 60,
+        "revive_window": 1800,
+        "regret_window": 1800,
+        "regret_suspend_days": 7,
+        "ask_per_day": 3,
+        "ask_pair_gap_days": 7,
+        "ask_gui": True,
+        "review_ttl_days": 14,
+        "identity_denylist": [
+            "MainThread",
+            "Thread-*",
+            "pool-*",
+            "GC",
+            "Finalizer",
+            "sleep",
+            "cat",
+            "head",
+            "sort",
+            "grep",
+            "true",
+        ],
+        "remember_argv": False,
+    },
+    "mem": {
+        "enabled": True,
+        "manage": "soft",
+        "budget": "auto",
+        "fraction": 0.80,
+        "floor": "512M",
+        "min_headroom": "128M",
+        "headroom_percent": 10,
+        "reclaim": True,
+        "reclaim_interval": 60,
+        "reclaim_cooldown": 300,
+        "reclaim_max": "2G",
+        "idle_reclaim_grace": 300,
+        "pressure_gate": 10,
+        "pressure_ceiling": 60,
+        "swap_reclaim": True,
+        "zswap": True,
+        "oom_policy": "log",
+        "probe": False,
+    },
+    "veto": {"enabled": True, "default_expiry": "0", "block_reclaim": True},
+    "ui": {"color": "auto", "dashboard_refresh": 2, "events_tail": 200},
+    "review": {"queue": True, "prompt": True, "prompt_interval": 86400},
+    "agent": {
+        "enabled": True,
+        "window_backend": "auto",
+        "windowless_grace": 30,
+        "max_events_per_s": 50,
+        "store_titles": False,
+    },
+    "notify": {
+        "enabled": True,
+        "backend": "auto",
+        "batch_seconds": 60,
+        "max_per_hour": 6,
+        "min_mem": "200M",
+        "quiet_hours": "22:00-08:00",
+        "ttl": 600,
+        "undo_toast_seconds": 30,
+        "countdown_seconds": 30,
+        "digest": "off",
+    },
+    "freeze": {
+        "enabled": True,
+        "adopt": False,
+        "after": 120,
+        "wake_on_connect": True,
+        "max_frozen": 32,
+        "cpu_idle_max": 0.5,
+    },
+    "qos": {
+        "enabled": True,
+        "leftover_cpu_idle": True,
+        "leftover_io_weight": 10,
+        "background_cpu_weight": 50,
+        "focus_boost": False,
+        "focus_cpu_weight": 300,
+        "leftover_pids_max": 0,
+    },
+    "guard": {
+        "enabled": True,
+        "available_floor": "auto",
+        "psi_some": "150ms/2s",
+        "psi_full": "50ms/2s",
+        "cooldown": 10,
+        "freeze_in_adopt": False,
+        "oom_adj_leftover": 500,
+        "oom_adj_shared": 200,
+        "oom_group_leftover": True,
+    },
+    "store": {
+        "path": "~/.local/state/taema/state.db",
+        "retention_days": 90,
+        "sample_interval": 60,
+        "max_events": 200000,
+        "daily_export": True,
+    },
+    "experimental": {
+        "freeze": True,
+        "guard": True,
+        "window_close": True,
+        "launch_wrap": True,
+        "eventd": False,
+    },
+    "profile": {
+        "active": "auto",
+        "auto": {"on_battery": "battery", "when_running": {"gamescope": "game"}},
+        "game": {"notify": {"enabled": False}, "freeze": {"after": 0}},
+    },
+}
 
 
 def __getattr__(name):
@@ -50,12 +180,33 @@ def user_state_dir():
     return os.path.join(xdg("XDG_STATE_HOME", "~/.local/state"), "taema")
 
 
+def _toml_location(error, content=""):
+    """Read TOMLDecodeError locations on Python 3.11 and later."""
+    line = getattr(error, "lineno", None)
+    col = getattr(error, "colno", None)
+    if not isinstance(line, int) or not isinstance(col, int):
+        match = re.search(r"at line (\d+), column (\d+)", str(error))
+        if match:
+            line, col = int(match.group(1)), int(match.group(2))
+    if not isinstance(line, int) or not isinstance(col, int):
+        line, col = len(content.splitlines()) + 1, 1
+    return line, col
+
+
 def _read(path):
     try:
         with open(path, "rb") as f:
             return tomllib.load(f)
     except FileNotFoundError:
         return {}
+    except tomllib.TOMLDecodeError as error:
+        try:
+            with open(path, "rb") as source:
+                content = source.read().decode("utf-8", errors="replace")
+        except OSError:
+            content = ""
+        line, col = _toml_location(error, content)
+        raise ValueError("%s:%d:%d: %s" % (path, line, col, error)) from error
 
 
 def merge(system, user):
@@ -66,13 +217,24 @@ def merge(system, user):
             prot = out.setdefault("protected", {})
             for pk, pv in v.items():
                 if pk in PROTECTED_LISTS:
-                    prot[pk] = list(dict.fromkeys(list(prot.get(pk, [])) + list(pv)))
+                    previous = prot.get(pk, [])
+                    if isinstance(previous, list) and isinstance(pv, list):
+                        prot[pk] = list(dict.fromkeys(previous + pv))
+                    else:
+                        prot[pk] = copy.deepcopy(pv)
                 elif pk == "env_prefix":
-                    env = prot.setdefault("env_prefix", {})
-                    for var, prefixes in pv.items():
-                        env[var] = list(
-                            dict.fromkeys(list(env.get(var, [])) + list(prefixes))
-                        )
+                    if isinstance(pv, dict) and isinstance(prot.get(pk, {}), dict):
+                        env = prot.setdefault("env_prefix", {})
+                        for var, prefixes in pv.items():
+                            old = env.get(var, [])
+                            if isinstance(old, list) and isinstance(prefixes, list):
+                                env[var] = list(dict.fromkeys(old + prefixes))
+                            else:
+                                env[var] = copy.deepcopy(prefixes)
+                    else:
+                        prot[pk] = copy.deepcopy(pv)
+                else:
+                    prot[pk] = copy.deepcopy(pv)
             continue
         if k == "learner" and isinstance(v, dict):
             out_l = out.setdefault("learner", {})
@@ -89,24 +251,69 @@ def merge(system, user):
     return out
 
 
-def load_config(path=None):
-    path = path or os.environ.get("TAEMA_CONFIG")
-    if path:
-        with open(path, "rb") as f:
-            cfg = tomllib.load(f)
-        sources = [path]
-    else:
-        user_path = os.path.join(user_config_dir(), "taema.toml")
-        cfg = merge(_read(SYSTEM_CONFIG), _read(user_path))
-        sources = [p for p in (SYSTEM_CONFIG, user_path) if os.path.exists(p)]
+def _layers(path=None):
+    override = path or os.environ.get("TAEMA_CONFIG")
+    if override:
+        return [override]
+    system_dir = os.path.join(os.path.dirname(SYSTEM_CONFIG), "taema.d")
+    user_dir = user_config_dir()
+    return [
+        SYSTEM_CONFIG,
+        *sorted(glob.glob(os.path.join(system_dir, "*.toml"))),
+        os.path.join(user_dir, "taema.toml"),
+        *sorted(glob.glob(os.path.join(user_dir, "taema.d", "*.toml"))),
+    ]
+
+
+def _flatten_sources(value, source, prefix="", out=None):
+    out = {} if out is None else out
+    for key, child in value.items():
+        name = "%s.%s" % (prefix, key) if prefix else key
+        if isinstance(child, dict) and child:
+            _flatten_sources(child, source, name, out)
+        else:
+            out[name] = source
+    return out
+
+
+def _validate_config(cfg, sources):
+    if cfg.get("mode") not in MODES:
+        source = sources.get("mode", "built-in defaults")
+        raise ValueError("%s:1:1: mode must be one of %s" % (source, MODES))
+    protected = cfg.get("protected")
+    if not isinstance(protected, dict):
+        source = sources.get("protected", "built-in defaults")
+        raise ValueError("%s:1:1: protected must be a table" % source)
+    for name in PROTECTED_LISTS:
+        if not isinstance(protected.get(name, []), list):
+            source = sources.get("protected." + name, "built-in defaults")
+            raise ValueError("%s:1:1: protected.%s must be an array" % (source, name))
+    env_prefix = protected.get("env_prefix", {})
+    if not isinstance(env_prefix, dict) or any(
+        not isinstance(prefixes, list) for prefixes in env_prefix.values()
+    ):
+        source = sources.get("protected.env_prefix", "built-in defaults")
+        raise ValueError(
+            "%s:1:1: protected.env_prefix must be a table of arrays" % source
+        )
+
+
+def _load_files(files, required=()):
+    cfg = copy.deepcopy(_DEFAULTS)
+    source_map = _flatten_sources(cfg, "built-in defaults")
+    sources = []
+    for filename in files:
+        if filename in required and not os.path.exists(filename):
+            raise FileNotFoundError(filename)
+        if not os.path.exists(filename):
+            continue
+        layer = _read(filename)
+        cfg = merge(cfg, layer)
+        source_map.update(_flatten_sources(layer, filename))
+        sources.append(filename)
     cfg["_sources"] = sources
-    cfg.setdefault("mode", "observe")
-    if cfg["mode"] not in MODES:
-        raise ValueError("mode must be one of %s" % (MODES,))
-    for k in ("paths", "timers", "protected", "seeds", "learner"):
-        cfg.setdefault(k, {})
-    cfg["timers"].setdefault("leftover_expire_days", 0)
-    cfg["learner"].setdefault("deny_owners", [])
+    cfg["_source_map"] = source_map
+    _validate_config(cfg, source_map)
     p = cfg["paths"]
     p.setdefault("session_cgroup", "auto")
     p.setdefault("state_dir", user_state_dir())
@@ -114,7 +321,30 @@ def load_config(path=None):
     p.setdefault("socket_fallback", os.path.join(expand(p["state_dir"]), "taema.sock"))
     p.setdefault("helper", HELPER)
     p.setdefault("hooks_dir", os.path.join(user_config_dir(), "hooks"))
+    source_map = cfg["_source_map"]
+    for key in (
+        "session_cgroup",
+        "state_dir",
+        "socket",
+        "socket_fallback",
+        "helper",
+        "hooks_dir",
+    ):
+        source_map.setdefault("paths." + key, "built-in defaults")
     return cfg
+
+
+def load_config(path=None):
+    override = path or os.environ.get("TAEMA_CONFIG")
+    return _load_files(_layers(path), required=(override,) if override else ())
+
+
+def load_system_config():
+    """Return built-in defaults plus the system file and its ordered drop-ins."""
+    dropin_dir = os.path.join(os.path.dirname(SYSTEM_CONFIG), "taema.d")
+    return _load_files(
+        [SYSTEM_CONFIG, *sorted(glob.glob(os.path.join(dropin_dir, "*.toml")))]
+    )
 
 
 def state_dir(cfg):
@@ -134,17 +364,62 @@ def units_dirs(cfg):
     return [SYSTEM_UNITS, os.path.join(user_config_dir(), "units")]
 
 
+def config_watch_paths(cfg=None):
+    """Small set of files and directories whose mtimes drive config and unit reloads."""
+    paths = set(_layers())
+    paths.update(os.path.dirname(path) for path in _layers())
+    for directory in units_dirs(cfg or load_config()):
+        paths.add(directory)
+        if os.path.isdir(directory):
+            paths.update(
+                os.path.join(directory, name)
+                for name in os.listdir(directory)
+                if name.endswith(".toml")
+            )
+    return sorted(paths)
+
+
+def file_fingerprint(paths):
+    result = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+            result.append((path, info.st_mtime_ns, info.st_size, info.st_ino))
+        except OSError:
+            result.append((path, None, None, None))
+    return tuple(result)
+
+
 def load_units(cfg):
     by_name = {}
+    errors = []
     for d in units_dirs(cfg):
         if not os.path.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".toml"):
-                with open(os.path.join(d, fn), "rb") as f:
-                    u = tomllib.load(f)
+                path = os.path.join(d, fn)
+                try:
+                    with open(path, "rb") as f:
+                        u = tomllib.load(f)
+                except (OSError, tomllib.TOMLDecodeError) as error:
+                    if isinstance(error, tomllib.TOMLDecodeError):
+                        try:
+                            with open(path, "rb") as source:
+                                content = source.read().decode(
+                                    "utf-8", errors="replace"
+                                )
+                        except OSError:
+                            content = ""
+                        line, col = _toml_location(error, content)
+                        message = "%s:%d:%d: %s" % (path, line, col, error)
+                    else:
+                        message = "%s: %s" % (path, error)
+                    errors.append(message)
+                    continue
                 u["_file"] = os.path.join(d, fn)
                 by_name[fn] = u
+    cfg["_unit_errors"] = errors
     return [by_name[k] for k in sorted(by_name)]
 
 

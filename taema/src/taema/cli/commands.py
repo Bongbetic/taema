@@ -1114,7 +1114,19 @@ def print_auto(auto):
 def cmd_status(a):
     from . import view
 
-    cfg, store = _load_status(a)
+    client_config_error = None
+    try:
+        cfg, store = _load_status(a)
+    except (ValueError, OSError) as error:
+        from .. import doctor
+
+        client_config_error = str(error)
+        cfg = doctor.fallback_config()
+        socket_override = getattr(a, "socket", None)
+        if socket_override:
+            cfg["paths"]["socket"] = policy.expand(socket_override)
+            cfg["paths"]["socket_fallback"] = cfg["paths"]["socket"]
+        store = None
     reply = ask(cfg, {"cmd": "status"})
     empty_hold_state = {
         "global": False,
@@ -1137,6 +1149,7 @@ def cmd_status(a):
             "hold": hold or "",
             "hold_state": hold_state,
             "config": list(cfg["_sources"]),
+            "config_error": client_config_error,
             "details": {
                 "reviews": len(store.open_reviews()) if store else 0,
                 "latest_decision": store.latest_decision() if store else None,
@@ -1160,7 +1173,8 @@ def cmd_status(a):
             "feedback_invalid": int(reply["feedback_invalid"]),
             "hold": reply["hold"] or "",
             "hold_state": reply["hold_state"],
-            "config": list(cfg["_sources"]),
+            "config": list(reply.get("config", cfg["_sources"])),
+            "config_error": reply.get("config_error") or client_config_error,
             "details": reply,
         }
         result = 0
@@ -1235,6 +1249,119 @@ def cmd_doctor(a):
         )
     view.emit(report, a, doctor.render(report))
     return 1 if report.get("status") == "fail" else 0
+
+
+def _config_error(error):
+    print("taema: %s" % error, file=sys.stderr)
+    return 1
+
+
+def _reload_after_config(cfg):
+    reply = ask(cfg, {"cmd": "reload"})
+    if reply is None:
+        print(
+            "saved; daemon is unavailable and will load this configuration at startup"
+        )
+        return 0
+    if not isinstance(reply, dict) or not reply.get("reloaded"):
+        error = (
+            reply.get("config_error") or reply.get("error")
+            if isinstance(reply, dict)
+            else "invalid reply"
+        )
+        print("configuration saved, but daemon reload failed: %s" % error)
+        return 1
+    print("configuration saved and reloaded")
+    return 0
+
+
+def cmd_config_show(a):
+    from ..config import management
+
+    try:
+        cfg = policy.load_config(path=getattr(a, "config", None))
+        rendered = management.effective_toml(cfg)
+        if getattr(a, "sources", False):
+            rendered += "\n".join(management.source_lines(cfg)) + "\n"
+        print(rendered, end="")
+        return 0
+    except Exception as error:
+        return _config_error(error)
+
+
+def cmd_config_get(a):
+    from ..config import management
+
+    try:
+        value = management.get_value(a.key, getattr(a, "config", None))
+        print(management.format_value(value))
+        return 0
+    except Exception as error:
+        return _config_error(error)
+
+
+def cmd_config_set(a):
+    from ..config import management
+
+    try:
+        management.set_value(a.key, a.value)
+        cfg = policy.load_config()
+    except Exception as error:
+        return _config_error(error)
+    return _reload_after_config(cfg)
+
+
+def cmd_config_unset(a):
+    from ..config import management
+
+    try:
+        management.unset_value(a.key)
+        cfg = policy.load_config()
+    except Exception as error:
+        return _config_error(error)
+    return _reload_after_config(cfg)
+
+
+def cmd_config_edit(a):
+    from ..config import management
+
+    try:
+        management.edit_managed()
+        cfg = policy.load_config()
+    except Exception as error:
+        return _config_error(error)
+    return _reload_after_config(cfg)
+
+
+def cmd_config_diff(a):
+    from ..config import management
+
+    try:
+        rendered = management.diff_text()
+    except Exception as error:
+        return _config_error(error)
+    print(rendered or "no configuration differences")
+    return 0
+
+
+def cmd_reload(a):
+    try:
+        cfg = policy.load_config(path=getattr(a, "config", None))
+    except Exception as error:
+        return _config_error(error)
+    reply = ask(cfg, {"cmd": "reload"})
+    if reply is None:
+        print("taema: daemon is unavailable", file=sys.stderr)
+        return 3
+    if not isinstance(reply, dict) or not reply.get("reloaded"):
+        daemon_error = (
+            reply.get("config_error") or reply.get("error")
+            if isinstance(reply, dict)
+            else "invalid daemon reply"
+        )
+        return _config_error(daemon_error)
+    print("configuration and units reloaded")
+    return 0
 
 
 def cmd_review(a):

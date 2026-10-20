@@ -82,6 +82,7 @@
           "additionalProperties": false
         },
         "config": { "type": "array", "items": { "type": "string" } },
+        "config_error": { "type": ["string", "null"] },
         "details": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
       },
       "additionalProperties": false

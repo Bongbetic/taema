@@ -116,6 +116,13 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "arguments": ((("--dry-run",), {"action": "store_true"}),),
     },
     {
+        "name": "doctor",
+        "aliases": (),
+        "help": "check system support and report setup problems",
+        "handler": "cmd_doctor",
+        "read": True,
+    },
+    {
         "name": "status",
         "aliases": (),
         "help": "show daemon and policy status",

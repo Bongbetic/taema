@@ -38,6 +38,7 @@ __all__ = (
     "print_pairs",
     "print_auto",
     "cmd_status",
+    "cmd_doctor",
     "cmd_review",
     "cmd_learn_export",
     "cmd_gc",

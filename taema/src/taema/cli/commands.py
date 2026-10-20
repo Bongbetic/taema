@@ -1082,6 +1082,54 @@ def cmd_status(a):
     return result
 
 
+def cmd_doctor(a):
+    """Ask the daemon for diagnostics, then run the same checks locally if it is down."""
+    from .. import doctor
+    from . import view
+
+    config_error = None
+    try:
+        cfg = policy.load_config(path=getattr(a, "config", None))
+    except Exception as error:
+        config_error = error
+        try:
+            cfg = policy.load_config()
+        except Exception:
+            cfg = doctor.fallback_config()
+
+    report = ask(cfg, {"cmd": "doctor"}) if config_error is None else None
+    if not isinstance(report, dict) or not isinstance(report.get("checks"), list):
+        store = None
+        units = None
+        units_error = None
+        store_error = None
+        if config_error is None:
+            try:
+                store = knowledge.Store(
+                    policy.expand(cfg["paths"]["state_dir"]),
+                    cfg.get("seeds"),
+                    read_only=True,
+                    deny=policy.owner_deny(cfg),
+                    mode=cfg.get("mode", "observe"),
+                )
+            except Exception as error:
+                store_error = error
+            try:
+                units = policy.load_units(cfg)
+            except Exception as error:
+                units_error = error
+        report = doctor.diagnose(
+            cfg,
+            store,
+            units,
+            config_error=config_error,
+            units_error=units_error,
+            store_error=store_error,
+        )
+    view.emit(report, a, doctor.render(report))
+    return 1 if report.get("status") == "fail" else 0
+
+
 def cmd_review(a):
     from . import view
 

@@ -6,6 +6,7 @@ MAX_REQUEST_ID = (1 << 53) - 1
 
 _COMMANDS = {
     "status": ({}, ()),
+    "doctor": ({}, ()),
     "review": ({}, ()),
     "register": ({"scope": "string", "owner": "integer"}, ("scope", "owner")),
     "attach": ({"scope": "string", "pids": "array"}, ("scope", "pids")),

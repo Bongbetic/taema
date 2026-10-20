@@ -9,7 +9,8 @@
     { "$ref": "#/$defs/reviews" },
     { "$ref": "#/$defs/review" },
     { "$ref": "#/$defs/explain" },
-    { "$ref": "#/$defs/gc" }
+    { "$ref": "#/$defs/gc" },
+    { "$ref": "#/$defs/doctor" }
   ],
   "$defs": {
     "view": {
@@ -107,6 +108,30 @@
       "properties": {
         "schema": { "const": "taema.gc.v1" },
         "result": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "doctor": {
+      "type": "object",
+      "required": ["schema", "status", "checks"],
+      "properties": {
+        "schema": { "const": "taema.doctor.v1" },
+        "status": { "enum": ["ok", "warn", "fail"] },
+        "checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/doctor-check" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "doctor-check": {
+      "type": "object",
+      "required": ["name", "status", "message", "fix"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["ok", "warn", "fail"] },
+        "message": { "type": "string" },
+        "fix": { "type": "string" }
       },
       "additionalProperties": false
     }

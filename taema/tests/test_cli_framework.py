@@ -41,6 +41,7 @@ class CliRegistry(unittest.TestCase):
             "never": ["firefox"],
             "undo": [],
             "review": [],
+            "doctor": [],
             "status": [],
             "gc": [],
             "adopt": [],

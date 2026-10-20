@@ -1644,6 +1644,10 @@ class Daemon:
         if not isinstance(msg, dict):
             return {"error": "bad request"}
         c = msg.get("cmd")
+        if c == "doctor":
+            from ..doctor import diagnose
+
+            return diagnose(self.cfg, self.store, self.units)
         if c == "status":
             self.store.expire_reviews()
             self._save_if_idle()

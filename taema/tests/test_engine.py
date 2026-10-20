@@ -31,7 +31,9 @@ def decide(
         mock.patch.object(engine.inspect, "Snapshot", return_value=None),
         mock.patch.object(engine.inspect, "edges", return_value=edges),
         mock.patch.object(engine.inspect, "comm", side_effect=lambda p: comms[p]),
-        mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: comms[p]),
+        mock.patch.object(
+            engine.policy, "app_key", side_effect=lambda p, **kw: comms[p]
+        ),
         mock.patch.object(
             engine.policy,
             "protected_reason",

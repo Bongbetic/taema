@@ -67,6 +67,35 @@ def is_kernel_thread(pid):
     return not exe(pid) and not cmdline(pid)
 
 
+def unix_socket_paths(pid, limit=1024):
+    """Bounded Unix socket paths owned by pid, from /proc only (no `ss` or runtime CLI)."""
+    try:
+        with open(PROC + "/net/unix", encoding="utf-8", errors="replace") as source:
+            rows = source.read().splitlines()[1:]
+    except OSError:
+        return []
+    paths = {}
+    for row in rows:
+        fields = row.split(None, 7)
+        if len(fields) == 8:
+            paths[fields[6]] = fields[7]
+    try:
+        descriptors = os.listdir("%s/%d/fd" % (PROC, pid))[:limit]
+    except OSError:
+        return []
+    found = set()
+    for descriptor in descriptors:
+        try:
+            target = os.readlink("%s/%d/fd/%s" % (PROC, pid, descriptor))
+        except OSError:
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            path = paths.get(target[8:-1])
+            if path:
+                found.add(path)
+    return sorted(found)
+
+
 def starttime(pid):
     """Field 22 of /proc/PID/stat (clock ticks since boot), or None when the pid is gone."""
     data = read(pid, "stat")

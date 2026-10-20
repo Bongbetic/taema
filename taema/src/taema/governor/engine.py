@@ -102,7 +102,7 @@ def plan_stop(
     keep_set = set(keep) | set((unit or {}).get("kill", {}).get("keep", []))
     out = {}
     for pid in pids:
-        key = policy.exe_key(pid)
+        key = policy.app_key(pid, units=[unit] if unit else ())
         d = {
             "pid": pid,
             "comm": inspect.comm(pid),
@@ -201,15 +201,13 @@ def _run_hook(hook):
         p.wait()
 
 
-def veto_for_scope(store, path):
+def veto_for_scope(store, path, unit=None):
     """Resolve scope, app, and pid vetoes against a leaf and its current members."""
     members = []
     for pid in cgroup.tree_procs(path):
         start = inspect.starttime(pid)
-        apps = {policy.app_key(pid), policy.exe_key(pid)}
-        members.append(
-            {"pid": pid, "start": start, "apps": [key for key in apps if key]}
-        )
+        key = policy.app_key(pid, units=[unit] if unit else ())
+        members.append({"pid": pid, "start": start, "apps": [key] if key else []})
     return store.match_veto(scope=cgroup.rel(path), members=members)
 
 
@@ -230,7 +228,7 @@ def _stop_impl(
     """Stop a scope: move shared members aside, run the hook, SIGTERM, SIGKILL leftovers, rmdir.
     allow_sigkill=False (auto mode, pairs not explicitly answered): members that ignore SIGTERM live."""
     self_guard(path)
-    veto = veto_for_scope(store, path)
+    veto = veto_for_scope(store, path, unit)
     if veto:
         target = store._target(veto)
         store.log(event="vetoed", trigger="stop", scope=cgroup.rel(path), target=target)
@@ -752,7 +750,7 @@ def gc_candidates(
             held = next(
                 (
                     k
-                    for k in map(policy.exe_key, roots)
+                    for k in (policy.app_key(p, units=units) for p in roots)
                     if k in protect or store.peek(k)["user_keep"] > 0
                 ),
                 None,
@@ -838,7 +836,7 @@ def gc_candidates(
             if not cpu_moved:
                 out.append((d, env_reason))
             continue
-        key = policy.exe_key(pids[0])
+        key = policy.app_key(pids[0], units=units)
         grace = store.idle_grace(key, policy.timer(cfg, "idle_grace", 600))
         if now() - first >= grace:
             if auto and rel.startswith(LEFTOVER + "/") and expiry_due:
@@ -894,9 +892,10 @@ def remove_empty(path):
 def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
     """Facts auto_stop_ok needs about one process. edges None = unknown (ss failed)."""
     e = lin.entry(pid) if lin is not None else None
+    units = getattr(lin, "units", ()) if lin is not None else ()
     return {
         "pid": pid,
-        "key": e["key"] if e else policy.app_key(pid),
+        "key": e["key"] if e else policy.app_key(pid, units=units),
         "origin": origin if origin is not None else (e["root_key"] if e else ""),
         "edges": edge_map.get(pid, []) if edges_ok else None,
         "protected": policy.protected_reason(pid, cfg),

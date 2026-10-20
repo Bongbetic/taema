@@ -577,11 +577,8 @@ def protected_reason(pid, cfg, pp=None):
 
 
 def exe_key(pid):
-    """Learning key: exe basename, else comm."""
-    from ..core import process as inspect
-
-    e = inspect.exe(pid)
-    return os.path.basename(e) if e else inspect.comm(pid)
+    """Compatibility alias for the one authority-bearing application identity key."""
+    return app_key(pid)
 
 
 INTERPRETERS = (
@@ -600,7 +597,6 @@ INTERPRETERS = (
 )
 INTERP_PREFIXES = ("python", "lua", "php")
 _VERSIONED = re.compile(r"^(python3?|lua|php|nodejs)[0-9.]*$")
-_JAVA_VALUE_OPTS = ("-cp", "-classpath", "--class-path", "-p", "--module-path")
 
 
 def interp_name(base):
@@ -615,67 +611,20 @@ def interp_name(base):
     return None
 
 
-def _script_of(interp, args):
-    """First non-option argument (python -m MOD -> MOD, java -jar X -> X); '' when the
-    interpreter runs inline code (-c, -e) or has no script."""
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("-c", "-e", "--eval", "-p", "--print") and interp != "java":
-            return ""
-        if a == "-m" and interp.startswith("python"):
-            return args[i + 1] if i + 1 < len(args) else ""
-        if (
-            a.startswith("-m")
-            and interp.startswith("python")
-            and len(a) > 2
-            and not a.startswith("--")
-        ):
-            return a[2:]
-        if a == "-jar" and interp == "java":
-            return args[i + 1] if i + 1 < len(args) else ""
-        if interp == "java" and a in _JAVA_VALUE_OPTS:
-            i += 2
-            continue
-        if a.startswith("-"):
-            i += 1
-            continue
-        return a
-    return ""
+def app_identity(pid, units=(), hints=None):
+    """Resolve one process to a validated, provenance-bearing application identity."""
+    from ..core.identity import resolve_process
+
+    return resolve_process(pid, units=units, hints=hints)
 
 
-def app_key(pid, table=None):
-    """Learning key v2. Interpreters key on '<interp>:<script>' (node vite.js -> node:vite.js,
-    python -m http.server -> python3:http.server); a process that set its own title (comm differs
-    from the exe and is not the interpreter) keys on comm. Everything else keys like exe_key().
-    table: an optional ProcTable, accepted for call-site symmetry; the key needs only this pid."""
-    return _clean(_app_key(pid))
+def app_key(pid, table=None, units=(), hints=None):
+    """Return the authority-bearing application identity key for pid.
 
-
-def _clean(k):
-    return "".join(c for c in k if c.isprintable())[:64]
-
-
-def _app_key(pid):
-    from ..core import process as inspect
-
-    e = inspect.exe(pid)
-    base = os.path.basename(e) if e else ""
-    if not base:
-        return inspect.comm(pid)
-    interp = interp_name(base)
-    if interp is None:
-        return base
-    c = inspect.comm(pid)
-    if c and c != base[:15] and interp_name(c) != interp:
-        return c
-    argv = [
-        a.decode(errors="replace")
-        for a in inspect.read(pid, "cmdline").split(b"\0")[1:]
-        if a
-    ]
-    script = os.path.basename(_script_of(interp, argv).rstrip("/"))[:64]
-    return "%s:%s" % (interp, script) if script else interp
+    ``table`` remains accepted for the old call-site contract. ``units`` and ``hints`` let
+    daemon collectors add unit and later desktop/launch evidence without a second key path.
+    """
+    return app_identity(pid, units=units, hints=hints).key
 
 
 leaf_key = app_key  # name used by knowledge pairs
@@ -711,18 +660,49 @@ def bad_owner(key, deny=()):
     extend those defaults."""
     if not isinstance(key, str) or not key:
         return "empty name"
-    base = key.split(":", 1)[0]
-    if key in OWNER_NAMES or any(fnmatch.fnmatchcase(key, g) for g in OWNER_GLOBS):
-        return "generic thread name %s" % key
-    if key[0].isdigit():
+    if key.startswith("invalid:"):
+        return "unvalidated identity %s" % key[8:]
+    # Desktop and launch names decorate an evidence key; policy always validates the evidence.
+    evidence_key = key.rsplit("|", 1)[-1]
+    if evidence_key.startswith("invalid:"):
+        return "unvalidated identity %s" % evidence_key[8:]
+    if evidence_key.startswith("exe:"):
+        name = evidence_key.split(":", 2)[1]
+        candidate = name
+        base = name
+    elif evidence_key.startswith("script:"):
+        parts = evidence_key.split(":", 3)
+        candidate = evidence_key
+        base = parts[1] if len(parts) > 1 else ""
+    elif evidence_key.startswith("comm:"):
+        candidate = evidence_key.partition(":")[2]
+        base = candidate.split(":", 1)[0]
+    elif evidence_key.startswith("runtime:"):
+        candidate = evidence_key
+        base = ""
+    else:
+        candidate = evidence_key
+        base = evidence_key.split(":", 1)[0]
+    if candidate in OWNER_NAMES or any(
+        fnmatch.fnmatchcase(candidate, g) for g in OWNER_GLOBS
+    ):
+        return "generic thread name %s" % candidate
+    if candidate and candidate[0].isdigit():
         return "name starts with a digit"
     if base in OWNER_SHELLS:
         return "shell %s" % base
     if base in OWNER_TRIVIAL:
         return "trivial command %s" % base
-    if interp_name(key) is not None:
-        return "interpreter %s without a script" % key
+    if evidence_key.startswith("comm:") and interp_name(candidate) is not None:
+        return "interpreter %s without a script" % candidate
+    if evidence_key.startswith("exe:") and interp_name(base) is not None:
+        return "interpreter %s without a script" % base
+    if (
+        not evidence_key.startswith(("script:", "runtime:"))
+        and interp_name(evidence_key) is not None
+    ):
+        return "interpreter %s without a script" % evidence_key
     for pat in deny:
-        if fnmatch.fnmatchcase(key, pat):
+        if fnmatch.fnmatchcase(candidate, pat) or fnmatch.fnmatchcase(key, pat):
             return "denied by config %s" % pat
     return None

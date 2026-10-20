@@ -99,7 +99,9 @@ class Daemon:
         )  # leaves that could not be watched: the GC pass checks them
         self.empty_seen = set()  # leaves seen empty by the previous GC pass
         self.last_result = {"adopt": None, "gc": None}
-        self.lineage = lineage.Lineage(cfg)
+        self.lineage = lineage.Lineage(
+            cfg, units=self.units, identity_sink=self.store.record_identities
+        )
         self.deadlines = []  # [(due ts, kind, arg)]: job settle and question expiry, run by tick()
         self.jobs = {}  # tag -> {"shell", "status", "word", "t"} awaiting its settle deadline
         self.pending = {}  # question id -> question record
@@ -526,23 +528,62 @@ class Daemon:
             owner = lin.ghosts.get(rid, {}).get("key")
             if owner:
                 left = lin.leftovers_of(rid[0])
+                valid_owner = lin.ghosts.get(rid, {}).get(
+                    "identity_validated", False
+                ) and not policy.bad_owner(owner, self.deny)
                 for key in dict.fromkeys(l["key"] for l in left):
                     self.store.observe_close(
                         owner, key, launcher=False
                     )  # weight 0: only counts closes
-                self.attribute(owner, left, root=rid[0])
+                if valid_owner:
+                    self.attribute(owner, left, root=rid[0])
+                elif left and not lin.ghosts.get(rid, {}).get("terminal"):
+                    self.queue_provenance_review(
+                        self._provenance_scope(rid),
+                        left,
+                        reason="closed process has no validated application owner",
+                    )
                 if left and not lin.ghosts.get(rid, {}).get("terminal"):
                     dec = self.authorize(authorization.GUI_CLOSE)
                     if dec.verdict == authorization.ACT:
                         self.guarded(
                             lambda: self.gui_close(
-                                rid, owner, left, authority=dec.authority or "mode"
+                                rid,
+                                owner if valid_owner else "",
+                                left,
+                                authority=dec.authority or "mode",
                             )
                         )
                     elif dec.verdict == authorization.WOULD_ACT:
                         self.guarded(
-                            lambda: self.would_contain_gui_close(rid, owner, left)
+                            lambda: self.would_contain_gui_close(
+                                rid, owner if valid_owner else "", left
+                            )
                         )
+
+    @staticmethod
+    def _provenance_scope(root):
+        return "%s/provenance-%d-%d" % (engine.LEFTOVER, root[0], root[1])
+
+    def queue_provenance_review(self, scope, left, reason):
+        """Record uncertain ownership for inspection; no candidate receives an answer."""
+        members = [
+            {"pid": item["pid"], "start": item.get("start"), "key": item["key"]}
+            for item in left
+        ]
+        review = self.store.add_provenance_review(
+            members, scope, self.candidates("", left), reason=reason
+        )
+        if review:
+            self.store.log(
+                event="provenance_review_created",
+                id=review["id"],
+                scope=scope,
+                survivors=review["survivors"],
+                candidates=[item["key"] for item in review["candidates"]],
+                reason=reason,
+            )
+        return review
 
     # ---- auto mode: silent GUI closes, survivors of closed jobs, regret ----
     def check_regret(self, lin, now):
@@ -630,7 +671,12 @@ class Daemon:
         if standalone:
             self.adopt_standalone(standalone, owner)
         if rest:
-            name = "%s/%s" % (engine.LEFTOVER, engine.leaf_slug(owner, rid[0]))
+            valid_owner = bool(owner) and not policy.bad_owner(owner, self.deny)
+            name = (
+                "%s/%s" % (engine.LEFTOVER, engine.leaf_slug(owner, rid[0]))
+                if valid_owner
+                else self._provenance_scope(rid)
+            )
             try:
                 ops = engine.run_ops(
                     self.cfg,
@@ -639,7 +685,7 @@ class Daemon:
                         {
                             "op": "move",
                             "scope": name,
-                            "owner": owner,
+                            "owner": owner if valid_owner else None,
                             "unit": None,
                             "auto": True,
                             "pids": [l["pid"] for l in rest],
@@ -653,7 +699,16 @@ class Daemon:
                 if op:
                     moved = set(op["pids"])
                     contained = [l for l in rest if l["pid"] in moved]
-                    review = self.store.add_review(owner, contained, name)
+                    review = (
+                        self.store.add_review(owner, contained, name)
+                        if valid_owner
+                        else self.store.add_provenance_review(
+                            contained,
+                            name,
+                            self.candidates("", left),
+                            reason="closed process has no validated application owner",
+                        )
+                    )
                     if review:
                         self.store.log(
                             event="review_created",
@@ -1047,6 +1102,16 @@ class Daemon:
             if standalone:
                 self.guarded(lambda: self.adopt_standalone(standalone))
         if not owner or launcher:
+            if not owner and not launcher:
+                scope = "%s/job-%s" % (
+                    engine.LEFTOVER,
+                    tag.replace("/", "-")[:96],
+                )
+                self.queue_provenance_review(
+                    scope,
+                    left,
+                    reason="terminal job has no validated application owner",
+                )
             self.store.log(
                 event="launcher_learned",
                 job=tag,
@@ -1097,7 +1162,7 @@ class Daemon:
 
         add("job", owner)
         for l in left:
-            for k, cid in zip(l["chain"], l["chain_ids"]):
+            for k, cid in zip(l.get("chain", []), l.get("chain_ids", [])):
                 e = self.lineage.entries.get(cid)
                 if (
                     k in SHELL_KEYS
@@ -1356,6 +1421,18 @@ class Daemon:
                     event="answer_refused", reason="owner is not a candidate"
                 )
             return {"error": "owner is not a candidate"}
+        if policy.bad_owner(owner, self.deny):
+            with self.store.decision_context(
+                "refusal",
+                owner=owner,
+                authority="user",
+                mode=self.mode,
+                why="answer owner is not a validated application identity",
+            ):
+                self.store.log(
+                    event="answer_refused", reason="owner identity is unvalidated"
+                )
+            return {"error": "owner identity is unvalidated"}
         with self.store.decision_context(
             "answer",
             owner=owner,
@@ -2362,6 +2439,8 @@ class Daemon:
         self.store.db.deny = tuple(self.deny)
         self.store.mode = cfg.get("mode", "observe")
         self.lineage.cfg = cfg
+        self.lineage.units = tuple(units)
+        self.lineage.identity_sink = self.store.record_identities
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
         self.config_error = None

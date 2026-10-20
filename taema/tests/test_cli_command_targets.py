@@ -74,7 +74,6 @@ class TargetCommands(unittest.TestCase):
             mock.patch.object(cli.inspect, "edges", return_value={42: []}),
             mock.patch.object(cli.inspect, "comm", return_value="browser"),
             mock.patch.object(cli.cgroup, "proc_cgroup", return_value="scope-x"),
-            mock.patch.object(cli.policy, "exe_key", return_value="browser"),
             mock.patch.object(cli.policy, "app_key", return_value="browser"),
             mock.patch.object(cli.policy, "protected_reason", return_value=None),
             mock.patch.object(view, "emit") as emit,

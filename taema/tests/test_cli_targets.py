@@ -133,7 +133,9 @@ class TargetResolution(unittest.TestCase):
             with (
                 mock.patch.object(process, "starttime", side_effect=starts.get),
                 mock.patch.object(process, "uid_of", return_value=os.getuid()),
-                mock.patch.object(policy, "app_key", side_effect=keys.get),
+                mock.patch.object(
+                    policy, "app_key", side_effect=lambda pid, **_kwargs: keys.get(pid)
+                ),
                 mock.patch.object(process, "comm", side_effect=lambda pid: keys[pid]),
                 mock.patch.object(process, "environ", side_effect=environments.get),
             ):

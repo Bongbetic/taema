@@ -186,7 +186,7 @@ class SigkillRule(unittest.TestCase):
             mock.patch.object(engine.cgroup, "tree_procs", return_value=[42]),
             mock.patch.object(engine.inspect, "starttime", return_value=1234),
             mock.patch.object(engine.policy, "app_key", return_value="firefox"),
-            mock.patch.object(engine.policy, "exe_key", return_value="firefox"),
+            mock.patch.object(engine.policy, "app_key", return_value="firefox"),
             mock.patch.object(engine, "_signal_all") as signal_all,
         ):
             with self.assertRaises(engine.Vetoed):

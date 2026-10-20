@@ -330,7 +330,6 @@ class DaemonStopPaths(unittest.TestCase):
             mock.patch.object(self.d, "sync_leaf_watches"),
             mock.patch.object(daemon.inspect, "starttime", return_value=100),
             mock.patch.object(daemon.policy, "app_key", return_value="firefox"),
-            mock.patch.object(daemon.policy, "exe_key", return_value="firefox"),
             mock.patch.object(daemon.engine, "stop") as stop,
         ):
             self.d.after_observe()  # GUI close contains the survivor in leftover/gui-77.

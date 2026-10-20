@@ -203,6 +203,18 @@ class Store:
     def _load(self):
         self.data = self.db.load_state(self.data)
 
+    def record_identity(self, identity, instance):
+        """Persist resolver evidence independently of learned pair authority."""
+        if self.read_only:
+            return False
+        return self.db.record_app_identity(identity, instance, now=self.now())
+
+    def record_identities(self, records):
+        """Persist identity rows discovered or changed by one process observe pass."""
+        if self.read_only:
+            return 0
+        return self.db.record_app_identities(records, now=self.now())
+
     def export_legacy(self):
         """Return the state fields understood by the 0.2 JSON store."""
         fields = (
@@ -1664,6 +1676,9 @@ class Store:
         review["state"] = "expired"
         review["closed"] = now
         review["reason"] = reason
+        if review.get("kind") == "provenance-candidate" or not review.get("owner"):
+            self.dirty = True
+            return
         for key in review.get("survivors", []):
             owner = review.get("owner")
             pair = (
@@ -1761,6 +1776,106 @@ class Store:
             "survivors": sorted(by_key),
             "pids": sorted({p for pids in by_key.values() for p in pids}),
             "scope": scope,
+            "created": now,
+            "expires": now + REVIEW_TTL,
+            "state": "open",
+        }
+        reviews.append(review)
+        self.data["review_seq"] = review_id
+        self.dirty = True
+        return dict(review)
+
+    def add_provenance_review(
+        self, members, scope, candidates=(), reason="owner is ambiguous"
+    ):
+        """Queue an unanswered ownership review without granting authority to a candidate."""
+        if not isinstance(scope, str) or not scope or len(scope) > 512:
+            return None
+        by_key = {}
+        for member in members:
+            if (
+                not isinstance(member, dict)
+                or not isinstance(member.get("key"), str)
+                or not isinstance(member.get("pid"), int)
+                or isinstance(member.get("pid"), bool)
+            ):
+                continue
+            by_key.setdefault(member["key"], set()).add(member["pid"])
+        if not by_key:
+            return None
+        normalized = []
+        seen = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            key = candidate.get("key")
+            if (
+                not isinstance(key, str)
+                or not key
+                or policy.bad_owner(key, self.deny)
+                or key in seen
+            ):
+                continue
+            seen.add(key)
+            normalized.append(
+                {
+                    "id": len(normalized) + 1,
+                    "kind": candidate.get("kind", "ancestor"),
+                    "key": key,
+                    "label": str(candidate.get("label") or key)[:128],
+                }
+            )
+            if len(normalized) >= 16:
+                break
+        self.expire_reviews()
+        reviews = self.data.setdefault("reviews", [])
+        existing = next(
+            (
+                review
+                for review in reviews
+                if isinstance(review, dict)
+                and review.get("kind") == "provenance-candidate"
+                and review.get("scope") == scope
+                and review.get("state") == "open"
+            ),
+            None,
+        )
+        if existing:
+            existing["candidates"] = normalized
+            existing["survivors"] = sorted(by_key)
+            existing["pids"] = sorted({pid for pids in by_key.values() for pid in pids})
+            existing["reason"] = str(reason)[:256]
+            self.dirty = True
+            return dict(existing)
+        opens = [
+            review
+            for review in reviews
+            if isinstance(review, dict) and review.get("state") == "open"
+        ]
+        while len(opens) >= MAX_OPEN_REVIEWS:
+            oldest = min(
+                opens,
+                key=lambda review: (review.get("created", 0), review.get("id", 0)),
+            )
+            now = self.now()
+            self._resolve_review(oldest, now, "queue cap")
+            self.log(
+                event="review_expired",
+                id=oldest.get("id"),
+                owner=oldest.get("owner"),
+                reason="queue cap",
+            )
+            opens.remove(oldest)
+        now = self.now()
+        review_id = self.data.get("review_seq", 0) + 1
+        review = {
+            "id": review_id,
+            "kind": "provenance-candidate",
+            "survivors": sorted(by_key),
+            "pids": sorted({pid for pids in by_key.values() for pid in pids}),
+            "scope": scope,
+            "candidates": normalized,
+            "reason": str(reason)[:256],
             "created": now,
             "expires": now + REVIEW_TTL,
             "state": "open",

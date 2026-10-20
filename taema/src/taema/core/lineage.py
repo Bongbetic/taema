@@ -16,7 +16,7 @@ import os
 import re
 import time
 
-from . import process as inspect
+from . import cgroup, process as inspect
 from ..config import policy
 
 MIN_AGE = 5.0  # nothing younger than this has a root
@@ -76,9 +76,15 @@ def find_tag(pid):
 
 
 class Lineage:
-    def __init__(self, cfg, uid=None):
+    def __init__(
+        self, cfg, uid=None, units=(), identity_hints=None, identity_sink=None
+    ):
         self.cfg = cfg
         self.uid = os.getuid() if uid is None else uid
+        self.units = tuple(units)
+        self.identity_hints = identity_hints
+        self.identity_sink = identity_sink
+        self._pending_identity_updates = []
         self.entries = {}  # (pid, start) -> entry dict
         self.by_pid = {}  # pid -> (pid, start)
         self.foreign = set()  # (pid, start) of processes of other users (not tracked)
@@ -141,7 +147,12 @@ class Lineage:
             e["seen"] += 1
             e["cpu"] = (e["cpu"] + [(self.now, r.cpu)])[-CPU_KEEP:]
             if e["start"] and self.age(e) < KEY_SETTLE:
-                e["key"] = policy.app_key(eid[0])
+                identity = self._identity(eid[0], eid[1])
+                if identity.key != e["key"]:
+                    e["identity"] = identity
+                    e["key"] = identity.key
+                    e["exe"] = identity.exe or e["exe"]
+                    self._persist_identity(e)
         for e in (
             self.entries.values()
         ):  # a root's key may have settled after its members were added
@@ -169,6 +180,7 @@ class Lineage:
             if e["root"] == eid:
                 self._root_exit(eid, e)
         self._prune_ghosts()
+        self._flush_identities()
         return self
 
     def _record(self, eid, e):
@@ -181,10 +193,44 @@ class Lineage:
             "parent_key": e["parent_key"],
             "job": e["job"],
             "chain": list(e["chain"]),
+            "identity_validated": bool(e["identity"].validated),
+            "identity_kind": e["identity"].kind,
+            "identity_display": e["identity"].display,
         }
 
+    def _identity(self, pid, start):
+        hints = self.identity_hints(pid, start) if self.identity_hints else None
+        return policy.app_identity(pid, units=self.units, hints=hints)
+
+    def _persist_identity(self, entry):
+        if self.identity_sink is None:
+            return
+        self._pending_identity_updates.append(
+            (
+                entry["identity"],
+                {
+                    "pid": entry["pid"],
+                    "start": entry["start"],
+                    "born": self._birth(entry),
+                    "parent_app": entry.get("parent_key"),
+                    "scope": cgroup.proc_cgroup(entry["pid"]),
+                    "terminal": int(bool(entry.get("tty") or entry.get("job"))),
+                    "class": entry["identity"].kind,
+                    "runtime": entry["identity"].runtime,
+                    "launched_by": entry["identity"].launch_name,
+                },
+            )
+        )
+
+    def _flush_identities(self):
+        if not self._pending_identity_updates:
+            return
+        pending, self._pending_identity_updates = self._pending_identity_updates, []
+        self.identity_sink(pending)
+
     def _add(self, pid, r):
-        key = policy.app_key(pid)
+        identity = self._identity(pid, r.start)
+        key = identity.key
         e = {
             "pid": pid,
             "start": r.start,
@@ -195,7 +241,8 @@ class Lineage:
             "state": r.state,
             "cpu": [(self.now, r.cpu)],
             "key": key,
-            "exe": os.path.basename(inspect.exe(pid)),
+            "exe": identity.exe or os.path.basename(inspect.exe(pid)),
+            "identity": identity,
             "first_seen": self.now,
             "last_seen": self.now,
             "seen": 1,
@@ -226,6 +273,7 @@ class Lineage:
                 e["job"] = tag
                 self._note_job(e, tag)
         self._assign(eid, e, r, pe)
+        self._persist_identity(e)
 
     def _note_job(self, e, tag):
         j = self.jobs.setdefault(
@@ -285,6 +333,9 @@ class Lineage:
             return
         self.ghosts[rid] = {
             "key": e["key"],
+            "identity_validated": bool(e["identity"].validated),
+            "identity_kind": e["identity"].kind,
+            "identity_display": e["identity"].display,
             "pid": rid[0],
             "ppid": e["ppid"],
             "exited": self.now,

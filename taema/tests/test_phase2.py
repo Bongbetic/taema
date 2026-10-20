@@ -75,7 +75,8 @@ class FakeProc:
         for n in ("exe",):
             if os.path.lexists(d + "/exe"):
                 os.unlink(d + "/exe")
-            os.symlink(exe or "/usr/bin/" + comm, d + "/exe")
+            # Synthetic targets keep host executable inodes out of lineage fixtures.
+            os.symlink(exe or self.root + "/exe/" + comm, d + "/exe")
         with open(d + "/cmdline", "wb") as f:
             f.write(b"\0".join(a.encode() for a in (argv or [comm])) + b"\0")
         with open(d + "/environ", "wb") as f:
@@ -115,57 +116,60 @@ class AppKey(ProcCase):
         return policy.app_key(50)
 
     def test_node_script(self):
-        self.assertEqual(
+        self.assertRegex(
             self.key(
                 "node", "/usr/bin/node", ["node", "--inspect", "/x/y/vite.js", "dev"]
             ),
-            "node:vite.js",
+            r"^script:node:vite\.js:[0-9a-f]{12}$",
         )
 
     def test_python_module_and_script(self):
-        self.assertEqual(
+        self.assertRegex(
             self.key(
                 "python3.12",
                 "/usr/bin/python3.12",
                 ["python3", "-u", "-m", "http.server", "8"],
             ),
-            "python3:http.server",
+            r"^script:python3:http\.server:[0-9a-f]{12}$",
         )
-        self.assertEqual(
+        self.assertRegex(
             self.key("python3", "/usr/bin/python3", ["python3", "/a/b/run.py"]),
-            "python3:run.py",
+            r"^script:python3:run\.py:[0-9a-f]{12}$",
         )
 
     def test_java_jar_and_class(self):
-        self.assertEqual(
+        self.assertRegex(
             self.key("java", "/usr/bin/java", ["java", "-Xmx1g", "-jar", "/o/app.jar"]),
-            "java:app.jar",
+            r"^script:java:app\.jar:[0-9a-f]{12}$",
         )
-        self.assertEqual(
+        self.assertRegex(
             self.key("java", "/usr/bin/java", ["java", "-cp", "lib/*", "com.Main"]),
-            "java:com.Main",
+            r"^script:java:Main:[0-9a-f]{12}$",
         )
 
     def test_inline_code_and_bare_interpreter(self):
-        self.assertEqual(
-            self.key("bash", "/usr/bin/bash", ["bash", "-c", "echo hi"]), "bash"
+        self.assertTrue(
+            self.key("bash", "/usr/bin/bash", ["bash", "-c", "echo hi"]).startswith(
+                "invalid:"
+            )
         )
-        self.assertEqual(self.key("node", "/usr/bin/node", ["node"]), "node")
+        self.assertTrue(
+            self.key("node", "/usr/bin/node", ["node"]).startswith("invalid:")
+        )
 
     def test_process_title_wins(self):
-        self.assertEqual(
-            self.key("eslint_d", "/usr/bin/node", ["eslint_d", "x.js"]), "eslint_d"
+        self.assertRegex(
+            self.key("eslint_d", "/usr/bin/node", ["eslint_d", "x.js"]),
+            r"^script:node:x\.js:[0-9a-f]{12}$",
         )
 
     def test_not_an_interpreter_and_exe_key_unchanged(self):
         self.assertEqual(
             self.key("firefox", "/usr/lib/firefox/firefox", ["firefox"]), "firefox"
         )
-        self.assertEqual(policy.exe_key(50), "firefox")
+        self.assertEqual(policy.exe_key(50), policy.app_key(50))
         self.fp.add(51, 1, comm="node", exe="/usr/bin/node", argv=["node", "vite.js"])
-        self.assertEqual(
-            policy.exe_key(51), "node"
-        )  # v1 key still the bare interpreter
+        self.assertEqual(policy.exe_key(51), policy.app_key(51))
 
     def test_exe_gone_falls_back_to_comm(self):
         self.fp.add(52, 1, comm="kthing")
@@ -217,7 +221,7 @@ class LineageTests(ProcCase):
         self.assertIsNone(l.root_for(20))  # session leader
         self.assertIsNone(l.root_for(30))
         self.assertEqual(l.entry(22)["root_key"], "npm")
-        self.assertEqual(l.entry(22)["chain"][:2], ["npm", "bash"])
+        self.assertEqual(l.entry(22)["chain"][:2], ["npm", "invalid:comm:bash"])
 
     def test_nothing_younger_than_five_seconds(self):
         l = lin()

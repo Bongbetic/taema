@@ -51,7 +51,7 @@ class Budget(unittest.TestCase):
                     "scan",
                     return_value=inspect.ProcTable.from_ppid({7: 1, 8: 1}),
                 ),
-                mock.patch.object(daemon.engine.policy, "exe_key", return_value="k"),
+                mock.patch.object(daemon.engine.policy, "app_key", return_value="k"),
             ):
                 d.adopt_pass()
                 d.gc_pass()

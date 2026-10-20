@@ -176,7 +176,7 @@ class LazySs(unittest.TestCase):
         with (
             mock.patch.object(engine.cgroup, "tree_procs", return_value=[5, 6]),
             mock.patch.object(engine.policy, "protected_reason", return_value="x"),
-            mock.patch.object(engine.policy, "exe_key", return_value="k"),
+            mock.patch.object(engine.policy, "app_key", return_value="k"),
             mock.patch.object(engine.inspect, "comm", return_value="c"),
             mock.patch.object(engine.inspect, "Snapshot") as sn,
         ):
@@ -190,7 +190,7 @@ class LazySs(unittest.TestCase):
         with (
             mock.patch.object(engine.cgroup, "tree_procs", return_value=[5]),
             mock.patch.object(engine.policy, "protected_reason", return_value=None),
-            mock.patch.object(engine.policy, "exe_key", return_value="k"),
+            mock.patch.object(engine.policy, "app_key", return_value="k"),
             mock.patch.object(engine.inspect, "comm", return_value="c"),
             mock.patch.object(engine.inspect, "edges", return_value={}),
             mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()) as sn,
@@ -224,7 +224,7 @@ class LazySs(unittest.TestCase):
                     "scan",
                     return_value=inspect.ProcTable.from_ppid({}),
                 ),
-                mock.patch.object(engine.policy, "exe_key", return_value="x"),
+                mock.patch.object(engine.policy, "app_key", return_value="x"),
             ):
                 engine.gc_candidates(cfg, [], store, {})
             self.assertEqual(sn.call_count, 1)

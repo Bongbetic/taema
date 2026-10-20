@@ -254,6 +254,26 @@ def render_reviews(reviews):
                 )
             )
             continue
+        if item.get("kind") == "provenance-candidate":
+            candidates = (
+                ", ".join(
+                    candidate.get("label", candidate.get("key", "?"))
+                    for candidate in item.get("candidates", [])
+                )
+                or "none"
+            )
+            lines.append(
+                "review #%s provenance scope=%s survivors=%s candidates=%s reason=%s age=%ds"
+                % (
+                    item.get("id", "?"),
+                    item.get("scope", "?"),
+                    ", ".join(item.get("survivors") or []) or "none",
+                    candidates,
+                    item.get("reason", "owner is ambiguous"),
+                    age,
+                )
+            )
+            continue
         if item.get("kind") == "scope":
             lines.append(
                 "review #%s scope=%s reason=%s age=%ds"

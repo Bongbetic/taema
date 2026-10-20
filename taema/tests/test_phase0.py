@@ -139,7 +139,9 @@ def plan(snap, members=(10, 11), protected=(), hard=False):
         mock.patch.object(engine.inspect, "Snapshot", return_value=snap),
         mock.patch.object(engine.inspect, "edges", return_value={}),
         mock.patch.object(engine.inspect, "comm", side_effect=lambda p: "p%d" % p),
-        mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: "p%d" % p),
+        mock.patch.object(
+            engine.policy, "app_key", side_effect=lambda p, **kw: "p%d" % p
+        ),
         mock.patch.object(
             engine.policy,
             "protected_reason",
@@ -202,7 +204,7 @@ class StopAccounting(unittest.TestCase):
                     engine.inspect, "comm", side_effect=lambda p: keys[p]
                 ),
                 mock.patch.object(
-                    engine.policy, "exe_key", side_effect=lambda p: keys[p]
+                    engine.policy, "app_key", side_effect=lambda p, **kw: keys[p]
                 ),
                 mock.patch.object(engine.policy, "protected_reason", return_value=None),
             ):
@@ -495,7 +497,9 @@ class GcRules(unittest.TestCase):
             ),
             mock.patch.object(engine.inspect, "edges", return_value={}),
             mock.patch.object(
-                engine.policy, "exe_key", side_effect=lambda p: self.keys.get(p, "x")
+                engine.policy,
+                "app_key",
+                side_effect=lambda p, **kw: self.keys.get(p, "x"),
             ),
         ):
             return engine.gc_candidates(

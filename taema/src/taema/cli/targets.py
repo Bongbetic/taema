@@ -46,11 +46,14 @@ def _desktop_id(environment):
     return os.path.basename(value)
 
 
-def live_targets(base=None, include_desktop=True):
+def live_targets(base=None, include_desktop=True, units=None):
     """Return managed scopes and live app, desktop-id, and pid targets."""
     from ..config import policy
     from ..core import cgroup, process
 
+    if units is None:
+        cfg = policy.load_config()
+        units = policy.load_units(cfg)
     base = base or cgroup.base()
     if not os.path.isdir(base):
         return []
@@ -74,7 +77,7 @@ def live_targets(base=None, include_desktop=True):
                 start = process.starttime(pid)
                 if start is None or process.uid_of(pid) != os.getuid():
                     continue
-                key = policy.app_key(pid)
+                key = policy.app_key(pid, units=units)
                 add(
                     Target(
                         "pid",

@@ -796,6 +796,42 @@ def _trim_oldest(connection, table, key, cap, order, eligible="1"):
         )
 
 
+def _prune_app_rows(connection, now):
+    connection.execute(
+        "DELETE FROM instances WHERE coalesce(exited, born) < ?",
+        (now - INSTANCE_RETENTION,),
+    )
+    _trim_oldest(
+        connection, "instances", "id", MAX_INSTANCES, "coalesce(exited, born, 0), id"
+    )
+    _prune_apps(connection, now)
+
+
+def _prune_apps(connection, now):
+    connection.execute("CREATE TEMP TABLE _taema_app_evictions (key TEXT PRIMARY KEY)")
+    connection.execute(
+        "INSERT INTO _taema_app_evictions(key) "
+        "SELECT key FROM apps AS candidate "
+        "WHERE NOT EXISTS (SELECT 1 FROM pairs WHERE owner = candidate.key "
+        "AND (ex_stop > 0 OR ex_keep > 0)) "
+        "AND NOT EXISTS (SELECT 1 FROM standalone WHERE key = candidate.key) "
+        "AND NOT EXISTS (SELECT 1 FROM pairs WHERE source = 'legacy-invalid' "
+        "AND (owner = candidate.key OR leftover = candidate.key)) "
+        "AND NOT EXISTS (SELECT 1 FROM vetoes WHERE kind = 'app' "
+        "AND value = candidate.key AND (expires IS NULL OR expires > ?)) "
+        "ORDER BY coalesce(last_seen, 0), key "
+        "LIMIT max(0, (SELECT count(*) FROM apps) - ?)",
+        (now, MAX_APPS),
+    )
+    connection.execute(
+        "DELETE FROM instances WHERE app IN (SELECT key FROM _taema_app_evictions)"
+    )
+    connection.execute(
+        "DELETE FROM apps WHERE key IN (SELECT key FROM _taema_app_evictions)"
+    )
+    connection.execute("DROP TABLE _taema_app_evictions")
+
+
 def _prune(connection, now):
     """Apply documented storage bounds without evicting active vetoes or answers."""
     connection.execute(
@@ -890,28 +926,8 @@ def _prune(connection, now):
         (MAX_SIGNATURES_PER_OWNER,),
     )
 
-    connection.execute("CREATE TEMP TABLE _taema_app_evictions (key TEXT PRIMARY KEY)")
-    connection.execute(
-        "INSERT INTO _taema_app_evictions(key) "
-        "SELECT key FROM apps AS candidate "
-        "WHERE NOT EXISTS (SELECT 1 FROM pairs WHERE owner = candidate.key "
-        "AND (ex_stop > 0 OR ex_keep > 0)) "
-        "AND NOT EXISTS (SELECT 1 FROM standalone WHERE key = candidate.key) "
-        "AND NOT EXISTS (SELECT 1 FROM pairs WHERE source = 'legacy-invalid' "
-        "AND (owner = candidate.key OR leftover = candidate.key)) "
-        "AND NOT EXISTS (SELECT 1 FROM vetoes WHERE kind = 'app' "
-        "AND value = candidate.key AND (expires IS NULL OR expires > ?)) "
-        "ORDER BY coalesce(last_seen, 0), key "
-        "LIMIT max(0, (SELECT count(*) FROM apps) - ?)",
-        (now, MAX_APPS),
-    )
-    connection.execute(
-        "DELETE FROM instances WHERE app IN (SELECT key FROM _taema_app_evictions)"
-    )
-    connection.execute(
-        "DELETE FROM apps WHERE key IN (SELECT key FROM _taema_app_evictions)"
-    )
-    connection.execute("DROP TABLE _taema_app_evictions")
+    _prune_apps(connection, now)
+
     connection.execute(
         "DELETE FROM reviews WHERE state != 'open' "
         "AND coalesce(json_extract(payload, '$.closed'), created, 0) < ?",
@@ -1158,6 +1174,131 @@ class StateDB:
             yield connection
         finally:
             connection.close()
+
+    def record_app_identity(self, identity, instance, now=None):
+        """Persist one identity and pid/start instance."""
+        return self.record_app_identities(((identity, instance),), now=now)
+
+    def record_app_identities(self, identities, now=None):
+        """Persist one observe pass of identities in a single bounded transaction."""
+        if self.read_only or not self.available:
+            return 0
+        now = time.time() if now is None else now
+        apps, instances = [], []
+        for identity, instance in identities:
+            key = getattr(identity, "key", None)
+            pid, start = instance.get("pid"), instance.get("start")
+            if (
+                not isinstance(key, str)
+                or not key
+                or len(key) > 512
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or not isinstance(start, int)
+                or isinstance(start, bool)
+            ):
+                continue
+            instance_id = "%d:%d" % (pid, start)
+            first_seen = _number(instance.get("born"), now)
+            display = _text(getattr(identity, "display", ""), "")[:256]
+            exe = _text(getattr(identity, "exe", ""), "")[:256]
+            kind = _text(getattr(identity, "kind", "comm"), "comm")[:32]
+            desktop_id = (_text(getattr(identity, "desktop_id")) or "")[:256] or None
+            unit = (_text(getattr(identity, "unit")) or "")[:256] or None
+            runtime = (
+                _text(instance.get("runtime") or getattr(identity, "runtime", None))
+                or ""
+            )[:128] or None
+            confidence = "high" if getattr(identity, "validated", False) else "low"
+            apps.append(
+                (
+                    key,
+                    kind,
+                    display or key,
+                    exe,
+                    getattr(identity, "device", None),
+                    getattr(identity, "inode", None),
+                    desktop_id,
+                    unit,
+                    first_seen,
+                    now,
+                    confidence,
+                )
+            )
+            instances.append(
+                (
+                    instance_id,
+                    key,
+                    pid,
+                    start,
+                    first_seen,
+                    (_text(instance.get("parent_app")) or "")[:512] or None,
+                    (_text(instance.get("scope")) or "")[:1024] or None,
+                    instance.get("terminal"),
+                    _text(instance.get("class") or kind, kind)[:64],
+                    runtime,
+                    (_text(instance.get("launched_by")) or "")[:256] or None,
+                )
+            )
+        if not apps:
+            return 0
+
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                previous_apps = {}
+                ids = [row[0] for row in instances]
+                for offset in range(0, len(ids), 400):
+                    batch = ids[offset : offset + 400]
+                    placeholders = ",".join("?" for _ in batch)
+                    previous_apps.update(
+                        {
+                            row["id"]: row["app"]
+                            for row in connection.execute(
+                                "SELECT id, app FROM instances WHERE id IN (%s)"
+                                % placeholders,
+                                batch,
+                            )
+                        }
+                    )
+                connection.executemany(
+                    """INSERT INTO apps
+                       (key, kind, display, exe, dev, ino, desktop_id, unit,
+                        first_seen, last_seen, instances, confidence)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                         kind=excluded.kind, display=excluded.display, exe=excluded.exe,
+                         dev=excluded.dev, ino=excluded.ino,
+                         desktop_id=coalesce(excluded.desktop_id, apps.desktop_id),
+                         unit=coalesce(excluded.unit, apps.unit),
+                         first_seen=min(coalesce(apps.first_seen, excluded.first_seen), excluded.first_seen),
+                         last_seen=max(coalesce(apps.last_seen, excluded.last_seen), excluded.last_seen),
+                         confidence=excluded.confidence""",
+                    apps,
+                )
+                connection.executemany(
+                    """INSERT INTO instances
+                       (id, app, pid, start, born, parent_app, scope, terminal,
+                        class, runtime, launched_by)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET app=excluded.app,
+                         parent_app=excluded.parent_app, scope=excluded.scope,
+                         terminal=excluded.terminal, class=excluded.class,
+                         runtime=excluded.runtime, launched_by=coalesce(excluded.launched_by, instances.launched_by)""",
+                    instances,
+                )
+                affected = {row[0] for row in apps}
+                affected.update(previous_apps.values())
+                connection.executemany(
+                    "UPDATE apps SET instances=(SELECT count(*) FROM instances WHERE app=?) WHERE key=?",
+                    [(key, key) for key in affected],
+                )
+                _prune_app_rows(connection, now)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return len(apps)
 
     def _migrate(self, connection):
         version = connection.execute("PRAGMA user_version").fetchone()[0]

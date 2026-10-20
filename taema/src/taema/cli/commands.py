@@ -795,29 +795,34 @@ def cmd_explain(a):
         pp = inspect.ppid_map()
         members = set(inspect.descendants([pid], pp))
         edges = inspect.edges(members, inspect.Snapshot()).get(pid, [])
-        key = policy.exe_key(pid)
-        app_key = policy.app_key(pid)
+        identity = policy.app_identity(pid, units=policy.load_units(cfg))
+        key = identity.key
         info = store.explain(key)
-        info["pairs"] = store.explain(app_key)["pairs"]
         explanation = {
             "pid": pid,
             "comm": inspect.comm(pid),
-            "key": key,
-            "app_key": app_key,
+            "identity": {
+                "key": key,
+                "display": identity.display,
+                "kind": identity.kind,
+                "validated": identity.validated,
+                "reason": identity.reason,
+            },
             "cgroup": cgroup.proc_cgroup(pid),
             "protected": policy.protected_reason(pid, cfg),
             "outside_users": edges,
             "learning": info,
         }
         human = (
-            "pid %d comm=%s key=%s app_key=%s\n"
+            "pid %d comm=%s identity=%s display=%s validated=%s\n"
             "cgroup: %s\nprotected: %s\n"
             "edges (outside users of this pid and its descendants): %s\n%s\n"
             % (
                 pid,
                 explanation["comm"],
                 key,
-                app_key,
+                identity.display,
+                identity.validated,
                 explanation["cgroup"],
                 explanation["protected"] or "no",
                 json.dumps(edges) if edges else "none",

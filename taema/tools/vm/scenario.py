@@ -17,6 +17,7 @@ Scenario API:
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from unittest import mock
 
@@ -1197,46 +1199,648 @@ def scenario_m0(rec, args, tree_holder):
     return ok
 
 
-def scenario_upgrade(rec, args, tree_holder):
-    """Install the previous release, then upgrade back to the working tree."""
+def _store_modules():
+    """Load the installed store in a guest or the source package in host tests."""
+    installed = "/usr/lib/taema"
+    source = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "src",
+    )
+    if os.path.isfile(os.path.join(source, "taema", "config", "policy.py")):
+        module_path = source
+    elif os.path.isfile(os.path.join(installed, "taema", "config", "policy.py")):
+        module_path = installed
+    else:
+        raise ScenarioError("taema store modules are unavailable")
+    if module_path not in sys.path:
+        sys.path.insert(0, module_path)
+    sys.dont_write_bytecode = True
+    from taema.config import policy
+    from taema.core import signature as survivor_signature
+    from taema.store.knowledge import Store
+
+    return policy, survivor_signature, Store
+
+
+def replay_learning_fixture(fixture_path, state_dir):
+    """Replay the committed anonymized learning history and return safety evidence."""
+    policy, survivor_signature, Store = _store_modules()
+    day = 86400
+    with open(fixture_path, encoding="utf-8") as stream:
+        fixture = json.load(stream)
+    now = [0.0]
+    store = Store(state_dir, {}, now=lambda: now[0])
+    signature_ids = {}
+    stop_decision_ids = []
+
+    for event in fixture["events"]:
+        now[0] = event["at_day"] * day + event.get("after_seconds", 0)
+        owner, leftover, operation = (
+            event["owner"],
+            event["leftover"],
+            event["op"],
+        )
+        pair = (owner, leftover)
+        if operation == "inferred_kill":
+            store.observe_kill_inferred(owner, leftover, day=event["day"])
+        elif operation == "close":
+            store.observe_close(owner, leftover)
+        elif operation == "answer":
+            store.answer(owner, leftover, event["choice"])
+        elif operation == "signature_stop":
+            store.observe_close(owner, leftover)
+            descriptor = survivor_signature.signature(owner, [leftover])
+            descriptor = store.observe_signature_close(descriptor)
+            if not descriptor or not store.answer_signature(owner, descriptor, "stop"):
+                raise ScenarioError("fixture signature answer was rejected")
+            signature_ids[pair] = descriptor["id"]
+        elif operation == "auto_stop":
+            authority, why = event.get("authority"), event.get("why")
+            if not isinstance(authority, str) or not authority or not why:
+                raise ScenarioError("fixture stop is missing authorization evidence")
+            signature_id = signature_ids[pair]
+            with store.decision_context(
+                "stop",
+                scope="leftover/replay",
+                owner=owner,
+                authority=authority,
+                why=why,
+            ) as decision:
+                store.auto_stopped(owner, leftover, signature_id)
+                action = store.record_auto_action(
+                    "leftover/replay",
+                    why,
+                    [(owner, leftover)],
+                    apps=[leftover],
+                    decision=decision,
+                    owner=owner,
+                    authority=authority,
+                    signature_id=signature_id,
+                )
+            stop_decision_ids.append(action["decision_id"])
+        elif operation == "respawn_and_regret":
+            signature_id = signature_ids[pair]
+            store.auto_stop_respawn(owner, leftover, signature_id)
+            store.regret(owner, leftover, signature_id)
+        else:
+            raise ScenarioError("unknown replay operation %r" % operation)
+
+    now[0] = fixture["now_day"] * day
+    store.save()
+    reopened = Store(state_dir, {}, now=lambda: now[0], read_only=True)
+    generic_owners = [
+        pair["owner"]
+        for pair in reopened.pairs_summary(limit=1000)
+        if pair.get("action") != "invalid" and policy.bad_owner(pair.get("owner"))
+    ]
+    decisions = [reopened.decision(identifier) for identifier in stop_decision_ids]
+    return {
+        "active_generic_owners": sorted(set(generic_owners)),
+        "stop_count": len(decisions),
+        "stops_without_reason": sum(
+            not decision or not decision.get("authority") or not decision.get("why")
+            for decision in decisions
+        ),
+        "reopened_pairs": len(reopened.pairs_summary(limit=1000)),
+    }
+
+
+def wait_for_status(timeout=60, poll=0.5):
+    """Wait for the current per-user daemon to answer the public status command."""
+    deadline = time.monotonic() + timeout
+    result = None
+    while time.monotonic() < deadline:
+        result = _run(["/usr/bin/taema", "status"], timeout=10)
+        if result.returncode == 0:
+            return result
+        time.sleep(poll)
+    return result or _run(["/usr/bin/taema", "status"], timeout=10)
+
+
+def audit_events_after(path, offset):
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(offset)
+            lines = stream.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def audit_stopped_pid(event, pid):
+    """Whether a stop event records a kill for the given process."""
+    if pid in event.get("pids", []):
+        return True
+    return any(decision.get("pid") == pid for decision in event.get("decisions", []))
+
+
+def wait_for_audit_event_after(
+    path, offset, name, predicate=None, timeout=60, poll=0.25
+):
+    """Wait for a matching event appended after a scenario-specific log cursor."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for event in audit_events_after(path, offset):
+            if event.get("event") == name and (predicate is None or predicate(event)):
+                return event
+        time.sleep(poll)
+    raise ScenarioError("no new %s audit event appeared within %ss" % (name, timeout))
+
+
+def wait_for_review_signature(Store, state_dir, review_id, timeout=15, poll=0.25):
+    """Wait for the daemon's audit event and SQLite review row to converge."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reviews = Store(state_dir, {}, read_only=True).open_reviews()
+        review = next((row for row in reviews if row.get("id") == review_id), None)
+        if review and review.get("sig"):
+            return review["sig"]
+        time.sleep(poll)
+    return None
+
+
+def wait_for_auto_action(Store, state_dir, decision_id, timeout=15, poll=0.25):
+    """Wait until the stop's audit event is committed to the SQLite store."""
+    if not isinstance(decision_id, int) or isinstance(decision_id, bool):
+        store = Store(state_dir, {}, read_only=True)
+        return store, None, None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        store = Store(state_dir, {}, read_only=True)
+        action = store.auto_action(decision_id)
+        decision = store.decision(decision_id)
+        if action and decision:
+            return store, action, decision
+        time.sleep(poll)
+    return store, action, decision
+
+
+def wait_for_signature_veto(Store, state_dir, signature_id, timeout=15, poll=0.25):
+    """Wait for an undo's signature veto to appear in the durable store."""
+    if not signature_id:
+        return None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        veto = Store(state_dir, {}, read_only=True).match_veto(signature=signature_id)
+        if veto:
+            return veto
+        time.sleep(poll)
+    return None
+
+
+def install_previous_release(rec, args):
+    """Install and verify the previous package used by upgrade acceptance cases."""
     prevdir = os.path.dirname(args.previous)
     index = run_privileged(["xbps-rindex", "-f", "-a", args.previous])
     rec.step(
         "index-previous", index.returncode == 0, (index.stdout + index.stderr)[-600:]
     )
-    down = run_privileged(
+    installed = run_privileged(
         ["xbps-install", "-y", "-i", "--repository", prevdir, "taema"]
     )
     rec.step(
-        "install-previous", down.returncode == 0, (down.stdout + down.stderr)[-600:]
+        "install-previous",
+        installed.returncode == 0,
+        (installed.stdout + installed.stderr)[-600:],
     )
-
-    ver = _run(["/usr/bin/taema", "--version"])
+    version = _run(["/usr/bin/taema", "--version"])
     rec.step(
         "previous-version",
-        args.previous_version in (ver.stdout + ver.stderr),
-        (ver.stdout + ver.stderr).strip()[:200],
+        args.previous_version in (version.stdout + version.stderr),
+        (version.stdout + version.stderr).strip()[:200],
     )
 
-    up = run_privileged(
+
+def install_current_release(rec, args):
+    """Install and verify the current package from the transferred repository."""
+    installed = run_privileged(
         ["xbps-install", "-y", "-i", "--repository", args.package_dir, "taema"]
     )
-    rec.step("install-current", up.returncode == 0, (up.stdout + up.stderr)[-600:])
-
-    ver = _run(["/usr/bin/taema", "--version"])
+    rec.step(
+        "install-current",
+        installed.returncode == 0,
+        (installed.stdout + installed.stderr)[-600:],
+    )
+    version = _run(["/usr/bin/taema", "--version"])
     rec.step(
         "current-version",
-        args.current_version in (ver.stdout + ver.stderr),
-        (ver.stdout + ver.stderr).strip()[:200],
+        args.current_version in (version.stdout + version.stderr),
+        (version.stdout + version.stderr).strip()[:200],
     )
-
-    svc = run_privileged(["sv", "status", "/var/service/taema"])
-    rec.step("service-up", svc.returncode == 0, (svc.stdout + svc.stderr).strip()[:300])
-
-    status = _run(["/usr/bin/taema", "status"], timeout=30)
+    status = wait_for_status()
     rec.step(
-        "daemon-status", status.returncode == 0, (status.stdout or status.stderr)[:300]
+        "current-daemon-ready",
+        status.returncode == 0,
+        (status.stdout or status.stderr)[:300],
     )
+    service = run_privileged(["sv", "status", "/var/service/taema"])
+    rec.step(
+        "service-up",
+        service.returncode == 0,
+        (service.stdout + service.stderr).strip()[:300],
+    )
+
+
+def scenario_m1(rec, args, tree_holder):
+    """Upgrade a live VM from 0.3 JSON state to the SQLite release."""
+    if not args.previous or not args.package_dir or not args.migration_fixture:
+        raise ScenarioError(
+            "M1 needs previous/current packages and a migration fixture"
+        )
+
+    tree = spawn_gui_tree(os.path.join(args.artifacts, "m1-live-app"), children=2)
+    tree_holder.append(tree)
+    original_scope = wait_for_scope(tree["root"], ["app-"], timeout=90)
+    app_scope = daemon_scope(original_scope)
+    rec.step("live-app-managed", True, "scope=%s" % app_scope)
+
+    state_dir = args.state_dir
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    old_daemon = run_privileged(["sv", "down", "/var/service/taema"])
+    rec.step("stop-old-daemon", old_daemon.returncode == 0, old_daemon.stderr[-400:])
+    removed = run_privileged(["xbps-remove", "-y", "taema"])
+    rec.step("remove-current-package", removed.returncode == 0, removed.stderr[-400:])
+
+    for name in ("state.db", "state.db-wal", "state.db-shm"):
+        try:
+            os.unlink(os.path.join(state_dir, name))
+        except FileNotFoundError:
+            pass
+    legacy_path = os.path.join(state_dir, "knowledge.json")
+    shutil.copyfile(args.migration_fixture, legacy_path)
+    os.chmod(legacy_path, 0o600)
+    migration_log = os.path.join(state_dir, "decisions.log")
+    try:
+        with open(migration_log, "rb") as stream:
+            log_offset = os.fstat(stream.fileno()).st_size
+    except OSError:
+        log_offset = 0
+
+    install_previous_release(rec, args)
+    install_current_release(rec, args)
+
+    _policy, _signature, Store = _store_modules()
+    migrated = Store(state_dir, {}, read_only=True)
+    stop = migrated.pair_decision("npm", "vite")[0]
+    keep = migrated.pair_decision("editor", "language-server")[0]
+    invalid = migrated.pair_decision("MainThread", "sh")[0]
+    review = next(
+        (
+            item
+            for item in migrated.open_reviews()
+            if item.get("kind") == "legacy-invalid"
+            and item.get("owner") == "MainThread"
+            and item.get("answer") == "stop"
+        ),
+        None,
+    )
+    backups = sorted(glob.glob(legacy_path + ".backup-*"))
+    backup_ok = False
+    if backups:
+        try:
+            with open(backups[-1], encoding="utf-8") as stream:
+                backup = json.load(stream)
+            pair = backup.get("pairs", {}).get("npm\0vite", {})
+            backup_ok = (
+                pair.get("ex_last") == "stop"
+                and os.stat(backups[-1]).st_mode & 0o777 == 0o600
+            )
+        except (OSError, ValueError):
+            backup_ok = False
+    rec.step(
+        "valid-decisions-preserved",
+        stop == "stop" and keep == "keep",
+        "stop=%s keep=%s" % (stop, keep),
+    )
+    rec.step(
+        "invalid-answer-reviewed",
+        invalid == "invalid" and review is not None,
+        "pair=%s review=%s" % (invalid, bool(review)),
+    )
+    rec.step("private-backup-kept", backup_ok, "files=%d" % len(backups))
+
+    stop_events = [
+        event
+        for event in audit_events_after(migration_log, log_offset)
+        if event.get("event") in ("stop", "auto_stop")
+    ]
+    live = all(_alive(pid) for pid in [tree["root"]] + tree["children"])
+    scope_after = daemon_scope(scope_of(tree["root"]))
+    no_stop = live and scope_after == app_scope and not stop_events
+    rec.step(
+        "migration-stopped-nothing",
+        no_stop,
+        "live=%s same_scope=%s stop_events=%d"
+        % (live, scope_after == app_scope, len(stop_events)),
+    )
+    return all(step["ok"] for step in rec.steps)
+
+
+def scenario_m2(rec, args, tree_holder):
+    """Exercise live signature stops, undo, offline vetoes, and replay safety."""
+    if not args.replay_fixture:
+        raise ScenarioError("M2 needs the committed anonymized replay fixture")
+    with tempfile.TemporaryDirectory(prefix="taema-learning-replay-") as replay_state:
+        replay = replay_learning_fixture(args.replay_fixture, replay_state)
+    replay_ok = (
+        not replay["active_generic_owners"] and not replay["stops_without_reason"]
+    )
+    rec.step(
+        "replay-fixture-authorization", replay_ok, json.dumps(replay, sort_keys=True)
+    )
+
+    _policy, _signature, Store = _store_modules()
+    config_path = _m0_config_paths()[0]
+    config_snapshot = _m0_snapshot((config_path,))
+    tracked = []
+    log_path = os.path.join(args.state_dir, "decisions.log")
+
+    def track(tree):
+        tracked.append(tree)
+        tree_holder.append(tree)
+        return tree
+
+    def start_signature_tree(workdir, child_argv=None, sample_cpu=False):
+        for name in ("tree.json", "tree.json.tmp", "supervisor.pid"):
+            try:
+                os.unlink(os.path.join(workdir, name))
+            except FileNotFoundError:
+                pass
+        tree = track(spawn_gui_tree(workdir, children=1, child_argv=child_argv))
+        scope = wait_for_scope(tree["root"], ["app-"], timeout=90)
+        ready_delay = max(5.5, configured_adopt_interval() + 1.0)
+        if sample_cpu:
+            # Auto-stop refuses a process until lineage has at least 30 seconds
+            # of CPU history; give the guest clock one extra sampling interval.
+            ready_delay = max(ready_delay, 31.5)
+        time.sleep(ready_delay)
+        return tree, scope
+
+    def log_offset():
+        try:
+            return os.stat(log_path).st_size
+        except OSError:
+            return 0
+
+    try:
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as stream:
+            stream.write(
+                'mode = "adopt"\n\n[timers]\n'
+                "adopt_interval = 2\ngc_interval = 3600\n\n"
+                "[learn]\nrespawn_window = 0\nregret_window = 0\n"
+            )
+        restarted = run_privileged(["sv", "restart", "/var/service/taema"])
+        ready = wait_for_status()
+        rec.step(
+            "adopt-mode-ready",
+            restarted.returncode == 0
+            and ready.returncode == 0
+            and "mode: adopt" in ready.stdout,
+            (ready.stdout or ready.stderr)[:300],
+        )
+
+        workdir = os.path.join(args.artifacts, "m2-signature-app")
+        first, first_app_scope = start_signature_tree(workdir)
+        first_offset = log_offset()
+        close_root(first["root"], timeout=15)
+        first_review = wait_for_audit_event_after(
+            log_path,
+            first_offset,
+            "review_created",
+            predicate=lambda event: bool(event.get("id") and event.get("owner")),
+            timeout=60,
+        )
+        first_signature_id = wait_for_review_signature(
+            Store, args.state_dir, first_review["id"]
+        )
+        first_leftover = wait_for_scope(first["children"][0], ["leftover/"], timeout=30)
+        first_kept = (
+            _alive(first["children"][0])
+            and assert_scope_member(first["children"][0], "leftover/") == first_leftover
+        )
+        rec.step(
+            "initial-signature-review-keeps-survivor",
+            first_kept
+            and daemon_scope(first_app_scope).startswith("app-")
+            and bool(first_signature_id),
+            "review=%s signature=%s scope=%s alive=%s"
+            % (first_review.get("id"), first_signature_id, first_leftover, first_kept),
+        )
+        answer = _run(
+            ["/usr/bin/taema", "answer", str(first_review["id"]), "stop"], timeout=30
+        )
+        rec.step(
+            "explicit-signature-stop-answered",
+            answer.returncode == 0,
+            (answer.stdout or answer.stderr).strip()[:300],
+        )
+
+        identical, _identical_app_scope = start_signature_tree(workdir, sample_cpu=True)
+        identical_offset = log_offset()
+        close_root(identical["root"], timeout=15)
+        stop_event = wait_for_audit_event_after(
+            log_path,
+            identical_offset,
+            "stop",
+            predicate=lambda event: audit_stopped_pid(event, identical["children"][0]),
+            timeout=60,
+        )
+        decision_id = stop_event.get("decision_id")
+        _stop_store, action, decision = wait_for_auto_action(
+            Store, args.state_dir, decision_id
+        )
+        killed = _wait_process_dead(identical["children"][0], timeout=20)
+        undo_payload = decision.get("undo") if decision else None
+        signature_id = (
+            undo_payload.get("signature_id") if isinstance(undo_payload, dict) else None
+        )
+        rec.step(
+            "identical-signature-relaunch-is-stopped",
+            killed
+            and action is not None
+            and decision is not None
+            and decision.get("kind") in ("stop", "auto_stop")
+            and decision.get("authority")
+            and decision.get("why")
+            and signature_id
+            and signature_id == first_signature_id,
+            "pid=%d killed=%s action=%s signature_matches_review=%s decision=%s"
+            % (
+                identical["children"][0],
+                killed,
+                bool(action),
+                signature_id == first_signature_id,
+                {
+                    "kind": decision.get("kind") if decision else None,
+                    "authority": decision.get("authority") if decision else None,
+                    "why": decision.get("why") if decision else None,
+                },
+            ),
+        )
+
+        undo = _run(["/usr/bin/taema", "undo", str(decision_id)], timeout=30)
+        undo_veto = wait_for_signature_veto(Store, args.state_dir, signature_id)
+        rec.step(
+            "cli-undo-vetoes-signature",
+            undo.returncode == 0
+            and undo_veto is not None
+            and undo_veto.get("reason") == "undo automatic stop",
+            (undo.stdout or undo.stderr).strip()[:300],
+        )
+
+        after_undo_tree, _after_undo_app_scope = start_signature_tree(
+            workdir, sample_cpu=True
+        )
+        after_undo_offset = log_offset()
+        close_root(after_undo_tree["root"], timeout=15)
+        after_undo_scope = wait_for_scope(
+            after_undo_tree["children"][0], ["leftover/"], timeout=30
+        )
+        after_undo_review = wait_for_audit_event_after(
+            log_path,
+            after_undo_offset,
+            "review_created",
+            predicate=lambda event: (
+                event.get("scope") == daemon_scope(after_undo_scope)
+            ),
+            timeout=60,
+        )
+        after_undo_events = audit_events_after(log_path, after_undo_offset)
+        next_stop = any(
+            event.get("event") == "stop"
+            and audit_stopped_pid(event, after_undo_tree["children"][0])
+            for event in after_undo_events
+        )
+        veto_still_active = (
+            wait_for_signature_veto(Store, args.state_dir, signature_id) is not None
+        )
+        rec.step(
+            "undo-blocks-next-identical-stop",
+            _alive(after_undo_tree["children"][0])
+            and not next_stop
+            and veto_still_active
+            and bool(after_undo_review),
+            "pid=%d alive=%s stopped=%s veto=%s review=%s"
+            % (
+                after_undo_tree["children"][0],
+                _alive(after_undo_tree["children"][0]),
+                next_stop,
+                veto_still_active,
+                after_undo_review.get("id"),
+            ),
+        )
+
+        tail = shutil.which("tail") or "/usr/bin/tail"
+        changed, _changed_app_scope = start_signature_tree(
+            workdir, child_argv=[tail, "-f", "/dev/null"], sample_cpu=True
+        )
+        changed_offset = log_offset()
+        close_root(changed["root"], timeout=15)
+        changed_scope = wait_for_scope(
+            changed["children"][0], ["leftover/"], timeout=30
+        )
+        changed_review = wait_for_audit_event_after(
+            log_path,
+            changed_offset,
+            "review_created",
+            predicate=lambda event: event.get("scope") == daemon_scope(changed_scope),
+            timeout=60,
+        )
+        changed_events = audit_events_after(log_path, changed_offset)
+        changed_stopped = any(
+            event.get("event") == "stop"
+            and audit_stopped_pid(event, changed["children"][0])
+            for event in changed_events
+        )
+        changed_signature = wait_for_review_signature(
+            Store, args.state_dir, changed_review["id"]
+        )
+        rec.step(
+            "changed-signature-does-not-inherit-stop",
+            _alive(changed["children"][0])
+            and not changed_stopped
+            and bool(changed_review)
+            and changed_signature
+            and changed_signature != signature_id,
+            "pid=%d alive=%s stopped=%s prior_signature=%s changed_signature=%s"
+            % (
+                changed["children"][0],
+                _alive(changed["children"][0]),
+                changed_stopped,
+                signature_id,
+                changed_signature,
+            ),
+        )
+
+        tree = track(
+            spawn_gui_tree(os.path.join(args.artifacts, "m2-offline-veto"), children=1)
+        )
+        rel = wait_for_scope(tree["root"], ["app-"], timeout=90)
+        scope = daemon_scope(rel)
+        down = run_privileged(["sv", "down", "/var/service/taema"])
+        veto = _run(
+            [
+                "/usr/bin/taema",
+                "do-not-kill",
+                "--scope",
+                scope,
+                "--reason",
+                "VM offline veto acceptance",
+            ]
+        )
+        refused = _run(["/usr/bin/taema", "kill", "scope:" + scope], timeout=30)
+        survives = all(_alive(pid) for pid in [tree["root"]] + tree["children"])
+        rec.step("stop-daemon-for-veto", down.returncode == 0, down.stderr[-300:])
+        rec.step(
+            "offline-veto-queues",
+            veto.returncode == 0,
+            (veto.stdout or veto.stderr).strip()[:300],
+        )
+        rec.step(
+            "kill-refuses-with-exit-4",
+            refused.returncode == 4 and survives,
+            "rc=%d alive=%s output=%s"
+            % (
+                refused.returncode,
+                survives,
+                (refused.stderr or refused.stdout).strip()[:300],
+            ),
+        )
+        restarted = run_privileged(["sv", "up", "/var/service/taema"])
+        status = wait_for_status()
+        rec.step(
+            "daemon-restored-after-offline-veto",
+            restarted.returncode == 0 and status.returncode == 0,
+            (status.stdout or status.stderr)[:300],
+        )
+    finally:
+        restored = _m0_restore(config_snapshot)
+        rec.step(
+            "daemon-config-restored",
+            restored.returncode == 0,
+            (restored.stdout + restored.stderr).strip()[:300],
+        )
+        for tree in tracked:
+            kill_tree(tree, timeout=5)
+
+    return all(step["ok"] for step in rec.steps)
+
+
+def scenario_upgrade(rec, args, tree_holder):
+    """Install the previous release, then upgrade back to the working tree."""
+    stopped = run_privileged(["sv", "down", "/var/service/taema"])
+    rec.step("stop-current-daemon", stopped.returncode == 0, stopped.stderr[-300:])
+    removed = run_privileged(["xbps-remove", "-y", "taema"])
+    rec.step("remove-current-package", removed.returncode == 0, removed.stderr[-500:])
+    install_previous_release(rec, args)
+    install_current_release(rec, args)
     return all(s["ok"] for s in rec.steps)
 
 
@@ -1277,6 +1881,8 @@ def scenario_remove(rec, args, tree_holder):
 SCENARIOS = {
     "smoke": scenario_smoke,
     "m0": scenario_m0,
+    "m1": scenario_m1,
+    "m2": scenario_m2,
     "upgrade": scenario_upgrade,
     "remove": scenario_remove,
 }
@@ -1323,6 +1929,8 @@ def main(argv):
     common.add_argument("--previous", help="path to the previous release .xbps")
     common.add_argument("--previous-version", help="expected previous version")
     common.add_argument("--current-version", help="expected current version")
+    common.add_argument("--migration-fixture", help="0.3.0 JSON migration fixture")
+    common.add_argument("--replay-fixture", help="anonymized learner replay fixture")
     for name in sorted(SCENARIOS):
         sub.add_parser(name, parents=[common])
     args = parser.parse_args(argv)

@@ -1,7 +1,7 @@
 # Upgrade and downgrade state
 
-When the daemon first starts with `state.db` and an existing 0.2 `knowledge.json`, it
-copies the JSON file to a private `knowledge.json.backup-*` file and imports learning,
+When the daemon first starts with `state.db` and an existing `knowledge.json` from 0.3.0,
+it copies the JSON file to a private `knowledge.json.backup-*` file and imports learning,
 reviews, vetoes, metadata, and recent audit events in one SQLite transaction. The backup
 is kept for 30 days. The original JSON remains untouched and is no longer written. A
 restarted or upgraded daemon recognizes the committed import marker and will not import it
@@ -55,3 +55,17 @@ python3 tools/anonymize_state.py --output-dir tests/fixtures/legacy-v2
 ```
 
 The fixture parity test checks that every valid pair keeps its decision across import.
+
+## Upgrade from 0.3.0 to 0.4.0
+
+The 0.3.0 package stores learning in `knowledge.json`. On its first 0.4.0 daemon start,
+tæma imports valid pair decisions into `state.db` in one transaction, changes invalid-owner
+answers into open reviews, and leaves the original file untouched. The importer keeps a
+private mode-`0600` backup before committing and never calls a process-stop path. The package
+restarts the per-user daemon after replacing its files so migration runs promptly; managed
+application scopes and their processes remain in place. No manual export or shutdown is
+needed.
+
+Inspect imported decisions with `taema learn pairs`, invalid legacy answers with
+`taema learn show --legacy` or `taema review`, and the complete storage contract in
+`/usr/share/doc/taema/state-schema.md`.

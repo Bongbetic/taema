@@ -44,6 +44,7 @@ ALL_TOOLS = sorted(
         "ssh_keygen",
         "mke2fs",
         "make",
+        "git",
         "xbps_create",
         "xbps_rindex",
         "tar",
@@ -87,7 +88,9 @@ class VmTestCase(unittest.TestCase):
         self.tools = stub_tools(self.bindir)
         self.cfg_path = os.path.join(self.tmp, "config.toml")
 
-    def write_config(self, libcs=None, scenarios=None, glibc_sha=None):
+    def write_config(
+        self, libcs=None, scenarios=None, glibc_sha=None, package_repo="build/repo"
+    ):
         lines = [
             "libcs = [%s]"
             % ", ".join('"%s"' % c for c in (libcs or ["glibc", "musl"])),
@@ -101,7 +104,7 @@ class VmTestCase(unittest.TestCase):
             'test_user = "taematest"',
             "[paths]",
             'state_dir = "%s"' % self.state,
-            'package_repo = "build/repo"',
+            'package_repo = "%s"' % package_repo,
             "[tools]",
         ]
         for key, path in sorted(self.tools.items()):
@@ -111,7 +114,7 @@ class VmTestCase(unittest.TestCase):
             "[images]",
             'base_url = "https://repo-default.voidlinux.org/live/current"',
             'previous_url = "https://github.com/Bongbetic/taema/releases/download/'
-            'taema-v0.2.1/taema-0.2.1_1.noarch.xbps"',
+            'taema-v0.3.0/taema-0.3.0_1.noarch.xbps"',
             "",
             "[images.glibc]",
             'tarball = "void-x86_64-ROOTFS-20250202.tar.xz"',
@@ -360,11 +363,40 @@ class PlanTest(VmTestCase):
         self.assertEqual(names[-1], "teardown")
         self.assertIn("collect", names)
 
+    def test_m1_and_m2_plan_transfers_acceptance_fixtures(self):
+        plan = vmh.build_plan(
+            self.cfg,
+            libcs=["glibc"],
+            scenarios=["m1", "m2"],
+            kvm=False,
+        )
+        vm = plan["vms"][0]
+        bootstrap = next(
+            step for step in vm["steps"] if step["name"] == "scp-bootstrap"
+        )
+        m1 = next(step for step in vm["steps"] if step["name"] == "scenario:m1")
+        m2 = next(step for step in vm["steps"] if step["name"] == "scenario:m2")
+        self.assertIn(vmh.MIGRATION_FIXTURE, bootstrap["argv"])
+        self.assertIn(vmh.LEARNING_REPLAY_FIXTURE, bootstrap["argv"])
+        self.assertIn(vmh.previous_pkg_path(self.cfg), bootstrap["argv"])
+        self.assertIn("--migration-fixture", m1["argv"][-1])
+        self.assertIn(
+            "--previous /tmp/taema-vm/taema-0.3.0_1.noarch.xbps",
+            m1["argv"][-1],
+        )
+        self.assertIn("--previous-version 0.3.0", m1["argv"][-1])
+        self.assertIn("--replay-fixture", m2["argv"][-1])
+
     def test_plan_network_inputs_listed(self):
         plan = vmh.build_plan(self.cfg, scenarios=["upgrade"], kvm=False)
         urls = plan["network"]["urls"]
         self.assertTrue(any("ROOTFS" in u for u in urls))
         self.assertTrue(any("taema-" in u for u in urls))
+
+    def test_plan_omits_previous_url_when_source_tag_is_available(self):
+        with mock.patch.object(vmh, "previous_source_available", return_value=True):
+            plan = vmh.build_plan(self.cfg, scenarios=["upgrade"], kvm=False)
+        self.assertFalse(any("taema-" in url for url in plan["network"]["urls"]))
 
 
 class DryRunTest(VmTestCase):
@@ -403,6 +435,38 @@ class PackageBuildTest(VmTestCase):
         with mock.patch.object(vmh.subprocess, "run", side_effect=fake_run) as run:
             self.assertEqual(vmh.build_package(cfg), package)
         run.assert_called_once()
+
+
+class PreviousPackageBuildTest(VmTestCase):
+    def test_previous_package_builds_from_a_local_tag_without_network(self):
+        cfg = vmh.load_config(self.write_config(libcs=["glibc"]))
+        cfg["images"]["previous_ref"] = "taema-v0.3.0"
+        dest = vmh.previous_pkg_path(cfg)
+
+        def fake_run(argv, **kwargs):
+            if argv[0] == self.tools["git"]:
+                archive = argv[argv.index("--output") + 1]
+                with open(archive, "wb") as stream:
+                    stream.write(b"source archive")
+            elif argv[0] == self.tools["tar"]:
+                pass
+            else:
+                self.assertEqual(argv[0], "sh")
+                repository = argv[-1]
+                os.makedirs(repository, exist_ok=True)
+                with open(os.path.join(repository, os.path.basename(dest)), "wb") as f:
+                    f.write(b"previous package")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with (
+            mock.patch.object(vmh, "previous_source_available", return_value=True),
+            mock.patch.object(vmh.subprocess, "run", side_effect=fake_run) as run,
+        ):
+            self.assertEqual(vmh.fetch_previous(cfg, allow_network=False), dest)
+
+        with open(dest, "rb") as stream:
+            self.assertEqual(stream.read(), b"previous package")
+        self.assertEqual(run.call_count, 3)
 
 
 class ImageBuildScriptTest(VmTestCase):
@@ -517,7 +581,10 @@ class RunPipelineTest(VmTestCase):
 
     def setUp(self):
         super().setUp()
-        self.cfg_path = self.write_config(libcs=["glibc"], scenarios=["smoke"])
+        package_repo = os.path.join(self.tmp, "package-repo")
+        self.cfg_path = self.write_config(
+            libcs=["glibc"], scenarios=["smoke"], package_repo=package_repo
+        )
         self.cfg = vmh.load_config(self.cfg_path)
         self.stub_tool("qemu", "#!/bin/sh\nexec sleep 60\n")
         self.stub_tool("qemu_img", "#!/bin/sh\nexit 0\n")
@@ -606,18 +673,22 @@ class RunPipelineTest(VmTestCase):
 class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
         self.assertEqual(
-            vmh.parse_scenarios("all"), ["smoke", "m0", "upgrade", "remove"]
+            vmh.parse_scenarios("all"),
+            ["smoke", "m0", "m1", "m2", "upgrade", "remove"],
         )
 
     def test_m0_acceptance_is_a_registered_guest_scenario(self):
         self.assertIn("m0", vmh.SCENARIOS)
         self.assertIn("m0", scenario.SCENARIOS)
+        for name in ("m1", "m2"):
+            self.assertIn(name, vmh.SCENARIOS)
+            self.assertIn(name, scenario.SCENARIOS)
 
     def test_parse_libcs(self):
         self.assertEqual(vmh.parse_libcs("glibc, musl"), ["glibc", "musl"])
 
     def test_previous_version_derived_from_default_config(self):
-        self.assertEqual(vmh.previous_version(vmh.load_config()), "0.2.1")
+        self.assertEqual(vmh.previous_version(vmh.load_config()), "0.3.0")
 
     def test_unknown_subcommand_is_usage_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -638,7 +709,7 @@ class HarnessSurfacesTest(unittest.TestCase):
 
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
-        self.assertEqual(vmh.read_version(ROOT), "0.3.0")
+        self.assertEqual(vmh.read_version(ROOT), "0.4.0")
 
     def test_release_notes_document_forget_all_and_feedback_field(self):
         notes = read_text(os.path.join(REPO, "CHANGELOG.md"))
@@ -706,6 +777,16 @@ class ScenarioApiTest(unittest.TestCase):
         os.makedirs(self.cgroot)
         os.makedirs(self.procroot)
         self.tree = None
+
+    def test_replay_fixture_keeps_generic_owners_out_of_active_pairs(self):
+        fixture = os.path.join(ROOT, "tests", "fixtures", "learning-v3", "replay.json")
+        result = scenario.replay_learning_fixture(
+            fixture, os.path.join(self.tmp, "replay")
+        )
+        self.assertEqual(result["active_generic_owners"], [])
+        self.assertGreater(result["stop_count"], 0)
+        self.assertEqual(result["stops_without_reason"], 0)
+        self.assertGreater(result["reopened_pairs"], 0)
 
     def tearDown(self):
         if self.tree:
@@ -1145,6 +1226,23 @@ class ScenarioResultTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual([s["name"] for s in data["steps"]], ["spawn", "close"])
         self.assertTrue(all("ok" in s for s in data["steps"]))
+
+
+class StopAuditEventTest(unittest.TestCase):
+    def test_matches_pid_in_decisions_and_legacy_pid_list(self):
+        self.assertTrue(
+            scenario.audit_stopped_pid(
+                {"event": "stop", "decisions": [{"pid": 42, "action": "kill"}]},
+                42,
+            )
+        )
+        self.assertTrue(scenario.audit_stopped_pid({"event": "stop", "pids": [42]}, 42))
+        self.assertFalse(
+            scenario.audit_stopped_pid(
+                {"event": "stop", "decisions": [{"pid": 43, "action": "kill"}]},
+                42,
+            )
+        )
 
 
 if __name__ == "__main__":

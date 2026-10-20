@@ -13,6 +13,7 @@ artifacts.
 make -C taema vm-test                      # smoke + M0 acceptance on glibc + musl (default)
 make -C taema vm-test VMFLAGS="--libc glibc"          # one libc only
 make -C taema vm-test VMFLAGS="--allow-network --scenarios all"
+make -C taema vm-test VMFLAGS="--allow-network --scenarios m1,m2,upgrade"  # M1/M2 release gate
 ```
 
 Equivalent direct invocation: `taema/tools/vm/vmh run [flags]`.
@@ -37,6 +38,7 @@ prerequisite, missing `--allow-network`, bad configuration).
 - `ssh`, `scp`, `ssh-keygen`
 - `make`, `xbps-create`, `xbps-rindex` (package build; this host is Void)
 - `mke2fs`, `tar`, `unshare` (rootless image build; user namespaces required)
+- `git` for building the 0.3.0 comparison package from its local tag
 - Network **only** for first-time fetches, explicitly opted in with
   `--allow-network`: the official Void rootfs tarballs, the packages the image
   build installs (kernel, sshd, dhcpcd, python3, iproute2, sudo), and the
@@ -108,14 +110,19 @@ Built-in scenarios:
   one real hour for an idle scope to reach its GC threshold, checks repeated
   unchanged passes, then advances a clock through a separate simulated 24-hour
   GC test. The per-scenario timeout is long enough for the real idle window.
-- **upgrade** — index and install the previous release package, assert its
-  version, install the current package from the working tree, assert the
-  version, service, and daemon health (when the working tree still has the
-  same version as the previous release this exercises a reinstall of the
-  current package; after a version bump it is a true upgrade).
+- **upgrade** — remove the installed package, install the previous release,
+  assert its version and daemon health, then install the current package and
+  verify the version, service, and daemon health. The previous package can be
+  built from its local source tag without downloading a release asset.
 - **remove** — `xbps-remove taema`, then verify cleanup: package not
   queryable, binaries and the `/var/service/taema` link gone, no `taema
   daemon` process left.
+
+- **m1** — keep a live managed app running while a glibc or musl VM installs the 0.3.0
+  source-tag package with a committed JSON fixture and upgrades to 0.4.0. It checks valid
+  decision preservation, invalid-owner review, the private backup, and no stop events.
+- **m2** — replay the anonymized learning fixture and check owner hygiene and authorization
+  reasons; verify signature matching, stop undo, and offline veto refusal with exit 4.
 
 ## Artifacts
 
@@ -143,6 +150,18 @@ known_hosts, qemu.pid transport state for this run only
   throwaway key generated into the state directory.
 - Root inside the guest is reached only through `sudo -n` from the harness
   admin created in the image; nothing privileged executes on the host.
+
+## M1 and M2 release acceptance
+
+Run the m1, m2, and upgrade scenarios on both libcs before the 0.4.0 tag. The m1 scenario
+builds the previous package from the local taema-v0.3.0 source tag when it is not cached,
+then checks a live application survives the package change and that SQLite migration keeps
+valid answers, reviews invalid owners, and saves a private backup. The m2 scenario replays
+the committed anonymized learning fixture, checks signature matching and stop undo, and
+confirms an offline veto makes a manual stop return exit code 4.
+
+The VM workflow checkout fetches full Git history so the previous source tag is available.
+Populate the root image cache with the explicit network option when needed.
 
 ## CI
 

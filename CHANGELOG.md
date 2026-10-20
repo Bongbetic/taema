@@ -2,6 +2,19 @@
 
 ## Behaviour changes
 
+### SQLite state and provenance learning
+
+Learning state now lives in a transactional SQLite database, with concurrent read-only CLI
+access, retained decision provenance, and an anonymized replay fixture. Upgrading from 0.3.0
+imports valid pair decisions, quarantines invalid legacy owners for review, and keeps a
+private backup of the original JSON state; migration does not stop processes. Survivor
+signatures carry explicit answers across identical relaunched survivor sets, while changed
+sets require a separate review. Automatic-stop outcomes, regret, and undo update durable
+pair and signature decisions.
+
+The package includes the SQLite schema and migration guides plus the `taema-learning(7)`
+manual page.
+
 ### inspect and reset learned state
 
 `taema learn show`, `apps`, `pairs`, and `signatures` display learned decisions, evidence, and

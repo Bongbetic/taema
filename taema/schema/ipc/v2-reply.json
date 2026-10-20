@@ -11,7 +11,7 @@
       "type": "object",
       "required": ["code", "message", "hint"],
       "properties": {
-        "code": {"enum": ["invalid_request", "unsupported_version", "unknown_command", "forbidden", "invalid_nonce", "operation_failed"]},
+        "code": {"enum": ["invalid_request", "unsupported_version", "unknown_command", "forbidden", "invalid_nonce", "operation_failed", "slow_consumer"]},
         "message": {"type": "string"},
         "hint": {"type": "string"}
       },

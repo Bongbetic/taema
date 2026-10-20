@@ -234,6 +234,30 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "read": True,
     },
     {
+        "name": "watch",
+        "aliases": (),
+        "help": "print live changes as plain lines",
+        "handler": "cmd_watch",
+    },
+    {
+        "name": "events",
+        "aliases": (),
+        "help": "query or follow the event log",
+        "handler": "cmd_events",
+        "read": True,
+        "arguments": (
+            (("--since",), {"type": int, "default": 0, "metavar": "SEQ"}),
+            (("--event",), {"metavar": "NAME"}),
+            (("--follow",), {"action": "store_true"}),
+        ),
+    },
+    {
+        "name": "prompt",
+        "aliases": (),
+        "help": "print the cached prompt summary without contacting the daemon",
+        "handler": "cmd_prompt",
+    },
+    {
         "name": "review",
         "aliases": (),
         "help": "list pending close reviews",

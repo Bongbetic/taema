@@ -67,6 +67,30 @@
       ]
     },
     "review": {"type": "object", "required": ["reviews"], "properties": {"reviews": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": true},
+    "event": {
+      "type": "object", "required": ["seq", "ts", "event", "decision_id", "topics", "data"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 1},
+        "ts": {"type": "number", "minimum": 0},
+        "event": {"type": "string"},
+        "decision_id": {"type": ["integer", "null"]},
+        "topics": {"type": "array", "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}},
+        "data": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "subscribe": {
+      "type": "object",
+      "properties": {
+        "subscribed": {"type": "boolean"},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "since_seq": {"type": "integer", "minimum": 0},
+        "event": {"$ref": "#/$defs/event"},
+        "resync": {"type": "boolean"},
+        "latest_seq": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
     "register": {"type": "object", "required": ["watching"], "properties": {"watching": {"type": "boolean"}}, "additionalProperties": true},
     "attach": {"type": "object", "required": ["ok", "attached"], "properties": {"ok": {"const": true}, "attached": {"type": "array", "items": {"type": "integer"}}}, "additionalProperties": true},
     "job_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}, "ignored": {"type": "string"}}, "additionalProperties": true},

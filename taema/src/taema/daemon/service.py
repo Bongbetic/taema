@@ -17,6 +17,7 @@ import signal
 import socket
 import stat
 import struct
+import tempfile
 import time
 
 from ..model import authorization
@@ -24,7 +25,7 @@ from ..core import cgroup, process as inspect, lineage
 from ..governor import engine
 from ..store import knowledge
 from ..config import policy
-from .. import protocol
+from .. import events as event_views, protocol
 
 MAX_OWNERS = 256  # pidfd owner watches
 MAX_LEAF_WATCH = 256  # cgroup.events watches (EPOLLPRI)
@@ -47,6 +48,10 @@ KILL_LOOKBACK = (
 )
 SHELL_KEYS = ("sh", "bash", "dash", "zsh", "fish")
 MAX_GATE_SKIPS = 4  # fork gate: at most 4 skipped adopt passes, so every 5th one runs
+MAX_SUBSCRIBERS = 16
+MAX_SUBSCRIBER_QUEUE = 4096
+MAX_EVENT_REPLAY = 1000
+SUBSCRIBER_CLOSE_TTL = 1.0
 
 
 class Daemon:
@@ -112,6 +117,11 @@ class Daemon:
         self.stopping = False
         self.toggle_hold_requested = False
         self.session_seen = False
+        self.subscribers = {}
+        self._summary_path = os.path.join(self.qdir(), "summary")
+        self._summary_dirty = True
+        self._last_event = "ready"
+        self.store.add_event_listener(self._publish_event)
 
     def restore_runtime_hold(self):
         """Import an offline runtime marker and honor the cautious service boot setting."""
@@ -1720,6 +1730,7 @@ class Daemon:
         """Defer routine writes until the end of a daemon pass."""
         if not self._in_tick:
             self.store.save_if_dirty()
+            self._write_summary_if_dirty()
 
     # ---- socket API ----
     def handle(self, msg):
@@ -1884,6 +1895,228 @@ class Daemon:
             self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
         return {"ok": True, "attached": done}
 
+    def _summary_text(self):
+        state = self.store.hold_status()
+        held = []
+        if state.get("global"):
+            held.append("global")
+        scopes = state.get("scopes", [])
+        held.extend("scope:" + scope for scope in scopes[:3])
+        if len(scopes) > 3:
+            held.append("+%d scopes" % (len(scopes) - 3))
+        if state.get("snooze_until"):
+            held.append("snooze")
+        hold = ",".join(held) or "none"
+        reason = state.get("reason") or self.profile_reason
+        reason = " ".join(str(reason).split())[:96]
+        profile = " ".join(str(self.cfg.get("_profile_name", "auto")).split())[:64]
+        latest = " ".join(str(self._last_event).split())[:64]
+        line = "taema mode=%s profile=%s reason=%s hold=%s reviews=%d event=%s" % (
+            self.mode,
+            profile,
+            json.dumps(reason, ensure_ascii=False),
+            hold[:128],
+            self.store.review_count,
+            latest,
+        )
+        return line[:1023] + "\n"
+
+    def _write_summary_if_dirty(self):
+        if not self._summary_dirty:
+            return False
+        directory = os.path.dirname(self._summary_path)
+        temporary = None
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+            fd, temporary = tempfile.mkstemp(prefix=".summary-", dir=directory)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(self._summary_text())
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self._summary_path)
+            os.chmod(self._summary_path, 0o600)
+        except OSError:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            return False
+        self._summary_dirty = False
+        return True
+
+    def _publish_event(self, event):
+        self._summary_dirty = True
+        self._last_event = str(event.get("event", "unknown"))
+        view = event_views.view_event(event)
+        topics = set(view["topics"])
+        for conn, subscriber in tuple(self.subscribers.items()):
+            if subscriber["closing"] or not topics.intersection(subscriber["topics"]):
+                continue
+            if subscriber["queued_events"] >= MAX_SUBSCRIBER_QUEUE:
+                self._close_slow_subscriber(conn, subscriber)
+                continue
+            subscriber["queue"].append(({"event": view}, True))
+            subscriber["queued_events"] += 1
+            self._update_subscriber_interest(conn, subscriber)
+
+    def _wire_subscriber_item(self, subscriber, item):
+        failure = item.get("_failure")
+        if failure:
+            error = protocol.ProtocolError(*failure)
+            reply = protocol.error_reply(subscriber["id"], error)
+        else:
+            reply = protocol.reply_v2(subscriber["id"], item)
+        return (
+            json.dumps(reply, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode()
+
+    def _update_subscriber_interest(self, conn, subscriber):
+        if conn.fileno() < 0:
+            return
+        events = selectors.EVENT_READ
+        if subscriber["current"] is not None or subscriber["queue"]:
+            events |= selectors.EVENT_WRITE
+        try:
+            self.sel.modify(conn, events, ("subscriber", conn))
+        except (KeyError, OSError, ValueError):
+            try:
+                self.sel.register(conn, events, ("subscriber", conn))
+            except (KeyError, OSError, ValueError):
+                self._drop_subscriber(conn)
+
+    def _close_slow_subscriber(self, conn, subscriber):
+        subscriber["closing"] = True
+        subscriber["close_deadline"] = time.monotonic() + SUBSCRIBER_CLOSE_TTL
+        subscriber["queue"].clear()
+        subscriber["queued_events"] = 0
+        failure = {
+            "_failure": (
+                "slow_consumer",
+                "Subscriber event queue exceeded 4096 events.",
+                "Reconnect from the last processed sequence.",
+            )
+        }
+        if subscriber["current"] is None or subscriber["offset"] == 0:
+            subscriber["current"] = self._wire_subscriber_item(subscriber, failure)
+            subscriber["offset"] = 0
+        else:
+            subscriber["queue"].append((failure, False))
+        self._update_subscriber_interest(conn, subscriber)
+
+    def _drop_subscriber(self, conn):
+        self.subscribers.pop(conn, None)
+        try:
+            self.sel.unregister(conn)
+        except (KeyError, OSError, ValueError):
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _read_subscriber(self, conn):
+        try:
+            conn.recv(4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            self._drop_subscriber(conn)
+            return
+        self._drop_subscriber(conn)
+
+    def _write_subscriber(self, conn):
+        subscriber = self.subscribers.get(conn)
+        if subscriber is None:
+            return
+        while True:
+            if subscriber["current"] is None:
+                if not subscriber["queue"]:
+                    break
+                item, is_event = subscriber["queue"].popleft()
+                if is_event:
+                    subscriber["queued_events"] -= 1
+                subscriber["current"] = self._wire_subscriber_item(subscriber, item)
+                subscriber["offset"] = 0
+            try:
+                sent = conn.send(subscriber["current"][subscriber["offset"] :])
+            except BlockingIOError:
+                break
+            except OSError:
+                self._drop_subscriber(conn)
+                return
+            if sent <= 0:
+                self._drop_subscriber(conn)
+                return
+            subscriber["offset"] += sent
+            if subscriber["offset"] >= len(subscriber["current"]):
+                subscriber["current"] = None
+                subscriber["offset"] = 0
+        if (
+            subscriber["closing"]
+            and not subscriber["queue"]
+            and subscriber["current"] is None
+        ):
+            self._drop_subscriber(conn)
+        else:
+            self._update_subscriber_interest(conn, subscriber)
+
+    def _expire_subscribers(self):
+        now = time.monotonic()
+        for conn, subscriber in tuple(self.subscribers.items()):
+            deadline = subscriber.get("close_deadline")
+            if deadline is not None and deadline <= now:
+                self._drop_subscriber(conn)
+
+    def _start_subscription(self, conn, identifier, command):
+        if (
+            sum(not item["closing"] for item in self.subscribers.values())
+            >= MAX_SUBSCRIBERS
+        ):
+            return {"error": "subscriber limit reached"}
+        topics = set(command["topics"])
+        since_seq = command["since_seq"]
+        history = self.store.events_since(since_seq, limit=MAX_EVENT_REPLAY)
+        stale = since_seq > history["latest_seq"] or (
+            since_seq < history["latest_seq"]
+            and (history["oldest_seq"] is None or since_seq < history["oldest_seq"] - 1)
+        )
+        replay = [
+            {"event": event_views.view_event(event)}
+            for event in history["events"]
+            if topics.intersection(event_views.event_topics(event))
+        ]
+        resync = stale or history["more"] or len(replay) > MAX_EVENT_REPLAY
+        subscriber = {
+            "id": identifier,
+            "topics": topics,
+            "queue": collections.deque(),
+            "queued_events": 0,
+            "current": None,
+            "offset": 0,
+            "closing": False,
+            "close_deadline": None,
+        }
+        subscriber["queue"].append(
+            (
+                {"subscribed": True, "topics": sorted(topics), "since_seq": since_seq},
+                False,
+            )
+        )
+        if resync:
+            subscriber["queue"].append(
+                ({"resync": True, "latest_seq": history["latest_seq"]}, False)
+            )
+        else:
+            subscriber["queue"].extend((event, True) for event in replay)
+            subscriber["queued_events"] = len(replay)
+        conn.setblocking(False)
+        self.subscribers[conn] = subscriber
+        self._update_subscriber_interest(conn, subscriber)
+        return None
+
     def _read_request(self, conn):
         """Bytes up to a newline (or EOF) within 0.5 s total and 64 KiB."""
         deadline = time.monotonic() + 0.5
@@ -1906,6 +2139,7 @@ class Daemon:
             conn, _ = srv.accept()
         except OSError:
             return
+        keep_open = False
         try:
             pid, uid, _gid = struct.unpack(
                 "3i",
@@ -1928,7 +2162,18 @@ class Daemon:
                         except protocol.ProtocolError as error:
                             reply = protocol.error_reply(identifier, error)
                         else:
-                            reply = protocol.reply_v2(identifier, self.handle(command))
+                            if command["cmd"] == "subscribe":
+                                result = self._start_subscription(
+                                    conn, identifier, command
+                                )
+                                if result is None:
+                                    keep_open = True
+                                else:
+                                    reply = protocol.reply_v2(identifier, result)
+                            else:
+                                reply = protocol.reply_v2(
+                                    identifier, self.handle(command)
+                                )
                     elif protocol.is_legacy(message):
                         reply = self.handle(message)
                     elif isinstance(message, dict) and "v" in message:
@@ -1946,6 +2191,10 @@ class Daemon:
             Exception
         ) as e:  # bad input of any shape gets an error reply, never a crash
             reply = {"error": "%s: %s" % (type(e).__name__, e)}
+        if keep_open:
+            return
+        if self._summary_dirty and not self._in_tick:
+            self._write_summary_if_dirty()
         try:
             conn.settimeout(0.5)
             conn.sendall((json.dumps(reply) + "\n").encode())
@@ -2069,6 +2318,8 @@ class Daemon:
                     deny=policy.owner_deny(cfg),
                     mode=cfg.get("mode", "observe"),
                 )
+                new_store._event_seq = max(new_store._event_seq, old_store._event_seq)
+                new_store.add_event_listener(self._publish_event)
                 new_store.apply_feedback()
                 new_store.expire_reviews()
                 new_holds = new_store.hold_status(
@@ -2177,14 +2428,18 @@ class Daemon:
     def next_timeout(self, now=None):
         """Seconds until the next timer is due (adopt, gc), capped at MAX_SLEEP."""
         now = time.time() if now is None else now
-        due = min(
-            [
-                self.last["adopt"] + self.iv_adopt,
-                self.last["gc"] + self.iv_gc,
-                now + MAX_SLEEP,
-            ]
-            + [d[0] for d in self.deadlines]
+        due_times = [
+            self.last["adopt"] + self.iv_adopt,
+            self.last["gc"] + self.iv_gc,
+            now + MAX_SLEEP,
+        ] + [d[0] for d in self.deadlines]
+        monotonic_now = time.monotonic()
+        due_times.extend(
+            now + max(0, item["close_deadline"] - monotonic_now)
+            for item in self.subscribers.values()
+            if item.get("close_deadline") is not None
         )
+        due = min(due_times)
         return max(0.0, min(MAX_SLEEP, due - now))
 
     def tick(self):
@@ -2193,6 +2448,7 @@ class Daemon:
         self.store.defer_writes = True
         skip_pass = False
         try:
+            self._expire_subscribers()
             self.guarded(self.poll_config_reload)
             if not self.store.db.write_available():
                 skip_pass = True
@@ -2219,6 +2475,7 @@ class Daemon:
             if not skip_pass:
                 self.guarded(self.store.save_if_dirty)
                 self.guarded(self.store.export_daily_if_due)
+            self._write_summary_if_dirty()
 
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -2237,8 +2494,9 @@ class Daemon:
         self.store.log(
             event="daemon_start", mode=self.mode, units=[u["_file"] for u in self.units]
         )
+        self._write_summary_if_dirty()
         while not self.stopping:
-            for key, _ in self.sel.select(timeout=self.next_timeout()):
+            for key, mask in self.sel.select(timeout=self.next_timeout()):
                 if key.data == "srv":
                     self.guarded(lambda: self.serve(self.srv))
                 elif key.data == "wake":
@@ -2248,14 +2506,23 @@ class Daemon:
                         pass
                 elif key.data == "leaves":
                     self.guarded(self.on_leaf_events)
+                elif isinstance(key.data, tuple) and key.data[0] == "subscriber":
+                    conn = key.data[1]
+                    if mask & selectors.EVENT_READ:
+                        self.guarded(lambda: self._read_subscriber(conn))
+                    if mask & selectors.EVENT_WRITE and conn.fileno() >= 0:
+                        self.guarded(lambda: self._write_subscriber(conn))
                 else:
                     fd = key.fd
                     self.guarded(lambda: self.on_owner_exit(fd))
             self.tick()
+        for conn in tuple(self.subscribers):
+            self._drop_subscriber(conn)
         for qid in list(self.pending):
             self.drop_question(qid)
         self.store.log(event="daemon_stop")
         self.store.save()
+        self._write_summary_if_dirty()
         return 0
 
 

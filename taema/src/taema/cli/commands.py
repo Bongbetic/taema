@@ -71,6 +71,24 @@ def _load(args=None):
     return cfg, store, policy.load_units(cfg)
 
 
+def _load_events(args=None):
+    """Load only the read-only state needed by events and watch."""
+    cfg = policy.load_config(path=getattr(args, "config", None))
+    socket_override = getattr(args, "socket", None)
+    if socket_override:
+        socket_override = policy.expand(socket_override)
+        cfg["paths"]["socket"] = socket_override
+        cfg["paths"]["socket_fallback"] = socket_override
+    store = knowledge.Store(
+        policy.state_dir(cfg),
+        cfg.get("seeds"),
+        read_only=True,
+        deny=policy.owner_deny(cfg),
+        mode=cfg.get("mode", "observe"),
+    )
+    return cfg, store
+
+
 def _load_status(args=None):
     """Load the light status path, opening the store only when persisted state exists."""
     cfg = policy.load_config(path=getattr(args, "config", None))
@@ -173,6 +191,65 @@ def ask(cfg, msg, timeout=3.0):
         finally:
             s.close()
     return None
+
+
+def subscribe(cfg, topics, since_seq):
+    """Yield v2 subscription results until the daemon closes the stream."""
+    import socket
+
+    identifier = next(_REQUEST_IDS)
+    envelope = {
+        "v": 2,
+        "id": identifier,
+        "cmd": "subscribe",
+        "args": {"topics": list(topics), "since_seq": since_seq},
+    }
+    connection = None
+    for path in sock_paths(cfg):
+        candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        candidate.settimeout(3.0)
+        try:
+            candidate.connect(path)
+            candidate.sendall((json.dumps(envelope) + "\n").encode())
+        except OSError:
+            candidate.close()
+            continue
+        candidate.settimeout(None)
+        connection = candidate
+        break
+    if connection is None:
+        yield {"error": "daemon unavailable", "code": "daemon_unavailable"}
+        return
+
+    with connection:
+        buffer = b""
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                return
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                try:
+                    reply = json.loads(line)
+                except (UnicodeDecodeError, ValueError):
+                    yield {"error": "invalid stream reply", "code": "protocol_error"}
+                    return
+                if not isinstance(reply, dict) or reply.get("id") != identifier:
+                    yield {"error": "response id mismatch", "code": "protocol_error"}
+                    return
+                if reply.get("ok") is True and isinstance(reply.get("result"), dict):
+                    yield reply["result"]
+                    continue
+                error = reply.get("error")
+                if isinstance(error, dict):
+                    yield {
+                        "error": error.get("message", "request failed"),
+                        "code": error.get("code", "operation_failed"),
+                    }
+                else:
+                    yield {"error": "invalid stream reply", "code": "protocol_error"}
+                return
 
 
 def feedback(cfg, store, op, key):
@@ -1486,6 +1563,97 @@ def cmd_review(a):
     records = [view.record("review", {"review": item}) for item in reviews]
     view.emit(model, a, view.render_reviews(reviews), records)
     return 0
+
+
+def _emit_event(event, args, line_only=False):
+    from .. import events as event_views
+
+    record = {"schema": "taema.event.v1", **event_views.view_event(event)}
+    if line_only:
+        print(event_views.event_line(event))
+    elif getattr(args, "jsonl", False) or getattr(args, "follow", False):
+        print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    else:
+        print(event_views.event_line(event))
+
+
+def _follow_events(cfg, args, since_seq, line_only=False):
+    from .. import events as event_views
+
+    try:
+        for item in subscribe(cfg, event_views.TOPICS, since_seq):
+            if "error" in item:
+                print("taema: %s" % item["error"], file=sys.stderr)
+                return 3
+            event = item.get("event")
+            if isinstance(event, dict):
+                if not getattr(args, "event", None) or event.get("event") == args.event:
+                    _emit_event(event, args, line_only=line_only)
+            elif item.get("resync") is True:
+                marker = {
+                    "schema": "taema.resync.v1",
+                    "latest_seq": item.get("latest_seq", since_seq),
+                }
+                if line_only:
+                    print("resync %s" % marker["latest_seq"])
+                elif getattr(args, "json", False) or getattr(args, "jsonl", False):
+                    print(json.dumps(marker, sort_keys=True))
+                else:
+                    print("resync %s" % marker["latest_seq"])
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def cmd_events(a):
+    """Query retained audit events, optionally continuing as a live stream."""
+    from .. import events as event_views
+    from ..protocol import MAX_REQUEST_ID
+
+    if not 0 <= a.since <= MAX_REQUEST_ID:
+        return die("--since must be a non-negative safe sequence number")
+    cfg, store = _load_events(a)
+    result = store.events_since(a.since, limit=1000)
+    events = result["events"]
+    records = [event_views.view_event(event) for event in events]
+    if a.event:
+        records = [record for record in records if record["event"] == a.event]
+    if a.json:
+        print(
+            json.dumps(
+                {
+                    "schema": "taema.events.v1",
+                    "events": records,
+                    "latest_seq": result["latest_seq"],
+                    "has_more": result["more"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        for event in events:
+            if not a.event or event.get("event") == a.event:
+                _emit_event(event, a)
+    if not a.follow:
+        return 0
+    cursor = events[-1]["seq"] if events else a.since
+    return _follow_events(cfg, a, cursor)
+
+
+def cmd_watch(a):
+    """Print one plain event line whenever the daemon reports a change."""
+    cfg, store = _load_events(a)
+    return _follow_events(
+        cfg, a, store.events_since(0, limit=1)["latest_seq"], line_only=True
+    )
+
+
+def cmd_prompt(a):
+    """Print the cached prompt segment without connecting to the daemon."""
+    from . import framework
+
+    return framework._fast_prompt()
 
 
 def cmd_learn_export(a):

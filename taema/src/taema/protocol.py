@@ -9,6 +9,7 @@ _COMMANDS = {
     "doctor": ({}, ()),
     "reload": ({"reason": "string"}, ()),
     "review": ({}, ()),
+    "subscribe": ({"topics": "array", "since_seq": "integer"}, ("topics", "since_seq")),
     "register": ({"scope": "string", "owner": "integer"}, ("scope", "owner")),
     "attach": ({"scope": "string", "pids": "array"}, ("scope", "pids")),
     "job_done": (
@@ -272,6 +273,21 @@ def _validate_args(command, args):
             _fail("argument %s has the wrong type" % key)
     if command == "reload" and len(args.get("reason", "")) > 256:
         _fail("reload reason must be at most 256 characters")
+    if command == "subscribe":
+        from .events import TOPICS
+
+        topics = args["topics"]
+        if (
+            not topics
+            or len(topics) > len(TOPICS)
+            or any(
+                not _is_type(topic, "string") or topic not in TOPICS for topic in topics
+            )
+            or len(set(topics)) != len(topics)
+        ):
+            _fail("subscribe topics must be unique supported topic names")
+        if not 0 <= args["since_seq"] <= MAX_REQUEST_ID:
+            _fail("subscribe sequence must be a non-negative safe integer")
     if command in ("register", "attach", "job_done", "kill_done", "ask"):
         pid = args.get("owner") if command == "register" else args.get("shell_pid")
         if pid is not None and pid <= 1:

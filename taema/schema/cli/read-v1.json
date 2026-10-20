@@ -7,6 +7,8 @@
     { "$ref": "#/$defs/status-record" },
     { "$ref": "#/$defs/scope" },
     { "$ref": "#/$defs/reviews" },
+    { "$ref": "#/$defs/events" },
+    { "$ref": "#/$defs/event" },
     { "$ref": "#/$defs/review" },
     { "$ref": "#/$defs/explain" },
     { "$ref": "#/$defs/gc" },
@@ -95,6 +97,44 @@
       "properties": {
         "schema": { "const": "taema.reviews.v1" },
         "reviews": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": false
+    },
+    "events": {
+      "type": "object",
+      "required": ["schema", "events", "latest_seq", "has_more"],
+      "properties": {
+        "schema": {"const": "taema.events.v1"},
+        "events": {"type": "array", "items": {"$ref": "#/$defs/event-data"}},
+        "latest_seq": {"type": "integer", "minimum": 0},
+        "has_more": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["schema", "seq", "ts", "event", "decision_id", "topics", "data"],
+      "properties": {
+        "schema": {"const": "taema.event.v1"},
+        "seq": {"type": "integer", "minimum": 1},
+        "ts": {"type": "number", "minimum": 0},
+        "event": {"type": "string"},
+        "decision_id": {"type": ["integer", "null"]},
+        "topics": {"type": "array", "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}},
+        "data": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "event-data": {
+      "type": "object",
+      "required": ["seq", "ts", "event", "decision_id", "topics", "data"],
+      "properties": {
+        "seq": {"type": "integer", "minimum": 1},
+        "ts": {"type": "number", "minimum": 0},
+        "event": {"type": "string"},
+        "decision_id": {"type": ["integer", "null"]},
+        "topics": {"type": "array", "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}},
+        "data": {"type": "object"}
       },
       "additionalProperties": false
     },

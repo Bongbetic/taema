@@ -161,6 +161,7 @@ class Store:
         self._decision_seq, self._event_seq = self.db.audit_sequences()
         self._pending_decisions = []
         self._pending_events = []
+        self._event_listeners = []
         self._audit_context = None
         self._feedback_replay_pending = None
         self._feedback_replaying = False
@@ -328,6 +329,28 @@ class Store:
         self.save()
         return True
 
+    def add_event_listener(self, listener):
+        """Register a non-blocking observer for newly written audit events."""
+        self._event_listeners.append(listener)
+
+    def events_since(self, since_seq=0, limit=1001):
+        """Return retained and not-yet-saved events after a cursor."""
+        result = self.db.events_since(since_seq, limit)
+        pending = [event for event in self._pending_events if event["seq"] > since_seq]
+        combined = {event["seq"]: event for event in result["events"]}
+        combined.update({event["seq"]: event for event in pending})
+        ordered = [combined[seq] for seq in sorted(combined)]
+        oldest = result["oldest_seq"]
+        if pending:
+            oldest = min(pending[0]["seq"], oldest or pending[0]["seq"])
+        combined_more = result["more"] or len(ordered) > max(1, limit)
+        return {
+            "events": ordered[: max(1, limit)],
+            "oldest_seq": oldest,
+            "latest_seq": max(result["latest_seq"], self._event_seq),
+            "more": combined_more,
+        }
+
     def log(self, **fields):
         timestamp = round(self.now(), 3)
         event = fields.pop("event", "unknown")
@@ -352,18 +375,6 @@ class Store:
             "why": str(why)[:1024],
             **fields,
         }
-        if not self.read_only:
-            self._event_seq += 1
-            self._pending_events.append(
-                {
-                    "seq": self._event_seq,
-                    "ts": timestamp,
-                    "event": event,
-                    "decision_id": decision_id,
-                    "data": record,
-                }
-            )
-            self.dirty = True
         encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
         if len(encoded) > MAX_LOG_LINE:
             record = {
@@ -376,6 +387,18 @@ class Store:
                 "truncated": True,
             }
             encoded = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        tracked = None
+        if not self.read_only:
+            self._event_seq += 1
+            tracked = {
+                "seq": self._event_seq,
+                "ts": timestamp,
+                "event": event,
+                "decision_id": decision_id,
+                "data": record,
+            }
+            self._pending_events.append(tracked)
+            self.dirty = True
         self._mkdir()
         try:
             current_size = os.stat(self.log_path).st_size
@@ -405,6 +428,12 @@ class Store:
         with os.fdopen(fd, "ab") as f:
             os.fchmod(f.fileno(), 0o600)
             f.write(encoded)
+        if tracked is not None:
+            for listener in tuple(self._event_listeners):
+                try:
+                    listener(tracked)
+                except Exception:
+                    continue
 
     def record_decision(
         self,

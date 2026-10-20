@@ -326,6 +326,18 @@ taema keep adb             # prefer keeping adb alive (feedback for the learner)
 taema forget adb           # reset everything learned about adb
 ```
 
+Use `taema events` to read the retained audit stream by sequence number, optionally filtering by
+event name or writing schema-tagged JSON. Add `--follow` to continue with live events; `taema watch`
+prints the same changes as plain lines. `taema prompt` prints the daemon's cached one-line status
+segment without opening a socket.
+
+```sh
+taema events --since 120 --event stopped
+taema events --json --follow
+taema watch
+taema prompt
+```
+
 ### The prompt
 
 After a command that ran for 2 s or more, tæma looks for processes it left running. If

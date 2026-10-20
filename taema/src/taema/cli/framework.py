@@ -221,7 +221,12 @@ def _invoke(args):
     handler = getattr(commands, args._handler)
     args._color = view.color_enabled(args, sys.stdout)
     args._width = view.terminal_width(args)
-    capture = args.quiet or bool(getattr(args, "_read", False)) or args.command is None
+    streaming = args._command == "watch" or (
+        args._command == "events" and bool(getattr(args, "follow", False))
+    )
+    capture = (
+        args.quiet or bool(getattr(args, "_read", False)) or args.command is None
+    ) and not streaming
     if not capture:
         try:
             return handler(args) or 0
@@ -334,7 +339,24 @@ def _page(rendered):
         return False
 
 
+def _fast_prompt():
+    """Write the daemon's cached prompt segment using one bounded file read."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    try:
+        with open(
+            os.path.join(runtime, "taema", "summary"), encoding="utf-8"
+        ) as source:
+            summary = source.readline(2048)
+    except OSError:
+        return 0
+    if summary:
+        sys.stdout.write(summary.rstrip("\r\n") + "\n")
+    return 0
+
+
 def main(argv):
+    if argv == ["prompt"]:
+        return _fast_prompt()
     fast_args = _fast_status_args(argv)
     if fast_args is not None:
         return _invoke(fast_args)

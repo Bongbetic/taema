@@ -1325,6 +1325,43 @@ class StateDB:
             max(_number(values.get("audit.event_seq"), 0), event_max),
         )
 
+    def events_since(self, since_seq=0, limit=1001):
+        """Return retained audit events after a sequence and the event-history window."""
+        if not self.available:
+            return {"events": [], "oldest_seq": None, "latest_seq": 0, "more": False}
+        with self.connection() as connection:
+            bounds = connection.execute(
+                "SELECT min(seq) AS oldest, max(seq) AS latest FROM events"
+            ).fetchone()
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = ?", ("audit.event_seq",)
+            ).fetchone()
+            latest = max(
+                _number(_load(row["value"], 0), 0) if row else 0,
+                _number(bounds["latest"], 0),
+            )
+            rows = connection.execute(
+                "SELECT seq, ts, event, decision_id, data FROM events "
+                "WHERE seq > ? ORDER BY seq LIMIT ?",
+                (since_seq, max(1, limit) + 1),
+            ).fetchall()
+        events = [
+            {
+                "seq": row["seq"],
+                "ts": row["ts"],
+                "event": row["event"],
+                "decision_id": row["decision_id"],
+                "data": _load(row["data"], {}),
+            }
+            for row in rows[: max(1, limit)]
+        ]
+        return {
+            "events": events,
+            "oldest_seq": bounds["oldest"],
+            "latest_seq": latest,
+            "more": len(rows) > max(1, limit),
+        }
+
     @staticmethod
     def _decision(row):
         stored = _load(row["undo"], None)

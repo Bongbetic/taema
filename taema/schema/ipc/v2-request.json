@@ -5,6 +5,7 @@
     {"$ref": "#/$defs/status"},
     {"$ref": "#/$defs/reload"},
     {"$ref": "#/$defs/review"},
+    {"$ref": "#/$defs/subscribe"},
     {"$ref": "#/$defs/register"},
     {"$ref": "#/$defs/attach"},
     {"$ref": "#/$defs/job_done"},
@@ -194,6 +195,11 @@
     "review": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
       "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "review"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "subscribe": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "subscribe"}, "args": {"type": "object", "required": ["topics", "since_seq"], "properties": {"topics": {"type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}}, "since_seq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}}, "additionalProperties": false}},
       "additionalProperties": false
     },
     "register": {

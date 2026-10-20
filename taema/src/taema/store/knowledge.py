@@ -221,6 +221,9 @@ class Store:
     def latest_app_instance(self, key):
         return self.db.latest_app_instance(key)
 
+    def provenance_chain(self, key):
+        return self.db.provenance_chain(key)
+
     def export_legacy(self):
         """Return the state fields understood by the 0.2 JSON store."""
         fields = (

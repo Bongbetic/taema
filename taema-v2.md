@@ -2632,7 +2632,7 @@ swap_max = "0"                   # VMs default to 0 unless a save hook ran
 
 Directory modes are 0700 and file modes 0600. Nothing is world-readable.
 
-### 13.2 Schema (`PRAGMA user_version = 3`)
+### 13.2 Schema (`PRAGMA user_version = 4`)
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);   -- created, closes, last_decay
@@ -2650,12 +2650,15 @@ CREATE TABLE instances (
   born REAL, windowless REAL, exited REAL, parent_app TEXT, scope TEXT,
   terminal INTEGER, class TEXT, runtime TEXT,
   launched_by TEXT,                                    -- launch | adopt | unit | run
+  parent_evidence TEXT NOT NULL DEFAULT '[]',           -- per-instance evidence set (JSON)
+  last_seen REAL,                                       -- most recent pass that saw the pid/start
   survivors TEXT);                                     -- signature id
 CREATE INDEX instances_app_born ON instances(app, born);
 
 CREATE TABLE parents (
   app TEXT, parent TEXT, co_birth INTEGER, cgroup INTEGER, job INTEGER, runtime INTEGER,
   window INTEGER, launch INTEGER, last REAL, PRIMARY KEY (app, parent));
+CREATE INDEX parents_last ON parents(last);
 
 CREATE TABLE signatures (
   id TEXT PRIMARY KEY, owner TEXT NOT NULL, members TEXT NOT NULL,  -- JSON [[key,count],...]
@@ -2718,7 +2721,7 @@ database.
 
 | Table | Cap | Retention |
 |---|---|---|
-| `instances` | 50,000 rows | 90 days (`store.retention_days`) |
+| `instances` | 50,000 rows | 90 days since exit or last observation; answer/veto-referenced rows are protected |
 | `events` | 200,000 rows | 90 days |
 | `decisions` | 10,000 rows | 180 days, longer when referenced by a veto or an undo |
 | `mem_samples` | — | 7 days raw |
@@ -3362,7 +3365,10 @@ documented in `doctor` and `taema help safety`.
   `taema doctor` call it out. `observe` and `enforce` keep their contracts. `auto` becomes
   safer (no unlearned idle stop).
 - **Store:** the JSON store is migrated once to SQLite (§13.5), and `knowledge.json` is kept
-  as a 30-day backup. A downgrade needs `taema learn export --format v2` first (§13.8).
+  as a 30-day backup. Schema v4 adds `instances.parent_evidence` with an empty default and
+  `instances.last_seen`, preserving v3 rows. A downgrade needs `taema learn export --format v2`
+  first (§13.8); see
+  `docs/identity-resolution.md` for the v4 SQLite rollback steps.
 - **Package:** versions follow §17.1 (0.3.0 → 1.0.0). `conf_files` gains the new units and
   `/etc/taema/taema.d/`. Runtime dependencies are unchanged (Python stdlib); `libnotify` is
   optional. Rust adds build-time `cargo` only, and `scdoc` is added for man pages.

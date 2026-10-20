@@ -155,7 +155,48 @@ class Lineage:
                     self._persist_identity(e)
         for e in (
             self.entries.values()
-        ):  # a root's key may have settled after its members were added
+        ):  # a parent or root key may settle after its children were added
+            old_parent = (
+                e.get("parent_key"),
+                e.get("parent_scope"),
+                e.get("parent_job"),
+                e.get("parent_runtime"),
+                e.get("co_birth_parent_key"),
+                e.get("co_birth_parent_scope"),
+                e.get("co_birth_parent_job"),
+                e.get("co_birth_parent_runtime"),
+            )
+            e["chain"] = [
+                self.entries[ancestor_id]["key"]
+                if ancestor_id in self.entries
+                else key
+                for ancestor_id, key in zip(e["chain_ids"], e["chain"])
+            ]
+            parent = self._nearest_distinct_ancestor(e)
+            if parent is not None:
+                e["parent_key"] = parent["key"]
+                e["parent_id"] = (parent["pid"], parent["start"])
+                e["parent_scope"] = parent.get("scope")
+                e["parent_job"] = parent.get("job")
+                e["parent_runtime"] = parent["identity"].runtime
+            co_birth_parent = self.entries.get(e.get("co_birth_parent_id"))
+            if co_birth_parent is not None:
+                e["co_birth_parent_key"] = co_birth_parent["key"]
+                e["co_birth_parent_scope"] = co_birth_parent.get("scope")
+                e["co_birth_parent_job"] = co_birth_parent.get("job")
+                e["co_birth_parent_runtime"] = co_birth_parent["identity"].runtime
+            new_parent = (
+                e.get("parent_key"),
+                e.get("parent_scope"),
+                e.get("parent_job"),
+                e.get("parent_runtime"),
+                e.get("co_birth_parent_key"),
+                e.get("co_birth_parent_scope"),
+                e.get("co_birth_parent_job"),
+                e.get("co_birth_parent_runtime"),
+            )
+            if new_parent != old_parent:
+                self._persist_identity(e)
             root = self.entries.get(e["root"]) if e["root"] else None
             if root is not None:
                 e["root_key"] = root["key"]
@@ -177,6 +218,8 @@ class Lineage:
             else:
                 self._add(pid, r)
         for eid, e in gone_entries:
+            e["exited"] = self.now
+            self._persist_identity(e)
             if e["root"] == eid:
                 self._root_exit(eid, e)
         self._prune_ghosts()
@@ -202,9 +245,40 @@ class Lineage:
         hints = self.identity_hints(pid, start) if self.identity_hints else None
         return policy.app_identity(pid, units=self.units, hints=hints)
 
+    def _nearest_distinct_ancestor(self, entry):
+        for ancestor_id in entry["chain_ids"]:
+            ancestor = self.entries.get(ancestor_id)
+            if ancestor is not None and ancestor["key"] != entry["key"]:
+                return ancestor
+        return None
+
     def _persist_identity(self, entry):
         if self.identity_sink is None:
             return
+        parent_app = entry.get("parent_key") or entry.get("co_birth_parent_key")
+        if parent_app == entry["key"]:
+            parent_app = None
+        parent_scope = entry.get("parent_scope") or entry.get(
+            "co_birth_parent_scope"
+        )
+        parent_job = entry.get("parent_job") or entry.get("co_birth_parent_job")
+        parent_runtime = entry.get("parent_runtime") or entry.get(
+            "co_birth_parent_runtime"
+        )
+        evidence = set(entry.get("parent_evidence") or ())
+        if entry.get("co_birth"):
+            evidence.add("co_birth")
+        if entry.get("scope") and entry.get("scope") == parent_scope:
+            evidence.add("cgroup")
+        if entry.get("job") and entry.get("job") == parent_job:
+            evidence.add("job")
+        runtime = entry["identity"].runtime
+        if runtime and runtime == parent_runtime:
+            evidence.add("runtime")
+        if entry.get("launch_parent_app") == parent_app:
+            evidence.add("launch")
+        if entry.get("window_parent_app") == parent_app:
+            evidence.add("window")
         self._pending_identity_updates.append(
             (
                 entry["identity"],
@@ -212,15 +286,31 @@ class Lineage:
                     "pid": entry["pid"],
                     "start": entry["start"],
                     "born": self._birth(entry),
-                    "parent_app": entry.get("parent_key"),
-                    "scope": cgroup.proc_cgroup(entry["pid"]),
+                    "exited": entry.get("exited"),
+                    "parent_app": parent_app,
+                    "scope": entry.get("scope") or cgroup.proc_cgroup(entry["pid"]),
                     "terminal": int(bool(entry.get("tty") or entry.get("job"))),
                     "class": entry["identity"].kind,
-                    "runtime": entry["identity"].runtime,
-                    "launched_by": entry["identity"].launch_name,
+                    "runtime": runtime,
+                    "launched_by": self._launch_source(entry),
+                    "parent_evidence": sorted(evidence),
                 },
             )
         )
+
+    @staticmethod
+    def _launch_source(entry):
+        source = entry.get("launch_source")
+        if source == "launch":
+            return source
+        if entry["identity"].unit:
+            return "unit"
+        leaf = (entry.get("scope") or "").rstrip("/").rsplit("/", 1)[-1]
+        if leaf.startswith("scope-"):
+            return "run"
+        if leaf.startswith("app-"):
+            return "adopt"
+        return None
 
     def _flush_identities(self):
         if not self._pending_identity_updates:
@@ -247,17 +337,20 @@ class Lineage:
             "last_seen": self.now,
             "seen": 1,
             "job": None,
+            "scope": cgroup.proc_cgroup(pid),
             "host": None,
             "root": None,
             "root_key": "",
             "parent_key": "",
+            "parent_scope": None,
+            "parent_job": None,
+            "parent_runtime": None,
+            "co_birth": False,
             "chain": [],
             "chain_ids": [],
         }
         eid = (pid, r.start)
         pe = self.entries.get(self.by_pid.get(r.ppid))
-        if pe is not None:
-            e["parent_key"] = pe["key"]
         anc, cur = [], pe
         while cur is not None and len(anc) < CHAIN:
             anc.append(cur)
@@ -266,6 +359,13 @@ class Lineage:
         e["chain_ids"] = [(a["pid"], a["start"]) for a in anc]
         self.entries[eid] = e
         self.by_pid[pid] = eid
+        parent = self._nearest_distinct_ancestor(e)
+        if parent is not None:
+            e["parent_key"] = parent["key"]
+            e["parent_id"] = (parent["pid"], parent["start"])
+            e["parent_scope"] = parent.get("scope")
+            e["parent_job"] = parent.get("job")
+            e["parent_runtime"] = parent["identity"].runtime
         self.born.append(eid)
         if self.age(e) <= JOB_WINDOW:
             tag = find_tag(pid)
@@ -305,6 +405,12 @@ class Lineage:
                         best = (dt, rid, root)
             if best:
                 self._join(e, best[1], best[2]["key"])
+                e["co_birth"] = True
+                e["co_birth_parent_id"] = best[1]
+                e["co_birth_parent_key"] = best[2]["key"]
+                e["co_birth_parent_scope"] = best[2].get("scope")
+                e["co_birth_parent_job"] = best[2].get("job")
+                e["co_birth_parent_runtime"] = best[2]["identity"].runtime
 
     def _join(self, e, rid, rkey):
         e["root"], e["root_key"] = rid, rkey

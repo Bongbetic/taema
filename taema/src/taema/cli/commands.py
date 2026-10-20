@@ -831,9 +831,18 @@ def _why_report(
 ):
     unknown = list(extra_unknown)
     identity = _why_identity(key, cfg, store, live_identity)
-    stored_provenance = store.latest_app_instance(key) if key else None
+    stored_provenance = None
+    if key:
+        reader = getattr(store, "provenance_chain", None)
+        stored_provenance = reader(key) if reader else store.latest_app_instance(key)
     if provenance is None:
         provenance = stored_provenance or {}
+    elif stored_provenance:
+        provenance = {**stored_provenance, **provenance}
+        if "chain" not in provenance:
+            provenance["chain"] = stored_provenance.get("chain", [])
+        if "chain_text" not in provenance:
+            provenance["chain_text"] = stored_provenance.get("chain_text", "")
     if identity is None and not any(item.get("fact") == "identity" for item in unknown):
         unknown.append(
             {

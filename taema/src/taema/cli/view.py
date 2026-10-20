@@ -333,6 +333,31 @@ def render_explanation(target, explanation):
         )
     )
     lines.append("authority: %s" % explanation.get("authority_source", "unknown"))
+    provenance = explanation.get("provenance") or {}
+    chain = provenance.get("chain") or []
+    if chain:
+        lines.append("provenance: %s" % (provenance.get("chain_text") or "unknown"))
+        for item in chain:
+            relation = item.get("relation") or {}
+            if not relation:
+                continue
+            evidence = relation.get("evidence_counts") or {}
+            evidence_text = ", ".join(
+                "%s=%s" % (name, evidence[name]) for name in sorted(evidence)
+            ) or "no retained evidence"
+            confidence = relation.get("confidence")
+            confidence_text = (
+                "unknown" if confidence is None else "%.2f" % confidence
+            )
+            lines.append(
+                "  provenance evidence: %s ← %s (%s; confidence=%s)"
+                % (
+                    item.get("display") or item.get("app", "unknown"),
+                    relation.get("parent_display") or relation.get("parent", "unknown"),
+                    evidence_text,
+                    confidence_text,
+                )
+            )
     lines.append(
         "protection: %s%s"
         % (

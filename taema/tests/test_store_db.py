@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from taema.daemon import service as daemon
+from taema.core.identity import AppIdentity
 from taema.store import db as store_db
 from taema.store.db import StateDB
 from taema.store.knowledge import Store
@@ -47,7 +48,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 3
+                    connection.execute("PRAGMA user_version").fetchone()[0], 4
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -117,13 +118,72 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 3
+                    connection.execute("PRAGMA user_version").fetchone()[0], 4
                 )
                 self.assertTrue(
                     connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='instances'"
                     ).fetchone()
                 )
+
+    def test_schema_four_migration_preserves_v3_instances(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    + store_db._MIGRATIONS[1]
+                    + store_db._MIGRATIONS[2]
+                    + store_db._MIGRATIONS[3]
+                    + "\nPRAGMA user_version = 3;\nCOMMIT;"
+                )
+                connection.execute(
+                    "INSERT INTO apps(key, kind) VALUES ('app', 'exe')"
+                )
+                connection.execute(
+                    "INSERT INTO instances(id, app, pid, start, born) "
+                    "VALUES ('42:100', 'app', 42, 100, 500)"
+                )
+                connection.commit()
+
+            database = StateDB(path)
+            with database.connection() as connection:
+                row = connection.execute(
+                    "SELECT id, app, pid, start, born, parent_evidence, last_seen "
+                    "FROM instances"
+                ).fetchone()
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 4
+                )
+
+            self.assertEqual(
+                tuple(row),
+                ("42:100", "app", 42, 100, 500.0, "[]", None),
+            )
+
+    def test_pruning_retains_long_lived_instances_while_they_are_observed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            now = 1_800_000_000.0
+            store = Store(temporary, {}, now=lambda: now)
+            identity = AppIdentity(
+                "exe:long-lived:1:2", "long-lived", "exe", "/usr/bin/long-lived", 1, 2
+            )
+            self.assertTrue(
+                store.record_identity(
+                    identity,
+                    {
+                        "pid": 50,
+                        "start": 500,
+                        "born": now - 200 * store_db.DAY,
+                        "scope": "/user/1000/app-long-lived",
+                    },
+                )
+            )
+            instance = store.latest_app_instance(identity.key)
+
+        self.assertEqual(instance["id"], "50:500")
+        self.assertIsNone(instance["exited"])
+        self.assertEqual(instance["last_seen"], now)
 
     def test_read_only_reader_does_not_block_a_writer(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -350,7 +410,11 @@ class StoreDatabaseTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     connection.execute("SELECT count(*) FROM instances").fetchone()[0],
-                    2,
+                    3,
+                )
+                self.assertEqual(
+                    {row[0] for row in connection.execute("SELECT id FROM instances")},
+                    {"i1", "i2", "i3"},
                 )
                 self.assertEqual(
                     connection.execute("SELECT count(*) FROM events").fetchone()[0], 2
@@ -399,6 +463,59 @@ class StoreDatabaseTests(unittest.TestCase):
                     {row[0] for row in connection.execute("SELECT id FROM vetoes")},
                     {"veto-app"},
                 )
+
+    def test_instance_pruning_preserves_pid_and_scope_veto_references(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            now = 1_800_000_000.0
+            old = now - 200 * store_db.DAY
+            with store.db.connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.executemany(
+                    "INSERT INTO apps(key, kind, last_seen) VALUES (?, 'exe', ?)",
+                    [("pid-app", old), ("scope-app", old), ("free-app", old)],
+                )
+                connection.executemany(
+                    "INSERT INTO instances(id, app, pid, start, born, exited, scope) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("41:410", "pid-app", 41, 410, old, old, "/user/1000/shared"),
+                        (
+                            "42:420",
+                            "scope-app",
+                            42,
+                            420,
+                            old,
+                            old,
+                            "/user/1000/scope-guard/child",
+                        ),
+                        ("43:430", "free-app", 43, 430, old, old, "/user/1000/free"),
+                    ],
+                )
+                connection.executemany(
+                    "INSERT INTO vetoes(id, seq, kind, match, value, start, created, "
+                    "expires, payload) VALUES (?, ?, ?, '{}', ?, ?, ?, NULL, '{}')",
+                    [
+                        ("pid-veto", 1, "pid", "41", 410, now),
+                        ("scope-veto", 2, "scope", "scope-guard", None, now),
+                    ],
+                )
+                with mock.patch.multiple(
+                    store_db, MAX_INSTANCES=0, MAX_APPS=0
+                ):
+                    store_db._prune(connection, now)
+                connection.commit()
+
+            with store.db.connection() as connection:
+                instances = {
+                    row[0] for row in connection.execute("SELECT id FROM instances")
+                }
+                apps = {
+                    row[0] for row in connection.execute("SELECT key FROM apps")
+                }
+
+        self.assertEqual(instances, {"41:410", "42:420"})
+        self.assertEqual(apps, {"pid-app", "scope-app"})
 
     def test_daily_exports_are_private_and_keep_three_rotations(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -499,7 +616,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 incomplete.execute(
                     "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                 )
-                incomplete.execute("PRAGMA user_version = 3")
+                incomplete.execute("PRAGMA user_version = 4")
 
             recovered = Store(temporary, {})
 

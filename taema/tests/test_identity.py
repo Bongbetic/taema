@@ -336,12 +336,239 @@ class IdentityPersistence(unittest.TestCase):
                     "SELECT key, display FROM apps WHERE key=?", (app.key,)
                 ).fetchone()
                 saved_instance = connection.execute(
-                    "SELECT app, pid, start, scope FROM instances WHERE id='42:0'"
+                    "SELECT app, pid, start, scope, launched_by, exited "
+                    "FROM instances WHERE id='42:0'"
                 ).fetchone()
 
         self.assertEqual(saved_app["display"], "editor")
         self.assertEqual(saved_instance["app"], app.key)
         self.assertEqual(saved_instance["scope"], "/user/1000/app-editor")
+        self.assertEqual(saved_instance["launched_by"], "adopt")
+        self.assertIsNone(saved_instance["exited"])
+
+    def test_parent_evidence_is_idempotent_and_chain_survives_store_restart(self):
+        now = [1_800_000_000.0]
+        niri = identity.AppIdentity(
+            "unit:niri", "niri", "unit", "/usr/bin/niri", unit="niri.service"
+        )
+        firefox = identity.AppIdentity(
+            "exe:firefox:8:71", "firefox", "exe", "/usr/bin/firefox", 8, 71
+        )
+        parent = {
+            "pid": 40,
+            "start": 100,
+            "born": now[0],
+            "scope": "/user/1000/scope-desktop",
+            "launched_by": "unit",
+        }
+        child = {
+            "pid": 41,
+            "start": 101,
+            "born": now[0],
+            "parent_app": niri.key,
+            "scope": parent["scope"],
+            "runtime": "runtime:wayland",
+            "launched_by": "run",
+            "parent_evidence": ["co_birth", "cgroup", "job", "runtime"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = knowledge.Store(directory, now=lambda: now[0])
+            self.assertEqual(
+                store.record_identities([(niri, parent), (firefox, child)]), 2
+            )
+            now[0] += 1
+            restarted = knowledge.Store(directory, now=lambda: now[0])
+            self.assertEqual(restarted.record_identities([(niri, parent), (firefox, child)]), 2)
+
+            with restarted.db.connection() as connection:
+                counts = connection.execute(
+                    "SELECT co_birth, cgroup, job, runtime, window, launch "
+                    "FROM parents WHERE app = ? AND parent = ?",
+                    (firefox.key, niri.key),
+                ).fetchone()
+                instance_count = connection.execute(
+                    "SELECT count(*) FROM instances WHERE id='41:101'"
+                ).fetchone()[0]
+
+            self.assertEqual(tuple(counts), (1, 1, 1, 1, 0, 0))
+            self.assertEqual(instance_count, 1)
+
+            exited = dict(child, exited=now[0] + 10)
+            restarted.record_identity(firefox, exited)
+            self.assertEqual(
+                restarted.latest_app_instance(firefox.key)["exited"], now[0] + 10
+            )
+
+            now[0] += 11
+            live = knowledge.Store(directory, now=lambda: now[0])
+            live.record_identity(firefox, child)
+            self.assertIsNone(live.latest_app_instance(firefox.key)["exited"])
+            chain = live.provenance_chain(firefox.key)
+
+        self.assertEqual(chain["chain_text"], "firefox ← niri")
+        self.assertEqual(chain["chain"][0]["relation"]["evidence_counts"], {
+            "co_birth": 1,
+            "cgroup": 1,
+            "job": 1,
+            "runtime": 1,
+        })
+        self.assertEqual(chain["chain"][0]["relation"]["confidence"], 1.0)
+
+    def test_lineage_restart_reconciles_pid_start_and_records_exit(self):
+        now = [1_800_000_000.0]
+        niri = identity.AppIdentity(
+            "unit:niri", "niri", "unit", "/usr/bin/niri", runtime="runtime:wayland"
+        )
+        firefox = identity.AppIdentity(
+            "exe:firefox:8:71", "firefox", "exe", "/usr/bin/firefox", 8, 71,
+            runtime="runtime:wayland",
+        )
+        table = ProcTable.from_ppid({40: 1, 41: 40})
+        empty = ProcTable.from_ppid({})
+        with tempfile.TemporaryDirectory() as directory:
+            store = knowledge.Store(directory, now=lambda: now[0])
+
+            def app_for(pid, **_kwargs):
+                return niri if pid == 40 else firefox
+
+            with (
+                mock.patch.object(lineage.policy, "app_identity", side_effect=app_for),
+                mock.patch.object(lineage.inspect, "uid_of", return_value=0),
+                mock.patch.object(
+                    lineage.cgroup,
+                    "proc_cgroup",
+                    return_value="/user/1000/app-desktop",
+                ),
+            ):
+                first_daemon = lineage.Lineage({}, uid=0, identity_sink=store.record_identities)
+                first_daemon.observe(table, now=now[0], uptime=100)
+                now[0] += 1
+                restarted_daemon = lineage.Lineage(
+                    {}, uid=0, identity_sink=store.record_identities
+                )
+                restarted_daemon.observe(table, now=now[0], uptime=101)
+
+                with store.db.connection() as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT count(*) FROM instances").fetchone()[0],
+                        2,
+                    )
+                    evidence = connection.execute(
+                        "SELECT cgroup, runtime FROM parents WHERE app = ? AND parent = ?",
+                        (firefox.key, niri.key),
+                    ).fetchone()
+                self.assertEqual(tuple(evidence), (1, 1))
+
+                now[0] += 1
+                restarted_daemon.observe(empty, now=now[0], uptime=102)
+
+            exited = store.latest_app_instance(firefox.key)
+        self.assertEqual(exited["exited"], now[0])
+        self.assertEqual(exited["id"], "41:0")
+
+    def test_launch_source_uses_managed_source_not_display_hint(self):
+        app = identity.AppIdentity(
+            "exe:browser:1:2",
+            "Browser Display",
+            "exe",
+            "/usr/bin/browser",
+            launch_name="Browser Display",
+        )
+        self.assertEqual(
+            lineage.Lineage._launch_source(
+                {"identity": app, "scope": "/user/1000/app-browser"}
+            ),
+            "adopt",
+        )
+        self.assertEqual(
+            lineage.Lineage._launch_source(
+                {"identity": app, "scope": "/user/1000/scope-browser"}
+            ),
+            "run",
+        )
+        self.assertIsNone(
+            lineage.Lineage._launch_source(
+                {"identity": app, "scope": "/user/1000/shared/browser"}
+            )
+        )
+        unit_app = identity.AppIdentity(
+            "unit:editor", "editor", "unit", "/usr/bin/editor", unit="editor.service"
+        )
+        self.assertEqual(
+            lineage.Lineage._launch_source(
+                {"identity": unit_app, "scope": "/user/1000/shared/editor"}
+            ),
+            "unit",
+        )
+
+    def test_parent_evidence_moves_when_parent_identity_settles(self):
+        now = [1_800_000_000.0]
+        phase = [0]
+        unresolved = identity.AppIdentity(
+            "comm:niri", "niri", "comm", "/usr/bin/niri", runtime="runtime:wayland"
+        )
+        resolved = identity.AppIdentity(
+            "unit:niri",
+            "niri",
+            "unit",
+            "/usr/bin/niri",
+            runtime="runtime:wayland",
+            unit="niri.service",
+        )
+        firefox = identity.AppIdentity(
+            "exe:firefox:8:71",
+            "firefox",
+            "exe",
+            "/usr/bin/firefox",
+            8,
+            71,
+            runtime="runtime:wayland",
+        )
+        table = ProcTable(
+            {
+                40: process.Proc(1, 40, 40, 0, 100, "S"),
+                41: process.Proc(40, 41, 40, 0, 101, "S"),
+            }
+        )
+
+        def app_for(pid, **_kwargs):
+            if pid == 40:
+                return unresolved if phase[0] == 0 else resolved
+            return firefox
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = knowledge.Store(directory, now=lambda: now[0])
+            observed = lineage.Lineage({}, uid=0, identity_sink=store.record_identities)
+            with (
+                mock.patch.object(lineage.policy, "app_identity", side_effect=app_for),
+                mock.patch.object(lineage.inspect, "uid_of", return_value=0),
+                mock.patch.object(
+                    lineage.cgroup,
+                    "proc_cgroup",
+                    return_value="/user/1000/app-desktop",
+                ),
+            ):
+                observed.observe(table, now=now[0], uptime=1)
+                phase[0] = 1
+                now[0] += 1
+                observed.observe(table, now=now[0], uptime=2)
+
+            with store.db.connection() as connection:
+                child = connection.execute(
+                    "SELECT parent_app FROM instances WHERE id='41:101'"
+                ).fetchone()
+                old_edge = connection.execute(
+                    "SELECT 1 FROM parents WHERE app = ? AND parent = ?",
+                    (firefox.key, unresolved.key),
+                ).fetchone()
+                new_edge = connection.execute(
+                    "SELECT cgroup, runtime FROM parents WHERE app = ? AND parent = ?",
+                    (firefox.key, resolved.key),
+                ).fetchone()
+
+        self.assertEqual(child["parent_app"], resolved.key)
+        self.assertIsNone(old_edge)
+        self.assertEqual(tuple(new_edge), (1, 1))
 
     def test_governor_fallback_keeps_lineage_units_when_entry_is_missing(self):
         observed = mock.Mock()

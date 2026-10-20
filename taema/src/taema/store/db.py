@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -36,6 +36,7 @@ PAIR_RETENTION = 30 * DAY
 REVIEW_RETENTION = 30 * DAY
 LEGACY_BACKUP_RETENTION = 30 * DAY
 LEGACY_EVENT_LIMIT = 10_000
+PARENT_EVIDENCE = ("co_birth", "cgroup", "job", "runtime", "window", "launch")
 _LEGACY_MARKER = "migration.legacy_import"
 _RECOVERY_MARKER = "store.recovery"
 _DAILY_EXPORT_RE = re.compile(r"^state-export-(\d{8})\.json$")
@@ -259,6 +260,11 @@ _MIGRATIONS = {
             applied INTEGER,
             PRIMARY KEY (pid, start)
         );
+    """,
+    4: """
+        ALTER TABLE instances ADD COLUMN parent_evidence TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE instances ADD COLUMN last_seen REAL;
+        CREATE INDEX parents_last ON parents(last);
     """,
 }
 
@@ -796,35 +802,174 @@ def _trim_oldest(connection, table, key, cap, order, eligible="1"):
         )
 
 
-def _prune_app_rows(connection, now):
+def _instance_evidence(value):
+    value = _load(value, []) if isinstance(value, str) else value
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    return tuple(sorted({item for item in value if item in PARENT_EVIDENCE}))
+
+
+def _change_parent_evidence(deltas, app, parent, evidence, amount):
+    if not app or not parent or app == parent:
+        return
+    counts = deltas.setdefault((app, parent), dict.fromkeys(PARENT_EVIDENCE, 0))
+    for item in evidence:
+        counts[item] += amount
+
+
+def _apply_parent_deltas(connection, deltas, now):
+    for (app, parent), counts in deltas.items():
+        if not any(counts.values()):
+            continue
+        values = [counts[item] for item in PARENT_EVIDENCE]
+        existing = connection.execute(
+            "SELECT 1 FROM parents WHERE app = ? AND parent = ?", (app, parent)
+        ).fetchone()
+        if existing:
+            connection.execute(
+                """UPDATE parents SET
+                     co_birth=max(0, coalesce(co_birth, 0) + ?),
+                     cgroup=max(0, coalesce(cgroup, 0) + ?),
+                     job=max(0, coalesce(job, 0) + ?),
+                     runtime=max(0, coalesce(runtime, 0) + ?),
+                     window=max(0, coalesce(window, 0) + ?),
+                     launch=max(0, coalesce(launch, 0) + ?),
+                     last=max(coalesce(last, 0), ?)
+                   WHERE app = ? AND parent = ?""",
+                (*values, now, app, parent),
+            )
+        elif any(value > 0 for value in values):
+            connection.execute(
+                """INSERT INTO parents
+                   (app, parent, co_birth, cgroup, job, runtime, window, launch, last)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (app, parent, *(max(0, value) for value in values), now),
+            )
     connection.execute(
-        "DELETE FROM instances WHERE coalesce(exited, born) < ?",
-        (now - INSTANCE_RETENTION,),
+        "DELETE FROM parents WHERE coalesce(co_birth, 0) = 0 "
+        "AND coalesce(cgroup, 0) = 0 AND coalesce(job, 0) = 0 "
+        "AND coalesce(runtime, 0) = 0 AND coalesce(window, 0) = 0 "
+        "AND coalesce(launch, 0) = 0"
     )
-    _trim_oldest(
-        connection, "instances", "id", MAX_INSTANCES, "coalesce(exited, born, 0), id"
-    )
+
+
+def _delete_instances(connection, identifiers, now):
+    identifiers = list(dict.fromkeys(identifiers))
+    deltas = {}
+    for offset in range(0, len(identifiers), 400):
+        batch = identifiers[offset : offset + 400]
+        placeholders = ",".join("?" for _ in batch)
+        rows = connection.execute(
+            "SELECT id, app, parent_app, parent_evidence FROM instances "
+            "WHERE id IN (%s)" % placeholders,
+            batch,
+        ).fetchall()
+        for row in rows:
+            _change_parent_evidence(
+                deltas,
+                row["app"],
+                row["parent_app"],
+                _instance_evidence(row["parent_evidence"]),
+                -1,
+            )
+    _apply_parent_deltas(connection, deltas, now)
+    for offset in range(0, len(identifiers), 400):
+        batch = identifiers[offset : offset + 400]
+        placeholders = ",".join("?" for _ in batch)
+        connection.execute(
+            "DELETE FROM instances WHERE id IN (%s)" % placeholders, batch
+        )
+
+
+def _protected_instance_sql(alias="instances"):
+    return """(
+        EXISTS (
+            SELECT 1 FROM pairs AS answer
+            WHERE (answer.owner = {alias}.app OR answer.leftover = {alias}.app)
+              AND (answer.ex_stop > 0 OR answer.ex_keep > 0
+                   OR answer.ex_last IN ('stop', 'keep')
+                   OR answer.source = 'legacy-invalid')
+        )
+        OR EXISTS (SELECT 1 FROM standalone AS saved WHERE saved.key = {alias}.app)
+        OR EXISTS (
+            SELECT 1 FROM vetoes AS veto
+            WHERE (veto.expires IS NULL OR veto.expires > ?)
+              AND ((veto.kind = 'app' AND veto.value = {alias}.app)
+                OR (veto.kind = 'pid' AND veto.value = CAST({alias}.pid AS TEXT)
+                    AND veto.start = {alias}.start)
+                OR (veto.kind = 'scope' AND {alias}.scope IS NOT NULL
+                    AND ({alias}.scope = veto.value
+                      OR instr({alias}.scope, '/' || veto.value || '/') > 0
+                      OR substr({alias}.scope, -length(veto.value)) = veto.value)))
+        )
+    )""".format(alias=alias)
+
+
+def _prune_instances(connection, now):
+    protected = _protected_instance_sql()
+    stale = [
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM instances WHERE coalesce(exited, last_seen, born) < ? "
+            "AND NOT %s" % protected,
+            (now - INSTANCE_RETENTION, now),
+        )
+    ]
+    _delete_instances(connection, stale, now)
+
+    excess = connection.execute("SELECT count(*) FROM instances").fetchone()[0]
+    excess -= MAX_INSTANCES
+    if excess > 0:
+        oldest = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM instances WHERE NOT %s "
+                "ORDER BY coalesce(exited, last_seen, born, 0), id LIMIT ?"
+                % protected,
+                (now, excess),
+            )
+        ]
+        _delete_instances(connection, oldest, now)
+
+
+def _prune_app_rows(connection, now):
+    _prune_instances(connection, now)
     _prune_apps(connection, now)
 
 
 def _prune_apps(connection, now):
     connection.execute("CREATE TEMP TABLE _taema_app_evictions (key TEXT PRIMARY KEY)")
-    connection.execute(
+    query = (
         "INSERT INTO _taema_app_evictions(key) "
         "SELECT key FROM apps AS candidate "
         "WHERE NOT EXISTS (SELECT 1 FROM pairs WHERE owner = candidate.key "
-        "AND (ex_stop > 0 OR ex_keep > 0)) "
+        "AND (ex_stop > 0 OR ex_keep > 0 OR ex_last IN ('stop', 'keep'))) "
+        "AND NOT EXISTS (SELECT 1 FROM pairs WHERE leftover = candidate.key "
+        "AND (ex_stop > 0 OR ex_keep > 0 OR ex_last IN ('stop', 'keep'))) "
         "AND NOT EXISTS (SELECT 1 FROM standalone WHERE key = candidate.key) "
         "AND NOT EXISTS (SELECT 1 FROM pairs WHERE source = 'legacy-invalid' "
         "AND (owner = candidate.key OR leftover = candidate.key)) "
         "AND NOT EXISTS (SELECT 1 FROM vetoes WHERE kind = 'app' "
         "AND value = candidate.key AND (expires IS NULL OR expires > ?)) "
+        "AND NOT EXISTS (SELECT 1 FROM instances AS protected "
+        "WHERE protected.app = candidate.key AND %s) "
         "ORDER BY coalesce(last_seen, 0), key "
-        "LIMIT max(0, (SELECT count(*) FROM apps) - ?)",
-        (now, MAX_APPS),
-    )
+        "LIMIT max(0, (SELECT count(*) FROM apps) - ?)"
+    ) % _protected_instance_sql("protected")
     connection.execute(
-        "DELETE FROM instances WHERE app IN (SELECT key FROM _taema_app_evictions)"
+        query,
+        (now, now, MAX_APPS),
+    )
+    _delete_instances(
+        connection,
+        [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM instances WHERE app IN "
+                "(SELECT key FROM _taema_app_evictions)"
+            )
+        ],
+        now,
     )
     connection.execute(
         "DELETE FROM apps WHERE key IN (SELECT key FROM _taema_app_evictions)"
@@ -834,13 +979,7 @@ def _prune_apps(connection, now):
 
 def _prune(connection, now):
     """Apply documented storage bounds without evicting active vetoes or answers."""
-    connection.execute(
-        "DELETE FROM instances WHERE coalesce(exited, born) < ?",
-        (now - INSTANCE_RETENTION,),
-    )
-    _trim_oldest(
-        connection, "instances", "id", MAX_INSTANCES, "coalesce(exited, born, 0), id"
-    )
+    _prune_instances(connection, now)
 
     connection.execute("DELETE FROM events WHERE ts < ?", (now - EVENT_RETENTION,))
     _trim_oldest(connection, "events", "seq", MAX_EVENTS, "coalesce(ts, 0), seq")
@@ -1197,19 +1336,113 @@ class StateDB:
             return None
         with self.connection() as connection:
             row = connection.execute(
-                "SELECT id, app, pid, start, born, parent_app, scope, terminal, "
-                "class, runtime, launched_by FROM instances WHERE app = ? "
+                "SELECT id, app, pid, start, born, exited, last_seen, parent_app, scope, terminal, "
+                "class, runtime, launched_by, parent_evidence FROM instances WHERE app = ? "
                 "ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
                 (key,),
             ).fetchone()
         return dict(row) if row else None
+
+    def provenance_chain(self, key, max_depth=8):
+        """Read the latest retained parent chain and per-parent evidence support."""
+        if (
+            not self.available
+            or not isinstance(key, str)
+            or not key
+            or not isinstance(max_depth, int)
+            or isinstance(max_depth, bool)
+            or max_depth < 1
+        ):
+            return None
+        with self.connection() as connection:
+            first = connection.execute(
+                "SELECT id, app, pid, start, born, exited, last_seen, parent_app, scope, terminal, "
+                "class, runtime, launched_by, parent_evidence FROM instances "
+                "WHERE app = ? ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            if not first:
+                return None
+            result = dict(first)
+            chain = []
+            seen = set()
+            current = key
+            while current and current not in seen and len(chain) < max_depth:
+                seen.add(current)
+                instance = first if current == key else connection.execute(
+                    "SELECT id, app, pid, start, born, exited, last_seen, parent_app, scope, terminal, "
+                    "class, runtime, launched_by, parent_evidence FROM instances "
+                    "WHERE app = ? ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
+                    (current,),
+                ).fetchone()
+                if not instance:
+                    break
+                parent = instance["parent_app"]
+                app_row = connection.execute(
+                    "SELECT display FROM apps WHERE key = ?", (current,)
+                ).fetchone()
+                display = app_row["display"] if app_row else current
+                relation = None
+                if parent:
+                    candidates = connection.execute(
+                        "SELECT parent, coalesce(co_birth, 0) AS co_birth, "
+                        "coalesce(cgroup, 0) AS cgroup, coalesce(job, 0) AS job, "
+                        "coalesce(runtime, 0) AS runtime, coalesce(window, 0) AS window, "
+                        "coalesce(launch, 0) AS launch FROM parents WHERE app = ?",
+                        (current,),
+                    ).fetchall()
+                    selected = next(
+                        (row for row in candidates if row["parent"] == parent), None
+                    )
+                    if selected:
+                        counts = {
+                            item: selected[item]
+                            for item in PARENT_EVIDENCE
+                            if selected[item] > 0
+                        }
+                        support = sum(counts.values())
+                        total = sum(
+                            sum(row[item] for item in PARENT_EVIDENCE)
+                            for row in candidates
+                        )
+                        relation = {
+                            "parent": parent,
+                            "parent_display": None,
+                            "evidence_counts": counts,
+                            "confidence": support / total if total else None,
+                        }
+                    else:
+                        relation = {
+                            "parent": parent,
+                            "parent_display": None,
+                            "evidence_counts": {},
+                            "confidence": None,
+                        }
+                    parent_row = connection.execute(
+                        "SELECT display FROM apps WHERE key = ?", (parent,)
+                    ).fetchone()
+                    relation["parent_display"] = (
+                        parent_row["display"] if parent_row else parent
+                    )
+                chain.append({"app": current, "display": display, "relation": relation})
+                current = parent
+            result["chain"] = chain
+            result["chain_text"] = " ← ".join(
+                [item["display"] or item["app"] for item in chain]
+                + (
+                    [chain[-1]["relation"]["parent_display"]]
+                    if chain and chain[-1]["relation"]
+                    else []
+                )
+            )
+            return result
 
     def record_app_identities(self, identities, now=None):
         """Persist one observe pass of identities in a single bounded transaction."""
         if self.read_only or not self.available:
             return 0
         now = time.time() if now is None else now
-        apps, instances = [], []
+        apps, instances = {}, {}
         for identity, instance in identities:
             key = getattr(identity, "key", None)
             pid, start = instance.get("pid"), instance.get("start")
@@ -1235,35 +1468,34 @@ class StateDB:
                 or ""
             )[:128] or None
             confidence = "high" if getattr(identity, "validated", False) else "low"
-            apps.append(
-                (
-                    key,
-                    kind,
-                    display or key,
-                    exe,
-                    getattr(identity, "device", None),
-                    getattr(identity, "inode", None),
-                    desktop_id,
-                    unit,
-                    first_seen,
-                    now,
-                    confidence,
-                )
+            apps[key] = (
+                key,
+                kind,
+                display or key,
+                exe,
+                getattr(identity, "device", None),
+                getattr(identity, "inode", None),
+                desktop_id,
+                unit,
+                first_seen,
+                now,
+                confidence,
             )
-            instances.append(
-                (
-                    instance_id,
-                    key,
-                    pid,
-                    start,
-                    first_seen,
-                    (_text(instance.get("parent_app")) or "")[:512] or None,
-                    (_text(instance.get("scope")) or "")[:1024] or None,
-                    instance.get("terminal"),
-                    _text(instance.get("class") or kind, kind)[:64],
-                    runtime,
-                    (_text(instance.get("launched_by")) or "")[:256] or None,
-                )
+            instances[instance_id] = (
+                instance_id,
+                key,
+                pid,
+                start,
+                first_seen,
+                (_text(instance.get("parent_app")) or "")[:512] or None,
+                (_text(instance.get("scope")) or "")[:1024] or None,
+                instance.get("terminal"),
+                _text(instance.get("class") or kind, kind)[:64],
+                runtime,
+                (_text(instance.get("launched_by")) or "")[:256] or None,
+                _number(instance.get("exited")),
+                _dump(_instance_evidence(instance.get("parent_evidence"))),
+                now,
             )
         if not apps:
             return 0
@@ -1271,16 +1503,17 @@ class StateDB:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                previous_apps = {}
-                ids = [row[0] for row in instances]
+                previous_instances = {}
+                ids = list(instances)
                 for offset in range(0, len(ids), 400):
                     batch = ids[offset : offset + 400]
                     placeholders = ",".join("?" for _ in batch)
-                    previous_apps.update(
+                    previous_instances.update(
                         {
-                            row["id"]: row["app"]
+                            row["id"]: row
                             for row in connection.execute(
-                                "SELECT id, app FROM instances WHERE id IN (%s)"
+                                "SELECT id, app, parent_app, parent_evidence "
+                                "FROM instances WHERE id IN (%s)"
                                 % placeholders,
                                 batch,
                             )
@@ -1299,21 +1532,67 @@ class StateDB:
                          first_seen=min(coalesce(apps.first_seen, excluded.first_seen), excluded.first_seen),
                          last_seen=max(coalesce(apps.last_seen, excluded.last_seen), excluded.last_seen),
                          confidence=excluded.confidence""",
-                    apps,
+                    apps.values(),
                 )
+                parent_deltas = {}
+                for row in instances.values():
+                    old = previous_instances.get(row[0])
+                    new_relation = (row[1], row[5])
+                    new_evidence = _instance_evidence(row[12])
+                    if old:
+                        old_relation = (old["app"], old["parent_app"])
+                        old_evidence = _instance_evidence(old["parent_evidence"])
+                        if old_relation == new_relation:
+                            _change_parent_evidence(
+                                parent_deltas,
+                                *old_relation,
+                                old_evidence,
+                                -1,
+                            )
+                            _change_parent_evidence(
+                                parent_deltas,
+                                *new_relation,
+                                new_evidence,
+                                1,
+                            )
+                        else:
+                            _change_parent_evidence(
+                                parent_deltas,
+                                *old_relation,
+                                old_evidence,
+                                -1,
+                            )
+                            _change_parent_evidence(
+                                parent_deltas,
+                                *new_relation,
+                                new_evidence,
+                                1,
+                            )
+                    else:
+                        _change_parent_evidence(
+                            parent_deltas,
+                            *new_relation,
+                            new_evidence,
+                            1,
+                        )
+                _apply_parent_deltas(connection, parent_deltas, now)
                 connection.executemany(
                     """INSERT INTO instances
                        (id, app, pid, start, born, parent_app, scope, terminal,
-                        class, runtime, launched_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        class, runtime, launched_by, exited, parent_evidence, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET app=excluded.app,
                          parent_app=excluded.parent_app, scope=excluded.scope,
                          terminal=excluded.terminal, class=excluded.class,
-                         runtime=excluded.runtime, launched_by=coalesce(excluded.launched_by, instances.launched_by)""",
-                    instances,
+                         runtime=excluded.runtime,
+                         launched_by=coalesce(excluded.launched_by, instances.launched_by),
+                         exited=excluded.exited,
+                         parent_evidence=excluded.parent_evidence,
+                         last_seen=excluded.last_seen""",
+                    instances.values(),
                 )
-                affected = {row[0] for row in apps}
-                affected.update(previous_apps.values())
+                affected = set(apps)
+                affected.update(row["app"] for row in previous_instances.values())
                 connection.executemany(
                     "UPDATE apps SET instances=(SELECT count(*) FROM instances WHERE app=?) WHERE key=?",
                     [(key, key) for key in affected],
@@ -1323,7 +1602,7 @@ class StateDB:
             except Exception:
                 connection.rollback()
                 raise
-        return len(apps)
+        return len(instances)
 
     def _migrate(self, connection):
         version = connection.execute("PRAGMA user_version").fetchone()[0]

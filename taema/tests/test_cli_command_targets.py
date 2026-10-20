@@ -113,6 +113,47 @@ class TargetCommands(unittest.TestCase):
                 cli.cmd_explain(SimpleNamespace(target="pid:42", pick=False)), 2
             )
 
+    def test_why_renders_durable_parent_chain_and_evidence_confidence(self):
+        parent = AppIdentity(
+            "unit:niri", "niri", "unit", "/usr/bin/niri", unit="niri.service"
+        )
+        child = AppIdentity(
+            "exe:firefox:8:71", "firefox", "exe", "/usr/bin/firefox", 8, 71
+        )
+        now = self.store.now()
+        self.store.record_identities(
+            [
+                (
+                    parent,
+                    {
+                        "pid": 40,
+                        "start": 100,
+                        "born": now,
+                        "scope": "/user/1000/app-desktop",
+                    },
+                ),
+                (
+                    child,
+                    {
+                        "pid": 41,
+                        "start": 101,
+                        "born": now,
+                        "parent_app": parent.key,
+                        "scope": "/user/1000/app-desktop",
+                        "parent_evidence": ["co_birth", "cgroup"],
+                    },
+                ),
+            ]
+        )
+
+        explanation = cli._why_report(self.cfg, self.store, key=child.key)
+        rendered = view.render_explanation("app:firefox", explanation)
+
+        self.assertEqual(explanation["provenance"]["chain_text"], "firefox ← niri")
+        self.assertIn("provenance: firefox ← niri", rendered)
+        self.assertIn("cgroup=1, co_birth=1", rendered)
+        self.assertIn("confidence=1.00", rendered)
+
     def test_why_pair_explains_learned_and_invalid_owner_authority(self):
         self.store.answer("npm", "vite", "stop")
         with (

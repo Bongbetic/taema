@@ -56,6 +56,8 @@ __all__ = (
     "cmd_mode",
     "cmd_profile",
     "cmd_review",
+    "cmd_answer",
+    "cmd_teach",
     "cmd_learn_export",
     "cmd_gc",
     "cmd_adopt",

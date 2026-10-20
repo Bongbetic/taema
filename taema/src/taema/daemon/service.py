@@ -544,6 +544,7 @@ class Daemon:
                     self.store.observe_close(
                         owner, key, launcher=False
                     )  # weight 0: only counts closes
+                signature = None
                 if valid_owner and left:
                     signature = self.survivor_signature(owner, left)
                     self.attribute(owner, left, root=rid[0], signature=signature)
@@ -564,6 +565,7 @@ class Daemon:
                                 owner if valid_owner else "",
                                 left,
                                 authority=dec.authority or "mode",
+                                signature=signature,
                             )
                         )
                     elif dec.verdict == authorization.WOULD_ACT:
@@ -596,6 +598,20 @@ class Daemon:
             "+".join(sorted(runtime_classes)),
             tty,
         )
+
+    @staticmethod
+    def _review_memory(scope):
+        path = cgroup.resolve(scope)
+        return cgroup.memory_current(path) if path else None
+
+    @staticmethod
+    def _review_provenance(owner, members):
+        ancestors = []
+        for member in members:
+            for key in member.get("chain", []):
+                if key and key != owner and key not in ancestors:
+                    ancestors.append(key)
+        return "last seen under %s" % (", ".join(ancestors[:3]) or owner)
 
     def queue_provenance_review(self, scope, left, reason):
         """Record uncertain ownership for inspection; no candidate receives an answer."""
@@ -687,6 +703,7 @@ class Daemon:
             }
             for k, ls in by_key.items()
         ]
+        adopted = not bool(ops)
         try:
             for op in engine.run_ops(
                 self.cfg,
@@ -698,10 +715,54 @@ class Daemon:
             ):
                 if op["done"]:
                     self.auto_scopes.add(op["scope"])
+                    adopted = True
         except engine.Refused as e:
             self.store.log(event="standalone_adopt_refused", error=str(e))
+        return adopted
 
-    def gui_close(self, rid, owner, left, authority="mode"):
+    def _live_standalone_members(self, members, scope=None):
+        path = cgroup.resolve(scope) if scope else None
+        result = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            pid, start, key = member.get("pid"), member.get("start"), member.get("key")
+            if (
+                not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(key, str)
+                or inspect.starttime(pid) != start
+            ):
+                continue
+            if scope:
+                current = cgroup.proc_cgroup(pid)
+                if not path or not current or not cgroup.is_prefix(path, current):
+                    continue
+            result.append({"pid": pid, "start": start, "key": key})
+        return result
+
+    def _adopt_answered_standalones(self):
+        changed = False
+        for review in self.store.data.get("reviews", []):
+            if (
+                not isinstance(review, dict)
+                or review.get("state") != "answered"
+                or review.get("answer") != "standalone"
+                or review.get("adopted")
+            ):
+                continue
+            members = self._live_standalone_members(
+                review.get("members", []), scope=review.get("scope")
+            )
+            if self.adopt_standalone(members, review.get("owner")):
+                review["adopted"] = True
+                self.store.dirty = True
+                changed = True
+        return changed
+
+    def gui_close(self, rid, owner, left, authority="mode", signature=None):
         """A GUI root vanished (not a terminal job): standalone leftovers get their own scope, the rest
         go to leftover/<owner>-<id> with a pending review that holds the scope until answered or expiry."""
         standalone = [l for l in left if self.store.standalone(l["key"])]
@@ -738,7 +799,14 @@ class Daemon:
                     moved = set(op["pids"])
                     contained = [l for l in rest if l["pid"] in moved]
                     review = (
-                        self.store.add_review(owner, contained, name)
+                        self.store.add_review(
+                            owner,
+                            contained,
+                            name,
+                            signature=signature,
+                            memory=self._review_memory(name),
+                            provenance=self._review_provenance(owner, contained),
+                        )
                         if valid_owner
                         else self.store.add_provenance_review(
                             contained,
@@ -1191,7 +1259,12 @@ class Daemon:
                     tag, owner, left, dec, signature_id=signature["id"]
                 )
             )
-        ask = [k for k in keys if dec[k][0] == "ask" and self.store.can_ask((owner, k))]
+        ask = [
+            k
+            for k in keys
+            if dec[k][0] == "ask"
+            and self.store.can_ask((owner, k), signature=signature)
+        ]
         if ask:
             self.make_question(j, tag, owner, left, ask, signature=signature)
 
@@ -1305,6 +1378,8 @@ class Daemon:
             left = [
                 {
                     "key": key,
+                    "pid": r["pid"],
+                    "start": r.get("start"),
                     "comm": key.split(":")[-1],
                     "chain": list(r["chain"]),
                     "chain_ids": [None] * len(r["chain"]),
@@ -1319,9 +1394,7 @@ class Daemon:
                 kind="closed",
             )
 
-    def make_question(
-        self, j, tag, owner, left, ask_keys, kind="job", signature=None
-    ):
+    def make_question(self, j, tag, owner, left, ask_keys, kind="job", signature=None):
         shell = j["shell"]
         for qid in [i for i, q in self.pending.items() if q["shell_pid"] == shell]:
             self.drop_question(qid)
@@ -1346,6 +1419,11 @@ class Daemon:
             "owner": owner,
             "signature": signature,
             "ask_keys": list(ask_keys),
+            "members": [
+                {"key": item["key"], "pid": item["pid"], "start": item.get("start")}
+                for item in left
+                if item.get("key") in ask_keys
+            ],
             "candidates": self.candidates(owner, left),
             "leftovers": list(cnt.values()),
             "created": time.time(),
@@ -1416,12 +1494,20 @@ class Daemon:
             return {"question": None, "reason": "none"}
         pairs = [(q["owner"], k) for k in q["ask_keys"]]
         if not q["shown"]:
-            ok = [p for p in pairs if self.store.can_ask(p)]
+            ok = [
+                p for p in pairs if self.store.can_ask(p, signature=q.get("signature"))
+            ]
             if not ok:
                 self.drop_question(q["id"])
                 return {"question": None, "reason": "rate_limited"}
+            allowed = {leftover for _owner, leftover in ok}
+            q["ask_keys"] = [key for key in q["ask_keys"] if key in allowed]
+            q["leftovers"] = [
+                item for item in q["leftovers"] if item.get("key") in allowed
+            ]
+            q["members"] = [item for item in q["members"] if item.get("key") in allowed]
             q["shown"] = True
-            self.store.mark_asked(ok)
+            self.store.mark_asked(ok, signature=q.get("signature"))
         return {
             "question": {
                 "id": q["id"],
@@ -1495,23 +1581,20 @@ class Daemon:
                     event="answer_refused", reason="owner identity is unvalidated"
                 )
             return {"error": "owner identity is unvalidated"}
-        with self.store.decision_context(
-            "answer",
-            owner=owner,
-            authority="user",
-            mode=self.mode,
-            why="user answered %s" % choice,
+        if not self.store.apply_answer(
+            owner,
+            q["ask_keys"],
+            choice,
+            signature=q.get("signature"),
+            source="prompt",
+            apply_pairs=not (q.get("signature") and choice in ("stop", "keep")),
         ):
-            if choice in ("stop", "keep") and q.get("signature"):
-                self.store.answer_signature(owner, q["signature"], choice)
-            else:
-                for k in q["ask_keys"]:
-                    self.store.answer(owner, k, choice)
-            self.drop_question(q["id"])
-            self.store.log(
-                event="answer", choice=choice, owner=owner, leftovers=q["ask_keys"][:8]
-            )
-            self.store.save()
+            return {"error": "answer could not be applied"}
+        if choice == "standalone":
+            members = self._live_standalone_members(q.get("members", []))
+            self.adopt_standalone(members, owner)
+        self.drop_question(q["id"])
+        self.store.save()
         return {
             "ok": True,
             "choice": choice,
@@ -1631,7 +1714,13 @@ class Daemon:
                 )
         if owners and leaf.startswith(engine.LEFTOVER + "/"):
             for owner, members in owners.items():
-                review = self.store.add_review(owner, members, leaf)
+                review = self.store.add_review(
+                    owner,
+                    members,
+                    leaf,
+                    memory=self._review_memory(leaf),
+                    provenance=self._review_provenance(owner, members),
+                )
                 if review and review["id"] > before:
                     self.store.log(
                         event="review_created",
@@ -1655,7 +1744,9 @@ class Daemon:
     def gc_pass(self, dry_run=False):
         self.store.expire_reviews()
         self._save_if_idle()
-        if self.store.apply_feedback():
+        applied_feedback = self.store.apply_feedback()
+        adopted = self._adopt_answered_standalones()
+        if applied_feedback or adopted:
             self._save_if_idle()
         self.store.decay()
         self.store.enforce_caps()
@@ -1979,6 +2070,8 @@ class Daemon:
                     return {"error": "bad request"}
                 if not result.get("duplicate"):
                     self.store.save()
+                self._adopt_answered_standalones()
+                self.store.save_if_dirty()
                 return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):
                 return {"error": "bad request"}
@@ -2086,7 +2179,27 @@ class Daemon:
                 except OSError:
                     pass
             return False
+        self._write_review_flag()
         self._summary_dirty = False
+        return True
+
+    def _write_review_flag(self):
+        path = os.path.join(self.qdir(), "review")
+        count = self.store.review_count
+        try:
+            if count:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="ascii") as output:
+                    output.write("%d\n" % count)
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.chmod(path, 0o600)
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
         return True
 
     def _publish_event(self, event):

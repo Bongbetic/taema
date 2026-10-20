@@ -96,7 +96,7 @@
     "job_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}, "ignored": {"type": "string"}}, "additionalProperties": true},
     "kill_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true},
     "ask": {"type": "object", "required": ["question"], "properties": {"question": {"type": ["object", "null"]}, "reason": {"type": "string"}}, "additionalProperties": true},
-    "answer": {"type": "object", "required": ["ok", "choice", "owner", "leftovers"], "properties": {"ok": {"const": true}, "choice": {"enum": ["stop", "keep", "standalone"]}, "owner": {"type": "string"}, "leftovers": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true},
+    "answer": {"type": "object", "required": ["ok", "choice", "owner", "leftovers"], "properties": {"ok": {"const": true}, "choice": {"enum": ["stop", "keep", "standalone", "never"]}, "owner": {"type": "string"}, "leftovers": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": true},
     "gc": {"type": "object", "required": ["candidates"], "properties": {"candidates": {"type": "array", "items": {"type": "object"}}}, "additionalProperties": true},
     "feedback": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true}
   }

@@ -1257,6 +1257,28 @@ def cmd_explain(a):
 
 def cmd_keep(a):
     cfg, store, units = _load(a)
+    pair = getattr(a, "pair", None)
+    if pair:
+        if getattr(a, "exe", None):
+            return die("use either an executable or --pair OWNER LEFTOVER", 2)
+        owner, leftover = pair
+        if getattr(a, "dry_run", False):
+            print("dry run: remember keep for %s > %s" % (owner, leftover))
+            return 0
+        how, reply = feedback_action(
+            cfg,
+            store,
+            "teach",
+            owner=owner,
+            leftovers=[leftover],
+            choice="keep",
+        )
+        if not reply or not reply.get("ok"):
+            return die((reply or {}).get("error", "could not teach pair"))
+        print("%s > %s: keep (%s)" % (owner, leftover, how))
+        return 0
+    if not getattr(a, "exe", None):
+        return die("keep requires an executable or --pair OWNER LEFTOVER", 2)
     from . import targets
 
     key = a.exe
@@ -1953,14 +1975,165 @@ def cmd_profile(a):
 def cmd_review(a):
     from . import view
 
-    _cfg, store, _units = _load(a)
+    cfg, store, _units = _load(a)
     reviews = sorted(
-        store.open_reviews(),
+        store.review_details(store.open_reviews()),
         key=lambda item: (item.get("created", 0), str(item.get("id", ""))),
     )
+    if getattr(a, "interactive", False):
+        if getattr(a, "json", False) or getattr(a, "jsonl", False):
+            return die("--interactive cannot be combined with JSON output", 2)
+        if not sys.stdin.isatty():
+            return die("interactive review needs a terminal", 2)
+        return _interactive_reviews(a, cfg, store, reviews)
     model = view.record("reviews", {"reviews": reviews})
     records = [view.record("review", {"review": item}) for item in reviews]
     view.emit(model, a, view.render_reviews(reviews), records)
+    return 0
+
+
+def _review_choice(value):
+    return {
+        "1": "stop",
+        "2": "keep",
+        "3": "standalone",
+        "4": "never",
+    }.get(value, value)
+
+
+def _parse_review_id(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        if value.startswith("r-"):
+            return int(value[2:], 16)
+        return int(value.lstrip("#"), 10)
+    except ValueError:
+        return None
+
+
+def cmd_answer(a):
+    cfg, store, _units = _load(a)
+    identifier = _parse_review_id(a.id)
+    if not identifier or identifier < 1:
+        return die("review id must be a positive number or r-hex id", 2)
+    choice = _review_choice(a.choice)
+    if choice not in knowledge.CHOICES:
+        return die("choice must be stop, keep, standalone, or never", 2)
+    how, reply = feedback_action(
+        cfg,
+        store,
+        "review_answer",
+        review_id=identifier,
+        choice=choice,
+        **({"owner": a.owner} if getattr(a, "owner", None) else {}),
+    )
+    if not reply or not reply.get("ok"):
+        return die(
+            (reply or {}).get("error", "review is missing, expired, or not answerable")
+        )
+    print("review #%s answered %s (%s)" % (identifier, choice, how))
+    return 0
+
+
+def cmd_teach(a):
+    cfg, store, _units = _load(a)
+    how, reply = feedback_action(
+        cfg,
+        store,
+        "teach",
+        owner=a.owner,
+        leftovers=[a.leftover],
+        choice=a.choice,
+    )
+    if not reply or not reply.get("ok"):
+        return die((reply or {}).get("error", "could not teach relationship"))
+    print("%s > %s: %s (%s)" % (a.owner, a.leftover, a.choice, how))
+    return 0
+
+
+def _interactive_reviews(args, cfg, store, reviews):
+    if not reviews:
+        print("open reviews: 0")
+        return 0
+    for review in reviews:
+        identifier = review.get("id")
+        owner = review.get("owner")
+        candidates = [
+            item.get("key")
+            for item in review.get("candidates", [])
+            if isinstance(item, dict) and isinstance(item.get("key"), str)
+        ]
+        if not owner and len(candidates) == 1:
+            owner = candidates[0]
+        if not owner and candidates:
+            print("review #%s candidates: %s" % (identifier, ", ".join(candidates)))
+            try:
+                owner = input("Owner key (Enter to leave): ").strip() or None
+            except (EOFError, OSError):
+                return 0
+            if owner not in candidates:
+                print("review #%s left pending (choose one listed owner)" % identifier)
+                continue
+        from . import view
+
+        print(view.render_reviews([review]), end="")
+        if review.get("kind") == "scope":
+            continue
+        if review.get("shown"):
+            print("already shown; answer with `taema answer %s CHOICE`" % identifier)
+            continue
+        pairs = [
+            (owner, key)
+            for key in review.get("survivors", [])
+            if isinstance(owner, str)
+        ]
+        if not pairs or not all(
+            store.can_ask(pair, signature=review.get("sig")) for pair in pairs
+        ):
+            print("review #%s left pending (question limit reached)" % identifier)
+            continue
+        fields = {"review_id": identifier}
+        if owner and owner != review.get("owner"):
+            fields["owner"] = owner
+        how, reply = feedback_action(cfg, store, "review_shown", **fields)
+        if not reply or not reply.get("ok"):
+            print(
+                "review #%s left pending (%s)"
+                % (identifier, (reply or {}).get("error", "rate limited"))
+            )
+            continue
+        try:
+            value = (
+                input("Choice [1 stop, 2 keep, 3 standalone, 4 never, Enter later]: ")
+                .strip()
+                .lower()
+            )
+        except (EOFError, OSError):
+            return 0
+        if not value:
+            continue
+        choice = _review_choice(value)
+        if choice not in knowledge.CHOICES:
+            print("review #%s left pending (unknown choice)" % identifier)
+            continue
+        how, reply = feedback_action(
+            cfg,
+            store,
+            "review_answer",
+            review_id=identifier,
+            choice=choice,
+            **({"owner": owner} if owner and owner != review.get("owner") else {}),
+        )
+        if not reply or not reply.get("ok"):
+            print(
+                "review #%s left pending (%s)"
+                % (identifier, (reply or {}).get("error", "could not answer"))
+            )
+        else:
+            print("review #%s answered %s (%s)" % (identifier, choice, how))
     return 0
 
 
@@ -2168,7 +2341,52 @@ def cmd_complete(a):
 
 def cmd_adopt(a):
     cfg, store, units = _load(a)
-    if a.all:
+    if getattr(a, "standalone", False):
+        if a.all:
+            return die("--standalone cannot be combined with --all", 2)
+        pt = inspect.ProcTable.scan()
+        lin = lineage.Lineage(cfg)
+        lin.observe(pt)
+        in_session = set()
+        for session in policy.session_cgroups(cfg):
+            in_session.update(cgroup.procs(session))
+        wanted = set(store.data.get("standalone", {}))
+        candidates = sorted(
+            (
+                entry
+                for entry in lin.entries.values()
+                if entry.get("key") in wanted
+                and entry.get("pid") in in_session
+                and not policy.protected_reason(entry["pid"], cfg)
+            ),
+            key=lambda entry: (-len(entry.get("chain_ids", [])), entry["pid"]),
+        )
+        claimed = set()
+        ops = []
+        for entry in candidates:
+            pid = entry["pid"]
+            if pid in claimed:
+                continue
+            pids = [
+                child
+                for child in pt.descendants([pid])
+                if child in in_session and child not in claimed
+            ]
+            if not pids:
+                continue
+            claimed.update(pids)
+            ops.append(
+                {
+                    "op": "move",
+                    "scope": engine.auto_scope_name(entry["key"], pid, entry["start"]),
+                    "owner": entry["key"],
+                    "unit": None,
+                    "auto": True,
+                    "pids": pids,
+                }
+            )
+        decision = authorization.authorize(authorization.UNIT_ADOPT, cfg["mode"])
+    elif a.all:
         pt = inspect.ProcTable.scan()
         lin = lineage.Lineage(cfg)
         lin.observe(pt)

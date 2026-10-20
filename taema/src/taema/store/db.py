@@ -925,8 +925,7 @@ def _prune_instances(connection, now):
             row[0]
             for row in connection.execute(
                 "SELECT id FROM instances WHERE NOT %s "
-                "ORDER BY coalesce(exited, last_seen, born, 0), id LIMIT ?"
-                % protected,
+                "ORDER BY coalesce(exited, last_seen, born, 0), id LIMIT ?" % protected,
                 (now, excess),
             )
         ]
@@ -1370,12 +1369,16 @@ class StateDB:
             current = key
             while current and current not in seen and len(chain) < max_depth:
                 seen.add(current)
-                instance = first if current == key else connection.execute(
-                    "SELECT id, app, pid, start, born, exited, last_seen, parent_app, scope, terminal, "
-                    "class, runtime, launched_by, parent_evidence FROM instances "
-                    "WHERE app = ? ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
-                    (current,),
-                ).fetchone()
+                instance = (
+                    first
+                    if current == key
+                    else connection.execute(
+                        "SELECT id, app, pid, start, born, exited, last_seen, parent_app, scope, terminal, "
+                        "class, runtime, launched_by, parent_evidence FROM instances "
+                        "WHERE app = ? ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
+                        (current,),
+                    ).fetchone()
+                )
                 if not instance:
                     break
                 parent = instance["parent_app"]
@@ -1514,8 +1517,7 @@ class StateDB:
                             row["id"]: row
                             for row in connection.execute(
                                 "SELECT id, app, parent_app, parent_evidence "
-                                "FROM instances WHERE id IN (%s)"
-                                % placeholders,
+                                "FROM instances WHERE id IN (%s)" % placeholders,
                                 batch,
                             )
                         }
@@ -2061,6 +2063,7 @@ class StateDB:
         optional_meta_defaults = {
             "feedback_invalid": 0,
             "feedback_last_replay": "",
+            "signature_asked": {},
             "held": False,
             "held_scopes": [],
             "snooze_until": 0.0,
@@ -2075,6 +2078,7 @@ class StateDB:
                     "last_decay",
                     "closes",
                     "review_seq",
+                    "signature_asked",
                     "feedback_invalid",
                     "feedback_last_replay",
                     "held",

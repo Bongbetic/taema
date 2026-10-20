@@ -872,7 +872,7 @@ class JobFlow(ProcCase):
         )  # bash is a shell
         self.assertEqual(r["leftovers"], [{"key": "vite", "comm": "vite", "count": 1}])
         self.assertEqual(r["nonce"], q["nonce"])
-        self.assertEqual(r["choices"], ["stop", "keep", "standalone"])
+        self.assertEqual(r["choices"], ["stop", "keep", "standalone", "never"])
         ans = lambda **m: self.d.handle(dict({"cmd": "answer"}, **m))
         for bad in (
             {"nonce": "nope", "choice": "stop"},
@@ -888,9 +888,7 @@ class JobFlow(ProcCase):
         self.assertFalse(os.path.exists(qf))
         self.assertIn("error", ans(nonce=r["nonce"], choice="stop"))  # one-time nonce
         self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "ask")
-        self.assertEqual(
-            self.d.store.signature_decision(q["signature"])[0], "stop"
-        )
+        self.assertEqual(self.d.store.signature_decision(q["signature"])[0], "stop")
         reopened = knowledge.Store(self.d.store.dir, {})
         self.assertEqual(reopened.pair_decision("npm", "vite")[0], "ask")
         self.assertEqual(reopened.signature_decision(q["signature"])[0], "stop")
@@ -902,9 +900,7 @@ class JobFlow(ProcCase):
         first = self.d.pending[1]["signature"]
         nonce = self.ask()["question"]["nonce"]
         self.assertTrue(
-            self.d.handle({"cmd": "answer", "nonce": nonce, "choice": "stop"})[
-                "ok"
-            ]
+            self.d.handle({"cmd": "answer", "nonce": nonce, "choice": "stop"})["ok"]
         )
         self.assertEqual(self.d.store.signature_decision(first)[0], "stop")
         self.fp.remove(30)

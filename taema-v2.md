@@ -1032,11 +1032,13 @@ and offline enforcement. Both exist; they answer different questions.
 ID     OWNER              SURVIVORS                         CLOSES  MEM     AGE
 r-9c1  firefox            node:esbuild, node:vite.js             7   812M    2h
         ↳ last seen under app-firefox-3f2a1c; sig a1b2c3d4e5f6; answered? no
-        1 stop on close    2 keep / standalone    3 never (do-not-kill)    Enter later
+        1 stop on close    2 keep    3 standalone    4 never (do-not-kill)    Enter later
 ```
 
-- `taema answer r-9c1 1` (or `taema review --interactive`) applies the answer to the
-  signature and its pairs. The dashboard can answer too.
+- `taema answer r-9c1 stop` (or `taema review --interactive`) applies the answer to the
+  signature and its pairs. `never` adds an app veto; `standalone` adopts the survivors into their
+  own app scopes. `taema teach OWNER LEFTOVER stop|keep|standalone` records a relationship without
+  a pending review. The dashboard and notifications use the same answer operation.
 - Rate limits stay: at most 3 questions/day, one per pair/signature per 7 days. A review is
   not a question until it is shown; it does not consume the daily budget.
 - **Desktop notifications go through the session agent (§9.1), never from the daemon**,

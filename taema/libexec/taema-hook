@@ -123,6 +123,7 @@ def format_question(q):
                          for c in rest[:3])
         lines.append("  [2] part of another app: " + desc)
     lines.append("  [3] standalone app: give them their own scope, never stop with a parent")
+    lines.append("  [4] never stop these survivors")
     lines.append("  [Enter] ask me later")
     return [wrap(l, "      ") if i else wrap(l, "  ") for i, l in enumerate(lines)]
 
@@ -136,6 +137,8 @@ def map_key(key, q):
         return ("menu",) if len(cands) > 2 else ("answer", "stop", cands[1]["key"])
     if key == "3":
         return ("answer", "standalone", None)
+    if key == "4":
+        return ("answer", "never", None)
     return ("later",)
 
 

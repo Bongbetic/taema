@@ -318,10 +318,15 @@ taema kill --hard NAME            # ignore detected outside users
 
 ```sh
 taema status               # daemon mode, owner watches, idle scopes, last GC
-taema review               # pending GUI-close reviews
+taema review               # inspect pending reviews
+taema review --interactive # answer reviews from the terminal
+taema answer ID keep       # answer one review by id
+taema teach OWNER LEFTOVER stop  # teach a relationship without a review
 taema explain NAME|PID     # decision per member, edges found, learned stats
 taema gc --dry-run         # what GC would stop now, and why
 taema adopt --dry-run      # what adopt would move now
+taema adopt --standalone   # give learned standalone apps their own scopes
+taema keep --pair OWNER LEFTOVER # keep one owner/survivor pair
 taema keep adb             # prefer keeping adb alive (feedback for the learner)
 taema forget adb           # reset everything learned about adb
 ```
@@ -338,6 +343,14 @@ taema watch
 taema prompt
 ```
 
+A review shows its owner, surviving apps, close count, memory, age, provenance, and survivor
+signature. Answer it with `taema answer ID stop|keep|standalone|never`, or use the interactive
+review command. `never` adds an app veto; `standalone` remembers that the survivor should have
+its own app scope. `taema teach` and `taema keep --pair` teach a relationship even when no review
+is waiting. Queued reviews use no question budget until a question is shown; tæma asks at most
+three questions a day and once per pair or signature every seven days. Expired reviews keep their
+survivors.
+
 ### The prompt
 
 After a command that ran for 2 s or more, tæma looks for processes it left running. If
@@ -348,6 +361,7 @@ tæma: `npm run dev` left 2 processes running (node:esbuild, node:vite).
   [1] part of npm run dev: stop them when it closes
   [2] part of another app: code (seen 3x)
   [3] standalone app: give them their own scope, never stop with a parent
+  [4] never stop these survivors
   [Enter] ask me later
 ```
 

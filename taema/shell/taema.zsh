@@ -40,6 +40,13 @@ _taema_preexec() {
 
 _taema_precmd() {
     local st=$?     # first: the status of the command line that just ended
+    if [[ -z ${_taema_review_hint_shown-} && -e ${XDG_RUNTIME_DIR-}/taema/review ]]; then
+        local _taema_review_count
+        _taema_review_hint_shown=1
+        IFS= read -r _taema_review_count < "${XDG_RUNTIME_DIR-}/taema/review" || _taema_review_count=
+        [[ -n $_taema_review_count ]] || _taema_review_count=some
+        printf 'tæma: %s closes waiting for a decision — taema review\n' "$_taema_review_count"
+    fi
     if [[ -e ${XDG_RUNTIME_DIR-}/taema/q.$$ ]]; then
         "$_taema_hook" ask $$ 2>/dev/null
     fi

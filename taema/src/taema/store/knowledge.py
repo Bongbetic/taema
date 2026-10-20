@@ -66,7 +66,7 @@ REGRET_WINDOW = 30 * 60.0
 REGRET_SUSPEND = 7 * DAY
 ASK_PER_DAY = 3
 ASK_PAIR_GAP = 7 * DAY
-CHOICES = ("stop", "keep", "standalone")
+CHOICES = ("stop", "keep", "standalone", "never")
 SEP = "\0"
 
 
@@ -187,6 +187,7 @@ class Store:
             "standalone": {},
             "noise": {},
             "asked": {"day": 0, "n": 0},
+            "signature_asked": {},
             "reviews": [],
             "review_seq": 0,
             "vetoes": [],
@@ -1348,25 +1349,29 @@ class Store:
                 for key in leftovers
             ):
                 return None
-            kind = "answer" if op == "answer" else "teach"
-            with self.decision_context(
-                kind,
-                owner=owner,
-                authority="user",
-                why="user %s %s for %d relationship(s)"
-                % ("answered" if op == "answer" else "taught", choice, len(leftovers)),
+            if not self.apply_answer(
+                owner,
+                leftovers,
+                choice,
+                source="explicit" if op == "answer" else "teach",
+                audit_kind=op,
             ):
-                for key in leftovers:
-                    self.answer(
-                        owner,
-                        key,
-                        choice,
-                        source="explicit" if op == "answer" else "teach",
-                    )
-                self.log(
-                    event=kind, owner=owner, choice=choice, leftovers=leftovers[:8]
-                )
+                return None
             result = {"owner": owner, "choice": choice, "leftovers": leftovers}
+        elif msg["v"] == 2 and op == "review_answer":
+            result = self.answer_review(
+                msg["review_id"],
+                msg["choice"],
+                owner=msg.get("owner"),
+                source="review",
+            )
+            if result is None:
+                return None
+        elif msg["v"] == 2 and op == "review_shown":
+            result = self.mark_review_shown(msg["review_id"], owner=msg.get("owner"))
+            if not result:
+                return None
+            result = {"review_id": msg["review_id"]}
         elif msg["v"] == 2 and op == "mute":
             apps = set(self.data.get("muted_apps", []))
             if msg["muted"]:
@@ -1686,6 +1691,95 @@ class Store:
     def review_count(self):
         return len(self.open_reviews())
 
+    def review_details(self, reviews=None):
+        """Return review rows with stable signature, provenance, memory, and age fields."""
+        now = self.now()
+        result = []
+        for review in self.open_reviews() if reviews is None else reviews:
+            item = dict(review)
+            item["age"] = max(0, int(now - item.get("created", now)))
+            signature_id = item.get("sig")
+            signature = self.db.signature(signature_id) if signature_id else None
+            item["signature"] = signature
+            item["closes"] = int(
+                (signature or {}).get("closes", item.get("closes", 0)) or 0
+            )
+            provenance = item.get("provenance")
+            if not provenance and item.get("owner"):
+                instance = self.latest_app_instance(item["owner"])
+                if instance:
+                    provenance = instance.get("scope") or instance.get("parent_app")
+                if not provenance:
+                    chain = self.provenance_chain(item["owner"])
+                    provenance = chain.get("chain_text") if chain else None
+            item["provenance"] = provenance or "owner identity"
+            result.append(item)
+        return result
+
+    def mark_review_shown(self, identifier, owner=None):
+        """Count an interactive review once, when it is actually presented for a choice."""
+        review = next(
+            (
+                item
+                for item in self.data.get("reviews", [])
+                if isinstance(item, dict)
+                and item.get("id") == identifier
+                and item.get("state") == "open"
+                and item.get("expires", 0) > self.now()
+            ),
+            None,
+        )
+        if review is None:
+            return False
+        if review.get("shown"):
+            return True
+        review_owner = review.get("owner")
+        if owner is None:
+            owner = review_owner
+        elif review_owner and owner != review_owner:
+            return False
+        if not owner:
+            candidates = [
+                candidate.get("key")
+                for candidate in review.get("candidates", [])
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("key"), str)
+                and not policy.bad_owner(candidate["key"], self.deny)
+            ]
+            owner = candidates[0] if len(candidates) == 1 else None
+        if review.get("kind") == "provenance-candidate":
+            candidate_keys = {
+                candidate.get("key")
+                for candidate in review.get("candidates", [])
+                if isinstance(candidate, dict)
+            }
+            if owner not in candidate_keys:
+                return False
+        survivors = review.get("survivors", [])
+        pairs = [(owner, key) for key in survivors if isinstance(owner, str)]
+        signature = review.get("sig")
+        eligible = [pair for pair in pairs if self.can_ask(pair, signature=signature)]
+        if not eligible or len(eligible) != len(pairs):
+            return False
+        self.mark_asked(eligible, signature=signature)
+        review["shown"] = self.now()
+        self.dirty = True
+        with self.decision_context(
+            "question",
+            scope=review.get("scope"),
+            owner=owner,
+            authority="user",
+            why="user was shown review #%s" % identifier,
+        ):
+            self.log(
+                event="review_shown",
+                id=identifier,
+                owner=owner,
+                signature=signature,
+                leftovers=review.get("survivors", [])[:8],
+            )
+        return True
+
     def review_holds_scope(self, scope):
         """Pair and leftover scope reviews hold; adopt reviews for shared/unit scopes are informational."""
         return bool(self.hold_reason(scope)) or any(
@@ -1703,6 +1797,8 @@ class Store:
         if review.get("kind") == "provenance-candidate" or not review.get("owner"):
             self.dirty = True
             return
+        if review.get("sig"):
+            self.db.answer_signature(review["sig"], "keep", W_ANSWER, now=now)
         for key in review.get("survivors", []):
             owner = review.get("owner")
             pair = (
@@ -1755,8 +1851,17 @@ class Store:
             self.dirty = True
         return expired
 
-    def add_review(self, owner, members, scope):
+    def add_review(
+        self,
+        owner,
+        members,
+        scope,
+        signature=None,
+        memory=None,
+        provenance=None,
+    ):
         """Record one durable review for members moved to a leftover scope."""
+        members = list(members or ())
         if (
             not isinstance(owner, str)
             or not owner
@@ -1803,7 +1908,25 @@ class Store:
             "created": now,
             "expires": now + REVIEW_TTL,
             "state": "open",
+            "members": [
+                {
+                    "key": member["key"],
+                    "pid": member["pid"],
+                    "start": member.get("start"),
+                }
+                for member in members
+                if isinstance(member, dict)
+                and isinstance(member.get("key"), str)
+                and isinstance(member.get("pid"), int)
+                and not isinstance(member.get("pid"), bool)
+            ],
         }
+        if isinstance(signature, dict) and isinstance(signature.get("id"), str):
+            review["sig"] = signature["id"]
+        if isinstance(memory, int) and not isinstance(memory, bool) and memory >= 0:
+            review["mem"] = memory
+        if isinstance(provenance, str) and provenance:
+            review["provenance"] = provenance[:512]
         reviews.append(review)
         self.data["review_seq"] = review_id
         self.dirty = True
@@ -1813,6 +1936,7 @@ class Store:
         self, members, scope, candidates=(), reason="owner is ambiguous"
     ):
         """Queue an unanswered ownership review without granting authority to a candidate."""
+        members = list(members or ())
         if not isinstance(scope, str) or not scope or len(scope) > 512:
             return None
         by_key = {}
@@ -1868,7 +1992,20 @@ class Store:
             existing["candidates"] = normalized
             existing["survivors"] = sorted(by_key)
             existing["pids"] = sorted({pid for pids in by_key.values() for pid in pids})
+            existing["members"] = [
+                {
+                    "key": member["key"],
+                    "pid": member["pid"],
+                    "start": member.get("start"),
+                }
+                for member in members
+                if isinstance(member, dict)
+                and isinstance(member.get("key"), str)
+                and isinstance(member.get("pid"), int)
+                and not isinstance(member.get("pid"), bool)
+            ]
             existing["reason"] = str(reason)[:256]
+            existing["provenance"] = str(reason)[:512]
             self.dirty = True
             return dict(existing)
         opens = [
@@ -1900,9 +2037,22 @@ class Store:
             "scope": scope,
             "candidates": normalized,
             "reason": str(reason)[:256],
+            "provenance": str(reason)[:512],
             "created": now,
             "expires": now + REVIEW_TTL,
             "state": "open",
+            "members": [
+                {
+                    "key": member["key"],
+                    "pid": member["pid"],
+                    "start": member.get("start"),
+                }
+                for member in members
+                if isinstance(member, dict)
+                and isinstance(member.get("key"), str)
+                and isinstance(member.get("pid"), int)
+                and not isinstance(member.get("pid"), bool)
+            ],
         }
         reviews.append(review)
         self.data["review_seq"] = review_id
@@ -2054,6 +2204,15 @@ class Store:
         """
         if choice not in CHOICES or not self._ok(owner, leftover):
             return False
+        if choice == "never":
+            if not self.answer(owner, leftover, "keep", source=source):
+                return False
+            return (
+                self.add_veto(
+                    "app", leftover, reason="never stop survivor from %s" % owner
+                )
+                is not None
+            )
         if choice == "standalone":
             e = self.data["standalone"].setdefault(leftover, {"n": 0})
             e["n"] += 1
@@ -2077,6 +2236,172 @@ class Store:
         if choice == "keep":
             p["last_keep"] = self.now()
         return True
+
+    def apply_answer(
+        self,
+        owner,
+        leftovers,
+        choice,
+        signature=None,
+        signature_id=None,
+        source="explicit",
+        audit_kind="answer",
+        review=None,
+        apply_pairs=True,
+    ):
+        """Apply one explicit answer to its signature and pairs under a single audit decision."""
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or not isinstance(leftovers, (list, tuple))
+            or not leftovers
+            or choice not in CHOICES
+        ):
+            return False
+        keys = list(dict.fromkeys(leftovers))
+        if any(not self._ok(owner, key) for key in keys):
+            return False
+        if choice != "standalone" and policy.bad_owner(owner, self.deny):
+            return False
+        for key in keys:
+            pair = self.data.get("pairs", {}).get(self.pkey(owner, key))
+            if (
+                choice not in ("standalone",)
+                and isinstance(pair, dict)
+                and pair.get("source") == "legacy-invalid"
+            ):
+                return False
+
+        active_app_vetoes = set()
+        if choice == "never":
+            self._prune_vetoes()
+            active = self._active_vetoes(include_pending=False)
+            active_app_vetoes = {
+                veto.get("value") for veto in active if veto.get("kind") == "app"
+            }
+            if len(active) + len(set(keys) - active_app_vetoes) > db.MAX_VETOES:
+                return False
+
+        target_signature = None
+        if signature is not None:
+            target_signature = self.ensure_signature(owner, signature)
+        elif signature_id:
+            target_signature = self.db.signature(signature_id)
+            if target_signature and target_signature.get("owner") != owner:
+                return False
+        signature_id = target_signature.get("id") if target_signature else signature_id
+        scope = review.get("scope") if isinstance(review, dict) else None
+        with self.decision_context(
+            audit_kind,
+            scope=scope,
+            owner=owner,
+            authority="user",
+            why="user %s %s for %d relationship(s)" % (source, choice, len(keys)),
+        ):
+            if signature_id:
+                signature_choice = "stop" if choice == "stop" else "keep"
+                self.db.answer_signature(
+                    signature_id, signature_choice, W_ANSWER, now=self.now()
+                )
+            if apply_pairs:
+                for key in keys:
+                    if choice == "standalone":
+                        self.answer(owner, key, "standalone", source=source)
+                        self.answer(owner, key, "keep", source=source)
+                    elif choice == "never":
+                        self.answer(owner, key, "keep", source=source)
+                        active = self._audit_context or {}
+                        if key not in active_app_vetoes and not self.add_veto(
+                            "app",
+                            key,
+                            reason="never stop survivor from %s" % owner,
+                            corr=active.get("corr"),
+                        ):
+                            return False
+                    else:
+                        self.answer(owner, key, choice, source=source)
+            if choice == "never" and signature_id:
+                self.signature_outcome(signature_id, "veto")
+            if isinstance(review, dict):
+                review.update(
+                    state="answered",
+                    owner=owner,
+                    answer=choice,
+                    closed=self.now(),
+                    shown=review.get("shown") or self.now(),
+                )
+                self.dirty = True
+            self.log(
+                event=audit_kind,
+                review=(review or {}).get("id") if isinstance(review, dict) else None,
+                owner=owner,
+                choice=choice,
+                leftovers=keys[:8],
+                signature=signature_id,
+            )
+        return True
+
+    def answer_review(self, identifier, choice, owner=None, source="review"):
+        """Resolve one live close/provenance review through the shared answer path."""
+        if not isinstance(identifier, int) or isinstance(identifier, bool):
+            return None
+        self.expire_reviews()
+        review = next(
+            (
+                item
+                for item in self.data.get("reviews", [])
+                if isinstance(item, dict)
+                and item.get("id") == identifier
+                and item.get("state") == "open"
+                and item.get("expires", 0) > self.now()
+            ),
+            None,
+        )
+        if review is None or review.get("kind") == "scope":
+            return None
+        if owner is None:
+            owner = review.get("owner")
+            if not owner:
+                candidates = [
+                    candidate.get("key")
+                    for candidate in review.get("candidates", [])
+                    if isinstance(candidate, dict)
+                    and isinstance(candidate.get("key"), str)
+                    and not policy.bad_owner(candidate["key"], self.deny)
+                ]
+                if len(candidates) == 1:
+                    owner = candidates[0]
+        if not isinstance(owner, str) or policy.bad_owner(owner, self.deny):
+            return None
+        if review.get("owner") and owner != review["owner"]:
+            return None
+        if review.get("kind") == "provenance-candidate":
+            candidates = {
+                candidate.get("key")
+                for candidate in review.get("candidates", [])
+                if isinstance(candidate, dict)
+            }
+            if owner not in candidates:
+                return None
+        survivors = review.get("survivors", [])
+        if not self.apply_answer(
+            owner,
+            survivors,
+            choice,
+            signature_id=review.get("sig"),
+            source=source,
+            review=review,
+        ):
+            return None
+        self.dirty = True
+        return {
+            "review": dict(review),
+            "owner": owner,
+            "choice": choice,
+            "leftovers": list(survivors),
+            "members": list(review.get("members", [])),
+            "scope": review.get("scope"),
+        }
 
     def observe_signature_close(self, signature):
         """Persist one close for a survivor signature and link its pairs for display."""
@@ -2153,7 +2478,14 @@ class Store:
                 and all(abs(previous[key] - current[key]) <= 1 for key in current)
             ):
                 distance = sum(abs(previous[key] - current[key]) for key in current)
-                matches.append((distance, -(candidate.get("last_seen") or 0), candidate["id"], candidate))
+                matches.append(
+                    (
+                        distance,
+                        -(candidate.get("last_seen") or 0),
+                        candidate["id"],
+                        candidate,
+                    )
+                )
         return min(matches)[-1] if matches else None
 
     def signature_decision(self, signature):
@@ -2166,7 +2498,9 @@ class Store:
         if not matched:
             return None
         choice = matched.get("ex_last")
-        weight = matched.get("ex_" + str(choice), 0) if choice in ("stop", "keep") else 0
+        weight = (
+            matched.get("ex_" + str(choice), 0) if choice in ("stop", "keep") else 0
+        )
         if not weight:
             return None
         return (
@@ -2229,7 +2563,11 @@ class Store:
         """Recent signature counters for an owner or member key, suitable for `why`."""
         result = []
         for item in self.db.signatures_for_key(key, limit=limit):
-            answer = item.get("ex_last") if item.get("ex_last") in ("stop", "keep") else "none"
+            answer = (
+                item.get("ex_last")
+                if item.get("ex_last") in ("stop", "keep")
+                else "none"
+            )
             result.append(
                 {
                     "id": item["id"],
@@ -2352,22 +2690,40 @@ class Store:
         action, _conf, why = self.pair_decision(owner, leftover)
         return action == "stop" and why.startswith("answered stop")
 
-    def can_ask(self, pair, now=None):
-        """pair = (owner, leftover). At most 3 questions per day, each pair once per 7 days.
-        A pair with an invalid owner is never asked about."""
+    def _signature_ask_key(self, signature):
+        if isinstance(signature, dict):
+            matched = self.match_signature(signature)
+            return (matched or {}).get("id") or signature.get("id")
+        return signature if isinstance(signature, str) else None
+
+    def can_ask(self, pair, now=None, signature=None):
+        """Limit questions to 3/day and one pair or survivor signature per seven days."""
         if not pair or policy.bad_owner(pair[0], self.deny):
             return False
         now = self.now() if now is None else now
         a = self.data["asked"]
         if a.get("day") == int(now // DAY) and a.get("n", 0) >= ASK_PER_DAY:
             return False
+        signature_id = self._signature_ask_key(signature)
+        asked_signatures = self.data.get("signature_asked", {})
+        last_signature_asked = (
+            asked_signatures.get(signature_id)
+            if isinstance(asked_signatures, dict)
+            else None
+        )
+        if (
+            isinstance(last_signature_asked, (int, float))
+            and not isinstance(last_signature_asked, bool)
+            and now - last_signature_asked < ASK_PAIR_GAP
+        ):
+            return False
         p = self.data["pairs"].get(self.pkey(*pair))
         if p and p.get("source") == "legacy-invalid":
             return False
         return not (p and p.get("last_asked") and now - p["last_asked"] < ASK_PAIR_GAP)
 
-    def mark_asked(self, pairs, now=None):
-        """Record one question covering `pairs` [(owner, leftover)]: one daily count, per-pair stamp."""
+    def mark_asked(self, pairs, now=None, signature=None):
+        """Record one shown question: one daily count and seven-day pair/signature stamps."""
         now = self.now() if now is None else now
         a = self.data["asked"]
         day = int(now // DAY)
@@ -2382,6 +2738,22 @@ class Store:
                 and not (pair and pair.get("source") == "legacy-invalid")
             ):
                 self._pair(o, l)["last_asked"] = now
+        signature_id = self._signature_ask_key(signature)
+        if signature_id:
+            signatures = self.data.setdefault("signature_asked", {})
+            if not isinstance(signatures, dict):
+                signatures = self.data["signature_asked"] = {}
+            signatures = {
+                identifier: ts
+                for identifier, ts in signatures.items()
+                if isinstance(ts, (int, float)) and now - ts < ASK_PAIR_GAP
+            }
+            signatures[signature_id] = now
+            if len(signatures) > 4096:
+                signatures = dict(
+                    sorted(signatures.items(), key=lambda item: item[1])[-4096:]
+                )
+            self.data["signature_asked"] = signatures
         self.dirty = True
 
     def pairs_summary(self, limit=50):

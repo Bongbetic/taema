@@ -86,9 +86,13 @@ COMMANDS: tuple[dict[str, Any], ...] = (
     {
         "name": "keep",
         "aliases": ("allow",),
-        "help": "keep an executable",
+        "help": "keep an executable or owner/survivor pair",
         "handler": "cmd_keep",
-        "arguments": ((("--dry-run",), {"action": "store_true"}), (("exe",), {})),
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (("--pair",), {"nargs": 2, "metavar": ("OWNER", "LEFTOVER")}),
+            (("exe",), {"nargs": "?"}),
+        ),
     },
     {
         "name": "forget",
@@ -263,9 +267,46 @@ COMMANDS: tuple[dict[str, Any], ...] = (
     {
         "name": "review",
         "aliases": (),
-        "help": "list pending close reviews",
+        "help": "list pending reviews or answer them interactively",
         "handler": "cmd_review",
         "read": True,
+        "arguments": ((("--interactive",), {"action": "store_true"}),),
+    },
+    {
+        "name": "answer",
+        "aliases": (),
+        "help": "answer a pending review",
+        "handler": "cmd_answer",
+        "arguments": (
+            (("id",), {}),
+            (
+                ("choice",),
+                {
+                    "choices": (
+                        "stop",
+                        "keep",
+                        "standalone",
+                        "never",
+                        "1",
+                        "2",
+                        "3",
+                        "4",
+                    )
+                },
+            ),
+            (("--owner",), {"help": "choose the owner for an ambiguous review"}),
+        ),
+    },
+    {
+        "name": "teach",
+        "aliases": (),
+        "help": "teach an owner/survivor relationship without a review",
+        "handler": "cmd_teach",
+        "arguments": (
+            (("owner",), {}),
+            (("leftover",), {}),
+            (("choice",), {"choices": ("stop", "keep", "standalone")}),
+        ),
     },
     {
         "name": "learn",
@@ -302,6 +343,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_adopt",
         "arguments": (
             (("--all",), {"action": "store_true"}),
+            (("--standalone",), {"action": "store_true"}),
             (("--dry-run",), {"action": "store_true"}),
         ),
     },

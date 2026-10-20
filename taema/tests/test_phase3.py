@@ -106,7 +106,7 @@ QUESTION = {
         {"key": "node:esbuild", "comm": "node", "count": 1},
         {"key": "node:vite", "comm": "node", "count": 1},
     ],
-    "choices": ["stop", "keep", "standalone"],
+    "choices": ["stop", "keep", "standalone", "never"],
     "expires_in": 60,
 }
 
@@ -242,7 +242,8 @@ class QuestionText(unittest.TestCase):
         )
         self.assertEqual(lines[2], "  [2] part of another app: code")
         self.assertIn("[3] standalone app", lines[3])
-        self.assertEqual(lines[4], "  [Enter] ask me later")
+        self.assertIn("[4] never stop", lines[4])
+        self.assertEqual(lines[5], "  [Enter] ask me later")
 
     def test_seen_count_shown_when_given(self):
         q = json.loads(json.dumps(QUESTION))
@@ -294,7 +295,8 @@ class QuestionText(unittest.TestCase):
         self.assertEqual(m("1", QUESTION), ("answer", "stop", "npm"))
         self.assertEqual(m("2", QUESTION), ("answer", "stop", "code"))
         self.assertEqual(m("3", QUESTION), ("answer", "standalone", None))
-        for k in ("", "\r", "\n", "x", "4", "0"):
+        self.assertEqual(m("4", QUESTION), ("answer", "never", None))
+        for k in ("", "\r", "\n", "x", "5", "0"):
             self.assertEqual(m(k, QUESTION), ("later",), k)
         three = json.loads(json.dumps(QUESTION))
         three["candidates"].append(
@@ -596,6 +598,19 @@ class BashHook(unittest.TestCase):
         self.assertNotIn("command not found", out)
         self.assertEqual(self.called(), [])
 
+    def test_review_hint_uses_runtime_flag_once_without_a_child_command(self):
+        os.makedirs(self.env["XDG_RUNTIME_DIR"] + "/taema")
+        with open(self.env["XDG_RUNTIME_DIR"] + "/taema/review", "w") as flag:
+            flag.write("2\n")
+        body = self.src() + "PATH=; _taema_precmd; _taema_precmd; echo END"
+
+        _rc, output = bash_script(body, self.env)
+
+        self.assertEqual(output.count("closes waiting for a decision"), 1)
+        self.assertIn("2 closes waiting for a decision", output)
+        self.assertNotIn("command not found", output)
+        self.assertEqual(self.called(), [])
+
     def test_precmd_preserves_status(self):
         body = (
             self.src()
@@ -741,6 +756,23 @@ class KillFlow(ProcCase):
             self.d.handle({"cmd": "ask", "shell_pid": 20}),
             {"question": None, "reason": "none"},
         )
+
+    def test_question_shows_only_pairs_still_within_the_ask_budget(self):
+        self.d.store.mark_asked([("npm", "vite")])
+        left = [
+            {"key": "vite", "pid": 22, "start": 300, "comm": "vite"},
+            {"key": "webpack", "pid": 24, "start": 400, "comm": "webpack"},
+        ]
+        self.d.make_question(
+            {"shell": 20, "word": "npm"}, None, "npm", left, ["vite", "webpack"]
+        )
+
+        question = self.d.handle({"cmd": "ask", "shell_pid": 20})["question"]
+
+        self.assertEqual(
+            question["leftovers"], [{"key": "webpack", "comm": "webpack", "count": 1}]
+        )
+        self.assertEqual(self.d.pending[1]["ask_keys"], ["webpack"])
 
     def test_daily_limit(self):
         for _ in range(3):

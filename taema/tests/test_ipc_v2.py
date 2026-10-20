@@ -412,6 +412,51 @@ class IpcV2Tests(unittest.TestCase):
                     with self.assertRaises(protocol.ProtocolError):
                         protocol.validate_feedback(invalid)
 
+    def test_review_feedback_requires_valid_id_owner_and_choice(self):
+        operations = (
+            {"op": "review_shown", "review_id": 3, "owner": "editor"},
+            {"op": "review_answer", "review_id": 3, "choice": "never"},
+        )
+        for index, operation in enumerate(operations):
+            message = {"v": 2, "id": "review-%d" % index, **operation}
+            protocol.validate_feedback(message)
+            self.assertTrue(
+                matches(
+                    message,
+                    self.request_schema["$defs"]["feedback_args"],
+                    self.request_schema,
+                )
+            )
+        for index, operation in enumerate(
+            (
+                {"op": "review_shown", "review_id": True},
+                {"op": "review_answer", "review_id": 3, "choice": "later"},
+                {
+                    "op": "review_shown",
+                    "review_id": 3,
+                    "owner": "x" * 257,
+                },
+            )
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_feedback(
+                        {"v": 2, "id": "bad-review-%d" % index, **operation}
+                    )
+        answer_result = {
+            "ok": True,
+            "choice": "never",
+            "owner": "editor",
+            "leftovers": ["helper"],
+        }
+        self.assertTrue(
+            matches(
+                answer_result,
+                self.results_schema["$defs"]["answer"],
+                self.results_schema,
+            )
+        )
+
     def test_fuzz_inputs_get_errors_without_state_change(self):
         valid = json.dumps(self.request(9, "status", {})).encode()
         too_large = valid + b" " * (65538 - len(valid)) + b"\n"

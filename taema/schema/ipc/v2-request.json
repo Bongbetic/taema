@@ -139,7 +139,32 @@
             "op": {"enum": ["answer", "teach"]},
             "owner": {"type": "string", "minLength": 1, "maxLength": 256},
             "leftovers": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
-            "choice": {"enum": ["stop", "keep", "standalone"]}
+            "choice": {"enum": ["stop", "keep", "standalone", "never"]}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "review_id", "choice"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "review_answer"},
+            "review_id": {"type": "integer", "minimum": 1},
+            "choice": {"enum": ["stop", "keep", "standalone", "never"]},
+            "owner": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "review_id"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "review_shown"},
+            "review_id": {"type": "integer", "minimum": 1},
+            "owner": {"type": "string", "minLength": 1, "maxLength": 256}
           },
           "additionalProperties": false
         },
@@ -229,7 +254,7 @@
     },
     "answer": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
-      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "answer"}, "args": {"type": "object", "required": ["nonce", "choice"], "properties": {"nonce": {"type": "string", "minLength": 1, "maxLength": 64}, "choice": {"enum": ["stop", "keep", "standalone"]}, "owner": {"type": "string"}}, "additionalProperties": false}},
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "answer"}, "args": {"type": "object", "required": ["nonce", "choice"], "properties": {"nonce": {"type": "string", "minLength": 1, "maxLength": 64}, "choice": {"enum": ["stop", "keep", "standalone", "never"]}, "owner": {"type": "string"}}, "additionalProperties": false}},
       "additionalProperties": false
     },
     "gc": {

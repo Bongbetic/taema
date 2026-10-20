@@ -118,6 +118,7 @@ def _validate_feedback(args):
         "reason",
         "trigger",
         "owner",
+        "review_id",
         "leftovers",
         "choice",
         "app",
@@ -165,6 +166,8 @@ def _validate_feedback(args):
             "undo": common | {"action_id"},
             "answer": common | {"owner", "leftovers", "choice"},
             "teach": common | {"owner", "leftovers", "choice"},
+            "review_answer": common | {"review_id", "choice", "owner"},
+            "review_shown": common | {"review_id", "owner"},
             "mute": common | {"app", "muted"},
             "hold": common | {"scope", "held", "reason"},
             "snooze": common | {"until", "reason"},
@@ -206,8 +209,24 @@ def _validate_feedback(args):
             )
         ):
             _fail("feedback leftovers must be one to 64 non-empty strings")
-        if choice not in ("stop", "keep", "standalone"):
+        if choice not in ("stop", "keep", "standalone", "never"):
             _fail("feedback choice is invalid")
+    if op in ("review_answer", "review_shown"):
+        if not _is_type(args.get("review_id"), "integer") or args["review_id"] <= 0:
+            _fail("review operation requires a positive review id")
+    if op == "review_answer":
+        if args.get("choice") not in ("stop", "keep", "standalone", "never"):
+            _fail("feedback choice is invalid")
+    if (
+        op in ("review_answer", "review_shown")
+        and "owner" in args
+        and (
+            not _is_type(args["owner"], "string")
+            or not args["owner"]
+            or len(args["owner"]) > 256
+        )
+    ):
+        _fail("review owner is invalid")
     if op == "mute":
         if (
             not _is_type(args.get("app"), "string")
@@ -317,7 +336,7 @@ def _validate_args(command, args):
     if command == "answer":
         if not args["nonce"] or len(args["nonce"]) > 64:
             _fail("answer nonce is invalid")
-        if args["choice"] not in ("stop", "keep", "standalone"):
+        if args["choice"] not in ("stop", "keep", "standalone", "never"):
             _fail("answer choice is invalid")
         if "owner" in args and len(args["owner"]) > 256:
             _fail("answer owner is out of range")

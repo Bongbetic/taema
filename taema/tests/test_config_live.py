@@ -486,12 +486,13 @@ class DaemonConfigReload(unittest.TestCase):
         self.daemon.handle({"cmd": "reload"})
         self.assertEqual(self.daemon.mode, "observe")
         status = self.daemon.handle({"cmd": "status"})
-        self.assertIn(str(self.config_file) + ":1:", status["config_error"])
+        # TOML reports this unterminated array at EOF, on line 2 after the final newline.
+        self.assertIn(str(self.config_file) + ":2:1:", status["config_error"])
         report = self.daemon.handle({"cmd": "doctor"})
         config = next(
             item for item in report["checks"] if item["name"] == "configuration"
         )
-        self.assertIn(str(self.config_file) + ":1:", config["message"])
+        self.assertIn(str(self.config_file) + ":2:1:", config["message"])
 
     def test_state_directory_change_switches_the_live_store(self):
         old_store = self.daemon.store

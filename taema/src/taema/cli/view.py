@@ -241,20 +241,40 @@ def render_status(model, args, summary=False):
 def render_reviews(reviews):
     if not reviews:
         return "open reviews: 0\n"
-    import time
 
-    lines = ["open reviews: %d" % len(reviews)]
+    def age_text(seconds):
+        seconds = max(0, int(seconds))
+        if seconds >= 86400:
+            return "%dd" % (seconds // 86400)
+        if seconds >= 3600:
+            return "%dh" % (seconds // 3600)
+        if seconds >= 60:
+            return "%dm" % (seconds // 60)
+        return "%ds" % seconds
+
+    def memory_text(value):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return "?"
+        if value >= 1024 * 1024 * 1024:
+            return "%.1fG" % (value / (1024 * 1024 * 1024))
+        return "%dM" % round(value / (1024 * 1024))
+
+    lines = [] if len(reviews) == 1 else ["open reviews: %d" % len(reviews)]
     for item in reviews:
-        age = max(0, int(time.time() - item.get("created", time.time())))
+        age = item.get("age")
+        if age is None:
+            import time
+
+            age = max(0, int(time.time() - item.get("created", time.time())))
         if item.get("kind") == "legacy-invalid":
             lines.append(
-                "review #%s legacy owner=%s survivor=%s previous=%s age=%ds"
+                "review #%s legacy owner=%s survivor=%s previous=%s age=%s"
                 % (
                     item.get("id", "?"),
                     item.get("owner", "?"),
                     (item.get("survivors") or ["?"])[0],
                     item.get("answer", "?"),
-                    age,
+                    age_text(age),
                 )
             )
             continue
@@ -267,33 +287,51 @@ def render_reviews(reviews):
                 or "none"
             )
             lines.append(
-                "review #%s provenance scope=%s survivors=%s candidates=%s reason=%s age=%ds"
+                "review #%s provenance scope=%s survivors=%s candidates=%s reason=%s age=%s"
                 % (
                     item.get("id", "?"),
                     item.get("scope", "?"),
                     ", ".join(item.get("survivors") or []) or "none",
                     candidates,
                     item.get("reason", "owner is ambiguous"),
-                    age,
+                    age_text(age),
                 )
             )
             continue
         if item.get("kind") == "scope":
             lines.append(
-                "review #%s scope=%s reason=%s age=%ds"
+                "review #%s scope=%s reason=%s age=%s"
                 % (
                     item.get("id", "?"),
                     item.get("scope", "?"),
                     item.get("reason", "GC candidate"),
-                    age,
+                    age_text(age),
                 )
             )
             continue
         owner = item.get("owner") or "?"
         survivors = ", ".join(item.get("survivors") or []) or "none"
+        signature = item.get("signature") or {}
+        signature_id = signature.get("id") or item.get("sig") or "?"
+        answer = signature.get("ex_last") or item.get("answer") or "no"
+        provenance = item.get("provenance") or "unknown"
         lines.append(
-            "review #%s owner=%s survivors=%s age=%ds"
-            % (item.get("id", "?"), owner, survivors, age)
+            "review #%s owner=%s survivors=%s closes=%s mem=%s age=%s"
+            % (
+                item.get("id", "?"),
+                owner,
+                survivors,
+                item.get("closes", 0),
+                memory_text(item.get("mem")),
+                age_text(age),
+            )
+        )
+        lines.append(
+            "  ↳ provenance: %s; sig %s; answered? %s"
+            % (provenance, str(signature_id)[:16], answer)
+        )
+        lines.append(
+            "  [1] stop on close  [2] keep  [3] standalone  [4] never  [Enter] later"
         )
     return "\n".join(lines) + "\n"
 
@@ -346,13 +384,12 @@ def render_explanation(target, explanation):
             if not relation:
                 continue
             evidence = relation.get("evidence_counts") or {}
-            evidence_text = ", ".join(
-                "%s=%s" % (name, evidence[name]) for name in sorted(evidence)
-            ) or "no retained evidence"
-            confidence = relation.get("confidence")
-            confidence_text = (
-                "unknown" if confidence is None else "%.2f" % confidence
+            evidence_text = (
+                ", ".join("%s=%s" % (name, evidence[name]) for name in sorted(evidence))
+                or "no retained evidence"
             )
+            confidence = relation.get("confidence")
+            confidence_text = "unknown" if confidence is None else "%.2f" % confidence
             lines.append(
                 "  provenance evidence: %s ← %s (%s; confidence=%s)"
                 % (

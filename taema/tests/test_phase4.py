@@ -8,7 +8,7 @@ import os
 import time
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from taema.daemon import service as daemon
@@ -627,10 +627,122 @@ class GuiClose(AutoCase):
         self.assertIn("owner=firefox", out.getvalue())
         self.assertIn("survivors=helper", out.getvalue())
         self.assertIn("age=", out.getvalue())
+        self.assertIn("closes=", out.getvalue())
+        self.assertIn("mem=", out.getvalue())
+        self.assertIn("provenance:", out.getvalue())
+        self.assertIn("sig ", out.getvalue())
+        self.assertNotIn("open reviews: 1", out.getvalue())
 
         restarted = daemon.Daemon(make_cfg(self.d.store.dir, mode="adopt"))
         self.assertEqual(restarted.handle({"cmd": "status"})["reviews"], 1)
         self.assertEqual(restarted.handle({"cmd": "review"})["reviews"], reviews)
+
+    def test_standalone_review_answer_adopts_recorded_live_members(self):
+        self.d.cfg["mode"] = "adopt"
+        self.close_gui()
+        self.d.after_observe()
+        review = self.d.store.open_reviews()[0]
+
+        with (
+            mock.patch.object(
+                self.d,
+                "_live_standalone_members",
+                return_value=[{"key": "helper", "pid": 201, "start": 100}],
+            ),
+            mock.patch.object(cgroup, "move") as move,
+        ):
+            reply = self.d.handle(
+                {
+                    "cmd": "feedback",
+                    "v": 2,
+                    "id": "standalone-review-1",
+                    "op": "review_answer",
+                    "review_id": review["id"],
+                    "choice": "standalone",
+                }
+            )
+
+        self.assertTrue(reply["ok"])
+        self.assertTrue(self.d.store.standalone("helper"))
+        self.assertTrue(self.d.store.data["reviews"][0]["adopted"])
+        move.assert_called_once()
+        self.assertEqual(move.call_args.args[0], 201)
+
+    def test_interactive_review_routes_shown_and_answer_through_feedback(self):
+        class TTYInput(io.StringIO):
+            def isatty(self):
+                return True
+
+        self.d.cfg["mode"] = "adopt"
+        self.close_gui()
+        self.d.after_observe()
+        readonly = knowledge.Store(self.d.store.dir, read_only=True)
+        next_id = [0]
+
+        def feedback(_cfg, _store, op, **fields):
+            next_id[0] += 1
+            reply = self.d.handle(
+                {
+                    "cmd": "feedback",
+                    "v": 2,
+                    "id": "interactive-review-%d" % next_id[0],
+                    "op": op,
+                    **fields,
+                }
+            )
+            return "daemon", reply
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.d.cfg, readonly, [])),
+            mock.patch.object(cli, "feedback_action", side_effect=feedback),
+            mock.patch("sys.stdin", TTYInput("2\n")),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.main(["review", "--interactive"]), 0)
+
+        self.assertIn("Choice [1 stop", output.getvalue())
+        self.assertIn("answered keep", output.getvalue())
+        self.assertEqual(self.d.store.pair_decision("firefox", "helper")[0], "keep")
+        self.assertEqual(self.d.store.data["asked"]["n"], 1)
+        self.assertEqual(next_id[0], 2)
+
+    def test_interactive_review_empty_queue_and_terminal_requirements(self):
+        class TTYInput(io.StringIO):
+            def isatty(self):
+                return True
+
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(
+                cli, "_load", return_value=(self.d.cfg, self.d.store, [])
+            ),
+            mock.patch("sys.stdin", TTYInput("")),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.main(["review", "--interactive"]), 0)
+        self.assertIn("open reviews: 0", output.getvalue())
+
+        with (
+            mock.patch.object(
+                cli, "_load", return_value=(self.d.cfg, self.d.store, [])
+            ),
+            mock.patch("sys.stdin", TTYInput("")),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(cli.main(["review", "--interactive", "--json"]), 2)
+        self.assertIn("cannot be combined with JSON", errors.getvalue())
+
+        errors = io.StringIO()
+        with (
+            mock.patch.object(
+                cli, "_load", return_value=(self.d.cfg, self.d.store, [])
+            ),
+            mock.patch("sys.stdin", io.StringIO("")),
+            redirect_stderr(errors),
+        ):
+            self.assertEqual(cli.main(["review", "--interactive"]), 2)
+        self.assertIn("needs a terminal", errors.getvalue())
 
     def test_open_review_holds_a_previously_authorized_leftover(self):
         self.d.store.answer("firefox", "helper", "stop")

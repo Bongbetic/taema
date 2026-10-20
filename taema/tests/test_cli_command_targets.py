@@ -356,6 +356,103 @@ class TargetCommands(unittest.TestCase):
             )
         feedback.assert_not_called()
 
+    def test_keep_pair_uses_relationship_teaching_feedback(self):
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])),
+            mock.patch.object(
+                cli,
+                "feedback_action",
+                return_value=("queued", {"ok": True, "queued": True}),
+            ) as feedback,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.main(["keep", "--pair", "browser", "helper"]), 0)
+        feedback.assert_called_once_with(
+            self.cfg,
+            self.store,
+            "teach",
+            owner="browser",
+            leftovers=["helper"],
+            choice="keep",
+        )
+
+    def test_adopt_standalone_plans_only_live_standalone_members(self):
+        self.cfg["mode"] = "enforce"
+        self.store.data["standalone"] = {"helper": {"n": 1}}
+        pt = SimpleNamespace(descendants=mock.Mock(return_value=[101]))
+        entry = {
+            "key": "helper",
+            "pid": 101,
+            "start": 303,
+            "chain_ids": [(100, 200), (101, 303)],
+        }
+        lin = SimpleNamespace(entries={(101, 303): entry}, observe=mock.Mock())
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])),
+            mock.patch.object(cli.inspect.ProcTable, "scan", return_value=pt),
+            mock.patch.object(cli.lineage, "Lineage", return_value=lin),
+            mock.patch.object(cli.policy, "session_cgroups", return_value=["session"]),
+            mock.patch.object(cli.cgroup, "procs", return_value=[101]),
+            mock.patch.object(cli.policy, "protected_reason", return_value=None),
+            mock.patch.object(
+                cli.authorization,
+                "authorize",
+                return_value=SimpleNamespace(verdict="ACT"),
+            ),
+            mock.patch.object(
+                cli.engine,
+                "run_ops",
+                side_effect=lambda _cfg, _store, ops, _execute: [
+                    dict(op, done=True) for op in ops
+                ],
+            ) as run_ops,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.main(["adopt", "--standalone"]), 0)
+        ops = run_ops.call_args.args[2]
+        self.assertEqual(len(ops), 1)
+        self.assertEqual((ops[0]["owner"], ops[0]["pids"]), ("helper", [101]))
+
+    def test_answer_command_normalizes_review_id_and_choice(self):
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])),
+            mock.patch.object(
+                cli,
+                "feedback_action",
+                return_value=("daemon", {"ok": True}),
+            ) as feedback,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.main(["answer", "r-2a", "4", "--owner", "browser"]), 0)
+        feedback.assert_called_once_with(
+            self.cfg,
+            self.store,
+            "review_answer",
+            review_id=42,
+            choice="never",
+            owner="browser",
+        )
+
+    def test_teach_command_uses_the_shared_relationship_answer(self):
+        with (
+            mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])),
+            mock.patch.object(
+                cli,
+                "feedback_action",
+                return_value=("queued", {"ok": True}),
+            ) as feedback,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.main(["teach", "browser", "helper", "stop"]), 0)
+        feedback.assert_called_once_with(
+            self.cfg,
+            self.store,
+            "teach",
+            owner="browser",
+            leftovers=["helper"],
+            choice="stop",
+        )
+
     def test_unknown_desktop_id_is_rejected_for_mutating_target_commands(self):
         with (
             mock.patch.object(cli, "_load", return_value=(self.cfg, self.store, [])),

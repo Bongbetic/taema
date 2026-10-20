@@ -406,11 +406,11 @@ class KnowledgeHardening(unittest.TestCase):
         cfg = make_cfg(state)
         out = io.StringIO()
         with (
-            mock.patch.object(cli, "_load", return_value=(cfg, store, [])),
+            mock.patch.object(cli, "_load_status", return_value=(cfg, store)),
             mock.patch.object(cli, "ask", return_value=None),
             redirect_stdout(out),
         ):
-            self.assertEqual(cli.cmd_status(types.SimpleNamespace()), 1)
+            self.assertEqual(cli.cmd_status(types.SimpleNamespace()), 3)
         self.assertIn("feedback_invalid: 2", out.getvalue())
 
     def test_persist_seed(self):

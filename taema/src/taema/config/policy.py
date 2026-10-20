@@ -14,14 +14,24 @@ import os
 import re
 import tomllib
 
-from ..core import cgroup, process as inspect
-
 SYSTEM_CONFIG = os.environ.get("TAEMA_SYSTEM_CONFIG", "/etc/taema/taema.toml")
 SYSTEM_UNITS = "/etc/taema/units"
 USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
 MODES = ("observe", "adopt", "enforce", "auto")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
+
+
+def __getattr__(name):
+    if name == "cgroup":
+        from ..core import cgroup
+
+        return cgroup
+    if name == "inspect":
+        from ..core import process
+
+        return process
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 
 def expand(p):
@@ -156,6 +166,8 @@ def hook_for(cfg, leaf_name):
 def session_dirs(cfg):
     """Candidate login session cgroups, without looking inside: the pinned path, or every
     top-level numeric cgroup (elogind names them after the session id)."""
+    from ..core import cgroup
+
     sc = cfg["paths"].get("session_cgroup", "auto")
     if sc != "auto":
         return [sc] if os.path.isdir(sc) else []
@@ -165,6 +177,8 @@ def session_dirs(cfg):
 def session_cgroups(cfg, uid=None):
     """Login session cgroups that hold this user's processes. 'auto' means every top-level
     numeric cgroup with at least one process of uid."""
+    from ..core import cgroup, process as inspect
+
     uid = os.getuid() if uid is None else uid
     if cfg["paths"].get("session_cgroup", "auto") != "auto":
         return session_dirs(cfg)
@@ -193,6 +207,8 @@ def comm_protected(c, patterns):
 
 def protected_reason(pid, cfg, pp=None):
     """Why this pid must never be signalled or moved, or None."""
+    from ..core import cgroup, process as inspect
+
     me = os.getuid()
     if pid <= 1:
         return "pid 1"
@@ -225,6 +241,8 @@ def protected_reason(pid, cfg, pp=None):
 
 def exe_key(pid):
     """Learning key: exe basename, else comm."""
+    from ..core import process as inspect
+
     e = inspect.exe(pid)
     return os.path.basename(e) if e else inspect.comm(pid)
 
@@ -302,6 +320,8 @@ def _clean(k):
 
 
 def _app_key(pid):
+    from ..core import process as inspect
+
     e = inspect.exe(pid)
     base = os.path.basename(e) if e else ""
     if not base:

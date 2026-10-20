@@ -1976,6 +1976,6 @@ class Daemon:
         return 0
 
 
-def run():
-    cfg = policy.load_config()
+def run(cfg=None):
+    cfg = policy.load_config() if cfg is None else cfg
     return Daemon(cfg).run()

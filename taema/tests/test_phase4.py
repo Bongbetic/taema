@@ -1407,7 +1407,7 @@ class StatusAndModes(ProcCase):
             reply = d.handle({"cmd": "status"})
             out = io.StringIO()
             with (
-                mock.patch.object(cli, "_load", return_value=(cfg, d.store, [])),
+                mock.patch.object(cli, "_load_status", return_value=(cfg, d.store)),
                 mock.patch.object(cli, "ask", return_value=reply),
                 redirect_stdout(out),
             ):

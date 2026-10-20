@@ -1,27 +1,62 @@
 """`taema` command line. scoperun / scopekill / scopels are thin aliases (see bin/)."""
 
-import argparse
 from contextlib import nullcontext
 from itertools import count
 import json
 import os
-import socket
 import sys
-import tempfile
-import time
-import uuid
 
-from ..model import authorization
-from ..core import cgroup, process as inspect, lineage
-from ..governor import engine
-from ..store import knowledge
-from ..config import policy
+
+class _LazyModule:
+    """Load a command dependency on first use instead of during CLI import."""
+
+    def __init__(self, name, module):
+        self._global_name = name
+        self._name = module
+        self._module = None
+
+    def __getattr__(self, name):
+        if self._module is None:
+            module = __import__(self._name, fromlist=(name,))
+            object.__setattr__(self, "_module", module)
+            globals()[self._global_name] = module
+        return getattr(self._module, name)
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        if self._module is None:
+            getattr(self, name)
+        setattr(self._module, name, value)
+
+    def __delattr__(self, name):
+        if name.startswith("_"):
+            object.__delattr__(self, name)
+            return
+        if self._module is None:
+            getattr(self, name)
+        delattr(self._module, name)
+
+
+authorization = _LazyModule("authorization", "taema.model.authorization")
+cgroup = _LazyModule("cgroup", "taema.core.cgroup")
+inspect = _LazyModule("inspect", "taema.core.process")
+lineage = _LazyModule("lineage", "taema.core.lineage")
+engine = _LazyModule("engine", "taema.governor.engine")
+knowledge = _LazyModule("knowledge", "taema.store.knowledge")
+policy = _LazyModule("policy", "taema.config.policy")
 
 _REQUEST_IDS = count(1)
 
 
-def _load():
-    cfg = policy.load_config()
+def _load(args=None):
+    cfg = policy.load_config(path=getattr(args, "config", None))
+    socket_override = getattr(args, "socket", None)
+    if socket_override:
+        socket_override = policy.expand(socket_override)
+        cfg["paths"]["socket"] = socket_override
+        cfg["paths"]["socket_fallback"] = socket_override
     store = knowledge.Store(
         policy.state_dir(cfg),
         cfg.get("seeds"),
@@ -30,6 +65,46 @@ def _load():
         mode=cfg.get("mode", "observe"),
     )
     return cfg, store, policy.load_units(cfg)
+
+
+def _load_status(args=None):
+    """Load the light status path, opening the store only when persisted state exists."""
+    cfg = policy.load_config(path=getattr(args, "config", None))
+    socket_override = getattr(args, "socket", None)
+    if socket_override:
+        socket_override = policy.expand(socket_override)
+        cfg["paths"]["socket"] = socket_override
+        cfg["paths"]["socket_fallback"] = socket_override
+    state_dir = policy.expand(cfg["paths"]["state_dir"])
+    try:
+        has_state = bool(os.listdir(state_dir))
+    except OSError:
+        has_state = False
+    store = None
+    if has_state and not getattr(args, "_fast", False):
+        store = _status_store(cfg)
+    return cfg, store
+
+
+def _status_store(cfg, pending_only=False):
+    state_dir = policy.expand(cfg["paths"]["state_dir"])
+    if pending_only:
+        feedback = os.path.join(state_dir, "feedback.jsonl")
+        if not any(os.path.exists(path) for path in (feedback, feedback + ".replay")):
+            return None
+    else:
+        try:
+            if not os.listdir(state_dir):
+                return None
+        except OSError:
+            return None
+    return knowledge.Store(
+        state_dir,
+        cfg.get("seeds"),
+        read_only=True,
+        deny=policy.owner_deny(cfg),
+        mode=cfg.get("mode", "observe"),
+    )
 
 
 def sock_paths(cfg):
@@ -47,6 +122,8 @@ def sock_path(cfg):
 
 def ask(cfg, msg, timeout=3.0):
     """One JSON request to the daemon. Returns the reply dict, or None when it is not running."""
+    import socket
+
     if not isinstance(msg, dict) or not isinstance(msg.get("cmd"), str):
         return {"error": "invalid request", "code": "invalid_request"}
     identifier = next(_REQUEST_IDS)
@@ -102,6 +179,8 @@ def feedback(cfg, store, op, key):
 
 def feedback_action(cfg, store, op, **fields):
     """Send a versioned policy action to the daemon or append it for offline replay."""
+    import uuid
+
     msg = {"v": 2, "id": uuid.uuid4().hex, "op": op, **fields}
     reply = ask(cfg, {"cmd": "feedback", **msg})
     if reply is not None:
@@ -170,8 +249,43 @@ def veto_label(target):
     return label
 
 
-def die(msg, code=1):
+def die(msg, code=1, hint=None, suggestion=None):
     print("taema: " + msg, file=sys.stderr)
+    if hint is None:
+        if code == 4:
+            hint = "Inspect the target's safety state before changing policy."
+        elif code == 3:
+            hint = "Start or check the taema daemon, then retry the command."
+        elif code == 2:
+            hint = "List current targets with `taema ls` and choose one exactly."
+        else:
+            hint = "Check the arguments and run `taema COMMAND --help` for usage."
+    if suggestion is None:
+        import difflib
+        import re
+
+        target = re.search(r"no scope (.+)", msg)
+        suggestion = "Run `taema --help` to see related commands."
+        if target:
+            try:
+                base = cgroup.base()
+                candidates = []
+                pending = list(cgroup.subdirs(base)) if os.path.isdir(base) else []
+                while pending:
+                    path = pending.pop()
+                    candidates.append(cgroup.rel(path))
+                    pending.extend(cgroup.subdirs(path))
+                close = difflib.get_close_matches(
+                    target.group(1), candidates, n=1, cutoff=0.55
+                )
+                if close:
+                    suggestion = "Did you mean `%s`?" % close[0]
+                else:
+                    suggestion = "List available scopes with `taema ls`."
+            except OSError:
+                suggestion = "List available scopes with `taema ls`."
+    print("hint: " + hint, file=sys.stderr)
+    print("suggestion: " + suggestion, file=sys.stderr)
     return code
 
 
@@ -190,7 +304,7 @@ def _sudo_denied(msg):
 
 
 def cmd_run(a):
-    cfg, store, units = _load()
+    cfg, store, units = _load(a)
     name = a.name
     if not cgroup.valid_rel(name) or "/" in name or len(name) > 32:
         return die("bad name (use a-z 0-9 _ -, max 32)")
@@ -288,10 +402,10 @@ def cmd_run(a):
 def cmd_kill(a):
     if getattr(a, "do_not_kill", False):
         return die("kill and --do-not-kill cannot be combined", 2)
-    cfg, store, units = _load()
+    cfg, store, units = _load(a)
     path = cgroup.resolve(a.name)
     if not path:
-        return die("no scope %s" % a.name)
+        return die("no scope %s" % a.name, 2)
     veto = engine.veto_for_scope(store, path)
     scope = cgroup.rel(path)
     facts = authorization.Facts(
@@ -350,7 +464,7 @@ def cmd_kill(a):
             )
         except engine.Refused as e:
             store.log(event="refusal", scope=cgroup.rel(path), why=str(e))
-            if isinstance(e, engine.Vetoed):
+            if isinstance(e, engine.Vetoed) or "protect" in str(e).lower():
                 return die(str(e), 4)
             return die(str(e))
     for d in rep["decisions"]:
@@ -402,74 +516,108 @@ def _walk(path, depth, out):
         if c and c not in comms:
             comms.append(c)
     out.append(
-        (
-            depth,
-            os.path.basename(path) if depth else cgroup.rel(path),
-            len(pids),
-            _fmt_mem(cgroup.memory_current(path)),
-            _fmt_psi(cgroup.memory_psi(path)),
-            ",".join(comms),
-        )
+        {
+            "depth": depth,
+            "name": os.path.basename(path) if depth else cgroup.rel(path),
+            "processes": len(pids),
+            "memory_bytes": cgroup.memory_current(path),
+            "psi_avg10": cgroup.memory_psi(path),
+            "commands": sorted(comms),
+        }
     )
-    for d in cgroup.subdirs(path):
+    for d in sorted(cgroup.subdirs(path)):
         _walk(d, depth + 1, out)
 
 
+def _count_scopes(base):
+    pending = list(cgroup.subdirs(base))
+    count_scopes = 0
+    while pending:
+        path = pending.pop()
+        count_scopes += 1
+        pending.extend(cgroup.subdirs(path))
+    return count_scopes
+
+
 def cmd_ls(a):
+    from . import view
+
     base = cgroup.base()
     if not os.path.isdir(base):
-        return die("%s missing" % base)
+        model = view.snapshot("ls", scopes=())
+        view.emit(model, a, "scope tree unavailable: %s\n" % base)
+        return 3
     rows = []
-    for d in cgroup.subdirs(base):
+    for d in sorted(cgroup.subdirs(base)):
         _walk(d, 0, rows)
-    if not rows:
-        print("no scopes")
-    else:
-        print("%-28s %4s  %8s %6s  %s" % ("name", "procs", "MEM", "PSI", "comms"))
-        for depth, name, n, mem, psi, comms in rows:
-            print(
-                "%s%-*s %4d  %8s %6s  %s"
-                % ("  " * depth, 28 - 2 * depth, name, n, mem, psi, comms[:80])
-            )
+    model = view.snapshot("ls", scopes=rows)
+    records = [view.record("scope", row) for row in rows]
+    view.emit(model, a, view.render_scopes(rows, a), records)
     return 0
 
 
 def cmd_explain(a):
-    cfg, store, units = _load()
+    from . import view
+
+    cfg, store, units = _load(a)
     if a.target.isdigit():
         pid = int(a.target)
         pp = inspect.ppid_map()
         members = set(inspect.descendants([pid], pp))
         edges = inspect.edges(members, inspect.Snapshot()).get(pid, [])
-        print(
-            "pid %d comm=%s key=%s app_key=%s"
-            % (pid, inspect.comm(pid), policy.exe_key(pid), policy.app_key(pid))
-        )
-        print("cgroup: %s" % cgroup.proc_cgroup(pid))
-        print("protected: %s" % (policy.protected_reason(pid, cfg) or "no"))
-        print(
-            "edges (outside users of this pid and its descendants): %s"
-            % (json.dumps(edges) if edges else "none")
-        )
-        info = store.explain(policy.exe_key(pid))
-        info["pairs"] = store.explain(policy.app_key(pid))["pairs"]
-        print(json.dumps(info, indent=1))
-        return 0
-    path = cgroup.resolve(a.target)
-    if path:
-        unit = engine.unit_for_leaf(units, os.path.basename(path))
-        for d in engine.plan_stop(path, cfg, store, unit):
-            print(
-                "%-5s %7d %-18s %s"
-                % (d["action"], d["pid"], d["comm"][:18], d["why"][:140])
+        key = policy.exe_key(pid)
+        app_key = policy.app_key(pid)
+        info = store.explain(key)
+        info["pairs"] = store.explain(app_key)["pairs"]
+        explanation = {
+            "pid": pid,
+            "comm": inspect.comm(pid),
+            "key": key,
+            "app_key": app_key,
+            "cgroup": cgroup.proc_cgroup(pid),
+            "protected": policy.protected_reason(pid, cfg),
+            "outside_users": edges,
+            "learning": info,
+        }
+        human = (
+            "pid %d comm=%s key=%s app_key=%s\n"
+            "cgroup: %s\nprotected: %s\n"
+            "edges (outside users of this pid and its descendants): %s\n%s\n"
+            % (
+                pid,
+                explanation["comm"],
+                key,
+                app_key,
+                explanation["cgroup"],
+                explanation["protected"] or "no",
+                json.dumps(edges) if edges else "none",
+                json.dumps(info, indent=1),
             )
-        return 0
-    print(json.dumps(store.explain(a.target), indent=1))
+        )
+    else:
+        path = cgroup.resolve(a.target)
+        if path:
+            unit = engine.unit_for_leaf(units, os.path.basename(path))
+            decisions = engine.plan_stop(path, cfg, store, unit)
+            explanation = {"plan": decisions}
+            human = (
+                "".join(
+                    "%-5s %7d %-18s %s\n"
+                    % (d["action"], d["pid"], d["comm"][:18], d["why"][:140])
+                    for d in decisions
+                )
+                or "no planned actions\n"
+            )
+        else:
+            explanation = store.explain(a.target)
+            human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
+    model = view.record("explain", {"target": a.target, "explanation": explanation})
+    view.emit(model, a, human)
     return 0
 
 
 def cmd_keep(a):
-    cfg, store, units = _load()
+    cfg, store, units = _load(a)
     how = feedback(cfg, store, "keep", a.exe)
     store.bump(a.exe, "user_keep", 3.0)  # local view only: read-only store, never saved
     print("%s: %s (%s)" % (a.exe, store.default_action(a.exe)[0], how))
@@ -477,7 +625,7 @@ def cmd_keep(a):
 
 
 def cmd_do_not_kill(a):
-    cfg, store, _units = _load()
+    cfg, store, _units = _load(a)
     if a.target:
         try:
             targets = [veto_target(a.target, store)]
@@ -486,7 +634,7 @@ def cmd_do_not_kill(a):
     else:
         action = store.auto_action()
         if not action:
-            return die("no automatic stop to veto")
+            return die("no automatic stop to veto", 2)
         apps = action.get("apps") or [
             pair[1]
             for pair in action.get("pairs", [])
@@ -508,11 +656,11 @@ def cmd_do_not_kill(a):
     return 0
 
 
-def cmd_undo(_a):
-    cfg, store, _units = _load()
+def cmd_undo(a):
+    cfg, store, _units = _load(a)
     action = store.auto_action()
     if not action:
-        return die("no automatic stop to undo")
+        return die("no automatic stop to undo", 2)
     target_id = action.get("decision_id") or action["id"]
     how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
     if not reply or not reply.get("ok"):
@@ -531,7 +679,7 @@ def cmd_undo(_a):
 
 
 def cmd_forget(a):
-    cfg, store, units = _load()
+    cfg, store, units = _load(a)
     if getattr(a, "veto", False):
         try:
             target = veto_target(a.exe, store, for_removal=True)
@@ -589,6 +737,8 @@ def print_pairs(pairs):
 
 def print_auto(auto):
     """Auto mode: scopes it created, leftover leaves, and the last auto stops with their reason."""
+    import time
+
     print(
         "auto: %d auto-adopted scopes, %d leftover leaves"
         % (auto.get("auto_adopted_scopes", 0), auto.get("leftover_leaves", 0))
@@ -609,85 +759,89 @@ def print_auto(auto):
 
 
 def cmd_status(a):
-    cfg, store, units = _load()
+    from . import view
+
+    cfg, store = _load_status(a)
     reply = ask(cfg, {"cmd": "status"})
+    if store is None:
+        store = _status_store(cfg, pending_only=reply is not None)
     if reply is None:
-        print(
-            "daemon: not running (config mode=%s, from %s)"
-            % (cfg["mode"], ", ".join(cfg["_sources"]) or "built-in defaults")
-        )
-        invalid = int(store.data.get("feedback_invalid", 0))
-        print("feedback_invalid: %d" % (invalid + store.pending_feedback_invalid()))
-        hold = store.hold_reason()
-        if hold:
-            print("hold: %s" % hold)
-        return 1
-    reply["feedback_invalid"] = (
-        int(reply.get("feedback_invalid", store.data.get("feedback_invalid", 0)))
-        + store.pending_feedback_invalid()
+        invalid = int(store.data.get("feedback_invalid", 0)) if store else 0
+        hold = store.hold_reason() if store else ""
+        status = {
+            "daemon": "unavailable",
+            "mode": cfg["mode"],
+            "feedback_invalid": invalid
+            + (store.pending_feedback_invalid() if store else 0),
+            "hold": hold or "",
+            "config": list(cfg["_sources"]),
+            "details": {
+                "reviews": len(store.open_reviews()) if store else 0,
+                "latest_decision": store.latest_decision() if store else None,
+            },
+        }
+        result = 3
+    else:
+        reply["feedback_invalid"] = int(
+            reply.get(
+                "feedback_invalid",
+                store.data.get("feedback_invalid", 0) if store else 0,
+            )
+        ) + (store.pending_feedback_invalid() if store else 0)
+        reply["hold"] = store.hold_reason() if store else reply.get("hold", "")
+        status = {
+            "daemon": "running",
+            "mode": reply.get("mode", cfg["mode"]),
+            "feedback_invalid": int(reply["feedback_invalid"]),
+            "hold": reply["hold"] or "",
+            "config": list(cfg["_sources"]),
+            "details": reply,
+        }
+        result = 0
+    base = cgroup.base()
+    if os.path.isdir(base):
+        if getattr(a, "json", False) or getattr(a, "jsonl", False):
+            scopes = []
+            for path in sorted(cgroup.subdirs(base)):
+                _walk(path, 0, scopes)
+            scope_count = len(scopes)
+        else:
+            scopes = []
+            scope_count = _count_scopes(base)
+    else:
+        scopes = []
+        scope_count = 0
+    model = view.snapshot("status", status, scopes, scope_count=scope_count)
+    records = [view.record("status", {"status": status})]
+    records.extend(view.record("scope", row) for row in scopes)
+    view.emit(
+        model,
+        a,
+        view.render_status(model, a, summary=bool(getattr(a, "_summary", False))),
+        records,
     )
-    reply["hold"] = store.hold_reason()
-    reply["config"] = cfg["_sources"]
-    pairs = reply.pop("pairs", [])
-    auto = reply.pop("auto", None)
-    print(json.dumps(reply, indent=1))
-    print_pairs(pairs)
-    if auto:
-        print_auto(auto)
-    return 0
+    return result
 
 
 def cmd_review(a):
-    _cfg, store, _units = _load()
-    reviews = store.open_reviews()
-    print("open reviews: %d" % len(reviews))
-    now = time.time()
-    for review in reviews:
-        if review.get("kind") == "legacy-invalid":
-            age = max(0, int(now - review.get("created", now)))
-            print(
-                "review #%s legacy owner=%s survivor=%s previous=%s age=%ds"
-                % (
-                    review.get("id", "?"),
-                    lineage.clean(review.get("owner", "?"), 40),
-                    lineage.clean((review.get("survivors") or ["?"])[0], 40),
-                    lineage.clean(review.get("answer", "?"), 16),
-                    age,
-                )
-            )
-            continue
-        if review.get("kind") == "scope":
-            age = max(0, int(now - review.get("created", now)))
-            print(
-                "review #%s scope=%s reason=%s age=%ds"
-                % (
-                    review.get("id", "?"),
-                    lineage.clean(review.get("scope", "?"), 80),
-                    lineage.clean(review.get("reason", "GC candidate"), 80),
-                    age,
-                )
-            )
-            continue
-        survivors = (
-            ", ".join(lineage.clean(k, 40) for k in review.get("survivors", []))
-            or "none"
-        )
-        age = max(0, int(now - review.get("created", now)))
-        print(
-            "review #%s owner=%s survivors=%s age=%ds"
-            % (
-                review.get("id", "?"),
-                lineage.clean(review.get("owner", "?"), 40),
-                survivors,
-                age,
-            )
-        )
+    from . import view
+
+    _cfg, store, _units = _load(a)
+    reviews = sorted(
+        store.open_reviews(),
+        key=lambda item: (item.get("created", 0), str(item.get("id", ""))),
+    )
+    model = view.record("reviews", {"reviews": reviews})
+    records = [view.record("review", {"review": item}) for item in reviews]
+    view.emit(model, a, view.render_reviews(reviews), records)
     return 0
 
 
 def cmd_learn_export(a):
     """Write the current store in the JSON format understood by the 0.2 release."""
-    _cfg, store, _units = _load()
+    import tempfile
+
+    _cfg, store, _units = _load(a)
     payload = json.dumps(store.export_legacy(), indent=2, sort_keys=True) + "\n"
     if not a.output:
         sys.stdout.write(payload)
@@ -715,20 +869,24 @@ def cmd_learn_export(a):
 
 
 def cmd_gc(a):
-    cfg, store, units = _load()
+    from . import view
+
+    cfg, store, units = _load(a)
     reply = ask(cfg, {"cmd": "gc", "dry_run": a.dry_run}, timeout=60)
+    available = reply is not None
     if reply is None:
         cands = engine.gc_candidates(cfg, units, store, {})
         reply = {
             "candidates": [[cgroup.rel(p), why] for p, why in cands],
             "note": "daemon not running; immediate candidates only",
         }
-    print(json.dumps(reply, indent=1))
-    return 0
+    model = view.record("gc", {"result": reply})
+    view.emit(model, a, json.dumps(reply, indent=1, ensure_ascii=False) + "\n")
+    return 0 if available else 3
 
 
 def cmd_adopt(a):
-    cfg, store, units = _load()
+    cfg, store, units = _load(a)
     if a.all:
         pt = inspect.ProcTable.scan()
         lin = lineage.Lineage(cfg)
@@ -757,96 +915,16 @@ def cmd_adopt(a):
 def cmd_daemon(a):
     from ..daemon import service as daemon
 
-    return daemon.run()
+    cfg = policy.load_config(path=getattr(a, "config", None))
+    socket_override = getattr(a, "socket", None)
+    if socket_override:
+        socket_override = policy.expand(socket_override)
+        cfg["paths"]["socket"] = socket_override
+        cfg["paths"]["socket_fallback"] = socket_override
+    return daemon.run(cfg)
 
 
 def main(argv):
-    from .. import __version__
+    from .framework import main as framework_main
 
-    p = argparse.ArgumentParser(
-        prog="taema", description="Dependency-aware cgroup v2 process scopes"
-    )
-    p.add_argument("--version", action="version", version="taema " + __version__)
-    p.add_argument(
-        "--do-not-kill",
-        nargs="?",
-        const="",
-        metavar="TARGET",
-        help="veto a target, or the latest automatic stop",
-    )
-    sub = p.add_subparsers(dest="c")
-    s = sub.add_parser("run", help="run CMD inside scope-NAME")
-    s.add_argument("--join", action="store_true")
-    s.add_argument("--owner", type=int, help="stop the scope when this pid exits")
-    s.add_argument(
-        "--bind", action="store_true", help="stop the scope when CMD itself exits"
-    )
-    s.add_argument("name")
-    s.add_argument("cmd", nargs=argparse.REMAINDER)
-    s.set_defaults(f=cmd_run)
-    s = sub.add_parser(
-        "kill", help="stop a scope; shared members are moved aside, not killed"
-    )
-    s.add_argument("-t", "--timeout", type=float)
-    s.add_argument("--dry-run", action="store_true")
-    s.add_argument(
-        "--do-not-kill",
-        action="store_true",
-        help="conflicts with kill; use the do-not-kill command separately",
-    )
-    s.add_argument("--force", action="store_true", help="ignore learned/seed defaults")
-    s.add_argument(
-        "--hard", action="store_true", help="also ignore detected outside users"
-    )
-    s.add_argument(
-        "--keep", help="comma list of exe names to move aside instead of killing"
-    )
-    s.add_argument("name")
-    s.set_defaults(f=cmd_kill)
-    s = sub.add_parser("ls")
-    s.set_defaults(f=cmd_ls)
-    s = sub.add_parser("explain")
-    s.add_argument("target")
-    s.set_defaults(f=cmd_explain)
-    s = sub.add_parser("keep")
-    s.add_argument("exe")
-    s.set_defaults(f=cmd_keep)
-    s = sub.add_parser("forget")
-    s.add_argument("--veto", action="store_true")
-    s.add_argument("exe")
-    s.set_defaults(f=cmd_forget)
-    s = sub.add_parser("do-not-kill", aliases=["dnk", "never"])
-    s.add_argument("target", nargs="?")
-    s.set_defaults(f=cmd_do_not_kill)
-    s = sub.add_parser("undo")
-    s.set_defaults(f=cmd_undo)
-    s = sub.add_parser("status")
-    s.set_defaults(f=cmd_status)
-    s = sub.add_parser("review", help="list pending close reviews")
-    s.set_defaults(f=cmd_review)
-    s = sub.add_parser("learn", help="inspect or export learned state")
-    learn = s.add_subparsers(dest="learn_command", required=True)
-    export = learn.add_parser("export", help="export state for a 0.2 downgrade")
-    export.add_argument("--format", choices=("v2",), required=True)
-    export.add_argument("--output", help="write atomically to PATH instead of stdout")
-    export.set_defaults(f=cmd_learn_export)
-    s = sub.add_parser("gc")
-    s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(f=cmd_gc)
-    s = sub.add_parser("adopt")
-    s.add_argument("--all", action="store_true")
-    s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(f=cmd_adopt)
-    s = sub.add_parser("daemon")
-    s.set_defaults(f=cmd_daemon)
-    a = p.parse_args(argv)
-    if a.c is None:
-        if a.do_not_kill is None:
-            p.error("a command is required")
-        return cmd_do_not_kill(argparse.Namespace(target=a.do_not_kill or None))
-    if a.c == "run":
-        if a.cmd and a.cmd[0] == "--":
-            a.cmd = a.cmd[1:]
-        if not a.cmd:
-            return die("usage: taema run [--join] [--owner PID|--bind] NAME CMD...")
-    return a.f(a) or 0
+    return framework_main(argv)

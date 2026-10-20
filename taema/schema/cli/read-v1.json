@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taema.dev/schema/cli/read-v1.json",
+  "title": "tæma CLI read output v1",
+  "oneOf": [
+    { "$ref": "#/$defs/view" },
+    { "$ref": "#/$defs/status-record" },
+    { "$ref": "#/$defs/scope" },
+    { "$ref": "#/$defs/reviews" },
+    { "$ref": "#/$defs/review" },
+    { "$ref": "#/$defs/explain" },
+    { "$ref": "#/$defs/gc" }
+  ],
+  "$defs": {
+    "view": {
+      "type": "object",
+      "required": ["schema", "kind", "status", "scopes", "scope_count"],
+      "properties": {
+        "schema": { "const": "taema.view.v1" },
+        "kind": { "enum": ["status", "ls"] },
+        "status": { "anyOf": [{ "$ref": "#/$defs/status-data" }, { "type": "null" }] },
+        "scopes": { "type": "array", "items": { "$ref": "#/$defs/scope-data" } },
+        "scope_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "status-record": {
+      "type": "object",
+      "required": ["schema", "status"],
+      "properties": {
+        "schema": { "const": "taema.status.v1" },
+        "status": { "$ref": "#/$defs/status-data" }
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "required": ["schema", "depth", "name", "processes", "memory_bytes", "psi_avg10", "commands"],
+      "properties": {
+        "schema": { "const": "taema.scope.v1" },
+        "depth": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string", "minLength": 1 },
+        "processes": { "type": "integer", "minimum": 0 },
+        "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
+        "commands": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "scope-data": {
+      "type": "object",
+      "required": ["depth", "name", "processes", "memory_bytes", "psi_avg10", "commands"],
+      "properties": {
+        "depth": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string", "minLength": 1 },
+        "processes": { "type": "integer", "minimum": 0 },
+        "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
+        "commands": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "status-data": {
+      "type": "object",
+      "required": ["daemon", "mode", "feedback_invalid", "hold", "config", "details"],
+      "properties": {
+        "daemon": { "enum": ["running", "unavailable"] },
+        "mode": { "type": "string" },
+        "feedback_invalid": { "type": "integer", "minimum": 0 },
+        "hold": { "type": "string" },
+        "config": { "type": "array", "items": { "type": "string" } },
+        "details": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "reviews": {
+      "type": "object",
+      "required": ["schema", "reviews"],
+      "properties": {
+        "schema": { "const": "taema.reviews.v1" },
+        "reviews": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object",
+      "required": ["schema", "review"],
+      "properties": {
+        "schema": { "const": "taema.review.v1" },
+        "review": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "explain": {
+      "type": "object",
+      "required": ["schema", "target", "explanation"],
+      "properties": {
+        "schema": { "const": "taema.explain.v1" },
+        "target": { "type": "string" },
+        "explanation": {}
+      },
+      "additionalProperties": false
+    },
+    "gc": {
+      "type": "object",
+      "required": ["schema", "result"],
+      "properties": {
+        "schema": { "const": "taema.gc.v1" },
+        "result": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

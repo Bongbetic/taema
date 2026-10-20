@@ -1903,8 +1903,8 @@ class StateDB:
                 raise
         return cursor.rowcount == 1
 
-    def suspend_signature(self, identifier, until, now=None):
-        """Suspend inherited authority for one signature after attributed regret."""
+    def suspend_signature(self, identifier, until, now=None, outcome=None):
+        """Suspend authority and optionally persist an attributed regret outcome."""
         if (
             self.read_only
             or not self.available
@@ -1912,17 +1912,26 @@ class StateDB:
             or not isinstance(until, (int, float))
             or isinstance(until, bool)
             or not math.isfinite(until)
+            or outcome not in (None, "regret")
         ):
             return False
         now = time.time() if now is None else now
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                cursor = connection.execute(
-                    "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
-                    "last_seen = ? WHERE id = ?",
-                    (until, now, now, identifier),
-                )
+                if outcome == "regret":
+                    cursor = connection.execute(
+                        "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
+                        "last_seen = ?, last_outcome = 'regret', last_outcome_at = ? "
+                        "WHERE id = ?",
+                        (until, now, now, now, identifier),
+                    )
+                else:
+                    cursor = connection.execute(
+                        "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
+                        "last_seen = ? WHERE id = ?",
+                        (until, now, now, identifier),
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()

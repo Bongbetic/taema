@@ -144,6 +144,45 @@ class LearnCliTests(unittest.TestCase):
             {"decision": "keep", "outcome": "respawn", "at": 201.0},
         )
 
+    def test_regret_is_latest_pair_and_signature_outcome_after_reopen(self):
+        from taema.core import signature as survivor_signature
+
+        now = [200.0]
+        self.store.now = lambda: now[0]
+        observed = survivor_signature.signature(
+            "browser", ["worker"], "runtime-hash", "node", False
+        )
+        signature_id = self.store.ensure_signature("browser", observed)["id"]
+        self.store.auto_stopped(
+            "browser", "worker", signature_id, stop_id="stop-regretted"
+        )
+        now[0] = 260.0
+        self.assertTrue(self.store.auto_stop_success("browser", "worker"))
+        now[0] = 270.0
+        self.assertTrue(self.store.regret("browser", "worker", signature_id))
+        self.store.save()
+
+        reopened = Store(self.temporary.name, {}, now=lambda: now[0], read_only=True)
+        output = io.StringIO()
+        with (
+            mock.patch.object(commands, "_load", return_value=({}, reopened, [])),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(commands.main(["learn", "show", "--json"]), 0)
+
+        document = json.loads(output.getvalue())
+        pair = next(
+            record
+            for record in document["pairs"]
+            if (record["owner"], record["leftover"]) == ("browser", "worker")
+        )
+        signature = next(
+            record for record in document["signatures"] if record["id"] == signature_id
+        )
+        expected = {"decision": "keep", "outcome": "regret", "at": 270.0}
+        self.assertEqual(pair["last_outcome"], expected)
+        self.assertEqual(signature["last_outcome"], expected)
+
     def test_apps_json_lists_identity_and_learning_evidence(self):
         now = self.store.now()
         identity = AppIdentity(

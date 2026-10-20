@@ -3214,6 +3214,8 @@ class Store:
             return {"decision": "stop", "outcome": outcome, "at": at}
         if outcome == "respawn":
             return {"decision": "keep", "outcome": outcome, "at": at}
+        if outcome == "regret":
+            return {"decision": "keep", "outcome": outcome, "at": at}
         if outcome == "answered":
             answer = item.get("ex_last")
             if answer in ("stop", "keep"):
@@ -3605,14 +3607,21 @@ class Store:
             )
         ):
             return False
+        regret_at = self.now()
         p["regret_keep"] = float(p.get("regret_keep", 0.0)) + W_REGRET
-        p["last_keep"] = self.now()
-        p["suspended_until"] = self.now() + suspend
+        p["last_keep"] = regret_at
+        p["last_auto_outcome"] = {
+            "decision": "keep",
+            "outcome": "regret",
+            "at": regret_at,
+        }
+        p["suspended_until"] = regret_at + suspend
         if recorded_signature:
             self.db.suspend_signature(
                 recorded_signature,
                 p["suspended_until"],
-                now=p["last_keep"],
+                now=regret_at,
+                outcome="regret",
             )
         p["last_auto_stop"] = 0.0
         p.pop("pending_stop", None)
@@ -3860,7 +3869,7 @@ class Store:
         if (
             isinstance(automatic, dict)
             and automatic.get("decision") in ("stop", "keep")
-            and automatic.get("outcome") in ("stop_ok", "respawn")
+            and automatic.get("outcome") in ("stop_ok", "respawn", "regret")
         ):
             add(
                 automatic["decision"],

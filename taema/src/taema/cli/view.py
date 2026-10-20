@@ -469,7 +469,7 @@ def render_explanation(target, explanation):
     signatures = learning.get("signatures") or []
     for item in signatures[:5]:
         lines.append(
-            "signature: owner=%s id=%s answer=%s closes=%d stop_ok=%d respawn=%d veto=%d"
+            "signature: owner=%s id=%s answer=%s closes=%d stop_ok=%d respawn=%d veto=%d probation=%d"
             % (
                 item.get("owner", "?"),
                 item.get("id", "?"),
@@ -478,6 +478,7 @@ def render_explanation(target, explanation):
                 item.get("stop_ok", 0),
                 item.get("respawn", 0),
                 item.get("veto", 0),
+                item.get("probation", 0),
             )
         )
     if len(signatures) > 5:

@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -267,6 +267,7 @@ _MIGRATIONS = {
         CREATE INDEX parents_last ON parents(last);
     """,
     5: "",
+    6: "ALTER TABLE signatures ADD COLUMN probation INTEGER NOT NULL DEFAULT 0;",
 }
 
 
@@ -1830,7 +1831,7 @@ class StateDB:
         if (
             self.read_only
             or not self.available
-            or counter not in ("stop_ok", "respawn", "veto")
+            or counter not in ("stop_ok", "respawn", "veto", "probation")
             or not isinstance(amount, int)
             or isinstance(amount, bool)
             or amount < 1

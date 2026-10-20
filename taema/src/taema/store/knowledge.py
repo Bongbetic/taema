@@ -18,6 +18,7 @@ import uuid
 from ..config import policy
 from .. import protocol
 from ..core import signature as survivor_signature
+from ..model import learning as pair_learning
 from . import db
 
 DECAY_DAYS = 7
@@ -54,14 +55,16 @@ MAX_PAIRS = 1000
 MAX_PER_OWNER = 32
 W_ANSWER = 3.0  # explicit answer weight; never decayed
 W_INFERRED = 0.25  # user kill inferred from a vanished pid
+W_STOP_OK = 0.5  # own successful stop; confidence only unless opted in
+W_RESPAWN = 1.0  # own stop that respawned; decays with inferred evidence
 W_REGRET = 3.0  # keep evidence added when an auto-stopped app comes back
-SILENT_KILLS = 5  # shell-observed kills ...
-SILENT_DAYS = 3  # ... on this many distinct days
-SILENT_RATIO = 0.9
-SILENT_KEEP_FREE_DAYS = 30  # no keep evidence this long
-SILENT_MIN_AGE = DAY  # pair first seen more than 24 h ago
-BURN_IN_DAYS = 7  # store age ...
-BURN_IN_CLOSES = 20  # ... or closes seen since creation
+SILENT_KILLS = pair_learning.SILENT_KILLS
+SILENT_DAYS = pair_learning.SILENT_DAYS
+SILENT_RATIO = pair_learning.SILENT_RATIO
+SILENT_KEEP_FREE_DAYS = pair_learning.SILENT_KEEP_FREE_DAYS
+SILENT_MIN_AGE = pair_learning.SILENT_MIN_AGE
+BURN_IN_DAYS = pair_learning.BURN_IN_DAYS
+BURN_IN_CLOSES = pair_learning.BURN_IN_CLOSES
 REGRET_WINDOW = 30 * 60.0
 REGRET_SUSPEND = 7 * DAY
 ASK_PER_DAY = 3
@@ -70,65 +73,19 @@ CHOICES = ("stop", "keep", "standalone", "never")
 SEP = "\0"
 
 
-def decide(p, now, created, closes_total):
-    """Pure pair decision from a pair record (or None). Returns (action, confidence, why).
-    Explicit answers act at once; silent stop needs the Phase 4 evidence; anything else asks."""
-    if not p:
-        return "ask", 0.0, "no evidence"
-    if p.get("suspended_until", 0) > now:
-        return (
-            "ask",
-            0.0,
-            "suspended after regret until day +%d"
-            % int((p["suspended_until"] - now) // DAY + 1),
-        )
-    ex_s, ex_k = p.get("ex_stop", 0), p.get("ex_keep", 0)
-    stop, keep = p.get("stop", 0), p.get("keep", 0)
-    if (
-        ex_s or ex_k
-    ):  # explicit: the last answer holds until contrary evidence outweighs it
-        last = p.get("ex_last") or ("stop" if ex_s >= ex_k else "keep")
-        if last == "stop" and keep < ex_s:
-            return (
-                "stop",
-                1.0,
-                "answered stop (weight %.0f), contrary %.2f" % (ex_s, keep),
-            )
-        if last == "keep" and stop < ex_k:
-            return (
-                "keep",
-                1.0,
-                "answered keep (weight %.0f), contrary %.2f" % (ex_k, stop),
-            )
-        return "ask", 0.0, "answer overturned by contrary evidence"
-    if p.get("launches") and not p.get("kills"):
-        return "keep", 0.5, "launcher pattern: survivors are what the job started"
-    tot = stop + keep
-    ratio = stop / tot if tot else 0.0
-    kills, days = p.get("kills", 0), len(p.get("days", ()))
-    burn = now - created >= BURN_IN_DAYS * DAY or closes_total >= BURN_IN_CLOSES
-    quiet = not keep and now - p.get("last_keep", 0) > SILENT_KEEP_FREE_DAYS * DAY
-    old = now - p.get("first_seen", now) > SILENT_MIN_AGE
-    if (
-        kills >= SILENT_KILLS
-        and days >= SILENT_DAYS
-        and ratio >= SILENT_RATIO
-        and quiet
-        and old
-        and burn
-    ):
-        return (
-            "stop",
-            ratio,
-            "silent: %d kills on %d days, ratio %.2f" % (kills, days, ratio),
-        )
-    if keep > stop and keep >= 1:
-        return "keep", keep / tot, "keep evidence %.2f vs stop %.2f" % (keep, stop)
-    return (
-        "ask",
-        ratio,
-        "kills %d/%d, days %d/%d, ratio %.2f, quiet %s, old %s, burn-in %s"
-        % (kills, SILENT_KILLS, days, SILENT_DAYS, ratio, quiet, old, burn),
+def decide(p, now, authority="learned", allow_self_authority=False, learn=None):
+    """Pure compatibility entry point for the pair model."""
+    learn = learn if isinstance(learn, dict) else {}
+    return pair_learning.decide_pair(
+        p,
+        now,
+        authority=authority,
+        allow_self_authority=allow_self_authority,
+        silent_kills=learn.get("silent_kills", SILENT_KILLS),
+        silent_days=learn.get("silent_days", SILENT_DAYS),
+        silent_ratio=learn.get("silent_ratio", SILENT_RATIO),
+        burn_in_days=learn.get("burn_in_days", BURN_IN_DAYS),
+        burn_in_closes=learn.get("burn_in_closes", BURN_IN_CLOSES),
     )
 
 
@@ -141,6 +98,7 @@ class Store:
         read_only=False,
         deny=(),
         mode="observe",
+        learn=None,
     ):
         self.dir = state_dir
         self.path = os.path.join(state_dir, "state.db")
@@ -151,7 +109,7 @@ class Store:
         self.seeds = seeds or {}
         self.read_only = read_only  # CLI: the daemon is the single writer
         self.deny = tuple(deny)  # configured owner-deny entries (extend the defaults)
-        self.mode = mode
+        self.configure_learning(learn, mode)
         self.dirty = False
         self.defer_writes = False
         self.last_save = 0.0
@@ -175,6 +133,31 @@ class Store:
                 source=self.recovery.get("source"),
                 quarantined=self.recovery.get("quarantined"),
             )
+
+    def configure_learning(self, learn=None, mode=None):
+        """Apply validated learner settings without coupling the model to config loading."""
+        if mode is not None:
+            self.mode = mode
+        self.learn = dict(learn) if isinstance(learn, dict) else {}
+        configured = self.learn.get("authority")
+        if configured in policy.LEARN_AUTHORITIES:
+            self.learn_authority = configured
+        elif self.mode == "adopt":
+            self.learn_authority = "answered"
+        elif self.mode == "enforce":
+            self.learn_authority = "unit"
+        else:
+            self.learn_authority = "learned"
+        self.allow_self_authority = bool(
+            self.learn.get("allow_self_authority", False)
+        )
+        self.probation_stops = max(0, int(self.learn.get("probation_stops", 3)))
+        self.respawn_window = max(0.0, float(self.learn.get("respawn_window", 60)))
+        self.revive_window = max(0.0, float(self.learn.get("revive_window", 1800)))
+        self.regret_window = max(0.0, float(self.learn.get("regret_window", 1800)))
+        self.regret_suspend = max(
+            0.0, float(self.learn.get("regret_suspend_days", 7)) * DAY
+        )
 
     def _fresh(self):
         return {
@@ -204,6 +187,17 @@ class Store:
 
     def _load(self):
         self.data = self.db.load_state(self.data)
+        for pair in self.data["pairs"].values():
+            if not isinstance(pair, dict):
+                continue
+            if "inferred_kills" not in pair:
+                pair["inferred_kills"] = pair.get("kills", 0)
+                self.dirty = True
+            if "self_stop" not in pair:
+                pair["self_stop"] = pair.get("stop_ok", 0) * W_STOP_OK
+                self.dirty = True
+            pair.setdefault("regret_keep", 0.0)
+            pair.setdefault("respawn_weight", 0.0)
 
     def record_identity(self, identity, instance):
         """Persist resolver evidence independently of learned pair authority."""
@@ -1547,6 +1541,9 @@ class Store:
             for c in (
                 "stop",
                 "keep",
+                "inferred_kills",
+                "self_stop",
+                "respawn_weight",
             ):  # inferred evidence only; ex_* counters never decay
                 v = p.get(c, 0.0) * f
                 p[c] = 0.0 if v < 0.01 else v
@@ -1622,17 +1619,24 @@ class Store:
         for f in (
             "stop",
             "keep",
+            "self_stop",
+            "respawn_weight",
+            "regret_keep",
             "ex_stop",
             "ex_keep",
             "closes",
             "kills",
             "launches",
+            "stop_ok",
+            "respawn",
+            "probation",
             "last_asked",
             "last_auto_stop",
             "last_keep",
             "suspended_until",
         ):
             p.setdefault(f, 0 if f in ("closes", "kills", "launches") else 0.0)
+        p.setdefault("inferred_kills", p.get("kills", 0))
         p.setdefault("days", [])
         p["last_seen"] = self.now()
         self.dirty = True
@@ -1643,6 +1647,8 @@ class Store:
         return (
             p.get("stop", 0)
             + p.get("keep", 0)
+            + p.get("self_stop", 0)
+            + p.get("regret_keep", 0)
             + p.get("ex_stop", 0)
             + p.get("ex_keep", 0)
         )
@@ -2231,7 +2237,12 @@ class Store:
         p["ex_source"] = source
         if source != "review_expiry":
             p["review_expiries"] = {}
-        p["keep" if choice == "stop" else "stop"] = 0.0
+        if choice == "stop":
+            p["keep"] = 0.0
+            p["regret_keep"] = 0.0
+        else:
+            p["stop"] = 0.0
+            p["self_stop"] = 0.0
         p["suspended_until"] = 0.0
         if choice == "keep":
             p["last_keep"] = self.now()
@@ -2489,9 +2500,9 @@ class Store:
         return min(matches)[-1] if matches else None
 
     def signature_decision(self, signature):
-        """Return an explicit matched signature decision, or ``None`` for pair fallback."""
+        """Return a matched signature decision, or ``None`` for pair fallback."""
         matched = self.match_signature(signature)
-        return self._signature_answer(matched)
+        return self._signature_answer(matched) or self._signature_outcome_answer(matched)
 
     @staticmethod
     def _signature_answer(matched):
@@ -2510,13 +2521,35 @@ class Store:
             % (choice, matched["id"], weight),
         )
 
+    def _signature_outcome_answer(self, matched):
+        if (
+            not matched
+            or self.learn_authority != "aggressive"
+            or not self.allow_self_authority
+        ):
+            return None
+        successful = matched.get("stop_ok", 0)
+        respawned = matched.get("respawn", 0)
+        if successful < pair_learning.SELF_AUTHORITY_SUCCESSES or successful <= respawned:
+            return None
+        total = successful + respawned
+        confidence = successful / total if total else 0.0
+        return (
+            "stop",
+            confidence,
+            "self-authority: signature %s has %d successful stops"
+            % (matched["id"], successful),
+        )
+
     def signature_decisions(self, signature):
         """Return inherited decisions for covered members; unmatched members use pair fallback."""
         if not isinstance(signature, dict):
             return {}
         matched = self.match_signature(signature)
         if matched:
-            answer = self._signature_answer(matched)
+            answer = self._signature_answer(matched) or self._signature_outcome_answer(
+                matched
+            )
             if answer:
                 return {
                     item["key"]: answer
@@ -2530,7 +2563,9 @@ class Store:
         candidates = []
         for candidate in self.db.signatures_for_owner(signature.get("owner")):
             previous = survivor_signature.member_counts(candidate.get("members"))
-            answer = self._signature_answer(candidate)
+            answer = self._signature_answer(candidate) or self._signature_outcome_answer(
+                candidate
+            )
             if (
                 not previous
                 or not answer
@@ -2577,6 +2612,7 @@ class Store:
                     "closes": item.get("closes", 0),
                     "stop_ok": item.get("stop_ok", 0),
                     "respawn": item.get("respawn", 0),
+                    "probation": item.get("probation", 0),
                     "veto": item.get("veto", 0),
                 }
             )
@@ -2614,6 +2650,7 @@ class Store:
         p = self._pair(owner, leftover)
         p["stop"] += W_INFERRED
         p["kills"] += 1
+        p["inferred_kills"] += 1.0
         d = int(self.now() // DAY) if day is None else int(day)
         if d not in p["days"]:
             p["days"] = (p["days"] + [d])[-32:]
@@ -2627,31 +2664,176 @@ class Store:
         self.bump(key, "respawned", 1.0)
         return True
 
-    def auto_stopped(self, owner, leftover):
+    def auto_stopped(
+        self,
+        owner,
+        leftover,
+        signature_id=None,
+        stop_id=None,
+        count_signature_probation=True,
+    ):
+        """Record a pair-authorized automatic stop and open its durable outcome window."""
         if self._ok(owner, leftover) and not policy.bad_owner(owner, self.deny):
             pair = self._pair(owner, leftover)
-            pair["last_auto_stop"] = self.now()
-            if pair.get("sig"):
-                self.signature_outcome(pair["sig"], "stop_ok")
+            now = self.now()
+            signature_id = signature_id or pair.get("sig")
+            stop_id = stop_id or uuid.uuid4().hex
+            pair["probation"] = int(pair.get("probation", 0)) + 1
+            pair["last_auto_stop"] = now
+            pair["pending_stop"] = {
+                "ts": now,
+                "signature_id": signature_id,
+                "stop_id": stop_id,
+                "respawn_recorded": False,
+                "stop_ok_recorded": False,
+            }
+            if signature_id and count_signature_probation:
+                self.signature_outcome(signature_id, "probation")
+            self.dirty = True
 
-    def regret(self, owner, leftover):
-        """The leftover came back within 30 min of an auto-stop: keep +3, suspended for 7 days
-        (the pair asks again). True when it was a regret."""
+    def in_probation(self, owner, leftover, limit=None):
+        """Whether this pair's next automatic stop is still inside graceful-only probation."""
+        pair = self.data["pairs"].get(self.pkey(owner, leftover))
+        limit = self.probation_stops if limit is None else max(0, int(limit))
+        return bool(pair and int(pair.get("probation", 0)) < limit)
+
+    def signature_in_probation(self, signature_id, limit=None):
+        """Unknown signature state stays graceful-only; known signatures use their stop count."""
+        if not signature_id:
+            return False
+        signature = self.db.signature(signature_id)
+        limit = self.probation_stops if limit is None else max(0, int(limit))
+        return signature is None or int(signature.get("probation", 0)) < limit
+
+    def stop_in_probation(self, owner, leftover, limit=None):
+        """Pair and linked-signature probation both constrain learned automatic stops."""
+        pair = self.data["pairs"].get(self.pkey(owner, leftover))
+        if self.in_probation(owner, leftover, limit):
+            return True
+        signature_id = pair.get("sig") if isinstance(pair, dict) else None
+        return self.signature_in_probation(signature_id, limit)
+
+    def pending_auto_stops(self):
+        """Return current automatic-stop watches as immutable owner/key/pending snapshots."""
+        return [
+            (owner, leftover, dict(pair["pending_stop"]))
+            for pair_key, pair in self.data["pairs"].items()
+            if isinstance(pair, dict) and isinstance(pair.get("pending_stop"), dict)
+            for owner, separator, leftover in (pair_key.partition(SEP),)
+            if separator
+        ]
+
+    def auto_stop_success(self, owner, leftover, signature_id=None):
+        """Record one no-respawn result after its window; duplicate observations are inert."""
+        pair = self.data["pairs"].get(self.pkey(owner, leftover))
+        pending = pair.get("pending_stop") if isinstance(pair, dict) else None
+        if not isinstance(pending, dict) or pending.get("stop_ok_recorded"):
+            return False
+        recorded_signature = pending.get("signature_id")
+        if signature_id and recorded_signature and signature_id != recorded_signature:
+            return False
+        pair["stop_ok"] = int(pair.get("stop_ok", 0)) + 1
+        pair["self_stop"] = float(pair.get("self_stop", 0.0)) + W_STOP_OK
+        pending["stop_ok_recorded"] = True
+        if recorded_signature:
+            stop_id = pending.get("stop_id")
+            related = [
+                candidate["pending_stop"]
+                for candidate in self.data["pairs"].values()
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("pending_stop"), dict)
+                and candidate["pending_stop"].get("signature_id") == recorded_signature
+                and candidate["pending_stop"].get("stop_id") == stop_id
+            ]
+            if not any(item.get("signature_stop_ok_recorded") for item in related):
+                self.signature_outcome(recorded_signature, "stop_ok")
+            for item in related:
+                item["signature_stop_ok_recorded"] = True
+        self.dirty = True
+        return True
+
+    def auto_stop_respawn(self, owner, leftover, signature_id=None):
+        """Record a respawn inside the stop window as decaying keep evidence."""
+        pair = self.data["pairs"].get(self.pkey(owner, leftover))
+        pending = pair.get("pending_stop") if isinstance(pair, dict) else None
+        if not isinstance(pending, dict) or pending.get("respawn_recorded"):
+            return False
+        recorded_signature = pending.get("signature_id")
+        if signature_id and recorded_signature and signature_id != recorded_signature:
+            return False
+        pair["respawn"] = int(pair.get("respawn", 0)) + 1
+        pair["respawn_weight"] = float(pair.get("respawn_weight", 0.0)) + W_RESPAWN
+        pair["keep"] = float(pair.get("keep", 0.0)) + W_RESPAWN
+        pair["last_keep"] = self.now()
+        pending["respawn_recorded"] = True
+        if recorded_signature:
+            stop_id = pending.get("stop_id")
+            related = [
+                candidate["pending_stop"]
+                for candidate in self.data["pairs"].values()
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("pending_stop"), dict)
+                and candidate["pending_stop"].get("signature_id") == recorded_signature
+                and candidate["pending_stop"].get("stop_id") == stop_id
+            ]
+            if not any(item.get("signature_respawn_recorded") for item in related):
+                self.signature_outcome(recorded_signature, "respawn")
+            for item in related:
+                item["signature_respawn_recorded"] = True
+        self.dirty = True
+        return True
+
+    def expire_auto_stops(self, now=None, respawn_window=None, revive_window=None):
+        """Finish durable stop watches as their 60-second and revival windows elapse."""
+        now = self.now() if now is None else now
+        respawn_window = (
+            self.respawn_window if respawn_window is None else max(0.0, respawn_window)
+        )
+        revive_window = (
+            self.revive_window if revive_window is None else max(0.0, revive_window)
+        )
+        for owner, leftover, pending in self.pending_auto_stops():
+            timestamp = pending.get("ts")
+            if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+                continue
+            if now - timestamp >= respawn_window and not pending.get("respawn_recorded"):
+                self.auto_stop_success(owner, leftover, pending.get("signature_id"))
+            if now - timestamp >= revive_window:
+                pair = self.data["pairs"].get(self.pkey(owner, leftover))
+                if isinstance(pair, dict):
+                    pair.pop("pending_stop", None)
+                    self.dirty = True
+
+    def regret(self, owner, leftover, signature_id=None, window=None, suspend=None):
+        """A same-pair revival adds durable keep evidence and suspends authority."""
         p = (
             self._pair(owner, leftover, create=False)
             if self._ok(owner, leftover)
             else None
         )
+        pending = p.get("pending_stop") if p else None
+        last_auto_stop = (
+            pending.get("ts")
+            if isinstance(pending, dict)
+            else p.get("last_auto_stop") if p else 0
+        )
+        window = self.regret_window if window is None else max(0.0, window)
+        suspend = self.regret_suspend if suspend is None else max(0.0, suspend)
+        recorded_signature = (
+            pending.get("signature_id") if isinstance(pending, dict) else None
+        )
         if (
             not p
-            or not p["last_auto_stop"]
-            or self.now() - p["last_auto_stop"] > REGRET_WINDOW
+            or not last_auto_stop
+            or self.now() - last_auto_stop > window
+            or (signature_id and recorded_signature and signature_id != recorded_signature)
         ):
             return False
-        p["keep"] += W_REGRET
+        p["regret_keep"] = float(p.get("regret_keep", 0.0)) + W_REGRET
         p["last_keep"] = self.now()
-        p["suspended_until"] = self.now() + REGRET_SUSPEND
+        p["suspended_until"] = self.now() + suspend
         p["last_auto_stop"] = 0.0
+        p.pop("pending_stop", None)
         self.dirty = True
         return True
 
@@ -2675,7 +2857,13 @@ class Store:
         why = policy.bad_owner(owner, self.deny)
         if why:
             return "invalid", 0.0, "invalid owner: %s" % why
-        return decide(p, self.now(), self.data["created"], self.data["closes"])
+        return decide(
+            p,
+            self.now(),
+            authority=self.learn_authority,
+            allow_self_authority=self.allow_self_authority,
+            learn=self.learn,
+        )
 
     def pair_decision(self, owner, leftover):
         """(action, confidence, why); action in ask|stop|keep|standalone|invalid."""
@@ -2795,10 +2983,23 @@ class Store:
                     "inherited": inherited,
                     "signature": p.get("sig"),
                     "confidence": round(1.0 if inherited else conf, 2),
-                    "stop": round(p.get("stop", 0) + p.get("ex_stop", 0), 2),
-                    "keep": round(p.get("keep", 0) + p.get("ex_keep", 0), 2),
+                    "stop": round(
+                        p.get("stop", 0)
+                        + p.get("self_stop", 0)
+                        + p.get("ex_stop", 0),
+                        2,
+                    ),
+                    "keep": round(
+                        p.get("keep", 0)
+                        + p.get("regret_keep", 0)
+                        + p.get("ex_keep", 0),
+                        2,
+                    ),
                     "closes": p.get("closes", 0),
                     "kills": p.get("kills", 0),
+                    "stop_ok": p.get("stop_ok", 0),
+                    "respawn": p.get("respawn", 0),
+                    "probation": p.get("probation", 0),
                     "why": display_why,
                 }
             )

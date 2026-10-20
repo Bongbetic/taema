@@ -531,16 +531,23 @@ class KnowledgeV2(unittest.TestCase):
         self.assertEqual(
             self.s.pair_decision("o", "l")[0], "ask"
         )  # burn-in (7 days) not passed
-        self.s.data["closes"] = 20  # 20 closes pass it
+        # Old store activity cannot authorize a newly observed relationship.
+        self.s.data["created"] = self.c.t - 30 * DAY
+        self.s.data["closes"] = 99
+        self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
+        for _ in range(19):
+            self.s.observe_close("o", "l")
+        self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
+        self.s.observe_close("o", "l")  # 20 closes for this pair pass burn-in
         a, conf, why = self.s.pair_decision("o", "l")
         self.assertEqual((a, conf), ("stop", 1.0), why)
         self.assertIn("silent", why)
 
     def test_silent_stop_needs_five_kills_three_days_and_no_keep(self):
-        self.s.data["closes"] = 99
         self.silent(n=4)
         self.c.t += 2 * DAY
         self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")  # only 4 kills
+        self.s._pair("o", "l")["closes"] = 20
         self.silent(n=1)
         self.assertEqual(self.s.pair_decision("o", "l")[0], "stop")
         self.silent(n=5, days=2, owner="o2")
@@ -561,8 +568,8 @@ class KnowledgeV2(unittest.TestCase):
         self.assertEqual(self.s.pair_decision("o", "l")[0], "stop")
 
     def test_pair_must_be_older_than_24h(self):
-        self.s.data["closes"] = 99
         self.silent()
+        self.s._pair("o", "l")["closes"] = 20
         self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
         self.c.t += DAY + 1
         self.assertEqual(self.s.pair_decision("o", "l")[0], "stop")
@@ -577,10 +584,80 @@ class KnowledgeV2(unittest.TestCase):
         self.c.t += 10 * 60
         self.assertTrue(self.s.regret("o", "l"))
         p = self.s.data["pairs"][self.s.pkey("o", "l")]
-        self.assertEqual(p["keep"], 3.0)
+        self.assertEqual(p["regret_keep"], 3.0)
         self.assertAlmostEqual(p["suspended_until"], self.c.t + 7 * DAY)
         self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
         self.assertFalse(self.s.regret("o", "l"))  # once per auto-stop
+
+    def test_stop_outcomes_wait_for_respawn_window_and_survive_restart(self):
+        from taema.core import signature as survivor_signature
+
+        observed = survivor_signature.signature("o", ["l"])
+        signature_id = self.s.ensure_signature("o", observed)["id"]
+        pair = self.s._pair("o", "l")
+        pair["sig"] = signature_id
+        self.s.auto_stopped("o", "l", signature_id, stop_id="stop-1")
+        self.s.save()
+        reopened = knowledge.Store(self.d, {}, now=self.c)
+
+        self.c.t += 59
+        reopened.expire_auto_stops()
+        self.assertEqual(reopened.data["pairs"][reopened.pkey("o", "l")]["stop_ok"], 0)
+        self.c.t += 1
+        reopened.expire_auto_stops()
+        reopened.expire_auto_stops()
+
+        pair = reopened.data["pairs"][reopened.pkey("o", "l")]
+        self.assertEqual(pair["stop_ok"], 1)
+        self.assertEqual(pair["self_stop"], 0.5)
+        self.assertEqual(reopened.db.signature(signature_id)["stop_ok"], 1)
+        self.assertEqual(reopened.db.signature(signature_id)["probation"], 1)
+
+    def test_respawn_and_regret_are_pair_and_signature_scoped(self):
+        from taema.core import signature as survivor_signature
+
+        observed = survivor_signature.signature("o", ["l"])
+        signature_id = self.s.ensure_signature("o", observed)["id"]
+        self.s._pair("o", "l")["sig"] = signature_id
+        self.s.auto_stopped("o", "l", signature_id, stop_id="stop-2")
+        self.c.t += 30
+
+        self.assertTrue(self.s.auto_stop_respawn("o", "l", signature_id))
+        self.assertTrue(self.s.regret("o", "l", signature_id))
+
+        pair = self.s.data["pairs"][self.s.pkey("o", "l")]
+        self.assertEqual(
+            (pair["respawn"], pair["keep"], pair["regret_keep"]), (1, 1, 3)
+        )
+        self.assertEqual(self.s.db.signature(signature_id)["respawn"], 1)
+        self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
+
+    def test_successful_stop_weight_is_confidence_unless_self_authority_is_enabled(
+        self,
+    ):
+        self.s._pair("o", "l").update(self_stop=1.5)
+        self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
+
+        aggressive = knowledge.Store(
+            tmp(),
+            {},
+            self.c,
+            mode="auto",
+            learn={"authority": "aggressive", "allow_self_authority": True},
+        )
+        aggressive._pair("o", "l").update(self_stop=1.5)
+        self.assertEqual(aggressive.pair_decision("o", "l")[0], "stop")
+
+    def test_own_stop_confidence_decays_but_regret_keep_does_not(self):
+        self.s.auto_stopped("o", "l")
+        self.assertTrue(self.s.auto_stop_success("o", "l"))
+        self.s.data["pairs"][self.s.pkey("o", "l")]["regret_keep"] = 3.0
+        self.c.t += 7 * DAY
+        self.s.decay()
+
+        pair = self.s.data["pairs"][self.s.pkey("o", "l")]
+        self.assertAlmostEqual(pair["self_stop"], 0.45)
+        self.assertEqual(pair["regret_keep"], 3.0)
 
     def test_can_ask_limits(self):
         pairs = [("o", "l%d" % i) for i in range(5)]
@@ -951,13 +1028,17 @@ class JobFlow(ProcCase):
         self.assertEqual(signal.call_count, 1, self.log())
         self.assertEqual([item["key"] for item in signal.call_args.args[1]], ["vite"])
         signature_id = question["signature"]["id"]
-        self.assertEqual(self.d.store.db.signature(signature_id)["stop_ok"], 1)
+        pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
+        self.assertEqual(pair["probation"], 1)
+        self.assertEqual(pair["pending_stop"]["signature_id"], signature_id)
+        self.assertEqual(pair["stop_ok"], 0)
+        self.assertEqual(self.d.store.db.signature(signature_id)["stop_ok"], 0)
 
-        self.fp.remove(30)
-        self.fp.add(40, 1, comm="vite", born=self.fp.up - 1.0)
-        self.d.lineage.observe(self.fp.table())
-        self.d.after_observe()
-        self.assertEqual(self.d.store.db.signature(signature_id)["respawn"], 1)
+        # No-respawn credit begins after the full follow-up window.
+        pair["pending_stop"]["ts"] -= self.d.store.respawn_window + 1
+        self.d.expire_respawns()
+        self.assertEqual(pair["stop_ok"], 1)
+        self.assertEqual(self.d.store.db.signature(signature_id)["stop_ok"], 1)
 
     def test_standalone_and_owner_choice(self):
         self.job()

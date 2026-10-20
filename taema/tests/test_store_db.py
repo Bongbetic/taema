@@ -48,7 +48,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 5
+                    connection.execute("PRAGMA user_version").fetchone()[0], 6
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -118,7 +118,7 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 5
+                    connection.execute("PRAGMA user_version").fetchone()[0], 6
                 )
                 self.assertTrue(
                     connection.execute(
@@ -160,7 +160,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     "SELECT id, owner, runtime_hash, veto FROM signatures"
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 5
+                    connection.execute("PRAGMA user_version").fetchone()[0], 6
                 )
 
             self.assertEqual(

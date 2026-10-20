@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from taema.cli import commands
+from taema.config import policy
 from taema.governor import engine
 from taema.store import db as store_db
 from taema.store import knowledge
@@ -138,8 +139,6 @@ class LegacyMigrationTests(unittest.TestCase):
             key: knowledge.decide(
                 record,
                 self.now,
-                self.document["created"],
-                self.document["closes"],
             )[0]
             for key, record in self.document["pairs"].items()
             if not key.startswith("MainThread\0")
@@ -500,7 +499,7 @@ Store(sys.argv[1], {})
             action = (
                 "standalone"
                 if leftover in source.get("standalone", {})
-                else knowledge.decide(pair, now, source["created"], source["closes"])[0]
+                else knowledge.decide(pair, now)[0]
             )
             expected[(owner, leftover)] = action
         state_dir = Path(self.temporary.name) / "fixture-import"
@@ -514,6 +513,20 @@ Store(sys.argv[1], {})
         migrated = Store(str(state_dir), {}, now=lambda: now)
         for (owner, leftover), action in expected.items():
             self.assertEqual(migrated.pair_decision(owner, leftover)[0], action)
+        active_owners = [
+            owner
+            for pair_key, pair in migrated.data["pairs"].items()
+            if pair.get("source") != "legacy-invalid"
+            for owner, _separator, _leftover in (pair_key.partition("\0"),)
+        ]
+        self.assertFalse(any(policy.bad_owner(owner) for owner in active_owners))
+        self.assertTrue(
+            all(
+                row["why"]
+                for row in migrated.pairs_summary()
+                if row["action"] == "stop"
+            )
+        )
         with StateDB(migrated.path, read_only=True).connection() as connection:
             event_count = connection.execute("SELECT count(*) FROM events").fetchone()[
                 0

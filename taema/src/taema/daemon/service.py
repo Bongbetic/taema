@@ -65,6 +65,7 @@ class Daemon:
             cfg.get("seeds"),
             deny=self.deny,
             mode=cfg.get("mode", "observe"),
+            learn=cfg.get("learn"),
         )
         self.store.apply_feedback()
         self.restore_runtime_hold()
@@ -111,12 +112,10 @@ class Daemon:
         self.next_kid = 1
         self.gone = []  # [(ts, vanished record)] from recent observes
         self.stopped = {}  # key -> ts of the last stop (respawn tracking)
-        self.stopped_signatures = {}  # key -> signature used for the last auto stop
         self.auto_scopes = set()  # app-* scopes created by auto adoption (status)
         self.auto_stops = collections.deque(
             maxlen=5
         )  # last auto stops, newest last (status)
-        self.auto_recent = {}  # leftover key -> (owner key, ts) of an auto stop, for regret
         self.started = time.time()
         self.stopping = False
         self.toggle_hold_requested = False
@@ -491,7 +490,6 @@ class Daemon:
         while len(self.stopped) > 256:
             oldest = min(self.stopped, key=self.stopped.get)
             del self.stopped[oldest]
-            self.stopped_signatures.pop(oldest, None)
 
     def expire_respawns(self):
         """A stopped key that did not reappear within timers.respawn_window was a good stop."""
@@ -499,8 +497,12 @@ class Daemon:
         now = time.time()
         for k in [k for k, t in self.stopped.items() if now - t > w]:
             del self.stopped[k]
-            self.stopped_signatures.pop(k, None)
             self.store.gc_outcome(k, False)
+        self.store.expire_auto_stops(
+            now,
+            respawn_window=self.store.respawn_window,
+            revive_window=self.store.revive_window,
+        )
 
     def after_observe(self):
         lin, now = self.lineage, time.time()
@@ -522,11 +524,7 @@ class Daemon:
             ):  # a shell re-run is neither a respawn nor evidence about the stop
                 self.store.respawn(e["key"], False)
                 self.store.gc_outcome(e["key"], True)
-                signature_id = self.stopped_signatures.get(e["key"])
-                if signature_id:
-                    self.store.signature_outcome(signature_id, "respawn")
             del self.stopped[e["key"]]
-            self.stopped_signatures.pop(e["key"], None)
         self.check_regret(lin, now)
         for rid in lin.closed:
             owner = lin.ghosts.get(rid, {}).get("key")
@@ -635,32 +633,83 @@ class Daemon:
 
     # ---- auto mode: silent GUI closes, survivors of closed jobs, regret ----
     def check_regret(self, lin, now):
-        """The same leftover key reappearing within 30 min of an auto stop, under any owner, undoes it."""
-        for k in [
-            k
-            for k, (_o, t) in self.auto_recent.items()
-            if now - t > knowledge.REGRET_WINDOW
-        ]:
-            del self.auto_recent[k]
+        """Attribute respawn and regret to the recorded owner/member relationship."""
         for eid in lin.born:
             e = lin.entries.get(eid)
-            hit = self.auto_recent.get(e["key"]) if e else None
-            if hit and self.store.regret(hit[0], e["key"]):
-                self.store.log(event="regret", owner=hit[0], leftover=e["key"])
-                del self.auto_recent[e["key"]]
+            if not e:
+                continue
+            owner, leftover = e.get("root_key"), e.get("key")
+            if not isinstance(owner, str) or not isinstance(leftover, str):
+                continue
+            for stopped_owner, stopped_key, pending in self.store.pending_auto_stops():
+                if stopped_owner != owner or stopped_key != leftover:
+                    continue
+                timestamp = pending.get("ts")
+                if not isinstance(timestamp, (int, float)) or isinstance(
+                    timestamp, bool
+                ):
+                    continue
+                age = now - timestamp
+                if age < 0 or age > self.store.regret_window:
+                    continue
+                signature_id = pending.get("signature_id")
+                if signature_id:
+                    root = e.get("root")
+                    members = [
+                        {
+                            "pid": member["pid"],
+                            "start": member.get("start"),
+                            "key": member["key"],
+                        }
+                        for member in lin.entries.values()
+                        if member.get("root") == root
+                        and member.get("root_key") == owner
+                        and member.get("key") != owner
+                    ]
+                    observed = self.survivor_signature(owner, members)
+                    matched = self.store.match_signature(observed)
+                    if not matched or matched.get("id") != signature_id:
+                        continue
+                if age <= self.store.respawn_window:
+                    self.store.auto_stop_respawn(owner, leftover, signature_id)
+                if self.store.regret(
+                    owner,
+                    leftover,
+                    signature_id,
+                    window=self.store.regret_window,
+                    suspend=self.store.regret_suspend,
+                ):
+                    self.store.log(
+                        event="regret",
+                        owner=owner,
+                        leftover=leftover,
+                        signature=signature_id,
+                    )
 
     def note_auto_stop(
         self, scope, why, pairs, apps=(), decision=None, owner=None, signature_id=None
     ):
         """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
+        stop_id = (decision or {}).get("id")
+        seen_signatures = set()
         for o, k in pairs:
-            self.store.auto_stopped(o, k)
-            self.auto_recent[k] = (o, now)
-        if signature_id:
-            for key in apps:
-                self.stopped[key] = now
-                self.stopped_signatures[key] = signature_id
+            pair = self.store.data.get("pairs", {}).get(self.store.pkey(o, k), {})
+            pair_signature = signature_id or pair.get("sig")
+            count_signature = bool(
+                pair_signature and pair_signature not in seen_signatures
+            )
+            if pair_signature:
+                seen_signatures.add(pair_signature)
+            self.store.auto_stopped(
+                o,
+                k,
+                signature_id=pair_signature,
+                stop_id=stop_id,
+                count_signature_probation=count_signature,
+            )
+        for key in apps:
+            self.stopped[key] = now
         self.store.record_auto_action(
             scope,
             why,
@@ -671,10 +720,6 @@ class Daemon:
             authority=(decision or {}).get("authority", "mode"),
         )
         self._save_if_idle()
-        while len(self.auto_recent) > 256:
-            del self.auto_recent[
-                min(self.auto_recent, key=lambda k: self.auto_recent[k][1])
-            ]
         self.auto_stops.append(
             {
                 "ts": int(now),
@@ -828,10 +873,15 @@ class Daemon:
 
         good_items = [item for item, _decision in good]
         explicit = all(self.store.explicit_stop(decision) for _, decision in good)
-        why = "closed app %s: %s" % (owner, good[0][1][2])
         matched_signature = self.store.match_signature(
             signature or self.survivor_signature(owner, good_items)
         )
+        signature_id = (matched_signature or {}).get("id")
+        probationary = any(
+            self.store.stop_in_probation(owner, item["key"]) for item in good_items
+        ) or self.store.signature_in_probation(signature_id)
+        allow_sigkill = explicit and not probationary
+        why = "closed app %s: %s" % (owner, good[0][1][2])
         with self.store.decision_context(
             "stop",
             scope=scope,
@@ -844,7 +894,7 @@ class Daemon:
                 self.cfg,
                 good_items,
                 engine.auto_grace(self.store, {item["key"] for item in good_items}),
-                explicit,
+                allow_sigkill,
             )
             sent_items = [item for item in good_items if item["pid"] in sent]
             if sent_items:
@@ -865,7 +915,7 @@ class Daemon:
                     apps=[item["key"] for item in sent_items],
                     decision=audit_decision,
                     owner=owner,
-                    signature_id=(matched_signature or {}).get("id"),
+                    signature_id=signature_id,
                 )
         return {item["pid"] for item in sent_items}
 
@@ -1074,8 +1124,13 @@ class Daemon:
                     )
                 return False
         pairs = [(i["origin"], i["key"]) for i in infos if i["origin"]]
-        explicit = require_pair and all(
-            self.store.pair_explicit(o, k) for o, k in pairs
+        explicit = (
+            require_pair
+            and bool(pairs)
+            and all(self.store.pair_explicit(o, k) for o, k in pairs)
+        )
+        probationary = require_pair and any(
+            self.store.stop_in_probation(o, k) for o, k in pairs
         )
         grace = engine.auto_grace(self.store, {i["key"] for i in infos})
         unit = engine.unit_for_leaf(self.units, os.path.basename(path))
@@ -1095,7 +1150,7 @@ class Daemon:
                     unit,
                     hook=policy.hook_for(self.cfg, os.path.basename(path)),
                     timeout=grace,
-                    allow_sigkill=explicit,
+                    allow_sigkill=explicit and not probationary,
                     decision_authority=decision["authority"],
                     decision_why=why,
                     decision_owner=decision["owner"],
@@ -1104,11 +1159,17 @@ class Daemon:
                 self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
                 return False
             self.note_stop(rep)
+            unkilled = set(rep.get("unkilled", []))
+            stopped_apps = {
+                item["key"]
+                for item in rep.get("decisions", [])
+                if item.get("action") == "kill" and item.get("pid") not in unkilled
+            }
             self.note_auto_stop(
                 leaf,
                 why,
-                list(dict.fromkeys(pairs)),
-                apps=[d["key"] for d in rep["decisions"] if d.get("action") == "kill"],
+                [pair for pair in dict.fromkeys(pairs) if pair[1] in stopped_apps],
+                apps=sorted(stopped_apps),
                 decision=decision,
                 owner=decision["owner"],
             )
@@ -1181,10 +1242,14 @@ class Daemon:
         if not good:
             return
         pairs = list(dict.fromkeys((owner, l["key"]) for l in good))
-        explicit = all(
+        explicit = bool(pairs) and all(
             self.store.explicit_stop(dec.get(k)) or self.store.pair_explicit(o, k)
             for o, k in pairs
         )
+        probationary = any(
+            self.store.stop_in_probation(o, k) for o, k in pairs
+        ) or self.store.signature_in_probation(signature_id)
+        allow_sigkill = explicit and not probationary
         grace = engine.auto_grace(self.store, {k for _o, k in pairs})
         me = "/user/%d/" % os.getuid()
         slug = tag.replace(".", "-")
@@ -1236,7 +1301,7 @@ class Daemon:
                             self.store,
                             None,
                             timeout=grace,
-                            allow_sigkill=explicit,
+                            allow_sigkill=allow_sigkill,
                             decision_kind="stop",
                             decision_authority="pair",
                             decision_why=why,
@@ -1248,7 +1313,7 @@ class Daemon:
                         event="auto_stop_refused", scope=cgroup.rel(dest), why=str(e)
                     )
             if loose:
-                engine.signal_survivors(self.cfg, loose, grace, explicit)
+                engine.signal_survivors(self.cfg, loose, grace, allow_sigkill)
                 self.store.log(
                     event="stop", scope="job-" + slug, pids=[l["pid"] for l in loose]
                 )
@@ -2797,6 +2862,7 @@ class Daemon:
                     cfg.get("seeds"),
                     deny=policy.owner_deny(cfg),
                     mode=cfg.get("mode", "observe"),
+                    learn=cfg.get("learn"),
                 )
                 new_store._event_seq = max(new_store._event_seq, old_store._event_seq)
                 new_store.add_event_listener(self._publish_event)
@@ -2841,6 +2907,7 @@ class Daemon:
         self.store.deny = tuple(self.deny)
         self.store.db.deny = tuple(self.deny)
         self.store.mode = cfg.get("mode", "observe")
+        self.store.configure_learning(cfg.get("learn"), self.store.mode)
         self.lineage.cfg = cfg
         self.lineage.units = tuple(units)
         self.lineage.identity_sink = self.store.record_identities

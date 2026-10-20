@@ -45,7 +45,7 @@ class Authority(unittest.TestCase):
         for d in range(4):
             for _ in range(2):
                 s.observe_kill_inferred("npm", "vite", day=d)
-        s.data["pairs"][s.pkey("npm", "vite")]["first_seen"] = t[0] - 2 * DAY
+        s.data["pairs"][s.pkey("npm", "vite")]["first_seen"] = t[0] - age_days * DAY
         return s
 
     def test_explicit_stop_acts(self):
@@ -383,7 +383,13 @@ class AutoCase(ProcCase):
         )
         self.fp.add(20, 1, comm="bash", sid=20, tty=34816, born=1000.0)
         stop = mock.patch.object(
-            engine, "stop", return_value={"removed": True, "decisions": [], "left": []}
+            engine,
+            "stop",
+            return_value={
+                "removed": True,
+                "decisions": [{"action": "kill", "key": "vite", "pid": 30}],
+                "left": [],
+            },
         )
         self.stopm = stop.start()
         self.addCleanup(stop.stop)
@@ -439,13 +445,13 @@ class JobSurvivors(AutoCase):
     def refusals(self):
         return [e["why"] for e in self.log() if e["event"] == "auto_stop_refused"]
 
-    def test_explicit_stop_carves_and_stops_with_sigkill(self):
+    def test_explicit_stop_carves_and_stops_gracefully_during_probation(self):
         self.d.store.answer("npm", "vite", "stop")
         self.job()
         self.stopm.assert_called_once()
         path, kw = self.stopm.call_args[0][0], self.stopm.call_args[1]
         self.assertTrue(path.endswith("/app-host/job-20-1"), path)
-        self.assertTrue(kw["allow_sigkill"])
+        self.assertFalse(kw["allow_sigkill"])  # first automatic stop is probationary
         self.assertTrue(5 <= kw["timeout"] <= 30)
         with open(path + "/cgroup.procs") as f:
             self.assertEqual(f.read().split(), ["30"])  # carved, no sudo
@@ -458,7 +464,9 @@ class JobSurvivors(AutoCase):
         st = self.d.handle({"cmd": "status"})["auto"]
         self.assertEqual(len(st["auto_stops"]), 1)
         self.assertIn("answered stop", st["auto_stops"][0]["why"])
-        self.assertEqual(self.d.auto_recent["vite"][0], "npm")
+        pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
+        self.assertEqual(pair["probation"], 1)
+        self.assertEqual(len(self.d.store.pending_auto_stops()), 1)
 
     def test_adopt_stops_an_explicitly_answered_pair_on_job_close(self):
         self.d.cfg["mode"] = "adopt"
@@ -467,7 +475,7 @@ class JobSurvivors(AutoCase):
         self.job()
 
         self.stopm.assert_called_once()
-        self.assertTrue(self.stopm.call_args.kwargs["allow_sigkill"])
+        self.assertFalse(self.stopm.call_args.kwargs["allow_sigkill"])
         self.assertEqual(self.stopm.call_args.kwargs["decision_authority"], "pair")
 
     def test_adopt_answered_default_does_not_stop_a_learned_pair_on_close(self):
@@ -478,7 +486,7 @@ class JobSurvivors(AutoCase):
             for _ in range(2):
                 store.observe_kill_inferred("npm", "vite", day=day)
         store.data["pairs"][store.pkey("npm", "vite")]["first_seen"] -= (
-            5 * knowledge.DAY
+            8 * knowledge.DAY
         )
 
         self.job()
@@ -492,7 +500,7 @@ class JobSurvivors(AutoCase):
         for day in range(4):
             for _ in range(2):
                 s.observe_kill_inferred("npm", "vite", day=day)
-        s.data["pairs"][s.pkey("npm", "vite")]["first_seen"] -= 5 * DAY
+        s.data["pairs"][s.pkey("npm", "vite")]["first_seen"] -= 8 * DAY
         self.job()
         self.stopm.assert_called_once()
         self.assertFalse(self.stopm.call_args[1]["allow_sigkill"])
@@ -533,7 +541,7 @@ class JobSurvivors(AutoCase):
             self.job()
         self.stopm.assert_not_called()
         self.assertEqual([i["pid"] for i in sig.call_args[0][1]], [30])
-        self.assertTrue(sig.call_args[0][3])  # explicit: SIGKILL allowed
+        self.assertFalse(sig.call_args[0][3])  # explicit but still in probation
 
     def test_standalone_adopted_never_stopped(self):
         self.d.store.answer("npm", "vite", "standalone")
@@ -545,25 +553,44 @@ class JobSurvivors(AutoCase):
         self.assertRegex(hm.call_args[0][1], r"^app-vite-[0-9a-f]{6}$")
         self.assertEqual(len(self.d.auto_scopes), 1)
 
-    def test_regret_when_key_comes_back_under_any_owner(self):
+    def test_reappearance_under_an_unrelated_owner_does_not_regret_pair(self):
         self.d.store.answer("npm", "vite", "stop")
         self.job()
         self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "stop")
         self.fp.remove(30)
         self.d.lineage.observe(self.fp.table())
-        self.fp.add(60, 1, comm="vite", born=self.fp.up - 1)  # same key, another owner
+        self.fp.add(60, 1, comm="vite", born=self.fp.up - 1)
         self.d.lineage.observe(self.fp.table())
         self.d.after_observe()
-        self.assertEqual(
-            self.d.store.pair_decision("npm", "vite")[0], "ask"
-        )  # suspended 7 days
-        self.assertNotIn("vite", self.d.auto_recent)
+        self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "stop")
+        self.assertEqual([e["event"] for e in self.log()].count("regret"), 0)
+
+    def test_reappearance_under_the_same_owner_records_respawn_and_regret(self):
+        self.d.store.answer("npm", "vite", "stop")
+        self.job()
+        self.fp.remove(30)
+        self.d.lineage.observe(self.fp.table())
+        self.fp.add(60, 20, comm="npm", born=self.fp.up - 1)
+        self.fp.add(61, 60, comm="vite", born=self.fp.up - 1)
+        self.d.lineage.observe(self.fp.table())
+
+        self.d.after_observe()
+
+        pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
+        self.assertEqual(pair["respawn"], 1)
+        self.assertEqual(pair["keep"], 1.0)
+        self.assertEqual(pair["regret_keep"], 3.0)
+        self.assertGreater(pair["suspended_until"], time.time())
+        self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "ask")
         self.assertEqual([e["event"] for e in self.log()].count("regret"), 1)
 
     def test_regret_window_expires(self):
         self.d.store.answer("npm", "vite", "stop")
         self.d.note_auto_stop("s", "w", [("npm", "vite")])
-        self.d.auto_recent["vite"] = ("npm", time.time() - knowledge.REGRET_WINDOW - 5)
+        pending = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")][
+            "pending_stop"
+        ]
+        pending["ts"] = time.time() - knowledge.REGRET_WINDOW - 5
         self.fp.add(60, 1, comm="vite", born=self.fp.up - 1)
         self.d.lineage.observe(self.fp.table())
         self.d.check_regret(self.d.lineage, time.time())
@@ -618,7 +645,9 @@ class GuiClose(AutoCase):
             self.d.after_observe()
 
         stop.assert_called_once()
-        self.assertTrue(stop.call_args.args[3])
+        self.assertFalse(
+            stop.call_args.args[3]
+        )  # explicit answers still pass probation gracefully
         self.assertEqual(self.d.store.open_reviews(), [])
         self.assertFalse(os.path.exists(self.cg.base + "/leftover/firefox-200"))
 
@@ -637,7 +666,9 @@ class GuiClose(AutoCase):
             self.d.after_observe()
 
         stop.assert_called_once()
-        self.assertTrue(stop.call_args.args[3])
+        self.assertFalse(
+            stop.call_args.args[3]
+        )  # new signatures begin in graceful-only probation
         self.assertEqual(self.d.store.pair_decision("firefox", "helper")[0], "ask")
         self.assertEqual(self.d.store.open_reviews(), [])
 
@@ -960,13 +991,13 @@ class LeftoverGc(AutoCase):
         got = self.cands(auto=False)
         self.assertEqual([(os.path.basename(p), w) for p, w in got], [("y", "empty")])
 
-    def test_gc_pass_stops_by_pair_with_sigkill_only_if_explicit(self):
+    def test_gc_pass_stays_graceful_during_pair_probation(self):
         self.leaf()
         self.d.store.answer("foo", "vite", "stop")
         res = self.d.gc_pass()
         self.assertEqual(res[0][2], "stop")
         self.stopm.assert_called_once()
-        self.assertTrue(self.stopm.call_args[1]["allow_sigkill"])
+        self.assertFalse(self.stopm.call_args[1]["allow_sigkill"])
         self.assertEqual(len(self.d.auto_stops), 1)
         self.assertFalse(self.d.may_kill())
 
@@ -979,8 +1010,17 @@ class LeftoverGc(AutoCase):
 
         self.assertEqual(result[0][2], "stop")
         self.stopm.assert_called_once()
-        self.assertTrue(self.stopm.call_args.kwargs["allow_sigkill"])
+        self.assertFalse(self.stopm.call_args.kwargs["allow_sigkill"])
         self.assertEqual(self.stopm.call_args.kwargs["decision_authority"], "pair")
+
+    def test_gc_can_sigkill_after_pair_probation(self):
+        self.leaf()
+        self.d.store.answer("foo", "vite", "stop")
+        self.d.store._pair("foo", "vite")["probation"] = 3
+
+        self.d.gc_pass()
+
+        self.assertTrue(self.stopm.call_args.kwargs["allow_sigkill"])
 
     def test_adopt_answered_authority_refuses_a_learned_stop(self):
         self.d.cfg["mode"] = "adopt"
@@ -992,6 +1032,8 @@ class LeftoverGc(AutoCase):
             {
                 "stop": 5.0,
                 "kills": 5,
+                "inferred_kills": 5.0,
+                "closes": 20,
                 "days": [int(now // knowledge.DAY) - day for day in (2, 1, 0)],
                 "first_seen": now - 2 * knowledge.DAY,
             }
@@ -1013,6 +1055,8 @@ class LeftoverGc(AutoCase):
             {
                 "stop": 5.0,
                 "kills": 5,
+                "inferred_kills": 5.0,
+                "closes": 20,
                 "days": [int(now // knowledge.DAY) - day for day in (2, 1, 0)],
                 "first_seen": now - 2 * knowledge.DAY,
             }

@@ -8,6 +8,7 @@ replaces all file layers (used by tests and isolated runs).
 
 import copy
 import fnmatch
+import math
 import os
 import re
 import tomllib
@@ -313,6 +314,42 @@ def _validate_config(cfg, sources):
         raise ValueError(
             "%s:1:1: learn.allow_self_authority must be a boolean" % source
         )
+    for name in ("silent_kills", "silent_days", "burn_in_closes", "probation_stops"):
+        value = learn.get(name, _DEFAULTS["learn"][name])
+        source = sources.get("learn." + name, learn_source)
+        if type(value) is not int or value < (0 if name == "probation_stops" else 1):
+            raise ValueError(
+                "%s:1:1: learn.%s must be a non-negative integer" % (source, name)
+            )
+    ratio = learn.get("silent_ratio", _DEFAULTS["learn"]["silent_ratio"])
+    ratio_source = sources.get("learn.silent_ratio", learn_source)
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(ratio)
+        or not 0 <= ratio <= 1
+    ):
+        raise ValueError(
+            "%s:1:1: learn.silent_ratio must be between 0 and 1" % ratio_source
+        )
+    for name in (
+        "burn_in_days",
+        "respawn_window",
+        "revive_window",
+        "regret_window",
+        "regret_suspend_days",
+    ):
+        value = learn.get(name, _DEFAULTS["learn"][name])
+        source = sources.get("learn." + name, learn_source)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                "%s:1:1: learn.%s must be a non-negative number" % (source, name)
+            )
     protected = cfg.get("protected")
     if not isinstance(protected, dict):
         source = sources.get("protected", "built-in defaults")

@@ -67,6 +67,7 @@ def _load(args=None):
         read_only=True,
         deny=policy.owner_deny(cfg),
         mode=cfg.get("mode", "observe"),
+        learn=cfg.get("learn"),
     )
     return cfg, store, policy.load_units(cfg)
 
@@ -85,6 +86,7 @@ def _load_events(args=None):
         read_only=True,
         deny=policy.owner_deny(cfg),
         mode=cfg.get("mode", "observe"),
+        learn=cfg.get("learn"),
     )
     return cfg, store
 
@@ -126,6 +128,7 @@ def _status_store(cfg, pending_only=False):
         read_only=True,
         deny=policy.owner_deny(cfg),
         mode=cfg.get("mode", "observe"),
+        learn=cfg.get("learn"),
     )
 
 
@@ -1758,6 +1761,7 @@ def cmd_doctor(a):
                     read_only=True,
                     deny=policy.owner_deny(cfg),
                     mode=cfg.get("mode", "observe"),
+                    learn=cfg.get("learn"),
                 )
             except Exception as error:
                 store_error = error

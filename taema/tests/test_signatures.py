@@ -155,6 +155,7 @@ class SurvivorSignatureTests(unittest.TestCase):
                         "closes": 1,
                         "stop_ok": 1,
                         "respawn": 1,
+                        "probation": 0,
                         "veto": 1,
                     }
                 ],

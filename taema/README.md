@@ -106,11 +106,10 @@ terminal multiplexer server may be shared with programs that are still running.
     users for an idle grace period.
   - *Session end:* when your last login session ends, scopes are stopped, except units
     marked `survive_logout`.
-- **Learning.** tæma keeps per-executable counters: how often a program turned out to be
-  shared, how long it takes to exit after SIGTERM, and whether it came back after a stop.
-  It uses them to choose default actions, graceful timeouts and idle grace periods. The
-  data is plain JSON. Every decision is written to an audit log, and `taema explain` shows
-  the reasoning.
+- **Learning.** tæma keeps bounded learning, review, and decision history in SQLite, plus
+  an audit log: how often a program turned out to be shared, how long it takes to exit after
+  SIGTERM, and whether it came back after a stop. It uses this evidence to choose default
+  actions, graceful timeouts and idle grace periods. `taema explain` shows the reasoning.
 - **Safe by construction.** The daemon runs as your user. The only privileged step,
   moving your own processes out of the login-session cgroup, is a small root helper that
   validates every request. Session infrastructure (compositor, audio, D-Bus, portals,

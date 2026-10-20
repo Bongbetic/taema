@@ -290,7 +290,7 @@ A release needs no manual work. Bump `__version__` in `taema/src/taema/__init__.
 then push a tag named `taema-vX.Y.Z`:
 
 ```sh
-git tag taema-v0.3.0 && git push origin taema-v0.3.0
+git tag taema-v0.4.0 && git push origin taema-v0.4.0
 ```
 
 The `release` workflow runs the tests, builds the `.xbps`, signs an XBPS repository, and

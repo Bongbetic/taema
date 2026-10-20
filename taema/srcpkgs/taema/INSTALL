@@ -50,6 +50,16 @@ post)
                     >> "${ROOTDIR}/etc/zsh/zshrc" 2>/dev/null || true
             fi
         fi
+    elif [ "${UPDATE}" = yes ]; then
+        # Load the upgraded daemon and run storage migrations promptly. Restarting the
+        # manager leaves the user's application scopes and processes in their cgroups.
+        case "${ROOTDIR}" in
+        ""|/)
+            if command -v sv >/dev/null 2>&1; then
+                sv restart taema >/dev/null 2>&1 || true
+            fi
+            ;;
+        esac
     fi
     ;;
 esac

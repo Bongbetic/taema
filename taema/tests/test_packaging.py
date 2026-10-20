@@ -52,6 +52,26 @@ class SyntaxTest(unittest.TestCase):
         self.assertIn('TAEMA_HOLD="${TAEMA_HOLD:-0}"', user_run)
 
 
+class InstalledDocumentationTest(unittest.TestCase):
+    def test_install_publishes_learning_manual_and_state_docs(self):
+        with tempfile.TemporaryDirectory() as staged:
+            result = subprocess.run(
+                ["make", "DESTDIR=" + staged, "install"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path in (
+                "usr/share/man/man7/taema-learning.7",
+                "usr/share/doc/taema/state-schema.md",
+                "usr/share/doc/taema/legacy-state-migration.md",
+            ):
+                with self.subTest(path=path):
+                    self.assertTrue(os.path.isfile(os.path.join(staged, path)), path)
+
+
 class ScriptTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -78,10 +98,10 @@ class ScriptTest(unittest.TestCase):
         self.write(path, "#!/bin/sh\n" + body)
         os.chmod(path, 0o755)
 
-    def run_script(self, script, action, update):
+    def run_script(self, script, action, update, root=None):
         env = {
             "PATH": self.stubs + ":/usr/bin:/bin",
-            "ROOTDIR": self.root,
+            "ROOTDIR": self.root if root is None else root,
             "STUBLOG": self.log,
             "LC_ALL": "C",
         }
@@ -160,6 +180,10 @@ class InstallTest(ScriptTest):
         self.assertEqual(self.calls(), [])
         self.assertFalse(os.path.lexists(self.link))
         self.assertFalse(os.path.exists(self.zshrc))
+
+    def test_live_update_restarts_daemon_after_install(self):
+        self.run_script(INSTALL, "post", "yes", root="/")
+        self.assertEqual(self.calls(), ["sv restart taema"])
 
 
 class RemoveTest(ScriptTest):

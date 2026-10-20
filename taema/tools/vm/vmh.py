@@ -25,6 +25,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -35,12 +36,19 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 has no tomllib
 
 VM_DIR = os.path.dirname(os.path.abspath(__file__))
 TAEMA_ROOT = os.path.dirname(os.path.dirname(VM_DIR))
+REPO_ROOT = os.path.dirname(TAEMA_ROOT)
 CONFIG_PATH = os.path.join(VM_DIR, "config.toml")
 BUILD_XBPS = os.path.join(TAEMA_ROOT, "tools", "build-xbps.sh")
+MIGRATION_FIXTURE = os.path.join(
+    TAEMA_ROOT, "tests", "fixtures", "upgrade-v3", "knowledge.json"
+)
+LEARNING_REPLAY_FIXTURE = os.path.join(
+    TAEMA_ROOT, "tests", "fixtures", "learning-v3", "replay.json"
+)
 GUEST_TMP = "/tmp/taema-vm"
 
 LIBCS = ("glibc", "musl")
-SCENARIOS = ("smoke", "m0", "upgrade", "remove")
+SCENARIOS = ("smoke", "m0", "m1", "m2", "upgrade", "remove")
 ACCELS = ("auto", "kvm", "tcg")
 IMAGE_KEYS = ("dir", "tarball", "rootfs", "base", "kernel", "initrd")
 
@@ -129,6 +137,13 @@ def _validate(raw, path="<config>"):
         url = images.get(key)
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             raise HarnessError("%s: images.%s must be an http(s) url" % (path, key))
+    previous_ref = images.get("previous_ref")
+    if previous_ref is not None and (
+        not isinstance(previous_ref, str)
+        or not re.fullmatch(r"[A-Za-z0-9._/-]+", previous_ref)
+        or previous_ref.startswith("-")
+    ):
+        raise HarnessError("%s: images.previous_ref must be a safe ref name" % path)
     for libc in libcs:
         entry = images.get(libc)
         if not isinstance(entry, dict):
@@ -248,6 +263,61 @@ def previous_version(cfg):
             "cannot derive previous version from %s" % cfg["images"]["previous_url"]
         )
     return m.group(1)
+
+
+def needs_previous_package(scenarios):
+    """Whether selected VM scenarios install the prior release."""
+    return any(name in scenarios for name in ("m1", "upgrade"))
+
+
+def bootstrap_sources(pub, package_repo, previous, scenarios):
+    """Files copied to a guest before provisioning and scenario execution."""
+    sources = [
+        os.path.join(VM_DIR, "provision.sh"),
+        os.path.join(VM_DIR, "scenario.py"),
+        pub,
+        package_repo,
+    ]
+    if needs_previous_package(scenarios):
+        sources.append(previous)
+    if "m1" in scenarios:
+        sources.append(MIGRATION_FIXTURE)
+    if "m2" in scenarios:
+        sources.append(LEARNING_REPLAY_FIXTURE)
+    return sources
+
+
+def scenario_command(name, cfg, repo_name, previous):
+    """Build the guest command and inputs for one selected scenario."""
+    remote = "python3 %s/scenario.py %s --artifacts %s/artifacts" % (
+        GUEST_TMP,
+        name,
+        GUEST_TMP,
+    )
+    if name in ("upgrade", "m1"):
+        remote += (
+            " --package-dir %s/%s --previous %s/%s"
+            " --previous-version %s --current-version %s"
+            % (
+                GUEST_TMP,
+                repo_name,
+                GUEST_TMP,
+                os.path.basename(previous),
+                previous_version(cfg),
+                read_version(),
+            )
+        )
+    if name == "m1":
+        remote += " --migration-fixture %s/%s" % (
+            GUEST_TMP,
+            os.path.basename(MIGRATION_FIXTURE),
+        )
+    elif name == "m2":
+        remote += " --replay-fixture %s/%s" % (
+            GUEST_TMP,
+            os.path.basename(LEARNING_REPLAY_FIXTURE),
+        )
+    return remote
 
 
 # ---- prerequisites and acceleration ---------------------------------------
@@ -442,17 +512,14 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     pkg = package_path(cfg)
     prev = previous_pkg_path(cfg)
     network_urls = [image_spec(cfg, c)["url"] for c in libcs]
-    if "upgrade" in scenarios:
+    if (
+        needs_previous_package(scenarios)
+        and not os.path.isfile(prev)
+        and not previous_source_available(cfg)
+    ):
         network_urls.append(cfg["images"]["previous_url"])
 
-    sources = [
-        os.path.join(VM_DIR, "provision.sh"),
-        os.path.join(VM_DIR, "scenario.py"),
-        pub,
-        package_repo_dir(cfg),
-    ]
-    if "upgrade" in scenarios:
-        sources.append(prev)
+    sources = bootstrap_sources(pub, package_repo_dir(cfg), prev, scenarios)
 
     vms = []
     for libc in libcs:
@@ -470,7 +537,7 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
                     key,
                     known,
                     vmadmin,
-                    "mkdir -p %s/previous-repo" % GUEST_TMP,
+                    "mkdir -p %s" % GUEST_TMP,
                 ),
             },
             {
@@ -506,24 +573,7 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
             },
         ]
         for s in scenarios:
-            remote = "python3 %s/scenario.py %s --artifacts %s/artifacts" % (
-                GUEST_TMP,
-                s,
-                GUEST_TMP,
-            )
-            if s == "upgrade":
-                remote += (
-                    " --package-dir %s/%s --previous %s/previous-repo/%s"
-                    " --previous-version %s --current-version %s"
-                    % (
-                        GUEST_TMP,
-                        repo_name,
-                        GUEST_TMP,
-                        os.path.basename(prev),
-                        previous_version(cfg),
-                        read_version(),
-                    )
-                )
+            remote = scenario_command(s, cfg, repo_name, prev)
             steps.append(
                 {
                     "name": "scenario:" + s,
@@ -628,14 +678,104 @@ def fetch_image(cfg, libc, allow_network=False):
     return cp["tarball"]
 
 
-def fetch_previous(cfg, allow_network=False):
-    if not allow_network:
-        raise HarnessError(
-            "previous release package is not cached; re-run with --allow-network"
+def previous_source_available(cfg):
+    """Whether the configured previous release source ref exists locally."""
+    ref = cfg["images"].get("previous_ref")
+    if not ref:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                cfg["tools"].get("git", "git"),
+                "rev-parse",
+                "--verify",
+                ref + "^{commit}",
+            ],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
         )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def build_previous_package(cfg, dest=None):
+    """Build the previous package from a checked-out source tag into the cache."""
+    ref = cfg["images"].get("previous_ref")
+    if not ref or not previous_source_available(cfg):
+        raise HarnessError("previous source ref is not available locally")
+    dest = dest or previous_pkg_path(cfg)
+    os.makedirs(state_dir(cfg), exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="taema-previous-", dir=state_dir(cfg)
+    ) as temporary:
+        archive = os.path.join(temporary, "source.tar")
+        git = cfg["tools"].get("git", "git")
+        exported = subprocess.run(
+            [git, "archive", "--format=tar", "--output", archive, "--", ref],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if exported.returncode:
+            raise HarnessError(
+                "cannot archive previous source %s: %s"
+                % (ref, (exported.stderr or exported.stdout).strip()[-1000:])
+            )
+        extracted = subprocess.run(
+            [cfg["tools"]["tar"], "-xf", archive, "-C", temporary],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if extracted.returncode:
+            raise HarnessError(
+                "cannot extract previous source %s: %s"
+                % (ref, (extracted.stderr or extracted.stdout).strip()[-1000:])
+            )
+        old_root = os.path.join(temporary, "taema")
+        repository = os.path.join(temporary, "repo")
+        built = subprocess.run(
+            ["sh", os.path.join(old_root, "tools", "build-xbps.sh"), repository],
+            cwd=old_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=1800,
+            check=False,
+        )
+        if built.returncode:
+            raise HarnessError(
+                "cannot build previous package from %s: %s"
+                % (ref, (built.stdout or "build exited %d" % built.returncode)[-2000:])
+            )
+        package = os.path.join(repository, os.path.basename(dest))
+        if not os.path.isfile(package):
+            raise HarnessError(
+                "previous source %s did not build %s" % (ref, os.path.basename(dest))
+            )
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copy2(package, dest)
+    return dest
+
+
+def fetch_previous(cfg, allow_network=False):
     dest = previous_pkg_path(cfg)
     if os.path.isfile(dest):
         return dest
+    if previous_source_available(cfg):
+        return build_previous_package(cfg, dest)
+    if not allow_network:
+        raise HarnessError(
+            "previous release package and source tag are not cached; "
+            "re-run with --allow-network"
+        )
     _download(cfg["images"]["previous_url"], dest)
     return dest
 
@@ -913,19 +1053,10 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
         )
         run_step(
             "mkdir-bootstrap",
-            ssh_argv(
-                cfg, port, key, known, admin, "mkdir -p %s/previous-repo" % GUEST_TMP
-            ),
+            ssh_argv(cfg, port, key, known, admin, "mkdir -p %s" % GUEST_TMP),
             run_dir,
         )
-        sources = [
-            os.path.join(VM_DIR, "provision.sh"),
-            os.path.join(VM_DIR, "scenario.py"),
-            pub,
-            pkg_src,
-        ]
-        if "upgrade" in scenarios:
-            sources.append(prev)
+        sources = bootstrap_sources(pub, pkg_src, prev, scenarios)
         run_step(
             "scp-bootstrap",
             scp_argv(
@@ -958,24 +1089,7 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
         )
         results = {}
         for s in scenarios:
-            remote = "python3 %s/scenario.py %s --artifacts %s/artifacts" % (
-                GUEST_TMP,
-                s,
-                GUEST_TMP,
-            )
-            if s == "upgrade":
-                remote += (
-                    " --package-dir %s/%s --previous %s/previous-repo/%s"
-                    " --previous-version %s --current-version %s"
-                    % (
-                        GUEST_TMP,
-                        repo_name,
-                        GUEST_TMP,
-                        os.path.basename(prev),
-                        previous_version(cfg),
-                        read_version(),
-                    )
-                )
+            remote = scenario_command(s, cfg, repo_name, prev)
             try:
                 run_step(
                     "scenario-" + s,
@@ -1042,8 +1156,12 @@ def cmd_run(cfg, args, out, err):
     for libc in libcs:
         if not os.path.isfile(cache_paths(cfg, libc)["base"]):
             need_net.append("base image for " + libc)
-    if "upgrade" in scenarios and not os.path.isfile(previous_pkg_path(cfg)):
-        need_net.append("previous release package")
+    if (
+        needs_previous_package(scenarios)
+        and not os.path.isfile(previous_pkg_path(cfg))
+        and not previous_source_available(cfg)
+    ):
+        need_net.append("previous release package or source tag")
     if need_net and not args.allow_network:
         raise HarnessError(
             "not cached: %s; re-run with --allow-network" % ", ".join(need_net)
@@ -1055,8 +1173,8 @@ def cmd_run(cfg, args, out, err):
             if not os.path.isfile(cache_paths(cfg, libc)["base"]):
                 fetch_image(cfg, libc, allow_network=True)
                 build_image(cfg, libc, log=lambda m: err.write("vmh: %s\n" % m))
-        if "upgrade" in scenarios and not os.path.isfile(previous_pkg_path(cfg)):
-            fetch_previous(cfg, allow_network=True)
+    if needs_previous_package(scenarios) and not os.path.isfile(previous_pkg_path(cfg)):
+        fetch_previous(cfg, allow_network=args.allow_network)
     else:
         for libc in libcs:
             if not os.path.isfile(cache_paths(cfg, libc)["base"]):
@@ -1116,7 +1234,7 @@ def cmd_fetch(cfg, args, out, err):
     for libc in cfg["libcs"]:
         path = fetch_image(cfg, libc, allow_network=args.allow_network)
         out.write("vmh: image %s ok: %s\n" % (libc, path))
-    if "upgrade" in cfg["scenarios"]:
+    if needs_previous_package(cfg["scenarios"]):
         out.write(
             "vmh: previous release ok: %s\n"
             % fetch_previous(cfg, allow_network=args.allow_network)

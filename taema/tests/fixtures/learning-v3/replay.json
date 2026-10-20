@@ -34,7 +34,7 @@
     {"at_day": 199, "op": "answer", "owner": "app-0005", "leftover": "app-0006", "choice": "stop"},
     {"at_day": 199, "op": "answer", "owner": "app-0007", "leftover": "app-0008", "choice": "keep"},
     {"at_day": 199, "op": "signature_stop", "owner": "app-0009", "leftover": "app-0010"},
-    {"at_day": 199, "op": "auto_stop", "owner": "app-0009", "leftover": "app-0010"},
+    {"at_day": 199, "op": "auto_stop", "owner": "app-0009", "leftover": "app-0010", "authority": "answered", "why": "user-approved signature stop"},
     {"at_day": 199, "after_seconds": 30, "op": "respawn_and_regret", "owner": "app-0009", "leftover": "app-0010"},
     {"at_day": 199, "op": "answer", "owner": "MainThread", "leftover": "app-0012", "choice": "stop"}
   ]

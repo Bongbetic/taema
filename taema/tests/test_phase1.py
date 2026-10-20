@@ -369,12 +369,30 @@ class DeadlineLoop(unittest.TestCase):
             write(events_path, "populated 1\nfrozen 0\n")
             leaf_file = open(events_path)
             self.addCleanup(leaf_file.close)
-            d.leaf_watch[leaf_file.fileno()] = ("app-busy", leaf_file)
+
+            class CountedEventFile:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+                    self.reads = 0
+
+                def fileno(self):
+                    return self.wrapped.fileno()
+
+                def seek(self, *args):
+                    return self.wrapped.seek(*args)
+
+                def read(self, *args):
+                    self.reads += 1
+                    return self.wrapped.read(*args)
+
+            watched_events = CountedEventFile(leaf_file)
+            d.leaf_watch[leaf_file.fileno()] = ("app-busy", watched_events)
             d.leaf_frozen["app-busy"] = False
 
             owner_fd, owner_writer = os.pipe()
             os.write(owner_writer, b"ready")
             os.close(owner_writer)
+            idle_owner_fd, idle_owner_writer = os.pipe()
 
             def close_if_open(fd):
                 try:
@@ -383,8 +401,26 @@ class DeadlineLoop(unittest.TestCase):
                     pass
 
             self.addCleanup(close_if_open, owner_fd)
+            self.addCleanup(close_if_open, idle_owner_fd)
+            self.addCleanup(close_if_open, idle_owner_writer)
             d.owners[owner_fd] = ("scope-owned", 7001, 42)
+            d.owners[idle_owner_fd] = ("scope-idle", 7002, 43)
             waits = []
+            poll_cost = {"instances": 0, "registrations": 0, "polls": 0}
+            real_poll = daemon.select.poll
+
+            class CountedPoll:
+                def __init__(self):
+                    poll_cost["instances"] += 1
+                    self.wrapped = real_poll()
+
+                def register(self, fd, events):
+                    poll_cost["registrations"] += 1
+                    return self.wrapped.register(fd, events)
+
+                def poll(self, *args):
+                    poll_cost["polls"] += 1
+                    return self.wrapped.poll(*args)
 
             class IdleSelector:
                 def register(self, *_args, **_kwargs):
@@ -413,6 +449,7 @@ class DeadlineLoop(unittest.TestCase):
             with (
                 mock.patch.object(daemon.signal, "signal"),
                 mock.patch.object(daemon.signal, "set_wakeup_fd"),
+                mock.patch.object(daemon.select, "poll", CountedPoll),
                 mock.patch.object(daemon.time, "time", side_effect=lambda: now[0]),
                 mock.patch.object(
                     daemon.socket, "socketpair", return_value=(wake_r, wake_w)
@@ -425,7 +462,8 @@ class DeadlineLoop(unittest.TestCase):
                     inspect.ProcTable,
                     "scan",
                     return_value=inspect.ProcTable.from_ppid({}),
-                ),
+                ) as proc_scan,
+                mock.patch.object(d, "tick", wraps=d.tick) as tick,
                 mock.patch.object(d, "adopt_pass", wraps=d.adopt_pass) as adopt,
                 mock.patch.object(d, "gc_pass", wraps=d.gc_pass) as gc_pass,
                 mock.patch.object(
@@ -443,11 +481,20 @@ class DeadlineLoop(unittest.TestCase):
             # intervals: one wake per minute, with no zero-timeout busy-spin iterations.
             self.assertEqual(waits, [daemon.MAX_SLEEP] * 3)
             self.assertEqual(now[0], 1180.0)
+            # Bound periodic CPU work as operations: three ticks, one owner poll
+            # registering two pidfds, one proc snapshot, and one watched-leaf read.
+            self.assertEqual(tick.call_count, len(waits))
             adopt.assert_called_once()
             gc_pass.assert_called_once()
             poll_owners.assert_called_once_with()
+            proc_scan.assert_called_once_with()
+            self.assertEqual(
+                poll_cost, {"instances": 1, "registrations": 2, "polls": 1}
+            )
+            self.assertEqual(watched_events.reads, 1)
             self.assertIs(d.leaf_frozen["app-busy"], True)
             self.assertNotIn(owner_fd, d.owners)
+            self.assertIn(idle_owner_fd, d.owners)
             self.assertFalse(d.collector_events)
 
     def test_session_state_file(self):

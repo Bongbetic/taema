@@ -2,6 +2,13 @@
 
 ## Behaviour changes
 
+### inspect and reset learned state
+
+`taema learn show`, `apps`, `pairs`, and `signatures` display learned decisions, evidence, and
+outcomes in human-readable or JSON form. `taema forget --all APP` clears that app's learned
+records while preserving its vetoes. Versioned v2 `forget` feedback now accepts the optional
+boolean `all` field to request this full reset.
+
 ### undo retained automatic actions and opt-in restore
 
 `taema undo [ID]` now reverses retained containment, priority, freeze, and stop actions. Stop undo

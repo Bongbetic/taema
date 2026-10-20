@@ -162,6 +162,7 @@ def _validate_feedback(args):
         "review_id",
         "leftovers",
         "choice",
+        "all",
         "app",
         "muted",
         "scope",
@@ -201,7 +202,7 @@ def _validate_feedback(args):
         if version == 1
         else {
             "keep": common | {"key"},
-            "forget": common | {"key"},
+            "forget": common | {"key", "all"},
             "kill": common | {"key"},
             "veto": common | {"target", "reason", "expires"},
             "unveto": common | {"target"},
@@ -239,6 +240,8 @@ def _validate_feedback(args):
     if op in ("keep", "forget", "kill"):
         if not _is_type(args.get("key"), "string") or not args["key"]:
             _fail("feedback key must be a non-empty string")
+    if op == "forget" and "all" in args and not _is_type(args["all"], "boolean"):
+        _fail("forget all must be a boolean")
     if op in ("answer", "teach"):
         owner, leftovers, choice = (
             args.get("owner"),

@@ -12,6 +12,7 @@
     { "$ref": "#/$defs/review" },
     { "$ref": "#/$defs/explain" },
     { "$ref": "#/$defs/gc" },
+    { "$ref": "#/$defs/learn" },
     { "$ref": "#/$defs/doctor" }
   ],
   "$defs": {
@@ -271,6 +272,138 @@
         "result": { "type": "object" }
       },
       "additionalProperties": false
+    },
+    "learn": {
+      "oneOf": [
+        { "$ref": "#/$defs/learn-show" },
+        { "$ref": "#/$defs/learn-legacy" },
+        { "$ref": "#/$defs/learn-apps" },
+        { "$ref": "#/$defs/learn-pairs" },
+        { "$ref": "#/$defs/learn-signatures" }
+      ]
+    },
+    "learn-show": {
+      "type": "object",
+      "required": ["schema", "view", "legacy", "apps", "pairs", "signatures", "counts"],
+      "properties": {
+        "schema": { "const": "taema.learn.v1" },
+        "view": { "const": "show" },
+        "legacy": { "const": false },
+        "apps": { "type": "array", "items": { "$ref": "#/$defs/learn-app-record" } },
+        "pairs": { "type": "array", "items": { "$ref": "#/$defs/learn-pair-record" } },
+        "signatures": { "type": "array", "items": { "$ref": "#/$defs/learn-signature-record" } },
+        "counts": { "$ref": "#/$defs/learn-counts" }
+      },
+      "additionalProperties": false
+    },
+    "learn-legacy": {
+      "type": "object",
+      "required": ["schema", "view", "legacy", "records", "reviews", "count"],
+      "properties": {
+        "schema": { "const": "taema.learn.v1" },
+        "view": { "const": "show" },
+        "legacy": { "const": true },
+        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-pair-record" } },
+        "reviews": { "type": "array", "items": { "type": "object" } },
+        "count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "learn-apps": {
+      "type": "object",
+      "required": ["schema", "view", "records", "count"],
+      "properties": {
+        "schema": { "const": "taema.learn.v1" },
+        "view": { "const": "apps" },
+        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-app-record" } },
+        "count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "learn-pairs": {
+      "type": "object",
+      "required": ["schema", "view", "records", "count"],
+      "properties": {
+        "schema": { "const": "taema.learn.v1" },
+        "view": { "const": "pairs" },
+        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-pair-record" } },
+        "count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "learn-signatures": {
+      "type": "object",
+      "required": ["schema", "view", "records", "count"],
+      "properties": {
+        "schema": { "const": "taema.learn.v1" },
+        "view": { "const": "signatures" },
+        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-signature-record" } },
+        "count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "learn-counts": {
+      "type": "object",
+      "required": ["apps", "pairs", "signatures"],
+      "properties": {
+        "apps": { "type": "integer", "minimum": 0 },
+        "pairs": { "type": "integer", "minimum": 0 },
+        "signatures": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "learn-app-record": {
+      "type": "object",
+      "required": ["key", "display", "decision", "confidence", "evidence", "last_outcome"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "display": { "type": "string" },
+        "kind": { "type": "string" },
+        "decision": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": { "$ref": "#/$defs/learn-evidence" },
+        "last_outcome": { "$ref": "#/$defs/learn-last-outcome" }
+      },
+      "additionalProperties": true
+    },
+    "learn-pair-record": {
+      "type": "object",
+      "required": ["owner", "leftover", "decision", "confidence", "evidence", "last_outcome"],
+      "properties": {
+        "owner": { "type": "string", "minLength": 1 },
+        "leftover": { "type": "string", "minLength": 1 },
+        "decision": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": { "$ref": "#/$defs/learn-evidence" },
+        "last_outcome": { "$ref": "#/$defs/learn-last-outcome" }
+      },
+      "additionalProperties": true
+    },
+    "learn-signature-record": {
+      "type": "object",
+      "required": ["id", "owner", "decision", "confidence", "evidence", "last_outcome"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string", "minLength": 1 },
+        "decision": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": { "$ref": "#/$defs/learn-evidence" },
+        "last_outcome": { "$ref": "#/$defs/learn-last-outcome" }
+      },
+      "additionalProperties": true
+    },
+    "learn-evidence": {
+      "type": "object",
+      "additionalProperties": { "type": "number", "minimum": 0 }
+    },
+    "learn-last-outcome": {
+      "type": ["object", "null"],
+      "properties": {
+        "decision": { "type": "string" },
+        "outcome": { "type": ["string", "null"] },
+        "at": { "type": ["number", "null"], "minimum": 0 }
+      },
+      "additionalProperties": true
     },
     "doctor": {
       "type": "object",

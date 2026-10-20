@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -271,6 +271,10 @@ _MIGRATIONS = {
     7: """
         ALTER TABLE signatures ADD COLUMN suspended_until REAL NOT NULL DEFAULT 0;
         ALTER TABLE signatures ADD COLUMN suspended_at REAL NOT NULL DEFAULT 0;
+    """,
+    8: """
+        ALTER TABLE signatures ADD COLUMN last_outcome TEXT;
+        ALTER TABLE signatures ADD COLUMN last_outcome_at REAL;
     """,
 }
 
@@ -1335,6 +1339,19 @@ class StateDB:
             ).fetchone()
         return dict(row) if row else None
 
+    def app_identities(self, limit=MAX_APPS):
+        """Read the bounded application identity catalogue for learner views."""
+        if not self.available:
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT key, kind, display, exe, dev, ino, desktop_id, unit, "
+                "first_seen, last_seen, instances, confidence FROM apps "
+                "ORDER BY key LIMIT ?",
+                (max(1, min(MAX_APPS, int(limit))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_app_instance(self, key):
         """Read the most recently observed pid/start provenance row for one app key."""
         if not self.available or not isinstance(key, str) or not key:
@@ -1784,6 +1801,18 @@ class StateDB:
             ).fetchone()
         return self._signature(row)
 
+    def signatures(self, limit=2000):
+        """Read recent signatures for the bounded learner view."""
+        if not self.available:
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM signatures ORDER BY "
+                "coalesce(last_seen, first_seen, 0) DESC, id LIMIT ?",
+                (max(1, min(10_000, int(limit))),),
+            ).fetchall()
+        return [self._signature(row) for row in rows]
+
     def signatures_for_owner(self, owner):
         """Read the bounded signature history for an owner, newest first."""
         if not self.available or not isinstance(owner, str):
@@ -1810,6 +1839,48 @@ class StateDB:
             ).fetchall()
         return [self._signature(row) for row in rows]
 
+    def forget_signatures_for_key(self, key, preserve=(), include=()):
+        """Drop signature learning for an app, retaining signatures protected by vetoes."""
+        if not self.available or not isinstance(key, str):
+            return []
+        with self.connection() as connection:
+            if connection is None:
+                return []
+            if not self.read_only:
+                connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    "SELECT id FROM signatures WHERE owner = ? OR EXISTS ("
+                    "SELECT 1 FROM json_each(signatures.members) AS member "
+                    "WHERE json_extract(member.value, '$.key') = ?) ",
+                    (key, key),
+                ).fetchall()
+                identifiers = list(
+                    dict.fromkeys([row["id"] for row in rows] + list(include))
+                )
+                if not self.read_only:
+                    protected = set(preserve)
+                    for identifier in identifiers:
+                        if identifier in protected:
+                            connection.execute(
+                                "UPDATE signatures SET closes = 0, stop_ok = 0, "
+                                "respawn = 0, ex_stop = 0, ex_keep = 0, ex_last = NULL, "
+                                "probation = 0, veto = 0, suspended_until = 0, "
+                                "suspended_at = 0, last_outcome = NULL, "
+                                "last_outcome_at = NULL WHERE id = ?",
+                                (identifier,),
+                            )
+                        else:
+                            connection.execute(
+                                "DELETE FROM signatures WHERE id = ?", (identifier,)
+                            )
+                    connection.commit()
+            except Exception:
+                if not self.read_only:
+                    connection.rollback()
+                raise
+        return identifiers
+
     def answer_signature(self, identifier, choice, weight, now=None):
         """Add no-decay explicit answer weight to a signature."""
         if self.read_only or not self.available or choice not in ("stop", "keep"):
@@ -1821,9 +1892,10 @@ class StateDB:
             try:
                 cursor = connection.execute(
                     "UPDATE signatures SET %s = coalesce(%s, 0) + ?, ex_last = ?, "
-                    "last_seen = ?, suspended_until = 0, suspended_at = 0 WHERE id = ?"
+                    "last_seen = ?, suspended_until = 0, suspended_at = 0, "
+                    "last_outcome = 'answered', last_outcome_at = ? WHERE id = ?"
                     % (column, column),
-                    (weight, choice, now, identifier),
+                    (weight, choice, now, now, identifier),
                 )
                 connection.commit()
             except Exception:
@@ -1831,8 +1903,8 @@ class StateDB:
                 raise
         return cursor.rowcount == 1
 
-    def suspend_signature(self, identifier, until, now=None):
-        """Suspend inherited authority for one signature after attributed regret."""
+    def suspend_signature(self, identifier, until, now=None, outcome=None):
+        """Suspend authority and optionally persist an attributed regret outcome."""
         if (
             self.read_only
             or not self.available
@@ -1840,17 +1912,26 @@ class StateDB:
             or not isinstance(until, (int, float))
             or isinstance(until, bool)
             or not math.isfinite(until)
+            or outcome not in (None, "regret")
         ):
             return False
         now = time.time() if now is None else now
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                cursor = connection.execute(
-                    "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
-                    "last_seen = ? WHERE id = ?",
-                    (until, now, now, identifier),
-                )
+                if outcome == "regret":
+                    cursor = connection.execute(
+                        "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
+                        "last_seen = ?, last_outcome = 'regret', last_outcome_at = ? "
+                        "WHERE id = ?",
+                        (until, now, now, now, identifier),
+                    )
+                else:
+                    cursor = connection.execute(
+                        "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
+                        "last_seen = ? WHERE id = ?",
+                        (until, now, now, identifier),
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -1872,11 +1953,19 @@ class StateDB:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                cursor = connection.execute(
-                    "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
-                    "last_seen = ? WHERE id = ?" % (counter, counter),
-                    (amount, now, identifier),
-                )
+                if counter in ("stop_ok", "respawn"):
+                    cursor = connection.execute(
+                        "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
+                        "last_seen = ?, last_outcome = ?, last_outcome_at = ? "
+                        "WHERE id = ?" % (counter, counter),
+                        (amount, now, counter, now, identifier),
+                    )
+                else:
+                    cursor = connection.execute(
+                        "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
+                        "last_seen = ? WHERE id = ?" % (counter, counter),
+                        (amount, now, identifier),
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()

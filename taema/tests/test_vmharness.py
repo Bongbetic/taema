@@ -640,6 +640,12 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
         self.assertEqual(vmh.read_version(ROOT), "0.3.0")
 
+    def test_release_notes_document_forget_all_and_feedback_field(self):
+        notes = read_text(os.path.join(REPO, "CHANGELOG.md"))
+        release = " ".join(notes.split("# 0.4.0", 1)[1].split("# 0.3.0", 1)[0].split())
+        self.assertIn("taema forget --all APP", release)
+        self.assertIn("optional boolean `all` field", release)
+
     def test_release_workflow_combines_manual_and_generated_release_notes(self):
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('notes="$(cat "$RUNNER_TEMP/notes.md")"', workflow)

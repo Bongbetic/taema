@@ -412,6 +412,39 @@ class IpcV2Tests(unittest.TestCase):
                     with self.assertRaises(protocol.ProtocolError):
                         protocol.validate_feedback(invalid)
 
+    def test_forget_all_feedback_is_limited_to_forget_and_matches_schema(self):
+        operation = {
+            "v": 2,
+            "id": "forget-all",
+            "op": "forget",
+            "key": "browser",
+            "all": True,
+        }
+        protocol.validate_feedback(operation)
+        self.assertTrue(
+            matches(
+                operation,
+                self.request_schema["$defs"]["feedback_args"],
+                self.request_schema,
+            )
+        )
+
+        for invalid in (
+            {**operation, "all": "yes"},
+            {**operation, "op": "keep"},
+            {**operation, "op": "kill"},
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_feedback(invalid)
+                self.assertFalse(
+                    matches(
+                        invalid,
+                        self.request_schema["$defs"]["feedback_args"],
+                        self.request_schema,
+                    )
+                )
+
     def test_veto_feedback_accepts_pair_targets_and_rejects_malformed_targets(self):
         valid = {
             "v": 2,

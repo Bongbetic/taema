@@ -105,6 +105,8 @@ def _parser(selected=None, include_all=True):
                     child["name"], help=child["help"], allow_abbrev=False
                 )
                 _add_options(child_parser, GLOBAL_OPTIONS, defaults=False)
+                if child.get("read"):
+                    _add_output_options(child_parser, defaults=False)
                 _add_arguments(child_parser, child.get("arguments", ()))
                 child_parser.set_defaults(
                     _handler=child["handler"],
@@ -395,6 +397,7 @@ def main(argv):
                     spec.get("read", False)
                     for spec in COMMANDS
                     if args._command == spec["name"]
+                    or args._command.startswith(spec["name"] + " ")
                 ),
                 False,
             )

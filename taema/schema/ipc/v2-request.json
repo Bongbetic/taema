@@ -93,8 +93,20 @@
           "properties": {
             "v": {"const": 2},
             "id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "op": {"enum": ["keep", "forget", "kill"]},
+            "op": {"enum": ["keep", "kill"]},
             "key": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "key"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "forget"},
+            "key": {"type": "string", "minLength": 1, "maxLength": 256},
+            "all": {"type": "boolean"}
           },
           "additionalProperties": false
         },

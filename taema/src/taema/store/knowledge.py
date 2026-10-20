@@ -17,6 +17,7 @@ import uuid
 
 from ..config import policy
 from .. import protocol
+from ..core import signature as survivor_signature
 from . import db
 
 DECAY_DAYS = 7
@@ -2077,6 +2078,172 @@ class Store:
             p["last_keep"] = self.now()
         return True
 
+    def observe_signature_close(self, signature):
+        """Persist one close for a survivor signature and link its pairs for display."""
+        if (
+            not isinstance(signature, dict)
+            or not self._ok(signature.get("owner"))
+            or policy.bad_owner(signature["owner"], self.deny)
+        ):
+            return None
+        normalized = survivor_signature.signature(
+            signature["owner"],
+            signature.get("members", []),
+            signature.get("runtime_hash", ""),
+            signature.get("runtime_class", ""),
+            signature.get("tty", False),
+        )
+        self.db.record_signature(normalized, now=self.now(), close=True)
+        for member in normalized["members"]:
+            pair = self.data.get("pairs", {}).get(
+                self.pkey(normalized["owner"], member["key"])
+            )
+            if isinstance(pair, dict):
+                pair["sig"] = normalized["id"]
+                pair["last_seen"] = self.now()
+                self.dirty = True
+        return self.db.signature(normalized["id"])
+
+    def ensure_signature(self, owner, signature):
+        """Ensure an answered owner/signature exists, without inventing a close."""
+        if (
+            not self._ok(owner)
+            or policy.bad_owner(owner, self.deny)
+            or not isinstance(signature, dict)
+        ):
+            return None
+        normalized = survivor_signature.signature(
+            owner,
+            signature.get("members", []),
+            signature.get("runtime_hash", ""),
+            signature.get("runtime_class", ""),
+            signature.get("tty", False),
+        )
+        self.db.record_signature(normalized, now=self.now(), close=False)
+        return normalized
+
+    def answer_signature(self, owner, signature, choice):
+        """Apply an explicit no-decay answer to the whole signature, never its pairs."""
+        if choice not in ("stop", "keep"):
+            return False
+        normalized = self.ensure_signature(owner, signature)
+        if not normalized:
+            return False
+        return self.db.answer_signature(
+            normalized["id"], choice, W_ANSWER, now=self.now()
+        )
+
+    def match_signature(self, signature):
+        """Match exact id, then same-key ±1 counts in the same runtime class."""
+        if not isinstance(signature, dict):
+            return None
+        exact = self.db.signature(signature.get("id"))
+        if exact and exact.get("owner") == signature.get("owner"):
+            return exact
+        current = survivor_signature.member_counts(signature.get("members", []))
+        if not current:
+            return None
+        matches = []
+        for candidate in self.db.signatures_for_owner(signature.get("owner")):
+            previous = survivor_signature.member_counts(candidate.get("members"))
+            if (
+                previous
+                and previous.keys() == current.keys()
+                and candidate.get("runtime") == signature.get("runtime_class", "")
+                and all(abs(previous[key] - current[key]) <= 1 for key in current)
+            ):
+                distance = sum(abs(previous[key] - current[key]) for key in current)
+                matches.append((distance, -(candidate.get("last_seen") or 0), candidate["id"], candidate))
+        return min(matches)[-1] if matches else None
+
+    def signature_decision(self, signature):
+        """Return an explicit matched signature decision, or ``None`` for pair fallback."""
+        matched = self.match_signature(signature)
+        return self._signature_answer(matched)
+
+    @staticmethod
+    def _signature_answer(matched):
+        if not matched:
+            return None
+        choice = matched.get("ex_last")
+        weight = matched.get("ex_" + str(choice), 0) if choice in ("stop", "keep") else 0
+        if not weight:
+            return None
+        return (
+            choice,
+            1.0,
+            "signature answered %s (id %s, weight %.0f)"
+            % (choice, matched["id"], weight),
+        )
+
+    def signature_decisions(self, signature):
+        """Return inherited decisions for covered members; unmatched members use pair fallback."""
+        if not isinstance(signature, dict):
+            return {}
+        matched = self.match_signature(signature)
+        if matched:
+            answer = self._signature_answer(matched)
+            if answer:
+                return {
+                    item["key"]: answer
+                    for item in signature.get("members", [])
+                    if isinstance(item, dict) and isinstance(item.get("key"), str)
+                }
+
+        current = survivor_signature.member_counts(signature.get("members", []))
+        if not current:
+            return {}
+        candidates = []
+        for candidate in self.db.signatures_for_owner(signature.get("owner")):
+            previous = survivor_signature.member_counts(candidate.get("members"))
+            answer = self._signature_answer(candidate)
+            if (
+                not previous
+                or not answer
+                or not previous.keys() < current.keys()
+                or candidate.get("runtime") != signature.get("runtime_class", "")
+                or not all(abs(previous[key] - current[key]) <= 1 for key in previous)
+            ):
+                continue
+            distance = sum(abs(previous[key] - current[key]) for key in previous)
+            candidates.append(
+                (
+                    -len(previous),
+                    distance,
+                    -(candidate.get("last_seen") or 0),
+                    candidate["id"],
+                    answer,
+                    previous,
+                )
+            )
+        if not candidates:
+            return {}
+        _coverage, _distance, _seen, _identifier, answer, previous = min(candidates)
+        return {key: answer for key in previous}
+
+    def signature_outcome(self, identifier, counter):
+        """Increment stop, respawn, or veto evidence for one signature."""
+        return self.db.increment_signature(identifier, counter, now=self.now())
+
+    def signature_summaries(self, key, limit=20):
+        """Recent signature counters for an owner or member key, suitable for `why`."""
+        result = []
+        for item in self.db.signatures_for_key(key, limit=limit):
+            answer = item.get("ex_last") if item.get("ex_last") in ("stop", "keep") else "none"
+            result.append(
+                {
+                    "id": item["id"],
+                    "owner": item["owner"],
+                    "members": item["members"],
+                    "answer": answer,
+                    "closes": item.get("closes", 0),
+                    "stop_ok": item.get("stop_ok", 0),
+                    "respawn": item.get("respawn", 0),
+                    "veto": item.get("veto", 0),
+                }
+            )
+        return result
+
     def note_noise(self, leftover):
         """One close classified as launcher/invalid-owner noise: counted per leftover key in
         data["noise"], never turned into a pair. Bad owners earn no evidence at all."""
@@ -2124,7 +2291,10 @@ class Store:
 
     def auto_stopped(self, owner, leftover):
         if self._ok(owner, leftover) and not policy.bad_owner(owner, self.deny):
-            self._pair(owner, leftover)["last_auto_stop"] = self.now()
+            pair = self._pair(owner, leftover)
+            pair["last_auto_stop"] = self.now()
+            if pair.get("sig"):
+                self.signature_outcome(pair["sig"], "stop_ok")
 
     def regret(self, owner, leftover):
         """The leftover came back within 30 min of an auto-stop: keep +3, suspended for 7 days
@@ -2216,20 +2386,37 @@ class Store:
 
     def pairs_summary(self, limit=50):
         out = []
+        signatures = {}
         for k, p in self.data["pairs"].items():
             owner, _, leftover = k.partition(SEP)
             action, conf, why = self._decide(owner, p)
+            signature_id = p.get("sig")
+            if signature_id and signature_id not in signatures:
+                signatures[signature_id] = self.db.signature(signature_id)
+            signature = signatures.get(signature_id)
+            inherited = None
+            if signature and signature.get("ex_last") in ("stop", "keep"):
+                if signature.get("ex_" + signature["ex_last"], 0):
+                    inherited = signature["ex_last"]
+            display_why = (
+                "inherited from signature %s" % signature["id"]
+                if inherited and signature
+                else why
+            )
             out.append(
                 {
                     "owner": owner,
                     "leftover": leftover,
-                    "action": action,
-                    "confidence": round(conf, 2),
+                    "action": inherited or action,
+                    "pair_action": action,
+                    "inherited": inherited,
+                    "signature": p.get("sig"),
+                    "confidence": round(1.0 if inherited else conf, 2),
                     "stop": round(p.get("stop", 0) + p.get("ex_stop", 0), 2),
                     "keep": round(p.get("keep", 0) + p.get("ex_keep", 0), 2),
                     "closes": p.get("closes", 0),
                     "kills": p.get("kills", 0),
-                    "why": why,
+                    "why": display_why,
                 }
             )
         out.sort(
@@ -2303,6 +2490,7 @@ class Store:
             "key": key,
             "standalone": self.standalone(key),
             "pairs": pairs,
+            "signatures": self.signature_summaries(key),
             "default_action": action,
             "why": why,
             "graceful_timeout_s": round(t, 1),

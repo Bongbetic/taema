@@ -904,16 +904,16 @@ def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
     }
 
 
-def auto_stop_ok(store, owner_key, leftover_key, mi):
-    """May auto mode stop this member? (ok, why). Only a pair decided "stop" (explicit answer, or
-    silent thresholds after burn-in) and a member that is plainly idle and known: no edges, not
-    protected / a pty host / a persist seed / a share seed the user keeps, <= 1 % CPU over the last
-    minute, origin known. Anything unknown keeps."""
-    action, _conf, why = (
+def auto_stop_ok(store, owner_key, leftover_key, mi, decision=None):
+    """May auto mode stop this member? (ok, why). A pair or matched survivor signature must decide
+    "stop", and the member must be plainly idle and known: no edges, not protected / a pty host / a
+    persist seed / a share seed the user keeps, <= 1 % CPU over the last minute, origin known.
+    Anything unknown keeps."""
+    action, _conf, why = decision or (
         store.pair_decision(owner_key, leftover_key) if owner_key else ("ask", 0, "")
     )
     if action != "stop":
-        return False, "pair decision is %s" % action
+        return False, "learning decision is %s" % action
     if not mi.get("origin"):
         return False, "origin unknown"
     if mi.get("edges") is None:

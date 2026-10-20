@@ -2632,7 +2632,7 @@ swap_max = "0"                   # VMs default to 0 unless a save hook ran
 
 Directory modes are 0700 and file modes 0600. Nothing is world-readable.
 
-### 13.2 Schema (`PRAGMA user_version = 4`)
+### 13.2 Schema (`PRAGMA user_version = 5`)
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);   -- created, closes, last_decay
@@ -2662,7 +2662,9 @@ CREATE INDEX parents_last ON parents(last);
 
 CREATE TABLE signatures (
   id TEXT PRIMARY KEY, owner TEXT NOT NULL, members TEXT NOT NULL,  -- JSON [[key,count],...]
-  runtime TEXT, tty INTEGER, kind TEXT NOT NULL DEFAULT 'exit',     -- exit | windowless
+  runtime TEXT, runtime_hash TEXT, tty INTEGER,
+  kind TEXT NOT NULL DEFAULT 'exit',                             -- exit | windowless
+  veto INTEGER NOT NULL DEFAULT 0,                                  -- signature veto outcomes
   closes INTEGER DEFAULT 0, stop_ok INTEGER DEFAULT 0, respawn INTEGER DEFAULT 0,
   ex_stop REAL DEFAULT 0, ex_keep REAL DEFAULT 0, ex_last TEXT, first_seen REAL, last_seen REAL);
 CREATE INDEX signatures_owner ON signatures(owner);

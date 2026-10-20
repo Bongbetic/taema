@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -266,6 +266,7 @@ _MIGRATIONS = {
         ALTER TABLE instances ADD COLUMN last_seen REAL;
         CREATE INDEX parents_last ON parents(last);
     """,
+    5: "",
 }
 
 
@@ -1613,9 +1614,54 @@ class StateDB:
             )
         while version < SCHEMA_VERSION:
             next_version = version + 1
+            migration = _MIGRATIONS[next_version]
+            if next_version == 5:
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signatures'"
+                ).fetchone()
+                if table:
+                    columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(signatures)")
+                    }
+                    statements = []
+                    if "runtime_hash" not in columns:
+                        statements.append(
+                            "ALTER TABLE signatures ADD COLUMN runtime_hash TEXT;"
+                        )
+                    if "veto" not in columns:
+                        statements.append(
+                            "ALTER TABLE signatures ADD COLUMN veto INTEGER NOT NULL DEFAULT 0;"
+                        )
+                    statements.append(
+                        "CREATE INDEX IF NOT EXISTS signatures_owner ON signatures(owner);"
+                    )
+                    migration = "\n".join(statements)
+                else:
+                    migration = """
+                        CREATE TABLE signatures (
+                            id TEXT PRIMARY KEY,
+                            owner TEXT NOT NULL,
+                            members TEXT NOT NULL,
+                            runtime TEXT,
+                            tty INTEGER,
+                            kind TEXT NOT NULL DEFAULT 'exit',
+                            closes INTEGER DEFAULT 0,
+                            stop_ok INTEGER DEFAULT 0,
+                            respawn INTEGER DEFAULT 0,
+                            ex_stop REAL DEFAULT 0,
+                            ex_keep REAL DEFAULT 0,
+                            ex_last TEXT,
+                            first_seen REAL,
+                            last_seen REAL,
+                            runtime_hash TEXT,
+                            veto INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE INDEX signatures_owner ON signatures(owner);
+                    """
             script = (
                 "BEGIN IMMEDIATE;\n"
-                + _MIGRATIONS[next_version]
+                + migration
                 + "\nPRAGMA user_version = %d;\nCOMMIT;" % next_version
             )
             try:
@@ -1675,6 +1721,133 @@ class StateDB:
                 connection.rollback()
                 raise
         return status
+
+    @staticmethod
+    def _signature(row):
+        if row is None:
+            return None
+        result = dict(row)
+        result["members"] = _load(result.get("members"), [])
+        return result
+
+    def record_signature(self, signature, now=None, close=False):
+        """Persist a canonical signature, optionally counting one observed close."""
+        if self.read_only or not self.available:
+            return False
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """INSERT INTO signatures
+                       (id, owner, members, runtime, runtime_hash, tty, closes,
+                        first_seen, last_seen)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         members=excluded.members, runtime=excluded.runtime,
+                         runtime_hash=excluded.runtime_hash, tty=excluded.tty,
+                         closes=coalesce(signatures.closes, 0) + ?,
+                         last_seen=excluded.last_seen""",
+                    (
+                        signature["id"],
+                        signature["owner"],
+                        _dump(signature["members"]),
+                        signature.get("runtime_class", ""),
+                        signature.get("runtime_hash", ""),
+                        int(bool(signature.get("tty"))),
+                        1 if close else 0,
+                        now,
+                        now,
+                        1 if close else 0,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return True
+
+    def signature(self, identifier):
+        """Read one signature record."""
+        if not self.available or not isinstance(identifier, str):
+            return None
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM signatures WHERE id = ?", (identifier,)
+            ).fetchone()
+        return self._signature(row)
+
+    def signatures_for_owner(self, owner):
+        """Read the bounded signature history for an owner, newest first."""
+        if not self.available or not isinstance(owner, str):
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM signatures WHERE owner = ? "
+                "ORDER BY coalesce(last_seen, first_seen, 0) DESC, id LIMIT ?",
+                (owner, MAX_SIGNATURES_PER_OWNER),
+            ).fetchall()
+        return [self._signature(row) for row in rows]
+
+    def signatures_for_key(self, key, limit=20):
+        """Read recent signatures where a key was the owner or a survivor."""
+        if not self.available or not isinstance(key, str):
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM signatures AS signature WHERE owner = ? OR EXISTS ("
+                "SELECT 1 FROM json_each(signature.members) AS member "
+                "WHERE json_extract(member.value, '$.key') = ?) "
+                "ORDER BY coalesce(last_seen, first_seen, 0) DESC, id LIMIT ?",
+                (key, key, max(1, min(100, int(limit)))),
+            ).fetchall()
+        return [self._signature(row) for row in rows]
+
+    def answer_signature(self, identifier, choice, weight, now=None):
+        """Add no-decay explicit answer weight to a signature."""
+        if self.read_only or not self.available or choice not in ("stop", "keep"):
+            return False
+        now = time.time() if now is None else now
+        column = "ex_" + choice
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE signatures SET %s = coalesce(%s, 0) + ?, ex_last = ?, "
+                    "last_seen = ? WHERE id = ?" % (column, column),
+                    (weight, choice, now, identifier),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return cursor.rowcount == 1
+
+    def increment_signature(self, identifier, counter, amount=1, now=None):
+        """Increment a bounded signature outcome counter."""
+        if (
+            self.read_only
+            or not self.available
+            or counter not in ("stop_ok", "respawn", "veto")
+            or not isinstance(amount, int)
+            or isinstance(amount, bool)
+            or amount < 1
+        ):
+            return False
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
+                    "last_seen = ? WHERE id = ?" % (counter, counter),
+                    (amount, now, identifier),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return cursor.rowcount == 1
 
     def load_state(self, data):
         if not self.available:

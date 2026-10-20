@@ -3,7 +3,7 @@
 Single threaded. Every lifecycle decision point asks the one authorization ladder
 (taema.authorization.authorize) instead of checking the mode itself: observe logs only, adopt
 moves, enforce also kills, auto moves and gives every app root its own scope; auto stops only what
-a learned or answered pair authorises (engine.auto_stop_ok, re-checked at actuation).
+a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re-checked at actuation).
 """
 
 import collections
@@ -21,7 +21,7 @@ import tempfile
 import time
 
 from ..model import authorization
-from ..core import cgroup, process as inspect, lineage
+from ..core import cgroup, process as inspect, lineage, signature as survivor_signature
 from ..governor import engine
 from ..store import knowledge
 from ..config import policy
@@ -110,6 +110,7 @@ class Daemon:
         self.next_kid = 1
         self.gone = []  # [(ts, vanished record)] from recent observes
         self.stopped = {}  # key -> ts of the last stop (respawn tracking)
+        self.stopped_signatures = {}  # key -> signature used for the last auto stop
         self.auto_scopes = set()  # app-* scopes created by auto adoption (status)
         self.auto_stops = collections.deque(
             maxlen=5
@@ -492,7 +493,9 @@ class Daemon:
             if d.get("action") == "kill":
                 self.stopped[d["key"]] = now
         while len(self.stopped) > 256:
-            del self.stopped[min(self.stopped, key=self.stopped.get)]
+            oldest = min(self.stopped, key=self.stopped.get)
+            del self.stopped[oldest]
+            self.stopped_signatures.pop(oldest, None)
 
     def expire_respawns(self):
         """A stopped key that did not reappear within timers.respawn_window was a good stop."""
@@ -500,6 +503,7 @@ class Daemon:
         now = time.time()
         for k in [k for k, t in self.stopped.items() if now - t > w]:
             del self.stopped[k]
+            self.stopped_signatures.pop(k, None)
             self.store.gc_outcome(k, False)
 
     def after_observe(self):
@@ -522,7 +526,11 @@ class Daemon:
             ):  # a shell re-run is neither a respawn nor evidence about the stop
                 self.store.respawn(e["key"], False)
                 self.store.gc_outcome(e["key"], True)
+                signature_id = self.stopped_signatures.get(e["key"])
+                if signature_id:
+                    self.store.signature_outcome(signature_id, "respawn")
             del self.stopped[e["key"]]
+            self.stopped_signatures.pop(e["key"], None)
         self.check_regret(lin, now)
         for rid in lin.closed:
             owner = lin.ghosts.get(rid, {}).get("key")
@@ -531,13 +539,17 @@ class Daemon:
                 valid_owner = lin.ghosts.get(rid, {}).get(
                     "identity_validated", False
                 ) and not policy.bad_owner(owner, self.deny)
+                terminal = lin.ghosts.get(rid, {}).get("terminal", False)
                 for key in dict.fromkeys(l["key"] for l in left):
                     self.store.observe_close(
                         owner, key, launcher=False
                     )  # weight 0: only counts closes
-                if valid_owner:
-                    self.attribute(owner, left, root=rid[0])
-                elif left and not lin.ghosts.get(rid, {}).get("terminal"):
+                if valid_owner and left:
+                    signature = self.survivor_signature(owner, left)
+                    self.attribute(owner, left, root=rid[0], signature=signature)
+                    if not terminal:
+                        self.store.observe_signature_close(signature)
+                elif left and not terminal:
                     self.queue_provenance_review(
                         self._provenance_scope(rid),
                         left,
@@ -564,6 +576,26 @@ class Daemon:
     @staticmethod
     def _provenance_scope(root):
         return "%s/provenance-%d-%d" % (engine.LEFTOVER, root[0], root[1])
+
+    def survivor_signature(self, owner, members):
+        """Build a stable signature from resolved members and live runtime/tty context."""
+        runtime_classes = set()
+        tty = False
+        for member in members:
+            entry = self.lineage.entries.get((member.get("pid"), member.get("start")))
+            if entry is None:
+                continue
+            runtime = getattr(entry.get("identity"), "runtime", None)
+            if runtime:
+                runtime_classes.add(runtime)
+            tty = tty or bool(entry.get("tty"))
+        return survivor_signature.signature(
+            owner,
+            members,
+            survivor_signature.runtime_dir_hash(),
+            "+".join(sorted(runtime_classes)),
+            tty,
+        )
 
     def queue_provenance_review(self, scope, left, reason):
         """Record uncertain ownership for inspection; no candidate receives an answer."""
@@ -601,12 +633,18 @@ class Daemon:
                 self.store.log(event="regret", owner=hit[0], leftover=e["key"])
                 del self.auto_recent[e["key"]]
 
-    def note_auto_stop(self, scope, why, pairs, apps=(), decision=None, owner=None):
+    def note_auto_stop(
+        self, scope, why, pairs, apps=(), decision=None, owner=None, signature_id=None
+    ):
         """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
         for o, k in pairs:
             self.store.auto_stopped(o, k)
             self.auto_recent[k] = (o, now)
+        if signature_id:
+            for key in apps:
+                self.stopped[key] = now
+                self.stopped_signatures[key] = signature_id
         self.store.record_auto_action(
             scope,
             why,
@@ -850,8 +888,8 @@ class Daemon:
             )
             return rep["removed"]
 
-    def auto_stop_survivors(self, tag, owner, left, dec):
-        """Survivors of a closed terminal job whose pair is decided stop: those that pass auto_stop_ok
+    def auto_stop_survivors(self, tag, owner, left, dec, signature_id=None):
+        """Survivors whose pair or matched signature says stop: those passing auto_stop_ok
         are carved into <host scope>/job-<id> (when the host scope is under user/<uid>, no sudo) and
         stopped there, else signalled in place. Everyone else is left alone."""
         want = [l for l in left if dec.get(l["key"], ("",))[0] == "stop"]
@@ -887,7 +925,13 @@ class Daemon:
         }
         good = []
         for l in want:
-            ok, w = engine.auto_stop_ok(self.store, owner, l["key"], infos[l["pid"]])
+            ok, w = engine.auto_stop_ok(
+                self.store,
+                owner,
+                l["key"],
+                infos[l["pid"]],
+                decision=dec.get(l["key"]),
+            )
             if ok:
                 good.append(l)
             else:
@@ -908,7 +952,11 @@ class Daemon:
         if not good:
             return
         pairs = list(dict.fromkeys((owner, l["key"]) for l in good))
-        explicit = all(self.store.pair_explicit(o, k) for o, k in pairs)
+        explicit = all(
+            dec.get(k, ("", 0.0, ""))[2].startswith("signature answered stop")
+            or self.store.pair_explicit(o, k)
+            for o, k in pairs
+        )
         grace = engine.auto_grace(self.store, {k for _o, k in pairs})
         me = "/user/%d/" % os.getuid()
         slug = tag.replace(".", "-")
@@ -924,7 +972,7 @@ class Daemon:
                 carved.setdefault(host, []).append(l["pid"])
             else:
                 loose.append(l)
-        why = "closed job %s: %s" % (tag, self.store.pair_decision(*pairs[0])[2])
+        why = "closed job %s: %s" % (tag, dec[pairs[0][1]][2])
         with self.store.decision_context(
             "stop",
             scope="job-" + slug,
@@ -983,14 +1031,16 @@ class Daemon:
                 apps=[l["key"] for l in good],
                 decision=decision,
                 owner=owner,
+                signature_id=signature_id,
             )
 
-    def attribute(self, owner, leftovers, root=None, job=None):
+    def attribute(self, owner, leftovers, root=None, job=None, signature=None):
         """Log would_attribute / would_stop for each distinct leftover key. Returns {key: decision}."""
         out = {}
+        inherited = self.store.signature_decisions(signature) if signature else {}
         for key in dict.fromkeys(l["key"] for l in leftovers):
             pids = [l["pid"] for l in leftovers if l["key"] == key]
-            out[key] = self.store.pair_decision(owner, key)
+            out[key] = inherited.get(key) or self.store.pair_decision(owner, key)
             self.store.log(
                 event="would_attribute",
                 owner=owner,
@@ -1120,11 +1170,15 @@ class Daemon:
                 why="no application ancestor" if not owner else "launcher",
             )
             return
-        dec = self.attribute(owner, left, job=tag)
+        signature = self.survivor_signature(owner, left)
+        dec = self.attribute(owner, left, job=tag, signature=signature)
+        self.store.observe_signature_close(signature)
         members = [
             {"pid": l["pid"], "start": l.get("start"), "apps": [l["key"]]} for l in left
         ]
         veto = self.store.match_veto(members=members)
+        if veto and any(action == "stop" for action, _confidence, _why in dec.values()):
+            self.store.signature_outcome(signature["id"], "veto")
         facts = authorization.Facts(
             vetoed=self.store.describe_veto(veto) if veto else ""
         )
@@ -1132,10 +1186,14 @@ class Daemon:
             self.authorize(authorization.JOB_SURVIVORS, facts).verdict
             == authorization.ACT
         ):
-            self.guarded(lambda: self.auto_stop_survivors(tag, owner, left, dec))
+            self.guarded(
+                lambda: self.auto_stop_survivors(
+                    tag, owner, left, dec, signature_id=signature["id"]
+                )
+            )
         ask = [k for k in keys if dec[k][0] == "ask" and self.store.can_ask((owner, k))]
         if ask:
-            self.make_question(j, tag, owner, left, ask)
+            self.make_question(j, tag, owner, left, ask, signature=signature)
 
     def candidates(self, owner, left):
         """Owners to offer, job root first, then recorded ancestors, then historical owners.
@@ -1261,7 +1319,9 @@ class Daemon:
                 kind="closed",
             )
 
-    def make_question(self, j, tag, owner, left, ask_keys, kind="job"):
+    def make_question(
+        self, j, tag, owner, left, ask_keys, kind="job", signature=None
+    ):
         shell = j["shell"]
         for qid in [i for i, q in self.pending.items() if q["shell_pid"] == shell]:
             self.drop_question(qid)
@@ -1284,6 +1344,7 @@ class Daemon:
             "tag": tag,
             "word": j["word"],
             "owner": owner,
+            "signature": signature,
             "ask_keys": list(ask_keys),
             "candidates": self.candidates(owner, left),
             "leftovers": list(cnt.values()),
@@ -1370,6 +1431,7 @@ class Daemon:
                 "job": q["word"],
                 "candidates": q["candidates"],
                 "leftovers": q["leftovers"],
+                "signature": (q.get("signature") or {}).get("id"),
                 "choices": list(knowledge.CHOICES),
                 "expires_in": max(0, int(PENDING_TTL - (time.time() - q["created"]))),
             }
@@ -1440,8 +1502,11 @@ class Daemon:
             mode=self.mode,
             why="user answered %s" % choice,
         ):
-            for k in q["ask_keys"]:
-                self.store.answer(owner, k, choice)
+            if choice in ("stop", "keep") and q.get("signature"):
+                self.store.answer_signature(owner, q["signature"], choice)
+            else:
+                for k in q["ask_keys"]:
+                    self.store.answer(owner, k, choice)
             self.drop_question(q["id"])
             self.store.log(
                 event="answer", choice=choice, owner=owner, leftovers=q["ask_keys"][:8]

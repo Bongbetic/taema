@@ -859,6 +859,7 @@ class JobFlow(ProcCase):
         self.settle()
         self.assertEqual(len(self.d.pending), 1)
         q = self.d.pending[1]
+        self.assertEqual(self.d.store.db.signature(q["signature"]["id"])["closes"], 1)
         qf = "%s/taema/q.20" % self.rt
         self.assertEqual(oct(os.stat(qf).st_mode & 0o777), "0o600")
         self.assertEqual(oct(os.stat(os.path.dirname(qf)).st_mode & 0o777), "0o700")
@@ -886,12 +887,81 @@ class JobFlow(ProcCase):
         self.assertEqual(ans(nonce=r["nonce"], choice="stop")["ok"], True)
         self.assertFalse(os.path.exists(qf))
         self.assertIn("error", ans(nonce=r["nonce"], choice="stop"))  # one-time nonce
-        self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "stop")
+        self.assertEqual(self.d.store.pair_decision("npm", "vite")[0], "ask")
         self.assertEqual(
-            knowledge.Store(self.d.store.dir, {}).pair_decision("npm", "vite")[0],
-            "stop",
-        )  # saved at once
+            self.d.store.signature_decision(q["signature"])[0], "stop"
+        )
+        reopened = knowledge.Store(self.d.store.dir, {})
+        self.assertEqual(reopened.pair_decision("npm", "vite")[0], "ask")
+        self.assertEqual(reopened.signature_decision(q["signature"])[0], "stop")
         self.assertEqual(self.ask(), {"question": None, "reason": "none"})
+
+    def test_new_survivor_member_is_reviewed_after_signature_stop_answer(self):
+        self.job()
+        self.settle()
+        first = self.d.pending[1]["signature"]
+        nonce = self.ask()["question"]["nonce"]
+        self.assertTrue(
+            self.d.handle({"cmd": "answer", "nonce": nonce, "choice": "stop"})[
+                "ok"
+            ]
+        )
+        self.assertEqual(self.d.store.signature_decision(first)[0], "stop")
+        self.fp.remove(30)
+        self.d.cfg["mode"] = "auto"
+
+        def safe_members(pids, origin=None):
+            return [
+                {
+                    "pid": pid,
+                    "key": "vite" if pid == 30 else "lint",
+                    "origin": origin,
+                    "edges": [],
+                    "protected": "",
+                    "ptmx": False,
+                    "cpu": 0.0,
+                }
+                for pid in pids
+            ]
+
+        with (
+            mock.patch.object(self.d, "_infos", side_effect=safe_members),
+            mock.patch.object(daemon.engine, "signal_survivors") as signal,
+            mock.patch.object(self.d, "guarded", side_effect=lambda fn: fn()),
+            mock.patch.object(
+                self.d, "auto_stop_survivors", wraps=self.d.auto_stop_survivors
+            ) as auto_stop,
+        ):
+            self.job(
+                tag="20.2",
+                survivors=(("vite", 7.0), ("lint", 6.0)),
+            )
+            self.settle("20.2")
+
+        question = next(iter(self.d.pending.values()))
+        self.assertNotEqual(question["signature"]["id"], first["id"])
+        self.assertEqual(question["ask_keys"], ["lint"])
+        self.assertEqual(self.d.store.pair_decision("npm", "lint")[0], "ask")
+        auto_stop.assert_called_once()
+        self.assertEqual(
+            auto_stop.call_args.args[3]["vite"][0],
+            "stop",
+            {
+                "decisions": auto_stop.call_args.args[3],
+                "signatures": self.d.store.db.signatures_for_owner("npm"),
+                "question_signature": question["signature"],
+            },
+        )
+        self.assertEqual(signal.call_count, 1, self.log())
+        self.assertEqual([item["key"] for item in signal.call_args.args[1]], ["vite"])
+        signature_id = question["signature"]["id"]
+        self.assertEqual(self.d.store.db.signature(signature_id)["stop_ok"], 1)
+
+        self.fp.remove(30)
+        self.fp.add(40, 1, comm="vite", born=self.fp.up - 1.0)
+        self.d.lineage.observe(self.fp.table())
+        self.d.after_observe()
+        self.assertEqual(self.d.store.db.signature(signature_id)["respawn"], 1)
 
     def test_standalone_and_owner_choice(self):
         self.job()

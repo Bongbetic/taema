@@ -208,7 +208,11 @@ def render_status(model, args, summary=False):
                     % (
                         _clip(pair.get("owner", ""), 20),
                         _clip(pair.get("leftover", ""), 20),
-                        pair.get("action", ""),
+                        "%s%s"
+                        % (
+                            pair.get("action", ""),
+                            " (signature)" if pair.get("inherited") else "",
+                        ),
                         pair.get("confidence", 0.0),
                         pair.get("stop", 0.0),
                         pair.get("keep", 0.0),
@@ -411,6 +415,22 @@ def render_explanation(target, explanation):
         lines.append("learning: recorded data")
     else:
         lines.append("learning: unknown")
+    signatures = learning.get("signatures") or []
+    for item in signatures[:5]:
+        lines.append(
+            "signature: owner=%s id=%s answer=%s closes=%d stop_ok=%d respawn=%d veto=%d"
+            % (
+                item.get("owner", "?"),
+                item.get("id", "?"),
+                item.get("answer", "none"),
+                item.get("closes", 0),
+                item.get("stop_ok", 0),
+                item.get("respawn", 0),
+                item.get("veto", 0),
+            )
+        )
+    if len(signatures) > 5:
+        lines.append("signature: (+%d more)" % (len(signatures) - 5))
     outcomes = explanation.get("mode_outcomes") or {}
     lines.append("authorization (%s):" % outcomes.get("trigger", "unknown"))
     for item in outcomes.get("modes", []):

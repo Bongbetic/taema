@@ -944,6 +944,13 @@ def _why_pair_report(owner, leftover, cfg, store):
             "leftover": leftover,
             "pair": pair,
             "owner_learning": store.explain(owner),
+            "signatures": list(
+                {
+                    item["id"]: item
+                    for item in store.signature_summaries(owner)
+                    + store.signature_summaries(leftover)
+                }.values()
+            ),
         },
     )
     return explanation

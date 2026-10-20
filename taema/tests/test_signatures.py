@@ -30,7 +30,9 @@ class SurvivorSignatureTests(unittest.TestCase):
         normalized = signature.signature(
             "editor", ["node:build"], runtime_hash=7, runtime_class=None
         )
-        self.assertEqual((normalized["runtime_hash"], normalized["runtime_class"]), ("", ""))
+        self.assertEqual(
+            (normalized["runtime_hash"], normalized["runtime_class"]), ("", "")
+        )
 
     def test_member_count_reader_rejects_malformed_stored_data(self):
         self.assertEqual(signature.member_counts(None), {})
@@ -73,7 +75,9 @@ class SurvivorSignatureTests(unittest.TestCase):
             expected,
         )
 
-    def test_signature_answer_matches_exact_and_near_groups_without_pair_authority(self):
+    def test_signature_answer_matches_exact_and_near_groups_without_pair_authority(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temporary:
             now = [1000.0]
             store = Store(temporary, {}, now=lambda: now[0])

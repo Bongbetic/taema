@@ -412,6 +412,61 @@ class IpcV2Tests(unittest.TestCase):
                     with self.assertRaises(protocol.ProtocolError):
                         protocol.validate_feedback(invalid)
 
+    def test_veto_feedback_accepts_pair_targets_and_rejects_malformed_targets(self):
+        valid = {
+            "v": 2,
+            "id": "pair-veto",
+            "op": "veto",
+            "target": {
+                "kind": "pair",
+                "value": "firefox",
+                "owner": "browser",
+                "leftover": "firefox",
+            },
+            "reason": "keep this process",
+            "expires": time.time() + 60,
+        }
+        protocol.validate_feedback(valid)
+        self.assertTrue(
+            matches(
+                valid,
+                self.request_schema["$defs"]["feedback_args"],
+                self.request_schema,
+            )
+        )
+
+        invalid_targets = (
+            {"kind": "pair", "value": "firefox", "owner": "browser"},
+            {
+                "kind": "pair",
+                "value": "firefox",
+                "owner": "browser",
+                "leftover": "node",
+            },
+            {"kind": "app", "value": "firefox", "owner": "browser"},
+            {"kind": "app", "value": True},
+            {"kind": "unknown", "value": "firefox"},
+        )
+        for index, target in enumerate(invalid_targets):
+            with self.subTest(target=target):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_feedback(
+                        {**valid, "id": "invalid-target-%d" % index, "target": target}
+                    )
+        for expires in (True, float("inf"), 10**1000):
+            with self.subTest(expires=expires):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_feedback({**valid, "expires": expires})
+
+    def test_unveto_pid_target_keeps_v1_wildcard_removal_compatibility(self):
+        operation = {
+            "v": 1,
+            "id": "legacy-unveto-pid",
+            "op": "unveto",
+            "target": {"kind": "pid", "value": "42"},
+        }
+        protocol.validate_feedback(operation)
+
     def test_review_feedback_requires_valid_id_owner_and_choice(self):
         operations = (
             {"op": "review_shown", "review_id": 3, "owner": "editor"},

@@ -84,26 +84,66 @@ def _is_type(value, kind):
     return False
 
 
-def _validate_target(target):
+def _finite_number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _validate_target(target, allow_pid_wildcard=False):
     if not isinstance(target, dict):
         _fail("feedback target must be an object")
-    if set(target) - {"kind", "value", "start"}:
+    if set(target) - {"kind", "value", "start", "owner", "leftover"}:
         _fail("feedback target contains an unknown field")
     if not {"kind", "value"} <= set(target):
         _fail("feedback target requires kind and value")
-    if target["kind"] not in ("scope", "app", "pid"):
+    if target["kind"] not in (
+        "pid",
+        "scope",
+        "pair",
+        "signature",
+        "app",
+        "owner",
+        "unit",
+        "cgroup",
+        "path",
+    ):
         _fail("feedback target kind is invalid")
     value = target["value"]
     if not isinstance(value, (str, int)) or isinstance(value, bool):
         _fail("feedback target value must be a string or integer")
     if not str(value) or len(str(value)) > 256:
         _fail("feedback target value is out of range")
-    if (
-        "start" in target
-        and target["start"] is not None
-        and not _is_type(target["start"], "integer")
-    ):
-        _fail("feedback target start must be an integer or null")
+    start = target.get("start")
+    if target["kind"] == "pid":
+        try:
+            pid = int(value)
+        except (TypeError, ValueError):
+            _fail("pid veto requires a positive pid and start time")
+        if pid <= 1 or (
+            not (allow_pid_wildcard and start is None)
+            and (not _is_type(start, "integer") or start <= 0)
+        ):
+            _fail("pid veto requires a positive pid and start time")
+    elif start is not None:
+        _fail("only a pid veto may have a start time")
+    if target["kind"] == "pair":
+        owner, leftover = target.get("owner"), target.get("leftover")
+        if (
+            not _is_type(owner, "string")
+            or not owner
+            or len(owner) > 256
+            or not _is_type(leftover, "string")
+            or not leftover
+            or len(leftover) > 256
+            or str(value) != leftover
+        ):
+            _fail("pair veto requires owner and leftover keys")
+    elif "owner" in target or "leftover" in target:
+        _fail("only a pair veto may have owner and leftover keys")
 
 
 def _validate_feedback(args):
@@ -127,6 +167,7 @@ def _validate_feedback(args):
         "held",
         "until",
         "reason",
+        "expires",
     }
     if "v" not in args:
         if set(args) != legacy_fields:
@@ -161,7 +202,7 @@ def _validate_feedback(args):
             "keep": common | {"key"},
             "forget": common | {"key"},
             "kill": common | {"key"},
-            "veto": common | {"target", "reason"},
+            "veto": common | {"target", "reason", "expires"},
             "unveto": common | {"target"},
             "undo": common | {"action_id"},
             "answer": common | {"owner", "leftovers", "choice"},
@@ -180,7 +221,7 @@ def _validate_feedback(args):
     if op in ("veto", "unveto", "vetoed"):
         if "target" not in args:
             _fail("feedback target is required")
-        _validate_target(args["target"])
+        _validate_target(args["target"], allow_pid_wildcard=op == "unveto")
     if op == "undo" and (
         not _is_type(args.get("action_id"), "string") or not args["action_id"]
     ):
@@ -188,6 +229,10 @@ def _validate_feedback(args):
     for field in ("action_id", "reason", "trigger"):
         if field in args and not _is_type(args[field], "string"):
             _fail("feedback %s must be a string" % field)
+    if op == "veto" and "reason" in args and len(args["reason"]) > 256:
+        _fail("feedback reason must be at most 256 characters")
+    if op == "veto" and "expires" in args and not _finite_number(args["expires"]):
+        _fail("feedback veto expiry must be a finite timestamp")
     if op in ("keep", "forget", "kill"):
         if not _is_type(args.get("key"), "string") or not args["key"]:
             _fail("feedback key must be a non-empty string")
@@ -251,12 +296,7 @@ def _validate_feedback(args):
             _fail("feedback reason must be a string of at most 256 characters")
     if op == "snooze":
         until = args.get("until")
-        if (
-            not isinstance(until, (int, float))
-            or isinstance(until, bool)
-            or not math.isfinite(until)
-            or until < 0
-        ):
+        if not _finite_number(until) or until < 0:
             _fail("feedback snooze expiry must be a finite timestamp")
         if "reason" in args and (
             not _is_type(args["reason"], "string") or len(args["reason"]) > 256

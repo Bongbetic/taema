@@ -2,6 +2,13 @@
 
 ## Behaviour changes
 
+### vetoes cover every target and action
+
+`taema do-not-kill` can protect process instances, scopes, pairs, signatures, app identities,
+owners, units, cgroup subtrees, and executable paths, with explicit precedence, reasons, and
+expiry. Vetoes also block actions while the daemon is down; `taema stop --force-veto` remains the
+single confirmed and audited override.
+
 ### adopt now contains and asks
 
 In `adopt`, a GUI app's surviving processes now move into a dedicated `leftover/` scope

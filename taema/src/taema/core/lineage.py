@@ -167,9 +167,7 @@ class Lineage:
                 e.get("co_birth_parent_runtime"),
             )
             e["chain"] = [
-                self.entries[ancestor_id]["key"]
-                if ancestor_id in self.entries
-                else key
+                self.entries[ancestor_id]["key"] if ancestor_id in self.entries else key
                 for ancestor_id, key in zip(e["chain_ids"], e["chain"])
             ]
             parent = self._nearest_distinct_ancestor(e)
@@ -258,9 +256,7 @@ class Lineage:
         parent_app = entry.get("parent_key") or entry.get("co_birth_parent_key")
         if parent_app == entry["key"]:
             parent_app = None
-        parent_scope = entry.get("parent_scope") or entry.get(
-            "co_birth_parent_scope"
-        )
+        parent_scope = entry.get("parent_scope") or entry.get("co_birth_parent_scope")
         parent_job = entry.get("parent_job") or entry.get("co_birth_parent_job")
         parent_runtime = entry.get("parent_runtime") or entry.get(
             "co_birth_parent_runtime"

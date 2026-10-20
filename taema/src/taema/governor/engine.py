@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from ..core import cgroup, process as inspect
+from ..core import cgroup, process as inspect, signature as survivor_signature
 from ..config import policy
 
 
@@ -81,7 +81,16 @@ def unit_for_leaf(units, leaf):
 
 
 def plan_stop(
-    path, cfg, store, unit=None, force=False, hard=False, keep=(), pt=None, snap=None
+    path,
+    cfg,
+    store,
+    unit=None,
+    force=False,
+    hard=False,
+    keep=(),
+    pt=None,
+    snap=None,
+    veto_override=False,
 ):
     """Decide per member: kill | share | skip. Never touches anything.
 
@@ -90,6 +99,11 @@ def plan_stop(
     pids = cgroup.tree_procs(path)
     pset = set(pids)
     pt = pt or inspect.ProcTable.scan()
+    vetoes = (
+        vetoes_for_scope(store, path, unit=unit)
+        if not veto_override and hasattr(store, "matching_vetoes")
+        else []
+    )
     reasons = {pid: policy.protected_reason(pid, cfg) for pid in pids}
     edge_map, edges_ok = {}, True
     if any(r is None for r in reasons.values()):
@@ -112,6 +126,8 @@ def plan_stop(
         reason = reasons[pid]
         if reason:
             d.update(action="skip", why=reason)
+        elif vetoes:
+            d.update(action="skip", why="vetoed " + store.describe_veto(vetoes[0]))
         elif d["edges"] and not hard:
             d.update(
                 action="share",
@@ -201,14 +217,97 @@ def _run_hook(hook):
         p.wait()
 
 
-def veto_for_scope(store, path, unit=None):
-    """Resolve scope, app, and pid vetoes against a leaf and its current members."""
+def vetoes_for_scope(store, path, unit=None, owner=None, signature=None, leftover=None):
+    """Resolve every veto target against a leaf and its current member identities."""
+    if not store._active_vetoes():
+        return []
     members = []
+    unit_name = (unit or {}).get("unit", {}).get("name")
     for pid in cgroup.tree_procs(path):
         start = inspect.starttime(pid)
         key = policy.app_key(pid, units=[unit] if unit else ())
-        members.append({"pid": pid, "start": start, "apps": [key] if key else []})
-    return store.match_veto(scope=cgroup.rel(path), members=members)
+        member = {
+            "pid": pid,
+            "start": start,
+            "apps": [key] if key else [],
+            "path": inspect.exe(pid) or "",
+            "cgroup": cgroup.proc_cgroup(pid) or "",
+            "unit": unit_name or "",
+            "owners": store.owners_of(key, limit=1024) if key else [],
+        }
+        if owner:
+            member["owner"] = owner
+        if key:
+            member["leftover"] = key
+        members.append(member)
+    if signature is None:
+        signature = _matching_signature_veto(store, members)
+    return store.matching_vetoes(
+        scope=cgroup.rel(path),
+        members=members,
+        owner=owner,
+        leftover=leftover,
+        signature=signature,
+        unit=unit_name,
+        cgroup_path=cgroup.rel(path),
+    )
+
+
+def _matching_signature_veto(store, members):
+    """Return an active signature veto matching this live member set, if one exists.
+
+    Manual stops can run while the daemon is down, so they cannot depend on the daemon's
+    in-memory lineage. A stored signature carries the owner and exact fingerprint inputs; using
+    those inputs lets the current cgroup membership resolve the same stable id offline.
+    """
+    active = [
+        veto for veto in store._active_vetoes() if veto.get("kind") == "signature"
+    ]
+    database = getattr(store, "db", None)
+    if not active or database is None or not hasattr(database, "signature"):
+        return None
+
+    keys = []
+    tty = False
+    for member in members:
+        apps = member.get("apps")
+        if not isinstance(apps, (list, tuple)) or len(apps) != 1:
+            return None
+        key = apps[0]
+        pid = member.get("pid")
+        if not isinstance(key, str) or not key or not isinstance(pid, int):
+            return None
+        stat = inspect._parse_stat(inspect.read(pid, "stat"))
+        if stat is None:
+            return None
+        keys.append(key)
+        tty = tty or bool(stat.tty)
+
+    if not keys:
+        return None
+    runtime_hash = survivor_signature.runtime_dir_hash()
+    for veto in active:
+        stored = database.signature(veto.get("value"))
+        if not isinstance(stored, dict) or not isinstance(stored.get("owner"), str):
+            continue
+        try:
+            current = survivor_signature.signature(
+                stored["owner"],
+                keys,
+                runtime_hash,
+                stored.get("runtime", ""),
+                tty,
+            )
+        except (TypeError, ValueError):
+            continue
+        if current["id"] == veto.get("value"):
+            return current["id"]
+    return None
+
+
+def veto_for_scope(store, path, unit=None, owner=None, signature=None, leftover=None):
+    matches = vetoes_for_scope(store, path, unit, owner, signature, leftover)
+    return matches[0] if matches else None
 
 
 def _stop_impl(
@@ -224,15 +323,45 @@ def _stop_impl(
     hook=None,
     passes=3,
     allow_sigkill=True,
+    veto_override=False,
+    decision_owner=None,
+    signature=None,
+    leftover=None,
 ):
     """Stop a scope: move shared members aside, run the hook, SIGTERM, SIGKILL leftovers, rmdir.
     allow_sigkill=False (auto mode, pairs not explicitly answered): members that ignore SIGTERM live."""
     self_guard(path)
-    veto = veto_for_scope(store, path, unit)
-    if veto:
-        target = store._target(veto)
-        store.log(event="vetoed", trigger="stop", scope=cgroup.rel(path), target=target)
+    scope = cgroup.rel(path)
+    if (unit or {}).get("kill", {}).get("never_stop"):
+        store.log(
+            event="unit_vetoed",
+            trigger="stop",
+            scope=scope,
+            target="kill.never_stop",
+        )
+        raise Vetoed("unit veto: kill.never_stop")
+    vetoes = vetoes_for_scope(store, path, unit, decision_owner, signature, leftover)
+    if vetoes and not veto_override:
+        veto = vetoes[0]
+        store.log(
+            event="vetoed",
+            trigger="stop",
+            scope=scope,
+            target=store._target(veto),
+            reason=veto.get("reason", ""),
+            source=veto.get("source", "user"),
+        )
         raise Vetoed("vetoed " + store.describe_veto(veto))
+    if vetoes:
+        for veto in vetoes:
+            store.log(
+                event="veto_override",
+                trigger="manual_stop",
+                scope=scope,
+                target=store._target(veto),
+                reason=veto.get("reason", ""),
+                source=veto.get("source", "user"),
+            )
     report = {
         "scope": cgroup.rel(path),
         "decisions": [],
@@ -248,7 +377,18 @@ def _stop_impl(
     )  # one ss snapshot for all passes, built only if needed
     for _ in range(passes):
         pt = inspect.ProcTable.scan()
-        plan = plan_stop(path, cfg, store, unit, force, hard, keep, pt=pt, snap=snap)
+        plan = plan_stop(
+            path,
+            cfg,
+            store,
+            unit,
+            force,
+            hard,
+            keep,
+            pt=pt,
+            snap=snap,
+            veto_override=veto_override,
+        )
         report["decisions"].extend(plan)
         if dry_run or not plan:
             break
@@ -385,6 +525,9 @@ def stop(
     decision_authority=None,
     decision_why=None,
     decision_owner=None,
+    veto_override=False,
+    signature=None,
+    leftover=None,
 ):
     """Trace a stop attempt unless its caller already established the decision context."""
     context = getattr(store, "decision_context", None)
@@ -402,6 +545,10 @@ def stop(
             hook,
             passes,
             allow_sigkill,
+            veto_override,
+            decision_owner,
+            signature,
+            leftover,
         )
     authority = decision_authority or ("manual" if force or unit is None else "unit")
     with context(
@@ -425,6 +572,10 @@ def stop(
             hook,
             passes,
             allow_sigkill,
+            veto_override,
+            decision_owner,
+            signature,
+            leftover,
         )
 
 
@@ -690,6 +841,7 @@ def gc_candidates(
     lin=None,
     auto=False,
     authority="learned",
+    signature_for_scope=None,
 ):
     """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}.
 
@@ -795,6 +947,11 @@ def gc_candidates(
                 scope=rel,
                 expiry_days=expiry_days,
                 at=now(),
+                signature=(
+                    signature_for_scope(d, pids)
+                    if callable(signature_for_scope)
+                    else None
+                ),
                 authority=authority,
             )
             if verdict[0] == "held":
@@ -868,6 +1025,7 @@ def _leftover_verdict(
     scope="",
     expiry_days=0,
     at=None,
+    signature=None,
     authority="learned",
 ):
     """("stop", why) when every member passes auto_stop_ok, ("held", why) when a member must not be
@@ -890,8 +1048,40 @@ def _leftover_verdict(
                 i["origin"], i["key"], scope, expiry_days, now=at
             ):
                 return "held", "pair decided keep: %s>%s" % (i["origin"], i["key"])
+    for i in infos:
+        veto = _member_veto(
+            store,
+            i["origin"],
+            i["key"],
+            i,
+            scope=scope,
+            signature=signature,
+        )
+        if veto:
+            with store.decision_context(
+                "refusal",
+                scope=scope,
+                authority="veto",
+                why="veto blocked automatic leftover stop",
+            ):
+                store.log(
+                    event="vetoed",
+                    trigger="gc_stop",
+                    scope=scope,
+                    target=store._target(veto),
+                    source=veto.get("source", "user"),
+                )
+            return "held", "vetoed " + store.describe_veto(veto)
     res = [
-        auto_stop_ok(store, i["origin"], i["key"], i, authority=authority)
+        auto_stop_ok(
+            store,
+            i["origin"],
+            i["key"],
+            i,
+            authority=authority,
+            scope=scope,
+            signature=signature,
+        )
         for i in infos
     ]
     if infos and all(r[0] for r in res):
@@ -919,6 +1109,7 @@ def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
     units = getattr(lin, "units", ()) if lin is not None else ()
     return {
         "pid": pid,
+        "start": inspect.starttime(pid),
         "key": e["key"] if e else policy.app_key(pid, units=units),
         "origin": origin if origin is not None else (e["root_key"] if e else ""),
         "edges": edge_map.get(pid, []) if edges_ok else None,
@@ -929,7 +1120,15 @@ def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
 
 
 def auto_stop_ok(
-    store, owner_key, leftover_key, mi, decision=None, authority="learned"
+    store,
+    owner_key,
+    leftover_key,
+    mi,
+    decision=None,
+    authority="learned",
+    scope=None,
+    signature=None,
+    unit=None,
 ):
     """May auto mode stop this member? (ok, why). A pair or matched survivor signature must decide
     "stop", and the member must be plainly idle and known: no edges, not protected / a pty host / a
@@ -942,6 +1141,17 @@ def auto_stop_ok(
         return False, "learning decision is %s" % action
     if authority == "answered" and not store.explicit_stop((action, _conf, why)):
         return False, "learning authority requires an explicit stop answer"
+    veto = _member_veto(
+        store,
+        owner_key,
+        leftover_key,
+        mi,
+        scope=scope,
+        signature=signature,
+        unit=unit,
+    )
+    if veto:
+        return False, "vetoed " + store.describe_veto(veto)
     if not mi.get("origin"):
         return False, "origin unknown"
     if mi.get("edges") is None:
@@ -965,6 +1175,42 @@ def auto_stop_ok(
     if cpu > AUTO_MAX_CPU:
         return False, "cpu %.1f%% > %.0f%%" % (cpu, AUTO_MAX_CPU)
     return True, why
+
+
+def _member_veto(store, owner, leftover, mi, scope=None, signature=None, unit=None):
+    """Resolve a veto against one known member and the automatic-stop context."""
+    if not store._active_vetoes():
+        return None
+    pid = mi.get("pid")
+    start = mi.get("start")
+    if start is None and isinstance(pid, int):
+        start = inspect.starttime(pid)
+    apps = [leftover] if isinstance(leftover, str) and leftover else []
+    owners = store.owners_of(leftover, limit=1024) if apps else []
+    if owner and owner not in owners:
+        owners.append(owner)
+    member = {
+        "pid": pid,
+        "start": start,
+        "apps": apps,
+        "owner": owner or "",
+        "owners": owners,
+        "leftover": leftover or "",
+        "unit": mi.get("unit") or unit or "",
+        "path": mi.get("path") or (inspect.exe(pid) if isinstance(pid, int) else ""),
+        "cgroup": mi.get("cgroup")
+        or (cgroup.proc_cgroup(pid) if isinstance(pid, int) else "")
+        or "",
+    }
+    return store.match_veto(
+        scope=scope,
+        members=[member],
+        owner=owner,
+        leftover=leftover,
+        signature=signature,
+        unit=member["unit"] or None,
+        cgroup_path=scope,
+    )
 
 
 def auto_grace(store, keys):

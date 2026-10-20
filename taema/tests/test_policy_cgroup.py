@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import errno
 import os
 import tempfile
 import unittest
@@ -71,6 +72,25 @@ class CgroupTests(unittest.TestCase):
         self.assertFalse(cgroup.is_prefix(t, "/user/1000/app-claude-desktop-2"))
         self.assertFalse(cgroup.is_prefix(t, "/2"))
         self.assertFalse(cgroup.is_prefix(t, None))
+
+    def test_move_reports_missing_process_and_propagates_other_errors(self):
+        with mock.patch(
+            "builtins.open", side_effect=OSError(errno.ESRCH, "process gone")
+        ):
+            self.assertFalse(cgroup.move(42, "/fake/scope"))
+        with mock.patch(
+            "builtins.open", side_effect=OSError(errno.EPERM, "permission denied")
+        ):
+            with self.assertRaises(OSError):
+                cgroup.move(42, "/fake/scope")
+
+    def test_rmdir_tree_removes_empty_descendants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = os.path.join(temporary, "scope")
+            nested = os.path.join(root, "child", "leaf")
+            os.makedirs(nested)
+            cgroup.rmdir_tree(root)
+            self.assertFalse(os.path.exists(root))
 
 
 class ConfigTests(unittest.TestCase):

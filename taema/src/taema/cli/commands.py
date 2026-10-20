@@ -329,10 +329,311 @@ def veto_target(target, store=None, for_removal=False):
 
 
 def veto_label(target):
+    if target.get("kind") == "pair":
+        return "pair %s>%s" % (target.get("owner"), target.get("leftover"))
     label = "%s %s" % (target["kind"], target["value"])
     if target["kind"] == "pid" and target.get("start") is not None:
         label += " (starttime %s)" % target["start"]
     return label
+
+
+def _veto_target_key(target):
+    if target.get("kind") == "pair":
+        return target["kind"], target.get("owner"), target.get("leftover")
+    return target["kind"], str(target.get("value")), target.get("start")
+
+
+def _map_resolved_target(selected):
+    if selected.kind == "scope":
+        return {"kind": "scope", "value": selected.value, "start": None}
+    if selected.kind == "pid":
+        if (
+            selected.pid is None
+            or selected.start is None
+            or inspect.starttime(selected.pid) != selected.start
+        ):
+            raise ValueError("pid %s changed since target selection" % selected.value)
+        return {
+            "kind": "pid",
+            "value": selected.value,
+            "start": selected.start,
+        }
+    value = selected.app_key or selected.value
+    if not value:
+        raise ValueError("target has no stable application identity")
+    return {"kind": "app", "value": value, "start": None}
+
+
+def resolve_veto_targets(a, store, units, *, removal=False):
+    """Resolve one explicit selector or a positional query without guessing."""
+    from . import targets
+
+    selectors = (
+        "scope",
+        "pid",
+        "pair",
+        "signature",
+        "app",
+        "owner",
+        "unit",
+        "cgroup",
+        "path",
+    )
+    selected_flags = [name for name in selectors if getattr(a, name, None) is not None]
+    query = getattr(a, "target", None)
+    if query is None:
+        query = getattr(a, "exe", None)
+    if selected_flags and query:
+        raise ValueError("use one explicit selector or a positional target")
+    if len(selected_flags) > 1:
+        raise ValueError("choose one veto target form")
+
+    active = store._active_vetoes()
+    if removal and query and not selected_flags:
+        try:
+            existing = veto_target(query, store, for_removal=True)
+        except ValueError:
+            existing = None
+        if existing and any(
+            store._same_veto_target(veto, existing, pid_wildcard=True)
+            for veto in active
+        ):
+            return [(existing, ["active " + veto_label(existing)])]
+
+    candidates = _target_candidates(None, store)
+    pid_query = query.split(":", 1)[-1] if isinstance(query, str) else ""
+    if isinstance(pid_query, str) and pid_query.isdigit():
+        try:
+            pid_target = targets.process_target(pid_query)
+        except targets.TargetNotFound:
+            pass
+        else:
+            if not any(
+                item.kind == "pid"
+                and item.value == pid_target.value
+                and item.start == pid_target.start
+                for item in candidates
+            ):
+                candidates.append(pid_target)
+
+    if not selected_flags:
+        if not query:
+            return []
+        matches = targets.matching_targets(query, candidates)
+        if not matches:
+            raise ValueError("no target matches %r" % query)
+        if len(matches) > 1 and not getattr(a, "all", False):
+            raise ValueError(
+                "target %r is ambiguous: %s; use --all or a more specific target form"
+                % (query, ", ".join(item.label for item in matches))
+            )
+        resolved = []
+        for item in matches:
+            target = _map_resolved_target(item)
+            resolved.append((target, [item.label]))
+    else:
+        selector = selected_flags[0]
+        value = getattr(a, selector)
+        if removal:
+            if selector == "pair":
+                probe = {
+                    "kind": "pair",
+                    "value": value[1],
+                    "start": None,
+                    "owner": value[0],
+                    "leftover": value[1],
+                }
+            elif selector == "pid":
+                existing = next(
+                    (
+                        store._target(v)
+                        for v in active
+                        if v.get("kind") == "pid" and v.get("value") == str(value)
+                    ),
+                    None,
+                )
+                probe = existing
+            else:
+                probe = {"kind": selector, "value": value, "start": None}
+            if probe and any(
+                store._same_veto_target(veto, probe, pid_wildcard=True)
+                for veto in active
+            ):
+                return [(probe, ["active " + veto_label(probe)])]
+        if selector == "pair":
+            owner, leftover = value
+            if not owner or not leftover or len(owner) > 256 or len(leftover) > 256:
+                raise ValueError("pair veto requires OWNER and LEFTOVER keys")
+            key = store.pkey(owner, leftover)
+            if key not in store.data.get("pairs", {}):
+                if not any(
+                    v.get("kind") == "pair"
+                    and v.get("owner") == owner
+                    and v.get("leftover") == leftover
+                    for v in active
+                ):
+                    raise ValueError("no stored pair matches %s>%s" % (owner, leftover))
+            target = {
+                "kind": "pair",
+                "value": leftover,
+                "start": None,
+                "owner": owner,
+                "leftover": leftover,
+            }
+            resolved = [(target, ["stored pair %s>%s" % (owner, leftover)])]
+        elif selector == "signature":
+            if not store.db.signature(value) and not any(
+                v.get("kind") == "signature" and v.get("value") == value for v in active
+            ):
+                raise ValueError("no stored signature matches %s" % value)
+            resolved = [
+                (
+                    {"kind": "signature", "value": value, "start": None},
+                    ["stored signature " + value],
+                )
+            ]
+        elif selector == "pid":
+            try:
+                item = targets.process_target(value)
+            except targets.TargetNotFound:
+                if removal:
+                    existing = next(
+                        (
+                            store._target(v)
+                            for v in active
+                            if v.get("kind") == "pid" and v.get("value") == str(value)
+                        ),
+                        None,
+                    )
+                    if existing:
+                        resolved = [(existing, ["active " + veto_label(existing)])]
+                    else:
+                        raise ValueError("no live pid matches %s" % value) from None
+                else:
+                    raise ValueError("no live pid matches %s" % value) from None
+            else:
+                resolved = [(_map_resolved_target(item), [item.label])]
+        elif selector in ("scope", "app"):
+            kind = selector
+            matches = [
+                item
+                for item in candidates
+                if item.kind == kind
+                and (
+                    item.value == value
+                    or (kind == "scope" and item.value.rsplit("/", 1)[-1] == value)
+                )
+            ]
+            if not matches:
+                if removal:
+                    existing = next(
+                        (
+                            store._target(v)
+                            for v in active
+                            if v.get("kind") == kind and v.get("value") == str(value)
+                        ),
+                        None,
+                    )
+                    if existing:
+                        return [(existing, ["active " + veto_label(existing)])]
+                raise ValueError("no %s target matches %r" % (kind, value))
+            if len(matches) > 1 and not getattr(a, "all", False):
+                raise ValueError(
+                    "%s target %r is ambiguous: %s; use --all"
+                    % (kind, value, ", ".join(item.label for item in matches))
+                )
+            resolved = [
+                (
+                    {"kind": kind, "value": item.value, "start": None},
+                    [item.label],
+                )
+                for item in matches
+            ]
+        elif selector == "owner":
+            known = {item.value for item in candidates if item.kind == "app"}
+            known.update(
+                key.split(knowledge.SEP, 1)[0] for key in store.data.get("pairs", {})
+            )
+            if value not in known:
+                raise ValueError("no owner identity matches %r" % value)
+            resolved = [
+                (
+                    {"kind": "owner", "value": value, "start": None},
+                    ["owner app:" + value],
+                )
+            ]
+        elif selector == "unit":
+            names = {
+                item.get("unit", {}).get("name")
+                for item in units
+                if isinstance(item.get("unit", {}).get("name"), str)
+            }
+            if value not in names:
+                raise ValueError("no configured unit matches %r" % value)
+            live = [
+                item.label
+                for item in candidates
+                if item.kind == "scope"
+                and (item.value == value or item.value.startswith(value + "-"))
+            ]
+            resolved = [
+                (
+                    {"kind": "unit", "value": value, "start": None},
+                    live or ["configured unit " + value],
+                )
+            ]
+        elif selector in ("cgroup", "path"):
+            if selector == "path" and not os.path.isabs(value):
+                raise ValueError("executable path must be absolute")
+
+            def is_under(path, prefix):
+                path, prefix = path.strip("/"), prefix.strip("/")
+                return bool(path and prefix) and (
+                    path == prefix or path.startswith(prefix + "/")
+                )
+
+            matched = []
+            pids = [item for item in candidates if item.kind == "pid"]
+            for item in pids:
+                path = (
+                    inspect.exe(item.pid)
+                    if selector == "path" and item.pid is not None
+                    else cgroup.proc_cgroup(item.pid)
+                    if item.pid is not None
+                    else None
+                )
+                if selector == "path" and path == value:
+                    matched.append(item.label)
+                elif (
+                    selector == "cgroup"
+                    and isinstance(path, str)
+                    and is_under(path, value)
+                ):
+                    matched.append(item.label)
+            if selector == "cgroup":
+                matched.extend(
+                    item.label
+                    for item in candidates
+                    if item.kind == "scope" and is_under(item.value, value)
+                )
+            if not matched:
+                raise ValueError("no %s target matches %r" % (selector, value))
+            resolved = [
+                (
+                    {"kind": selector, "value": value, "start": None},
+                    list(dict.fromkeys(matched)),
+                )
+            ]
+
+    deduped = {}
+    for target, labels in resolved:
+        key = _veto_target_key(target)
+        if key not in deduped:
+            deduped[key] = [target, []]
+        deduped[key][1].extend(
+            label for label in labels if label not in deduped[key][1]
+        )
+    return [(target, labels) for target, labels in deduped.values()]
 
 
 def die(msg, code=1, hint=None, suggestion=None):
@@ -619,11 +920,27 @@ def cmd_kill(a):
     path = _target_scope_path(selected)
     if path is None:
         return 2
-    veto = engine.veto_for_scope(store, path)
+    leaf_name = os.path.basename(path)
+    unit = engine.unit_for_leaf(units, leaf_name)
+    vetoes = engine.vetoes_for_scope(store, path, unit=unit)
+    force_veto = bool(getattr(a, "force_veto", False))
+    if vetoes and force_veto:
+        if not _confirm_bulk(
+            "override veto",
+            [store.describe_veto(veto) for veto in vetoes],
+            a,
+        ):
+            return 1
+    veto = vetoes[0] if vetoes else None
     scope = cgroup.rel(path)
     facts = authorization.Facts(
         scope=scope,
-        vetoed=veto_label(veto) if veto else "",
+        vetoed=veto_label(veto) if veto and not force_veto else "",
+        veto_source=veto.get("source", "user") if veto else "",
+        veto_target=veto_label(veto) if veto else "",
+        unit_veto=(
+            "kill.never_stop" if unit and unit.get("kill", {}).get("never_stop") else ""
+        ),
         held=store.hold_reason(scope),
     )
     dec = authorization.authorize(authorization.MANUAL_STOP, cfg["mode"], facts)
@@ -637,10 +954,11 @@ def cmd_kill(a):
         ):
             if dec.slot == authorization.VETO:
                 store.log(
-                    event="vetoed",
+                    event="unit_vetoed" if facts.unit_veto else "vetoed",
                     trigger=authorization.MANUAL_STOP,
                     scope=cgroup.rel(path),
-                    target=dec.reason,
+                    target=facts.veto_target or facts.vetoed or dec.reason,
+                    source=("unit" if facts.unit_veto else facts.veto_source or "user"),
                 )
             else:
                 store.log(
@@ -651,8 +969,6 @@ def cmd_kill(a):
         if dec.slot in (authorization.VETO, authorization.HOLD):
             return die(dec.reason, 4)
         return die("kill not allowed: %s" % dec.reason)
-    leaf_name = os.path.basename(path)
-    unit = engine.unit_for_leaf(units, leaf_name)
     with store.decision_context(
         "stop",
         scope=cgroup.rel(path),
@@ -674,6 +990,7 @@ def cmd_kill(a):
                 hook=policy.hook_for(cfg, leaf_name),
                 decision_authority=dec.authority or "manual",
                 decision_why=dec.reason,
+                veto_override=bool(vetoes and force_veto),
             )
         except engine.Refused as e:
             store.log(event="refusal", scope=cgroup.rel(path), why=str(e))
@@ -1318,78 +1635,123 @@ def cmd_keep(a):
 
 
 def cmd_do_not_kill(a):
-    cfg, store, _units = _load(a)
-    if a.target:
-        from . import targets
-
-        candidates = _target_candidates(a.target, store)
-        matches = targets.matching_targets(a.target, candidates)
-        if matches:
-            selected = _choose_target(
-                a.target, candidates, pick=getattr(a, "pick", False)
+    cfg, store, units = _load(a)
+    if (
+        getattr(a, "all", False)
+        and not a.target
+        and not any(
+            getattr(a, name, None) is not None
+            for name in (
+                "scope",
+                "pid",
+                "pair",
+                "signature",
+                "app",
+                "owner",
+                "unit",
+                "cgroup",
+                "path",
             )
-            if not isinstance(selected, targets.Target):
-                return selected
-            try:
-                if selected.kind == "scope":
-                    vetoes = [{"kind": "scope", "value": selected.value, "start": None}]
-                elif selected.kind == "pid":
-                    if (
-                        selected.pid is None
-                        or inspect.starttime(selected.pid) != selected.start
-                    ):
-                        return die(
-                            "pid %s changed since target selection" % selected.value, 2
-                        )
-                    vetoes = [
-                        {
-                            "kind": "pid",
-                            "value": selected.value,
-                            "start": selected.start,
-                        }
-                    ]
-                else:
-                    value = selected.app_key or selected.value
-                    vetoes = [{"kind": "app", "value": value, "start": None}]
-            except ValueError as e:
-                return die(str(e))
-        else:
-            if a.target.startswith("desktop:"):
-                return die("no live desktop id matches %r" % a.target, 2)
-            try:
-                vetoes = [veto_target(a.target, store)]
-            except ValueError as e:
-                return die(str(e))
-    else:
-        action = store.auto_action()
-        if not action:
-            return die("no automatic stop to veto", 2)
-        apps = action.get("apps") or [
-            pair[1]
-            for pair in action.get("pairs", [])
-            if isinstance(pair, list) and len(pair) == 2
-        ]
-        vetoes = (
-            [
-                {"kind": "app", "value": app, "start": None}
-                for app in dict.fromkeys(apps)
-            ]
-            if apps
-            else [{"kind": "scope", "value": action["scope"], "start": None}]
         )
+    ):
+        return die("--all requires an explicit target", 2)
+    try:
+        if a.target or any(
+            getattr(a, name, None) is not None
+            for name in (
+                "scope",
+                "pid",
+                "pair",
+                "signature",
+                "app",
+                "owner",
+                "unit",
+                "cgroup",
+                "path",
+            )
+        ):
+            resolved = resolve_veto_targets(a, store, units)
+        else:
+            resolved = None
+        if resolved is None:
+            action = store.auto_action()
+            if not action:
+                return die("no automatic stop to veto", 2)
+            apps = action.get("apps") or [
+                pair[1]
+                for pair in action.get("pairs", [])
+                if isinstance(pair, list) and len(pair) == 2
+            ]
+            targets = (
+                [
+                    (
+                        {"kind": "app", "value": app, "start": None},
+                        ["automatic stop %s, app:%s" % (action["scope"], app)],
+                    )
+                    for app in dict.fromkeys(apps)
+                ]
+                if apps
+                else [
+                    (
+                        {"kind": "scope", "value": action["scope"], "start": None},
+                        ["automatic stop " + action["scope"]],
+                    )
+                ]
+            )
+        else:
+            targets = resolved
+        for_duration = getattr(a, "for_duration", None)
+        until = getattr(a, "until", None)
+        reason = getattr(a, "reason", None) or ""
+        if for_duration is not None and until:
+            return die("use either --for or --until, not both", 2)
+        if len(reason) > 256:
+            return die("--reason must be at most 256 characters", 2)
+        expires = None
+        if for_duration is not None:
+            if for_duration <= 0:
+                return die("--for must be greater than zero", 2)
+            expires = time.time() + for_duration
+        elif until:
+            from .inputs import parse_time
+
+            expires = parse_time(until).timestamp()
+            if expires <= time.time():
+                return die("--until must be in the future", 2)
+    except ValueError as error:
+        return die(str(error), 2)
     if getattr(a, "dry_run", False):
-        for target in vetoes:
-            print("dry run: veto %s" % veto_label(target))
+        for target, matched in targets:
+            print(
+                "dry run: veto %s (matched: %s)"
+                % (veto_label(target), ", ".join(matched))
+            )
         return 0
-    if len(vetoes) > 1 and not _confirm_bulk(
-        "veto", [veto_label(target) for target in vetoes], a
+    if len(targets) > 1 and not _confirm_bulk(
+        "veto", [veto_label(target) for target, _matched in targets], a
     ):
         return 1
-    for target in vetoes:
-        how, reply = feedback_action(cfg, store, "veto", target=target)
+    for target, matched in targets:
+        fields = {"target": target}
+        if expires is not None:
+            fields["expires"] = expires
+        if reason:
+            fields["reason"] = reason
+        how, reply = feedback_action(cfg, store, "veto", **fields)
         if not reply or not reply.get("ok"):
-            return die(reply.get("error", "could not add veto"))
-        print("vetoed %s (%s)" % (veto_label(target), how))
+            return die((reply or {}).get("error", "could not add veto"))
+        suffix = (
+            "permanent"
+            if expires is None
+            else "expires %s"
+            % time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(expires))
+        )
+        if reason:
+            suffix += "; reason: " + reason
+        print(
+            "vetoed %s (matched: %s; %s; %s)"
+            % (veto_label(target), ", ".join(matched), how, suffix)
+        )
     return 0
 
 
@@ -1509,61 +1871,43 @@ def cmd_snooze(a):
 def cmd_forget(a):
     cfg, store, units = _load(a)
     if getattr(a, "veto", False):
-        from . import targets
-
-        candidates = _target_candidates(a.exe, store)
-        matches = targets.matching_targets(a.exe, candidates)
-        if matches:
-            selected = _choose_target(a.exe, candidates, pick=getattr(a, "pick", False))
-            if not isinstance(selected, targets.Target):
-                return selected
-            if selected.kind == "scope":
-                target = {"kind": "scope", "value": selected.value, "start": None}
-            elif selected.kind == "pid":
-                if (
-                    selected.pid is None
-                    or inspect.starttime(selected.pid) != selected.start
-                ):
-                    return die(
-                        "pid %s changed since target selection" % selected.value, 2
-                    )
-                target = {
-                    "kind": "pid",
-                    "value": selected.value,
-                    "start": selected.start,
-                }
-            else:
-                target = {
-                    "kind": "app",
-                    "value": selected.app_key or selected.value,
-                    "start": None,
-                }
-        else:
-            if a.exe.startswith("desktop:"):
-                return die("no live desktop id matches %r" % a.exe, 2)
-            try:
-                target = veto_target(a.exe, store, for_removal=True)
-            except ValueError as e:
-                return die(str(e))
-        existed = any(
-            v.get("kind") == target["kind"]
-            and v.get("value") == str(target["value"])
-            and (target.get("start") is None or v.get("start") == target.get("start"))
-            for v in store._active_vetoes()
-        )
+        try:
+            selected = resolve_veto_targets(a, store, units, removal=True)
+        except ValueError as error:
+            return die(str(error), 2)
+        if not selected:
+            return die("forget --veto requires a target", 2)
         if getattr(a, "dry_run", False):
-            print("dry run: remove veto for %s" % veto_label(target))
+            for target, matched in selected:
+                print(
+                    "dry run: remove veto for %s (matched: %s)"
+                    % (veto_label(target), ", ".join(matched))
+                )
             return 0
-        how, reply = feedback_action(cfg, store, "unveto", target=target)
-        if not reply or not reply.get("ok"):
-            return die(reply.get("error", "could not remove veto"))
-        removed = reply.get("removed", []) or existed
-        print(
-            "forgot veto for %s (%s)" % (veto_label(target), how)
-            if removed
-            else "no veto for %s (%s)" % (veto_label(target), how)
-        )
+        if len(selected) > 1 and not _confirm_bulk(
+            "remove veto", [veto_label(target) for target, _ in selected], a
+        ):
+            return 1
+        active = store._active_vetoes()
+        for target, matched in selected:
+            existed = any(
+                store._same_veto_target(veto, target, pid_wildcard=True)
+                for veto in active
+            )
+            how, reply = feedback_action(cfg, store, "unveto", target=target)
+            if not reply or not reply.get("ok"):
+                return die((reply or {}).get("error", "could not remove veto"))
+            removed = reply.get("removed", []) or existed
+            phrase = "forgot veto" if removed else "no veto"
+            print(
+                "%s for %s (matched: %s; %s)"
+                % (phrase, veto_label(target), ", ".join(matched), how)
+            )
         return 0
+    if not getattr(a, "exe", None):
+        return die(
+            "forget requires an executable; use --veto TARGET to remove a veto", 2
+        )
     if getattr(a, "dry_run", False):
         print("dry run: forget %s" % a.exe)
         return 0

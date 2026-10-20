@@ -360,6 +360,30 @@ class TruthTable(unittest.TestCase):
                 )
                 self.assertIn("app firefox", dec.reason)
 
+    def test_veto_blocks_stop_freeze_reclaim_and_budget_action_classes(self):
+        for action in ("stop", "freeze", "reclaim", "budget"):
+            with self.subTest(action=action):
+                trigger = "test_" + action
+                with mock.patch.dict(authorization.TRIGGER_ACTIONS, {trigger: action}):
+                    dec = authorization.authorize(
+                        trigger, "auto", authorization.Facts(vetoed="app firefox")
+                    )
+                self.assertEqual(
+                    (dec.verdict, dec.slot),
+                    (authorization.KEEP, authorization.VETO),
+                )
+
+    def test_configured_never_stop_remains_distinct_from_user_veto(self):
+        dec = authorization.authorize(
+            authorization.MANUAL_STOP,
+            "enforce",
+            authorization.Facts(vetoed="app firefox", unit_veto="kill.never_stop"),
+        )
+        self.assertEqual(
+            (dec.verdict, dec.slot), (authorization.KEEP, authorization.VETO)
+        )
+        self.assertEqual(dec.reason, "unit veto: kill.never_stop")
+
 
 class DaemonRouting(AutoCase):
     """AC 1: every daemon path that moves, stops, or adopts asks the ladder, not the mode."""

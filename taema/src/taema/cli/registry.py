@@ -59,6 +59,13 @@ COMMANDS: tuple[dict[str, Any], ...] = (
                 {"action": "store_true", "help": "also ignore detected outside users"},
             ),
             (
+                ("--force-veto",),
+                {
+                    "action": "store_true",
+                    "help": "show and explicitly confirm an audited veto override",
+                },
+            ),
+            (
                 ("--keep",),
                 {"help": "comma list of exe names to move aside instead of killing"},
             ),
@@ -102,7 +109,20 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "arguments": (
             (("--veto",), {"action": "store_true"}),
             (("--dry-run",), {"action": "store_true"}),
-            (("exe",), {}),
+            (
+                ("--all",),
+                {"action": "store_true", "help": "apply to every matching target"},
+            ),
+            (("--scope",), {"metavar": "SCOPE"}),
+            (("--pid",), {"metavar": "PID"}),
+            (("--pair",), {"nargs": 2, "metavar": ("OWNER", "LEFTOVER")}),
+            (("--signature",), {"metavar": "ID"}),
+            (("--app",), {"metavar": "APP"}),
+            (("--owner",), {"metavar": "APP"}),
+            (("--unit",), {"metavar": "UNIT"}),
+            (("--cgroup",), {"metavar": "PREFIX"}),
+            (("--path",), {"metavar": "EXECUTABLE"}),
+            (("exe",), {"nargs": "?"}),
         ),
     },
     {
@@ -112,6 +132,29 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_do_not_kill",
         "arguments": (
             (("--dry-run",), {"action": "store_true"}),
+            (
+                ("--all",),
+                {"action": "store_true", "help": "veto every matching target"},
+            ),
+            (("--scope",), {"metavar": "SCOPE"}),
+            (("--pid",), {"metavar": "PID"}),
+            (("--pair",), {"nargs": 2, "metavar": ("OWNER", "LEFTOVER")}),
+            (("--signature",), {"metavar": "ID"}),
+            (("--app",), {"metavar": "APP"}),
+            (("--owner",), {"metavar": "APP"}),
+            (("--unit",), {"metavar": "UNIT"}),
+            (("--cgroup",), {"metavar": "PREFIX"}),
+            (("--path",), {"metavar": "EXECUTABLE"}),
+            (
+                ("--for",),
+                {
+                    "dest": "for_duration",
+                    "type_name": "duration",
+                    "metavar": "DURATION",
+                },
+            ),
+            (("--until",), {"metavar": "DATE"}),
+            (("--reason",), {"metavar": "TEXT"}),
             (("target",), {"nargs": "?"}),
         ),
     },

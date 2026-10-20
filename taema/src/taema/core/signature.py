@@ -33,11 +33,7 @@ def signature(owner, members, runtime_hash="", runtime_class="", tty=False):
         if not isinstance(key, str) or not key:
             raise ValueError("signature members must have non-empty keys")
         count = member.get("count", 1) if isinstance(member, dict) else 1
-        if (
-            not isinstance(count, int)
-            or isinstance(count, bool)
-            or count < 1
-        ):
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("signature member counts must be positive integers")
         counts[key] += count
     if not counts:
@@ -47,7 +43,12 @@ def signature(owner, members, runtime_hash="", runtime_class="", tty=False):
     runtime_class = runtime_class if isinstance(runtime_class, str) else ""
     tty = bool(tty)
     material = json.dumps(
-        [owner, [[item["key"], item["count"]] for item in normalized], runtime_hash, tty],
+        [
+            owner,
+            [[item["key"], item["count"]] for item in normalized],
+            runtime_hash,
+            tty,
+        ],
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")

@@ -72,6 +72,7 @@ class Daemon:
         self.store.expire_reviews()
         self.store.save_if_dirty()
         self.units = policy.load_units(cfg)
+        self.thaw_held_scopes()
         self.config_error = None
         self.profile_reason = cfg.get("_profile_reason", "automatic profile selection")
         self.reload_requested = False
@@ -233,16 +234,45 @@ class Daemon:
                 if os.path.isabs(f.scope)
                 else os.path.join(cgroup.base(), f.scope)
             )
-            veto = engine.veto_for_scope(self.store, path) if not f.vetoed else None
+            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            veto = (
+                engine.veto_for_scope(self.store, path, unit=unit)
+                if not f.vetoed
+                else None
+            )
+            unit_veto = (
+                "kill.never_stop"
+                if unit and unit.get("kill", {}).get("never_stop")
+                else ""
+            )
             held = self.store.hold_reason(f.scope) if not f.held else ""
-            if veto or held:
+            if veto or held or unit_veto:
                 f = replace(
                     f,
                     vetoed=f.vetoed or (self.store.describe_veto(veto) if veto else ""),
+                    veto_source=f.veto_source
+                    or (veto.get("source", "user") if veto else ""),
+                    veto_target=f.veto_target
+                    or (self.store.describe_veto(veto) if veto else ""),
+                    unit_veto=f.unit_veto or unit_veto,
                     held=f.held or held,
                 )
         dec = authorization.authorize(trigger, self.mode, f)
-        if dec.slot == authorization.VETO:
+        if dec.slot == authorization.VETO and f.unit_veto:
+            with self.store.decision_context(
+                "refusal",
+                scope=f.scope or None,
+                authority="unit",
+                mode=self.mode,
+                why=dec.reason,
+            ):
+                self.store.log(
+                    event="unit_vetoed",
+                    trigger=trigger,
+                    scope=f.scope or None,
+                    target=f.unit_veto,
+                )
+        elif dec.slot == authorization.VETO:
             with self.store.decision_context(
                 "refusal",
                 scope=f.scope or None,
@@ -254,7 +284,8 @@ class Daemon:
                     event="vetoed",
                     trigger=trigger,
                     scope=f.scope or None,
-                    target=dec.reason,
+                    target=f.veto_target or f.vetoed or dec.reason,
+                    source=f.veto_source or "user",
                 )
         elif dec.slot == authorization.HOLD and self.store.changed(
             "action_held:%s:%s" % (trigger, f.scope),
@@ -841,8 +872,18 @@ class Daemon:
                         "pid": item["pid"],
                         "start": item.get("start"),
                         "apps": [item["key"]],
+                        "owner": owner,
+                        "owners": [owner],
+                        "leftover": item["key"],
+                        "path": inspect.exe(item["pid"]) or "",
+                        "cgroup": cgroup.proc_cgroup(item["pid"]) or "",
                     }
                 ],
+                owner=owner,
+                leftover=item["key"],
+                signature=(signature or {}).get("id")
+                if isinstance(signature, dict)
+                else signature,
             )
             facts = authorization.Facts(
                 scope=scope,
@@ -851,6 +892,8 @@ class Daemon:
                 pair_reason=decision[2],
                 pair_explicit=explicit,
                 vetoed=self.store.describe_veto(veto) if veto else "",
+                veto_source=veto.get("source", "user") if veto else "",
+                veto_target=self.store.describe_veto(veto) if veto else "",
             )
             gate = self.authorize(authorization.JOB_SURVIVORS, facts)
             if gate.verdict != authorization.ACT:
@@ -863,6 +906,10 @@ class Daemon:
                 info,
                 decision=decision,
                 authority=effective,
+                scope=scope,
+                signature=(signature or {}).get("id")
+                if isinstance(signature, dict)
+                else signature,
             )
             if ok:
                 good.append((item, decision))
@@ -1079,13 +1126,56 @@ class Daemon:
             pair_explicit=explicit,
         )
 
-    def auto_stop_path(self, path, why, require_pair, authority=None):
+    def auto_stop_path(
+        self,
+        path,
+        why,
+        require_pair,
+        authority=None,
+        trigger=authorization.GC_STOP,
+    ):
         """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
         decided stop); otherwise only the idle checks (known CPU, no edges, no pty host, not protected) apply.
         SIGKILL only when every pair was answered explicitly. Returns True when the scope was removed."""
         leaf = cgroup.rel(path)
         infos = self._infos(cgroup.tree_procs(path))
         if not infos:
+            return False
+        pairs = [(i["origin"], i["key"]) for i in infos if i["origin"]]
+        stop_owner = (
+            pairs[0][0]
+            if pairs and all(pair[0] == pairs[0][0] for pair in pairs)
+            else None
+        )
+        signature_id = (
+            self.survivor_signature(stop_owner, infos)["id"] if stop_owner else None
+        )
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        unit_name = (unit or {}).get("unit", {}).get("name")
+        vetoes = engine.vetoes_for_scope(
+            self.store,
+            path,
+            unit=unit,
+            owner=stop_owner,
+            signature=signature_id,
+        )
+        if vetoes:
+            veto = vetoes[0]
+            with self.store.decision_context(
+                "refusal",
+                scope=leaf,
+                owner=stop_owner,
+                authority="veto",
+                mode=self.mode,
+                why="veto blocked automatic stop",
+            ):
+                self.store.log(
+                    event="vetoed",
+                    trigger=trigger,
+                    scope=leaf,
+                    target=self.store._target(veto),
+                    source=veto.get("source", "user"),
+                )
             return False
         for i in infos:
             if require_pair:
@@ -1095,6 +1185,9 @@ class Daemon:
                     i["key"],
                     i,
                     authority=authority or self.effective_authority["value"],
+                    scope=leaf,
+                    signature=signature_id,
+                    unit=unit_name,
                 )
             else:
                 cpu = i.get("cpu")
@@ -1137,7 +1230,6 @@ class Daemon:
                         why=w,
                     )
                 return False
-        pairs = [(i["origin"], i["key"]) for i in infos if i["origin"]]
         explicit = (
             require_pair
             and bool(pairs)
@@ -1147,7 +1239,6 @@ class Daemon:
             self.store.stop_in_probation(o, k) for o, k in pairs
         )
         grace = engine.auto_grace(self.store, {i["key"] for i in infos})
-        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
         with self.store.decision_context(
             "stop",
             scope=leaf,
@@ -1168,6 +1259,7 @@ class Daemon:
                     decision_authority=decision["authority"],
                     decision_why=why,
                     decision_owner=decision["owner"],
+                    signature=signature_id,
                 )
             except engine.Refused as e:
                 self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
@@ -1200,7 +1292,22 @@ class Daemon:
         allowed = []
         for l in want:
             veto = self.store.match_veto(
-                members=[{"pid": l["pid"], "start": l.get("start"), "apps": [l["key"]]}]
+                members=[
+                    {
+                        "pid": l["pid"],
+                        "start": l.get("start"),
+                        "apps": [l["key"]],
+                        "owner": owner,
+                        "owners": [owner],
+                        "leftover": l["key"],
+                        "path": inspect.exe(l["pid"]) or "",
+                        "cgroup": cgroup.proc_cgroup(l["pid"]) or "",
+                    }
+                ],
+                scope=l.get("scope") or cgroup.rel(cgroup.proc_cgroup(l["pid"]) or ""),
+                owner=owner,
+                leftover=l["key"],
+                signature=signature_id,
             )
             if veto:
                 with self.store.decision_context(
@@ -1216,6 +1323,7 @@ class Daemon:
                         job=tag,
                         pid=l["pid"],
                         target=self.store._target(veto),
+                        source=veto.get("source", "user"),
                     )
             else:
                 allowed.append(l)
@@ -1234,6 +1342,8 @@ class Daemon:
                 infos[l["pid"]],
                 decision=dec.get(l["key"]),
                 authority=authority or self.effective_authority["value"],
+                scope=l.get("scope"),
+                signature=signature_id,
             )
             if ok:
                 good.append(l)
@@ -1492,12 +1602,20 @@ class Daemon:
         members = [
             {"pid": l["pid"], "start": l.get("start"), "apps": [l["key"]]} for l in left
         ]
-        veto = self.store.match_veto(members=members)
+        for member in members:
+            member["owner"] = owner
+            member["owners"] = [owner]
+            member["leftover"] = member["apps"][0]
+        veto = self.store.match_veto(
+            members=members, owner=owner, signature=signature["id"]
+        )
         if veto and any(action == "stop" for action, _confidence, _why in dec.values()):
             self.store.signature_outcome(signature["id"], "veto")
         stop_keys = [key for key, decision in dec.items() if decision[0] == "stop"]
         facts = authorization.Facts(
             vetoed=self.store.describe_veto(veto) if veto else "",
+            veto_source=veto.get("source", "user") if veto else "",
+            veto_target=self.store.describe_veto(veto) if veto else "",
             pair_action="stop" if stop_keys else "",
             pair_reason=dec[stop_keys[0]][2] if stop_keys else "",
             pair_explicit=any(
@@ -2002,7 +2120,16 @@ class Daemon:
         self._save_if_idle()
         return self.store.review_holds_scope(leaf)
 
+    def _gc_signature(self, path, pids):
+        """Build the same survivor signature used by the automatic-stop path."""
+        infos = self._infos(pids)
+        owners = {info["origin"] for info in infos if info.get("origin")}
+        if len(owners) != 1 or not infos:
+            return None
+        return self.survivor_signature(next(iter(owners)), infos)["id"]
+
     def gc_pass(self, dry_run=False):
+        self.store.prune_vetoes(trigger="gc")
         self.store.expire_reviews()
         self._save_if_idle()
         applied_feedback = self.store.apply_feedback()
@@ -2026,6 +2153,7 @@ class Daemon:
             lin=self.lineage,
             auto=leftover_leaves,
             authority=self.effective_authority["value"],
+            signature_for_scope=self._gc_signature,
         )
         res, now_empty = [], set()
         remove_empty = (
@@ -2220,6 +2348,7 @@ class Daemon:
                     "session ended",
                     True,
                     authority=self.effective_authority["value"],
+                    trigger=authorization.SESSION_END,
                 ):
                     self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
@@ -2377,6 +2506,8 @@ class Daemon:
                     self.store.save()
                 self._adopt_answered_standalones()
                 self.store.save_if_dirty()
+                if msg.get("op") == "veto" and not result.get("duplicate"):
+                    self.thaw_held_scopes()
                 return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):
                 return {"error": "bad request"}
@@ -2810,11 +2941,12 @@ class Daemon:
             self.store.log(event="socket_bound", path=want)
 
     def thaw_held_scopes(self):
-        """Thaw frozen managed scopes covered by a global, snooze, or scope hold."""
+        """Thaw frozen managed scopes covered by a hold or any active veto."""
         state = self.store.hold_status()
         global_hold = state["global"] or state["snooze_until"] is not None
         held_scopes = state["scopes"]
-        if not global_hold and not held_scopes:
+        active_vetoes = self.store._active_vetoes()
+        if not global_hold and not held_scopes and not active_vetoes:
             return
         stack = list(cgroup.subdirs(cgroup.base()))
         while stack:
@@ -2823,9 +2955,17 @@ class Daemon:
                 continue
             scope = cgroup.rel(path)
             stack.extend(cgroup.subdirs(path))
-            if not global_hold and not any(
-                scope == held or scope.startswith(held + "/") for held in held_scopes
-            ):
+            held = global_hold or any(
+                scope == held_scope or scope.startswith(held_scope + "/")
+                for held_scope in held_scopes
+            )
+            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            veto = engine.veto_for_scope(
+                self.store,
+                path,
+                unit=unit,
+            )
+            if not held and not veto:
                 continue
             freeze = os.path.join(path, "cgroup.freeze")
             try:
@@ -2833,17 +2973,33 @@ class Daemon:
                     frozen = source.read().strip() == "1"
                 if not frozen:
                     continue
-                reason = self.store.hold_reason(scope) or "runtime hold"
+                reason = (
+                    self.store.describe_veto(veto)
+                    if veto
+                    else self.store.hold_reason(scope) or "runtime hold"
+                )
+                authority = "veto" if veto else "hold"
+                why = (
+                    "veto thawed a managed freeze: %s"
+                    if veto
+                    else "hold thawed a managed freeze: %s"
+                ) % reason
                 with self.store.decision_context(
                     "thaw",
                     scope=scope,
-                    authority="hold",
+                    authority=authority,
                     mode=self.mode,
-                    why="hold thawed a managed freeze: %s" % reason,
+                    why=why,
                 ):
                     with open(freeze, "w", encoding="ascii") as target:
                         target.write("0\n")
-                    self.store.log(event="thaw", scope=scope, reason=reason)
+                    self.store.log(
+                        event="thaw",
+                        scope=scope,
+                        reason=reason,
+                        target=self.store._target(veto) if veto else None,
+                        source=veto.get("source") if veto else "hold",
+                    )
             except OSError as error:
                 self.store.log(
                     event="thaw_failed",

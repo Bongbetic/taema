@@ -378,7 +378,9 @@ class IdentityPersistence(unittest.TestCase):
             )
             now[0] += 1
             restarted = knowledge.Store(directory, now=lambda: now[0])
-            self.assertEqual(restarted.record_identities([(niri, parent), (firefox, child)]), 2)
+            self.assertEqual(
+                restarted.record_identities([(niri, parent), (firefox, child)]), 2
+            )
 
             with restarted.db.connection() as connection:
                 counts = connection.execute(
@@ -406,12 +408,15 @@ class IdentityPersistence(unittest.TestCase):
             chain = live.provenance_chain(firefox.key)
 
         self.assertEqual(chain["chain_text"], "firefox ← niri")
-        self.assertEqual(chain["chain"][0]["relation"]["evidence_counts"], {
-            "co_birth": 1,
-            "cgroup": 1,
-            "job": 1,
-            "runtime": 1,
-        })
+        self.assertEqual(
+            chain["chain"][0]["relation"]["evidence_counts"],
+            {
+                "co_birth": 1,
+                "cgroup": 1,
+                "job": 1,
+                "runtime": 1,
+            },
+        )
         self.assertEqual(chain["chain"][0]["relation"]["confidence"], 1.0)
 
     def test_lineage_restart_reconciles_pid_start_and_records_exit(self):
@@ -420,7 +425,12 @@ class IdentityPersistence(unittest.TestCase):
             "unit:niri", "niri", "unit", "/usr/bin/niri", runtime="runtime:wayland"
         )
         firefox = identity.AppIdentity(
-            "exe:firefox:8:71", "firefox", "exe", "/usr/bin/firefox", 8, 71,
+            "exe:firefox:8:71",
+            "firefox",
+            "exe",
+            "/usr/bin/firefox",
+            8,
+            71,
             runtime="runtime:wayland",
         )
         table = ProcTable.from_ppid({40: 1, 41: 40})
@@ -440,7 +450,9 @@ class IdentityPersistence(unittest.TestCase):
                     return_value="/user/1000/app-desktop",
                 ),
             ):
-                first_daemon = lineage.Lineage({}, uid=0, identity_sink=store.record_identities)
+                first_daemon = lineage.Lineage(
+                    {}, uid=0, identity_sink=store.record_identities
+                )
                 first_daemon.observe(table, now=now[0], uptime=100)
                 now[0] += 1
                 restarted_daemon = lineage.Lineage(
@@ -450,7 +462,9 @@ class IdentityPersistence(unittest.TestCase):
 
                 with store.db.connection() as connection:
                     self.assertEqual(
-                        connection.execute("SELECT count(*) FROM instances").fetchone()[0],
+                        connection.execute("SELECT count(*) FROM instances").fetchone()[
+                            0
+                        ],
                         2,
                     )
                     evidence = connection.execute(

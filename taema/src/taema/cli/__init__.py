@@ -27,6 +27,7 @@ __all__ = (
     "feedback_action",
     "veto_target",
     "veto_label",
+    "resolve_veto_targets",
     "die",
     "cmd_run",
     "cmd_kill",

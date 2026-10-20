@@ -22,9 +22,11 @@
       "type": "object",
       "required": ["kind", "value"],
       "properties": {
-        "kind": {"enum": ["scope", "app", "pid"]},
+        "kind": {"enum": ["pid", "scope", "pair", "signature", "app", "owner", "unit", "cgroup", "path"]},
         "value": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
-        "start": {"type": ["integer", "null"]}
+        "start": {"type": ["integer", "null"]},
+        "owner": {"type": "string", "minLength": 1, "maxLength": 256},
+        "leftover": {"type": "string", "minLength": 1, "maxLength": 256}
       },
       "additionalProperties": false
     },
@@ -47,7 +49,7 @@
             "id": {"type": "string", "minLength": 1, "maxLength": 128},
             "op": {"const": "veto"},
             "target": {"$ref": "#/$defs/target"},
-            "reason": {"type": "string"}
+            "reason": {"type": "string", "maxLength": 256}
           },
           "additionalProperties": false
         },
@@ -104,7 +106,8 @@
             "id": {"type": "string", "minLength": 1, "maxLength": 128},
             "op": {"const": "veto"},
             "target": {"$ref": "#/$defs/target"},
-            "reason": {"type": "string"}
+            "reason": {"type": "string", "maxLength": 256},
+            "expires": {"type": "number"}
           },
           "additionalProperties": false
         },

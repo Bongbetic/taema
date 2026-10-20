@@ -76,7 +76,9 @@ Trigger = Literal[
     "session_end",
     "manual_stop",
 ]
-GovernorAction = Literal["adopt", "contain", "remove", "reclaim", "stop"]
+GovernorAction = Literal[
+    "adopt", "budget", "contain", "freeze", "reclaim", "remove", "stop"
+]
 SlotFn = Callable[[str, str, "Facts"], tuple[Vote, str]]
 
 # verdicts
@@ -127,6 +129,9 @@ TRIGGER_ACTIONS: Final[dict[str, GovernorAction]] = {
     MANUAL_STOP: "stop",
 }
 HOLD_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(("stop", "reclaim"))
+VETO_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(
+    ("budget", "freeze", "reclaim", "stop")
+)
 
 # authority values an `act` carries to its actuation
 AUTHORITY_MODE: Final[Authority] = "mode"
@@ -155,6 +160,9 @@ class Facts:
     shared: bool = False
     unit_survive_logout: bool = False
     vetoed: str = ""
+    veto_source: str = ""
+    veto_target: str = ""
+    unit_veto: str = ""
     held: str = ""
     suppress_stops: bool = False
     hard_safety: str = ""
@@ -413,11 +421,10 @@ def _hard_safety(_trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
 
 
 def _veto(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
-    """Slot 2: a user veto blocks every stop trigger before mode or learned authority."""
-    if (
-        trigger in (OWNER_EXIT, JOB_SURVIVORS, GC_STOP, SESSION_END, MANUAL_STOP)
-        and facts.vetoed
-    ):
+    """Slot 2: a veto blocks any stop, freeze, reclaim, or budget action."""
+    if TRIGGER_ACTIONS.get(trigger) in VETO_BLOCKED_ACTIONS and facts.unit_veto:
+        return "deny", "unit veto: " + facts.unit_veto
+    if TRIGGER_ACTIONS.get(trigger) in VETO_BLOCKED_ACTIONS and facts.vetoed:
         return "deny", "vetoed: " + facts.vetoed
     return "pass", ""
 

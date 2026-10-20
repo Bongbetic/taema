@@ -40,6 +40,18 @@ MAX_EXES = 512
 STALE_DAYS = 90
 SCHEMA = 2
 MAX_VETOES = 512
+VETO_PRECEDENCE = (
+    "pid",
+    "scope",
+    "pair",
+    "signature",
+    "app",
+    "owner",
+    "unit",
+    "cgroup",
+    "path",
+)
+_VETO_RANK = {kind: rank for rank, kind in enumerate(VETO_PRECEDENCE)}
 MAX_AUTO_ACTIONS = 10_000  # durable undo context; status exposes only a recent view
 MAX_FEEDBACK_IDS = 50_000
 DAILY_EXPORT_RE = re.compile(r"^state-export-(\d{8})\.json$")
@@ -573,57 +585,109 @@ class Store:
 
     # ---- vetoes and automatic-stop correction -----------------------------------------------
     @staticmethod
-    def _valid_veto_target(target):
-        if not isinstance(target, dict) or target.get("kind") not in (
-            "scope",
-            "app",
-            "pid",
-        ):
+    def _finite_number(value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
+    @staticmethod
+    def _valid_veto_target(target, allow_pid_wildcard=False):
+        if not isinstance(target, dict) or target.get("kind") not in _VETO_RANK:
+            return False
+        kind = target["kind"]
         value = target.get("value")
         if not isinstance(value, (str, int)) or isinstance(value, bool):
             return False
         value = str(value)
-        if not value or len(value) > 256 or SEP in value:
+        if not value or len(value) > 256:
             return False
-        if target["kind"] == "pid":
+        if kind == "pid":
             try:
                 pid = int(value)
             except ValueError:
                 return False
             start = target.get("start")
-            return (
-                pid > 1
-                and isinstance(start, int)
-                and not isinstance(start, bool)
-                and start > 0
+            return pid > 1 and (
+                (allow_pid_wildcard and start is None)
+                or (
+                    isinstance(start, int) and not isinstance(start, bool) and start > 0
+                )
             )
-        return isinstance(target.get("start"), type(None))
+        if target.get("start") is not None:
+            return False
+        if kind == "pair":
+            owner, leftover = target.get("owner"), target.get("leftover")
+            return (
+                isinstance(owner, str)
+                and bool(owner)
+                and len(owner) <= 256
+                and SEP not in owner
+                and isinstance(leftover, str)
+                and bool(leftover)
+                and len(leftover) <= 256
+                and SEP not in leftover
+                and value == leftover
+            )
+        if kind == "path":
+            return os.path.isabs(value)
+        return SEP not in value
 
     @staticmethod
     def _target(veto):
-        return {
+        target = {
             "kind": veto["kind"],
             "value": veto["value"],
             "start": veto.get("start"),
         }
+        if veto.get("kind") == "pair":
+            target["owner"] = veto["owner"]
+            target["leftover"] = veto["leftover"]
+        return target
 
     @staticmethod
     def describe_veto(veto):
-        label = "%s %s" % (veto["kind"], veto["value"])
+        if veto["kind"] == "pair":
+            label = "pair %s>%s" % (veto["owner"], veto["leftover"])
+        else:
+            label = "%s %s" % (veto["kind"], veto["value"])
         if veto["kind"] == "pid" and veto.get("start") is not None:
             label += " (starttime %s)" % veto["start"]
+        if veto.get("reason"):
+            label += " (reason: %s)" % veto["reason"]
         return label
 
-    def add_veto(self, kind, value, start=None, identifier=None, reason="", corr=None):
-        """Create a durable veto for one scope, app key, or pid/start-time instance."""
+    def add_veto(
+        self,
+        kind,
+        value,
+        start=None,
+        identifier=None,
+        reason="",
+        corr=None,
+        expires=None,
+        source="user",
+        owner=None,
+        leftover=None,
+    ):
+        """Create a durable veto for one explicitly named target."""
         target = {"kind": kind, "value": value, "start": start}
+        if kind == "pair":
+            target.update(owner=owner, leftover=leftover)
         if not self._valid_veto_target(target):
             return None
         target["value"] = str(target["value"])
         if identifier is not None and (
             not isinstance(identifier, str) or not identifier or len(identifier) > 128
         ):
+            return None
+        if expires is not None and (not self._finite_number(expires)):
+            return None
+        if not isinstance(reason, str) or len(reason) > 256:
+            return None
+        if not isinstance(source, str) or not source or len(source) > 64:
             return None
         identifier = identifier or uuid.uuid4().hex
         existing = next(
@@ -636,7 +700,7 @@ class Store:
         )
         if existing:
             return dict(existing)
-        self._prune_vetoes()
+        self._prune_vetoes(trigger="add")
         if len(self.data["vetoes"]) >= MAX_VETOES:
             with self.decision_context(
                 "refusal",
@@ -653,12 +717,20 @@ class Store:
                 **target,
                 "created": self.now(),
                 "decision_id": decision["id"],
+                "expires": expires,
+                "source": source,
             }
-            if isinstance(reason, str) and reason:
-                veto["reason"] = reason[:256]
+            if reason:
+                veto["reason"] = reason
             self.data["vetoes"].append(veto)
             self.dirty = True
-            self.log(event="veto_added", target=self._target(veto))
+            self.log(
+                event="veto",
+                target=self._target(veto),
+                expires=expires,
+                reason=reason,
+                source=source,
+            )
             return dict(veto)
 
         active = self._audit_context
@@ -673,31 +745,30 @@ class Store:
         ) as decision:
             return append_veto(decision)
 
+    @staticmethod
+    def _same_veto_target(veto, target, pid_wildcard=False):
+        if veto.get("kind") != target.get("kind"):
+            return False
+        if target["kind"] == "pair":
+            return veto.get("owner") == target.get("owner") and veto.get(
+                "leftover"
+            ) == target.get("leftover")
+        return veto.get("value") == str(target.get("value")) and (
+            target.get("kind") != "pid"
+            or (target.get("start") is None and pid_wildcard)
+            or veto.get("start") == target.get("start")
+        )
+
     def remove_veto(self, target):
-        """Remove only a matching veto. PID removal may omit start to clear that pid's instances."""
-        if not isinstance(target, dict) or target.get("kind") not in (
-            "scope",
-            "app",
-            "pid",
-        ):
+        """Remove a named veto. PID removal may omit start to clear that pid's instances."""
+        if not self._valid_veto_target(target, allow_pid_wildcard=True):
             return []
-        value = target.get("value")
-        if not isinstance(value, (str, int)) or isinstance(value, bool):
-            return []
-        value = str(value)
-        start = target.get("start")
-        if start is not None and (
-            not isinstance(start, int) or isinstance(start, bool)
-        ):
-            return []
+        value = str(target.get("value"))
         removed = []
         keep = []
         for veto in self.data["vetoes"]:
-            same = (
-                isinstance(veto, dict)
-                and veto.get("kind") == target["kind"]
-                and veto.get("value") == value
-                and (start is None or veto.get("start") == start)
+            same = isinstance(veto, dict) and self._same_veto_target(
+                veto, target, pid_wildcard=True
             )
             (removed if same else keep).append(veto)
         if removed:
@@ -706,13 +777,15 @@ class Store:
             with self.decision_context(
                 "veto_removed",
                 scope=value if target["kind"] == "scope" else None,
-                owner=value if target["kind"] == "app" else None,
+                owner=target.get("owner", value)
+                if target["kind"] in ("app", "owner")
+                else None,
                 authority="user",
                 why="user removed a veto",
             ):
                 self.log(
                     event="veto_removed",
-                    target={"kind": target["kind"], "value": value, "start": start},
+                    target=self._target(target),
                 )
         return [dict(v) for v in removed]
 
@@ -731,17 +804,24 @@ class Store:
             op_id = op.get("id")
             if op.get("op") == "veto" and self._valid_veto_target(op.get("target")):
                 target = dict(op["target"])
-                vetoes.append({"id": op_id, **target, "created": self.now()})
+                pending = {
+                    "id": op_id,
+                    **target,
+                    "created": self.now(),
+                    "expires": op.get("expires"),
+                    "reason": op.get("reason", ""),
+                    "source": "offline",
+                }
+                if not self._veto_expired(pending, now):
+                    vetoes.append(pending)
             elif op.get("op") == "unveto":
                 target = op.get("target")
-                start = target.get("start")
                 vetoes = [
                     v
                     for v in vetoes
                     if not (
-                        v.get("kind") == target.get("kind")
-                        and v.get("value") == str(target.get("value"))
-                        and (start is None or v.get("start") == start)
+                        self._valid_veto_target(target, allow_pid_wildcard=True)
+                        and self._same_veto_target(v, target, pid_wildcard=True)
                     )
                 ]
             elif op.get("op") == "undo":
@@ -758,13 +838,16 @@ class Store:
                     for index, (kind, value) in enumerate(targets):
                         target = {"kind": kind, "value": value, "start": None}
                         if self._valid_veto_target(target):
-                            vetoes.append(
-                                {
-                                    "id": "%s:%d" % (op_id, index),
-                                    **target,
-                                    "created": self.now(),
-                                }
-                            )
+                            pending = {
+                                "id": "%s:%d" % (op_id, index),
+                                **target,
+                                "created": self.now(),
+                                "expires": op.get("expires"),
+                                "reason": op.get("reason", ""),
+                                "source": "offline",
+                            }
+                            if not self._veto_expired(pending, now):
+                                vetoes.append(pending)
         return vetoes
 
     def _feedback_batch_id(self, path):
@@ -982,9 +1065,14 @@ class Store:
             and expires <= now
         )
 
-    def _prune_vetoes(self):
+    def _prune_vetoes(self, trigger="save"):
         now = self.now()
         vetoes = self.data.get("vetoes", [])
+        expired = [
+            veto
+            for veto in vetoes
+            if isinstance(veto, dict) and self._veto_expired(veto, now)
+        ]
         kept = [
             veto
             for veto in vetoes
@@ -993,15 +1081,68 @@ class Store:
         if len(kept) != len(vetoes):
             self.data["vetoes"] = kept
             self.dirty = True
+            if not self.read_only:
+                for veto in expired:
+                    self.log(
+                        event="veto_expired",
+                        trigger=trigger,
+                        target=self._target(veto),
+                        expires=veto.get("expires"),
+                        reason=veto.get("reason", ""),
+                    )
+        return expired
 
-    def match_veto(self, scope=None, members=(), include_pending=True):
+    def prune_vetoes(self, trigger="gc"):
+        """Prune expired vetoes and log each removal at the lifecycle boundary."""
+        return self._prune_vetoes(trigger=trigger)
+
+    def match_veto(
+        self,
+        scope=None,
+        members=(),
+        include_pending=True,
+        owner=None,
+        leftover=None,
+        signature=None,
+        unit=None,
+        cgroup_path=None,
+    ):
         """Return the first veto matching a scope or observed member identities."""
-        matches = self.matching_vetoes(scope, members, include_pending)
+        matches = self.matching_vetoes(
+            scope,
+            members,
+            include_pending,
+            owner=owner,
+            leftover=leftover,
+            signature=signature,
+            unit=unit,
+            cgroup_path=cgroup_path,
+        )
         return matches[0] if matches else None
 
-    def matching_vetoes(self, scope=None, members=(), include_pending=True):
-        """Return all active vetoes matching a scope or observed member identities."""
+    def matching_vetoes(
+        self,
+        scope=None,
+        members=(),
+        include_pending=True,
+        owner=None,
+        leftover=None,
+        signature=None,
+        unit=None,
+        cgroup_path=None,
+    ):
+        """Return every active veto in the spec's target-precedence order."""
         matches = []
+        members = tuple(member for member in members if isinstance(member, dict))
+
+        def under(path, prefix):
+            return (
+                isinstance(path, str)
+                and isinstance(prefix, str)
+                and bool(path)
+                and bool(prefix)
+                and (path == prefix or path.startswith(prefix.rstrip("/") + "/"))
+            )
 
         def add(veto):
             if veto not in matches:
@@ -1009,30 +1150,88 @@ class Store:
 
         for veto in self._active_vetoes(include_pending):
             kind, value = veto.get("kind"), veto.get("value")
+            if kind == "scope" and under(scope, value):
+                add(veto)
+                continue
             if (
-                kind == "scope"
-                and isinstance(scope, str)
-                and (scope == value or scope.startswith(value.rstrip("/") + "/"))
+                kind == "pair"
+                and owner == veto.get("owner")
+                and leftover == veto.get("leftover")
             ):
                 add(veto)
                 continue
-            for member in members or ():
-                if not isinstance(member, dict):
-                    continue
-                if kind == "app" and value in member.get("apps", ()):
-                    add(veto)
-                    break
-                if (
-                    kind == "pid"
-                    and str(member.get("pid")) == value
-                    and (
-                        member.get("start") is None
-                        or member.get("start") == veto.get("start")
-                    )
+            if kind == "signature" and signature == value:
+                add(veto)
+                continue
+            if kind == "unit" and unit == value:
+                add(veto)
+                continue
+            if kind == "cgroup" and (
+                under(cgroup_path, value)
+                or under(scope, value)
+                or any(under(member.get("cgroup"), value) for member in members)
+            ):
+                add(veto)
+                continue
+            for member in members:
+                raw_apps = member.get("apps", ())
+                raw_owners = member.get("owners", ())
+                apps = (
+                    tuple(raw_apps) if isinstance(raw_apps, (list, tuple, set)) else ()
+                )
+                owners = (
+                    tuple(raw_owners)
+                    if isinstance(raw_owners, (list, tuple, set))
+                    else ()
+                )
+                if member.get("owner"):
+                    owners += (member["owner"],)
+                if owner and owner not in owners:
+                    owners += (owner,)
+                if leftover and leftover not in apps:
+                    apps += (leftover,)
+                if kind == "pid" and (
+                    str(member.get("pid")) == value
+                    and member.get("start") == veto.get("start")
                 ):
                     add(veto)
                     break
-        return matches
+                if kind == "app" and value in apps:
+                    add(veto)
+                    break
+                if kind == "owner" and (value == owner or value in owners):
+                    add(veto)
+                    break
+                if kind == "pair" and veto.get("leftover") in apps:
+                    if (
+                        veto.get("owner") == member.get("owner")
+                        or veto.get("owner") in owners
+                    ):
+                        add(veto)
+                        break
+                if kind == "path" and value in (
+                    member.get("path"),
+                    member.get("exe"),
+                ):
+                    add(veto)
+                    break
+                if kind == "unit" and value == member.get("unit"):
+                    add(veto)
+                    break
+                if kind == "cgroup" and under(member.get("cgroup"), value):
+                    add(veto)
+                    break
+        return sorted(
+            matches,
+            key=lambda veto: (
+                _VETO_RANK.get(veto.get("kind"), len(_VETO_RANK)),
+                veto.get("created")
+                if isinstance(veto.get("created"), (int, float))
+                and not isinstance(veto.get("created"), bool)
+                else 0,
+                str(veto.get("id", "")),
+            ),
+        )
 
     def record_auto_action(
         self, scope, why, pairs=(), apps=(), decision=None, owner=None, authority="mode"
@@ -1284,6 +1483,10 @@ class Store:
                 target.get("start"),
                 identifier=op_id,
                 reason=msg.get("reason", ""),
+                expires=msg.get("expires"),
+                source="offline" if self._feedback_replaying else "user",
+                owner=target.get("owner"),
+                leftover=target.get("leftover"),
             )
             if veto is None:
                 return None

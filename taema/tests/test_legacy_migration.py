@@ -547,6 +547,87 @@ Store(sys.argv[1], {})
                 self.assertFalse(migrated.can_ask((owner, leftover)))
                 self.assertFalse(migrated.answer(owner, leftover, "keep"))
 
+    def test_anonymized_learning_history_replays_through_current_decider(self):
+        from taema.core import signature as survivor_signature
+
+        fixture_path = (
+            Path(__file__).resolve().parent / "fixtures/learning-v3/replay.json"
+        )
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        now = [0.0]
+        replay_dir = Path(self.temporary.name) / "learning-replay"
+        replay_dir.mkdir()
+        replayed = Store(str(replay_dir), {}, now=lambda: now[0])
+        signature_ids = {}
+        answers = {}
+
+        for event in fixture["events"]:
+            now[0] = event["at_day"] * DAY + event.get("after_seconds", 0)
+            owner, leftover, operation = (
+                event["owner"],
+                event["leftover"],
+                event["op"],
+            )
+            pair = (owner, leftover)
+            if operation == "inferred_kill":
+                self.assertTrue(
+                    replayed.observe_kill_inferred(owner, leftover, day=event["day"])
+                )
+            elif operation == "close":
+                self.assertTrue(replayed.observe_close(owner, leftover))
+            elif operation == "answer":
+                answers[pair] = replayed.answer(owner, leftover, event["choice"])
+            elif operation == "signature_stop":
+                signature = survivor_signature.signature(owner, [leftover])
+                signature = replayed.ensure_signature(owner, signature)
+                self.assertTrue(replayed.answer_signature(owner, signature, "stop"))
+                signature_ids[pair] = signature["id"]
+            elif operation == "auto_stop":
+                replayed._pair(owner, leftover)["sig"] = signature_ids[pair]
+                replayed.auto_stopped(owner, leftover, signature_ids[pair])
+            elif operation == "respawn_and_regret":
+                signature_id = signature_ids[pair]
+                self.assertTrue(
+                    replayed.auto_stop_respawn(owner, leftover, signature_id)
+                )
+                self.assertTrue(replayed.regret(owner, leftover, signature_id))
+            else:
+                self.fail("unknown replay operation: %s" % operation)
+
+        now[0] = fixture["now_day"] * DAY
+        self.assertFalse(answers[("MainThread", "app-0012")])
+        self.assertEqual(replayed.pair_decision("MainThread", "app-0012")[0], "invalid")
+        self.assertEqual(replayed.pair_decision("app-0001", "app-0002")[0], "stop")
+        self.assertEqual(replayed.pair_decision("app-0003", "app-0004")[0], "stop")
+        self.assertGreaterEqual(
+            replayed.data["pairs"][replayed.pkey("app-0003", "app-0004")]["closes"],
+            knowledge.BURN_IN_CLOSES,
+        )
+        self.assertEqual(replayed.pair_decision("app-0005", "app-0006")[0], "stop")
+        self.assertEqual(replayed.pair_decision("app-0007", "app-0008")[0], "keep")
+        signature = survivor_signature.signature("app-0009", ["app-0010"])
+        self.assertEqual(replayed.signature_decision(signature)[0], "ask")
+        self.assertEqual(replayed.pair_decision("app-0009", "app-0010")[0], "ask")
+
+        replayed.save()
+        reopened = Store(str(replay_dir), {}, now=lambda: now[0])
+        self.assertEqual(reopened.signature_decision(signature)[0], "ask")
+        self.assertFalse(
+            any(
+                policy.bad_owner(owner)
+                for pair_key, pair_record in reopened.data["pairs"].items()
+                if pair_record.get("source") != "legacy-invalid"
+                for owner, _separator, _leftover in (pair_key.partition("\0"),)
+            )
+        )
+        self.assertTrue(
+            all(
+                row["why"]
+                for row in reopened.pairs_summary()
+                if row["action"] == "stop"
+            )
+        )
+
     def test_migration_does_not_call_a_process_stop(self):
         with mock.patch.object(engine, "stop") as stop:
             self.store()

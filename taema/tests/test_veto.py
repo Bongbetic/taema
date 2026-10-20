@@ -258,7 +258,11 @@ class DaemonStopPaths(unittest.TestCase):
 
     def test_owner_exit_stop_is_available_to_undo(self):
         self.cg.leaf("scope-owner")
-        report = {"decisions": [{"key": "firefox", "action": "kill"}], "removed": True}
+        report = {
+            "decisions": [{"key": "firefox", "action": "kill", "pid": 42}],
+            "removed": True,
+            "stopped": [42],
+        }
         with mock.patch.object(daemon.engine, "stop", return_value=report):
             self.d.stop_leaf("scope-owner", "owner exited")
         action = self.d.store.auto_action()
@@ -300,7 +304,11 @@ class DaemonStopPaths(unittest.TestCase):
 
     def test_session_end_stop_is_available_to_undo(self):
         self.cg.leaf("scope-session")
-        report = {"decisions": [{"key": "firefox", "action": "kill"}], "removed": True}
+        report = {
+            "decisions": [{"key": "firefox", "action": "kill", "pid": 42}],
+            "removed": True,
+            "stopped": [42],
+        }
         with mock.patch.object(daemon.engine, "stop", return_value=report):
             self.d.end_session()
         action = self.d.store.auto_action()

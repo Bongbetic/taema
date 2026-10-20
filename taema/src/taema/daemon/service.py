@@ -349,12 +349,8 @@ class Daemon:
                     decision_why=why,
                     decision_owner=owner,
                 )
-                self.note_stop(rep)
-                stopped = [
-                    d["key"]
-                    for d in rep.get("decisions", [])
-                    if d.get("action") == "kill"
-                ]
+                stopped_pids = self.note_stop(rep)
+                stopped = self.stopped_apps(rep, stopped_pids)
                 if stopped:
                     self.note_auto_stop(leaf, why, [], apps=stopped, decision=decision)
                 self.store.log(event="stopped", scope=leaf, why=why)
@@ -482,14 +478,32 @@ class Daemon:
 
     # ---- learning hooks (log only: nothing here kills) ----
     def note_stop(self, rep):
-        """Remember the keys a stop killed, to see whether they come back (respawn / GC outcome)."""
+        """Remember only processes confirmed gone after a stop signal."""
         now = time.time()
+        stopped = set((rep or {}).get("stopped", []))
         for d in (rep or {}).get("decisions", []):
-            if d.get("action") == "kill":
+            if d.get("action") == "kill" and d.get("pid") in stopped:
                 self.stopped[d["key"]] = now
         while len(self.stopped) > 256:
             oldest = min(self.stopped, key=self.stopped.get)
             del self.stopped[oldest]
+        return stopped
+
+    @staticmethod
+    def stopped_apps(rep, stopped_pids=None):
+        """App keys whose planned kill pids were confirmed gone after signalling."""
+        stopped_pids = set(
+            (rep or {}).get("stopped", []) if stopped_pids is None else stopped_pids
+        )
+        return sorted(
+            {
+                item["key"]
+                for item in (rep or {}).get("decisions", [])
+                if item.get("action") == "kill"
+                and item.get("pid") in stopped_pids
+                and isinstance(item.get("key"), str)
+            }
+        )
 
     def expire_respawns(self):
         """A stopped key that did not reappear within timers.respawn_window was a good stop."""
@@ -1158,21 +1172,20 @@ class Daemon:
             except engine.Refused as e:
                 self.store.log(event="auto_stop_refused", scope=leaf, why=str(e))
                 return False
-            self.note_stop(rep)
-            unkilled = set(rep.get("unkilled", []))
-            stopped_apps = {
-                item["key"]
-                for item in rep.get("decisions", [])
-                if item.get("action") == "kill" and item.get("pid") not in unkilled
-            }
-            self.note_auto_stop(
-                leaf,
-                why,
-                [pair for pair in dict.fromkeys(pairs) if pair[1] in stopped_apps],
-                apps=sorted(stopped_apps),
-                decision=decision,
-                owner=decision["owner"],
-            )
+            stopped_pids = self.note_stop(rep)
+            stopped_apps = self.stopped_apps(rep, stopped_pids)
+            stopped_pairs = [
+                pair for pair in dict.fromkeys(pairs) if pair[1] in stopped_apps
+            ]
+            if stopped_apps:
+                self.note_auto_stop(
+                    leaf,
+                    why,
+                    stopped_pairs,
+                    apps=stopped_apps,
+                    decision=decision,
+                    owner=decision["owner"],
+                )
             return rep["removed"]
 
     def auto_stop_survivors(
@@ -1266,6 +1279,7 @@ class Daemon:
             else:
                 loose.append(l)
         why = "closed job %s: %s" % (tag, dec[pairs[0][1]][2])
+        stopped = set()
         with self.store.decision_context(
             "stop",
             scope="job-" + slug,
@@ -1294,38 +1308,47 @@ class Daemon:
                         owner=owner,
                     )
                 try:
-                    self.note_stop(
-                        engine.stop(
-                            dest,
-                            self.cfg,
-                            self.store,
-                            None,
-                            timeout=grace,
-                            allow_sigkill=allow_sigkill,
-                            decision_kind="stop",
-                            decision_authority="pair",
-                            decision_why=why,
-                            decision_owner=owner,
-                        )
+                    report = engine.stop(
+                        dest,
+                        self.cfg,
+                        self.store,
+                        None,
+                        timeout=grace,
+                        allow_sigkill=allow_sigkill,
+                        decision_kind="stop",
+                        decision_authority="pair",
+                        decision_why=why,
+                        decision_owner=owner,
                     )
+                    stopped.update(self.note_stop(report))
                 except engine.Refused as e:
                     self.store.log(
                         event="auto_stop_refused", scope=cgroup.rel(dest), why=str(e)
                     )
             if loose:
-                engine.signal_survivors(self.cfg, loose, grace, allow_sigkill)
-                self.store.log(
-                    event="stop", scope="job-" + slug, pids=[l["pid"] for l in loose]
+                stopped.update(
+                    engine.signal_survivors(self.cfg, loose, grace, allow_sigkill)
                 )
-            self.note_auto_stop(
-                "job-" + slug,
-                why,
-                pairs,
-                apps=[l["key"] for l in good],
-                decision=decision,
-                owner=owner,
-                signature_id=signature_id,
-            )
+            stopped_items = [item for item in good if item["pid"] in stopped]
+            if stopped_items:
+                self.store.log(
+                    event="stop",
+                    scope="job-" + slug,
+                    pids=sorted({item["pid"] for item in stopped_items}),
+                )
+                stopped_pairs = list(
+                    dict.fromkeys((owner, item["key"]) for item in stopped_items)
+                )
+                stopped_apps = sorted({item["key"] for item in stopped_items})
+                self.note_auto_stop(
+                    "job-" + slug,
+                    why,
+                    stopped_pairs,
+                    apps=stopped_apps,
+                    decision=decision,
+                    owner=owner,
+                    signature_id=signature_id,
+                )
 
     def attribute(self, owner, leftovers, root=None, job=None, signature=None):
         """Log would_attribute / would_stop for each distinct leftover key. Returns {key: decision}."""
@@ -2115,12 +2138,8 @@ class Daemon:
                 except engine.Refused as e:
                     self.store.log(event="gc_refused", scope=leaf, why=str(e))
                     continue
-                self.note_stop(rep)
-                stopped = [
-                    d["key"]
-                    for d in rep.get("decisions", [])
-                    if d.get("action") == "kill"
-                ]
+                stopped_pids = self.note_stop(rep)
+                stopped = self.stopped_apps(rep, stopped_pids)
                 if stopped:
                     self.note_auto_stop(leaf, why, [], apps=stopped, decision=decision)
                 if rep["removed"]:
@@ -2222,12 +2241,8 @@ class Daemon:
                         decision_authority=dec.authority,
                         decision_why="session ended",
                     )
-                    self.note_stop(rep)
-                    stopped = [
-                        x["key"]
-                        for x in rep.get("decisions", [])
-                        if x.get("action") == "kill"
-                    ]
+                    stopped_pids = self.note_stop(rep)
+                    stopped = self.stopped_apps(rep, stopped_pids)
                     if stopped:
                         self.note_auto_stop(
                             scope, "session ended", [], apps=stopped, decision=decision

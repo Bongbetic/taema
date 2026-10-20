@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -268,6 +268,10 @@ _MIGRATIONS = {
     """,
     5: "",
     6: "ALTER TABLE signatures ADD COLUMN probation INTEGER NOT NULL DEFAULT 0;",
+    7: """
+        ALTER TABLE signatures ADD COLUMN suspended_until REAL NOT NULL DEFAULT 0;
+        ALTER TABLE signatures ADD COLUMN suspended_at REAL NOT NULL DEFAULT 0;
+    """,
 }
 
 
@@ -1817,8 +1821,35 @@ class StateDB:
             try:
                 cursor = connection.execute(
                     "UPDATE signatures SET %s = coalesce(%s, 0) + ?, ex_last = ?, "
-                    "last_seen = ? WHERE id = ?" % (column, column),
+                    "last_seen = ?, suspended_until = 0, suspended_at = 0 WHERE id = ?"
+                    % (column, column),
                     (weight, choice, now, identifier),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return cursor.rowcount == 1
+
+    def suspend_signature(self, identifier, until, now=None):
+        """Suspend inherited authority for one signature after attributed regret."""
+        if (
+            self.read_only
+            or not self.available
+            or not isinstance(identifier, str)
+            or not isinstance(until, (int, float))
+            or isinstance(until, bool)
+            or not math.isfinite(until)
+        ):
+            return False
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "UPDATE signatures SET suspended_until = ?, suspended_at = ?, "
+                    "last_seen = ? WHERE id = ?",
+                    (until, now, now, identifier),
                 )
                 connection.commit()
             except Exception:

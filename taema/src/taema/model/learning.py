@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Literal
 
 DAY = 86400.0
@@ -30,13 +31,60 @@ def _number(record: Mapping[str, object], key: str, default: float = 0.0) -> flo
     return default
 
 
-def _text(record: Mapping[str, object], key: str) -> str | None:
-    value = record.get(key)
-    return value if isinstance(value, str) else None
+@dataclass(frozen=True, slots=True)
+class PairEvidence:
+    """Validated immutable evidence consumed by the pair learning decision."""
+
+    ex_stop: float = 0.0
+    ex_keep: float = 0.0
+    ex_last: str | None = None
+    stop: float = 0.0
+    keep: float = 0.0
+    regret_keep: float = 0.0
+    self_stop: float = 0.0
+    suspended_until: float = 0.0
+    launches: float = 0.0
+    inferred_kills: float = 0.0
+    kills: float = 0.0
+    days: tuple[int, ...] = ()
+    first_seen: float = 0.0
+    closes: float = 0.0
+    last_keep: float = 0.0
+
+    @classmethod
+    def from_record(
+        cls, record: Mapping[str, object] | None, now: float
+    ) -> PairEvidence:
+        """Copy persisted data into a validated immutable decision input."""
+        record = record if isinstance(record, Mapping) else {}
+        raw_days = record.get("days", ())
+        days = (
+            tuple(dict.fromkeys(day for day in raw_days if type(day) is int))
+            if isinstance(raw_days, (list, tuple))
+            else ()
+        )
+        last = record.get("ex_last")
+        return cls(
+            ex_stop=_number(record, "ex_stop"),
+            ex_keep=_number(record, "ex_keep"),
+            ex_last=last if isinstance(last, str) else None,
+            stop=_number(record, "stop"),
+            keep=_number(record, "keep"),
+            regret_keep=_number(record, "regret_keep"),
+            self_stop=_number(record, "self_stop"),
+            suspended_until=_number(record, "suspended_until"),
+            launches=_number(record, "launches"),
+            inferred_kills=_number(record, "inferred_kills", _number(record, "kills")),
+            kills=_number(record, "kills"),
+            days=days,
+            first_seen=_number(record, "first_seen", now),
+            closes=_number(record, "closes"),
+            last_keep=_number(record, "last_keep"),
+        )
 
 
 def decide_pair(
-    pair: Mapping[str, object] | None,
+    pair: PairEvidence | None,
     now: float,
     *,
     authority: str = "learned",
@@ -47,32 +95,29 @@ def decide_pair(
     burn_in_days: float = BURN_IN_DAYS,
     burn_in_closes: int = BURN_IN_CLOSES,
 ) -> tuple[Action, float, str]:
-    """Return a deterministic decision for one pair without reading or mutating state."""
+    """Return a deterministic decision from one immutable pair evidence snapshot."""
     if not pair:
         return "ask", 0.0, "no evidence"
 
-    suspended_until = _number(pair, "suspended_until")
-    if suspended_until > now:
+    if pair.suspended_until > now:
         return (
             "ask",
             0.0,
             "suspended after regret until day +%d"
-            % int((suspended_until - now) // DAY + 1),
+            % int((pair.suspended_until - now) // DAY + 1),
         )
 
-    explicit_stop = _number(pair, "ex_stop")
-    explicit_keep = _number(pair, "ex_keep")
-    inferred_stop = _number(pair, "stop")
-    inferred_keep = _number(pair, "keep") + _number(pair, "regret_keep")
-    self_stop = _number(pair, "self_stop")
+    explicit_stop = pair.ex_stop
+    explicit_keep = pair.ex_keep
+    inferred_stop = pair.stop
+    inferred_keep = pair.keep + pair.regret_keep
+    self_stop = pair.self_stop
     self_authority = authority == "aggressive" and allow_self_authority
     stop = inferred_stop + (self_stop if self_authority else 0.0)
     keep = inferred_keep
 
     if explicit_stop or explicit_keep:
-        last = _text(pair, "ex_last") or (
-            "stop" if explicit_stop >= explicit_keep else "keep"
-        )
+        last = pair.ex_last or ("stop" if explicit_stop >= explicit_keep else "keep")
         if last == "stop" and keep < explicit_stop:
             return (
                 "stop",
@@ -87,7 +132,7 @@ def decide_pair(
             )
         return "ask", 0.0, "answer overturned by contrary evidence"
 
-    if _number(pair, "launches") and not _number(pair, "kills"):
+    if pair.launches and not pair.kills:
         return "keep", 0.5, "launcher pattern: survivors are what the job started"
 
     total = stop + keep
@@ -96,18 +141,13 @@ def decide_pair(
     confidence = (
         (inferred_stop + self_stop) / confidence_total if confidence_total else 0.0
     )
-    kills = _number(pair, "inferred_kills", _number(pair, "kills"))
-    raw_days = pair.get("days", ())
-    observed_days = []
-    if isinstance(raw_days, (list, tuple)):
-        observed_days = list(dict.fromkeys(day for day in raw_days if type(day) is int))
-    distinct_days = len(observed_days)
-    first_seen = _number(pair, "first_seen", now)
-    closes = _number(pair, "closes")
-    burn_in = now - first_seen >= burn_in_days * DAY or closes >= burn_in_closes
-    last_keep = _number(pair, "last_keep")
-    quiet = not keep and now - last_keep > SILENT_KEEP_FREE_DAYS
-    old = now - first_seen > SILENT_MIN_AGE
+    kills = pair.inferred_kills
+    distinct_days = len(pair.days)
+    burn_in = (
+        now - pair.first_seen >= burn_in_days * DAY or pair.closes >= burn_in_closes
+    )
+    quiet = not keep and now - pair.last_keep > SILENT_KEEP_FREE_DAYS
+    old = now - pair.first_seen > SILENT_MIN_AGE
 
     if (
         kills >= silent_kills

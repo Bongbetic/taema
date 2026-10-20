@@ -48,7 +48,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 6
+                    connection.execute("PRAGMA user_version").fetchone()[0], 7
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -89,6 +89,42 @@ class StoreDatabaseTests(unittest.TestCase):
                 reopened.match_veto(members=[{"apps": ["firefox"]}])["value"], "firefox"
             )
 
+    def test_schema_six_migration_adds_signature_regret_suspension(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE signatures (
+                        id TEXT PRIMARY KEY,
+                        owner TEXT NOT NULL,
+                        members TEXT NOT NULL,
+                        probation INTEGER NOT NULL DEFAULT 0
+                    );
+                    INSERT INTO signatures(id, owner, members)
+                    VALUES ('signature-1', 'app-0001', '[]');
+                    PRAGMA user_version = 6;
+                    """
+                )
+
+            StateDB(path)
+
+            with StateDB(path, read_only=True).connection() as connection:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(signatures)")
+                }
+                row = connection.execute(
+                    "SELECT suspended_until, suspended_at FROM signatures WHERE id = ?",
+                    ("signature-1",),
+                ).fetchone()
+                self.assertEqual(
+                    connection.execute("PRAGMA user_version").fetchone()[0], 7
+                )
+
+            self.assertTrue({"suspended_until", "suspended_at"}.issubset(columns))
+            self.assertEqual(tuple(row), (0.0, 0.0))
+
     def test_database_upgrades_forward_from_an_older_schema(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.db"
@@ -118,7 +154,7 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 6
+                    connection.execute("PRAGMA user_version").fetchone()[0], 7
                 )
                 self.assertTrue(
                     connection.execute(
@@ -137,9 +173,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     + store_db._MIGRATIONS[3]
                     + "\nPRAGMA user_version = 3;\nCOMMIT;"
                 )
-                connection.execute(
-                    "INSERT INTO apps(key, kind) VALUES ('app', 'exe')"
-                )
+                connection.execute("INSERT INTO apps(key, kind) VALUES ('app', 'exe')")
                 connection.execute(
                     "INSERT INTO instances(id, app, pid, start, born) "
                     "VALUES ('42:100', 'app', 42, 100, 500)"
@@ -160,7 +194,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     "SELECT id, owner, runtime_hash, veto FROM signatures"
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 6
+                    connection.execute("PRAGMA user_version").fetchone()[0], 7
                 )
 
             self.assertEqual(
@@ -508,9 +542,7 @@ class StoreDatabaseTests(unittest.TestCase):
                         ("scope-veto", 2, "scope", "scope-guard", None, now),
                     ],
                 )
-                with mock.patch.multiple(
-                    store_db, MAX_INSTANCES=0, MAX_APPS=0
-                ):
+                with mock.patch.multiple(store_db, MAX_INSTANCES=0, MAX_APPS=0):
                     store_db._prune(connection, now)
                 connection.commit()
 
@@ -518,9 +550,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 instances = {
                     row[0] for row in connection.execute("SELECT id FROM instances")
                 }
-                apps = {
-                    row[0] for row in connection.execute("SELECT key FROM apps")
-                }
+                apps = {row[0] for row in connection.execute("SELECT key FROM apps")}
 
         self.assertEqual(instances, {"41:410", "42:420"})
         self.assertEqual(apps, {"pid-app", "scope-app"})

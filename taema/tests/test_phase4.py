@@ -389,6 +389,7 @@ class AutoCase(ProcCase):
                 "removed": True,
                 "decisions": [{"action": "kill", "key": "vite", "pid": 30}],
                 "left": [],
+                "stopped": [30],
             },
         )
         self.stopm = stop.start()
@@ -467,6 +468,29 @@ class JobSurvivors(AutoCase):
         pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
         self.assertEqual(pair["probation"], 1)
         self.assertEqual(len(self.d.store.pending_auto_stops()), 1)
+
+    def test_refused_carved_stop_does_not_open_a_learning_outcome(self):
+        self.d.store.answer("npm", "vite", "stop")
+        self.stopm.side_effect = engine.Refused("stop refused")
+
+        self.job()
+
+        self.stopm.assert_called_once()
+        pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
+        self.assertEqual(pair.get("probation", 0), 0)
+        self.assertEqual(self.d.store.pending_auto_stops(), [])
+
+    def test_unsignalled_loose_survivor_does_not_open_a_learning_outcome(self):
+        self.d.store.answer("npm", "vite", "stop")
+        self.cgmap[30] = "/2"
+
+        with mock.patch.object(engine, "signal_survivors", return_value=[]) as signal:
+            self.job()
+
+        signal.assert_called_once()
+        pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
+        self.assertEqual(pair.get("probation", 0), 0)
+        self.assertEqual(self.d.store.pending_auto_stops(), [])
 
     def test_adopt_stops_an_explicitly_answered_pair_on_job_close(self):
         self.d.cfg["mode"] = "adopt"

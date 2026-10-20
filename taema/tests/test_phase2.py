@@ -632,6 +632,39 @@ class KnowledgeV2(unittest.TestCase):
         self.assertEqual(self.s.db.signature(signature_id)["respawn"], 1)
         self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
 
+    def test_regret_suspends_inherited_signature_authority_for_seven_days(self):
+        from taema.core import signature as survivor_signature
+
+        observed = survivor_signature.signature("o", ["l"])
+        signature_id = self.s.ensure_signature("o", observed)["id"]
+        self.assertTrue(self.s.answer_signature("o", observed, "stop"))
+        pair = self.s._pair("o", "l")
+        pair["sig"] = signature_id
+        self.s.auto_stopped("o", "l", signature_id, stop_id="regretted-stop")
+        self.c.t += 30
+        self.assertTrue(self.s.auto_stop_respawn("o", "l", signature_id))
+        self.assertTrue(self.s.regret("o", "l", signature_id))
+
+        self.assertEqual(self.s.pair_decision("o", "l")[0], "ask")
+        self.assertEqual(self.s.signature_decision(observed)[0], "ask")
+        self.assertEqual(self.s.signature_decisions(observed)["l"][0], "ask")
+        superset = survivor_signature.signature("o", ["l", "worker"])
+        inherited = self.s.signature_decisions(superset)
+        self.assertEqual(inherited.get("l", self.s.pair_decision("o", "l"))[0], "ask")
+
+        self.s.save()
+        reopened = knowledge.Store(self.d, {}, now=self.c)
+        self.assertEqual(reopened.signature_decision(observed)[0], "ask")
+        self.assertEqual(
+            reopened.signature_decisions(superset).get(
+                "l", reopened.pair_decision("o", "l")
+            )[0],
+            "ask",
+        )
+        self.c.t += knowledge.REGRET_SUSPEND + 1
+        self.assertEqual(reopened.signature_decision(observed)[0], "stop")
+        self.assertEqual(reopened.signature_decisions(superset)["l"][0], "stop")
+
     def test_successful_stop_weight_is_confidence_unless_self_authority_is_enabled(
         self,
     ):
@@ -999,7 +1032,9 @@ class JobFlow(ProcCase):
 
         with (
             mock.patch.object(self.d, "_infos", side_effect=safe_members),
-            mock.patch.object(daemon.engine, "signal_survivors") as signal,
+            mock.patch.object(
+                daemon.engine, "signal_survivors", return_value=[30]
+            ) as signal,
             mock.patch.object(self.d, "guarded", side_effect=lambda fn: fn()),
             mock.patch.object(
                 self.d, "auto_stop_survivors", wraps=self.d.auto_stop_survivors
@@ -1434,9 +1469,10 @@ class RespawnWiring(ProcCase):
         self.d.note_stop(
             {
                 "decisions": [
-                    {"action": "kill", "key": key},
+                    {"action": "kill", "key": key, "pid": 40},
                     {"action": "share", "key": "z"},
-                ]
+                ],
+                "stopped": [40],
             }
         )
         self.assertEqual(list(self.d.stopped), [key])

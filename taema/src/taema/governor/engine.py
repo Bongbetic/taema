@@ -233,7 +233,14 @@ def _stop_impl(
         target = store._target(veto)
         store.log(event="vetoed", trigger="stop", scope=cgroup.rel(path), target=target)
         raise Vetoed("vetoed " + store.describe_veto(veto))
-    report = {"scope": cgroup.rel(path), "decisions": [], "removed": False, "left": []}
+    report = {
+        "scope": cgroup.rel(path),
+        "decisions": [],
+        "removed": False,
+        "left": [],
+        "stopped": [],
+    }
+    stopped_pids = set()
     ran_hook = False
     counted, killed_keys, sigkill_keys = set(), set(), set()
     snap = (
@@ -319,8 +326,9 @@ def _stop_impl(
             counted.add(k)
         if timeout is not None:
             grace = float(timeout)
-        _signal_all(path, kill_set, signal.SIGTERM, cfg)
+        term_sent = _signal_all(path, kill_set, signal.SIGTERM, cfg)
         exited = _wait_each(path, kill_set, grace)
+        stopped_pids.update(set(term_sent) & set(exited))
         survivors = kill_set - set(exited)
         for d in kill:
             store.add_term_ms(d["key"], exited.get(d["pid"], grace * 1000))
@@ -331,12 +339,14 @@ def _stop_impl(
             report["unkilled"] = sorted(survivors)
             break
         if survivors:
-            _signal_all(path, survivors, signal.SIGKILL, cfg)
+            kill_sent = _signal_all(path, survivors, signal.SIGKILL, cfg)
             for d in kill:
                 if d["pid"] in survivors and d["key"] not in sigkill_keys:
                     sigkill_keys.add(d["key"])
                     store.bump(d["key"], "sigkill_needed")
-            _wait_each(path, survivors, 5)
+            killed = _wait_each(path, survivors, 5)
+            stopped_pids.update(set(kill_sent) & set(killed))
+    report["stopped"] = sorted(stopped_pids)
     if not dry_run:
         try:
             cgroup.rmdir_tree(path)
@@ -1026,7 +1036,7 @@ def auto_adopt_plan(cfg, units, table, lin, store, cap=AUTO_CAP):
 def signal_survivors(cfg, items, grace, allow_sigkill):
     """Stop job survivors that cannot be carved (they live outside user/<uid>): SIGTERM through a
     pidfd-pinned _signal_all, wait, SIGKILL only when allowed. items: [{"pid","start"}]. Returns the
-    pids signalled."""
+    pids that left the scope after a signal was sent."""
     groups = {}
     for it in items:
         if inspect.starttime(it["pid"]) != it["start"]:
@@ -1034,15 +1044,18 @@ def signal_survivors(cfg, items, grace, allow_sigkill):
         cg = cgroup.proc_cgroup(it["pid"])
         if cg:
             groups.setdefault(cgroup.CG + cg, []).append(it["pid"])
-    sent = []
+    stopped = set()
     for path, pids in groups.items():
         try:
             self_guard(path)
         except Refused:
             continue
-        sent += _signal_all(path, pids, signal.SIGTERM, cfg)
-        left = set(pids) - set(_wait_each(path, pids, grace))
+        term_sent = _signal_all(path, pids, signal.SIGTERM, cfg)
+        exited = _wait_each(path, pids, grace)
+        stopped.update(set(term_sent) & set(exited))
+        left = set(pids) - set(exited)
         if left and allow_sigkill:
-            _signal_all(path, left, signal.SIGKILL, cfg)
-            _wait_each(path, left, 5)
-    return sent
+            kill_sent = _signal_all(path, left, signal.SIGKILL, cfg)
+            killed = _wait_each(path, left, 5)
+            stopped.update(set(kill_sent) & set(killed))
+    return sorted(stopped)

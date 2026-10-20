@@ -77,7 +77,7 @@ def decide(p, now, authority="learned", allow_self_authority=False, learn=None):
     """Pure compatibility entry point for the pair model."""
     learn = learn if isinstance(learn, dict) else {}
     return pair_learning.decide_pair(
-        p,
+        pair_learning.PairEvidence.from_record(p, now),
         now,
         authority=authority,
         allow_self_authority=allow_self_authority,
@@ -148,9 +148,7 @@ class Store:
             self.learn_authority = "unit"
         else:
             self.learn_authority = "learned"
-        self.allow_self_authority = bool(
-            self.learn.get("allow_self_authority", False)
-        )
+        self.allow_self_authority = bool(self.learn.get("allow_self_authority", False))
         self.probation_stops = max(0, int(self.learn.get("probation_stops", 3)))
         self.respawn_window = max(0.0, float(self.learn.get("respawn_window", 60)))
         self.revive_window = max(0.0, float(self.learn.get("revive_window", 1800)))
@@ -2502,7 +2500,27 @@ class Store:
     def signature_decision(self, signature):
         """Return a matched signature decision, or ``None`` for pair fallback."""
         matched = self.match_signature(signature)
-        return self._signature_answer(matched) or self._signature_outcome_answer(matched)
+        if self._signature_suspended(matched):
+            return self._suspended_signature_decision(matched)
+        return self._signature_answer(matched) or self._signature_outcome_answer(
+            matched
+        )
+
+    def _signature_suspended(self, matched, now=None):
+        if not matched:
+            return False
+        now = self.now() if now is None else now
+        until = matched.get("suspended_until", 0)
+        return (
+            isinstance(until, (int, float))
+            and not isinstance(until, bool)
+            and until > now
+        )
+
+    def _suspended_signature_decision(self, matched):
+        until = float(matched.get("suspended_until", 0))
+        days = max(1, int((until - self.now()) // DAY + 1))
+        return "ask", 0.0, "signature suspended after regret for %d more day(s)" % days
 
     @staticmethod
     def _signature_answer(matched):
@@ -2530,7 +2548,10 @@ class Store:
             return None
         successful = matched.get("stop_ok", 0)
         respawned = matched.get("respawn", 0)
-        if successful < pair_learning.SELF_AUTHORITY_SUCCESSES or successful <= respawned:
+        if (
+            successful < pair_learning.SELF_AUTHORITY_SUCCESSES
+            or successful <= respawned
+        ):
             return None
         total = successful + respawned
         confidence = successful / total if total else 0.0
@@ -2546,6 +2567,29 @@ class Store:
         if not isinstance(signature, dict):
             return {}
         matched = self.match_signature(signature)
+        if self._signature_suspended(matched):
+            _action, _confidence, reason = self._suspended_signature_decision(matched)
+            suspended_at = float(matched.get("suspended_at", 0))
+            result = {}
+            for member in signature.get("members", []):
+                if not isinstance(member, dict) or not isinstance(
+                    member.get("key"), str
+                ):
+                    continue
+                key = member["key"]
+                pair = self.data.get("pairs", {}).get(
+                    self.pkey(signature.get("owner"), key)
+                )
+                if (
+                    isinstance(pair, dict)
+                    and isinstance(pair.get("ex_ts"), (int, float))
+                    and not isinstance(pair.get("ex_ts"), bool)
+                    and pair["ex_ts"] > suspended_at
+                ):
+                    result[key] = self._decide(signature.get("owner"), pair)
+                else:
+                    result[key] = "ask", 0.0, reason
+            return result
         if matched:
             answer = self._signature_answer(matched) or self._signature_outcome_answer(
                 matched
@@ -2563,12 +2607,13 @@ class Store:
         candidates = []
         for candidate in self.db.signatures_for_owner(signature.get("owner")):
             previous = survivor_signature.member_counts(candidate.get("members"))
-            answer = self._signature_answer(candidate) or self._signature_outcome_answer(
+            answer = self._signature_answer(
                 candidate
-            )
+            ) or self._signature_outcome_answer(candidate)
             if (
                 not previous
                 or not answer
+                or self._signature_suspended(candidate)
                 or not previous.keys() < current.keys()
                 or candidate.get("runtime") != signature.get("runtime_class", "")
                 or not all(abs(previous[key] - current[key]) <= 1 for key in previous)
@@ -2677,6 +2722,8 @@ class Store:
             pair = self._pair(owner, leftover)
             now = self.now()
             signature_id = signature_id or pair.get("sig")
+            if signature_id:
+                pair["sig"] = signature_id
             stop_id = stop_id or uuid.uuid4().hex
             pair["probation"] = int(pair.get("probation", 0)) + 1
             pair["last_auto_stop"] = now
@@ -2796,7 +2843,9 @@ class Store:
             timestamp = pending.get("ts")
             if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
                 continue
-            if now - timestamp >= respawn_window and not pending.get("respawn_recorded"):
+            if now - timestamp >= respawn_window and not pending.get(
+                "respawn_recorded"
+            ):
                 self.auto_stop_success(owner, leftover, pending.get("signature_id"))
             if now - timestamp >= revive_window:
                 pair = self.data["pairs"].get(self.pkey(owner, leftover))
@@ -2815,7 +2864,9 @@ class Store:
         last_auto_stop = (
             pending.get("ts")
             if isinstance(pending, dict)
-            else p.get("last_auto_stop") if p else 0
+            else p.get("last_auto_stop")
+            if p
+            else 0
         )
         window = self.regret_window if window is None else max(0.0, window)
         suspend = self.regret_suspend if suspend is None else max(0.0, suspend)
@@ -2826,12 +2877,22 @@ class Store:
             not p
             or not last_auto_stop
             or self.now() - last_auto_stop > window
-            or (signature_id and recorded_signature and signature_id != recorded_signature)
+            or (
+                signature_id
+                and recorded_signature
+                and signature_id != recorded_signature
+            )
         ):
             return False
         p["regret_keep"] = float(p.get("regret_keep", 0.0)) + W_REGRET
         p["last_keep"] = self.now()
         p["suspended_until"] = self.now() + suspend
+        if recorded_signature:
+            self.db.suspend_signature(
+                recorded_signature,
+                p["suspended_until"],
+                now=p["last_keep"],
+            )
         p["last_auto_stop"] = 0.0
         p.pop("pending_stop", None)
         self.dirty = True
@@ -2857,9 +2918,20 @@ class Store:
         why = policy.bad_owner(owner, self.deny)
         if why:
             return "invalid", 0.0, "invalid owner: %s" % why
+        now = self.now()
+        if isinstance(p, dict) and p.get("sig"):
+            signature = self.db.signature(p["sig"])
+            ex_ts = p.get("ex_ts", 0)
+            if (
+                self._signature_suspended(signature, now)
+                and isinstance(ex_ts, (int, float))
+                and not isinstance(ex_ts, bool)
+                and ex_ts <= float(signature.get("suspended_at", 0))
+            ):
+                return self._suspended_signature_decision(signature)
         return decide(
             p,
-            self.now(),
+            now,
             authority=self.learn_authority,
             allow_self_authority=self.allow_self_authority,
             learn=self.learn,
@@ -2966,7 +3038,11 @@ class Store:
                 signatures[signature_id] = self.db.signature(signature_id)
             signature = signatures.get(signature_id)
             inherited = None
-            if signature and signature.get("ex_last") in ("stop", "keep"):
+            if (
+                signature
+                and not self._signature_suspended(signature)
+                and signature.get("ex_last") in ("stop", "keep")
+            ):
                 if signature.get("ex_" + signature["ex_last"], 0):
                     inherited = signature["ex_last"]
             display_why = (
@@ -2984,9 +3060,7 @@ class Store:
                     "signature": p.get("sig"),
                     "confidence": round(1.0 if inherited else conf, 2),
                     "stop": round(
-                        p.get("stop", 0)
-                        + p.get("self_stop", 0)
-                        + p.get("ex_stop", 0),
+                        p.get("stop", 0) + p.get("self_stop", 0) + p.get("ex_stop", 0),
                         2,
                     ),
                     "keep": round(

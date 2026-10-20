@@ -43,6 +43,7 @@ __all__ = (
     "cmd_gc",
     "cmd_adopt",
     "cmd_daemon",
+    "cmd_complete",
     "main",
 )
 

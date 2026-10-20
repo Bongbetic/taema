@@ -9,6 +9,7 @@ from unittest import mock
 
 from taema.daemon import service as daemon
 import taema.cli.commands as cli
+from taema.cli import targets
 from taema.store import knowledge
 from tests.test_phase0 import FakeCg, make_cfg, tmp
 
@@ -184,6 +185,29 @@ class VetoCommands(unittest.TestCase):
                 cli.veto_target("pid:42", s),
                 {"kind": "pid", "value": "42", "start": 456},
             )
+
+    def test_pid_veto_uses_selected_process_instance_and_rejects_reuse(self):
+        target = targets.Target(
+            "pid", "42", "pid:42", scope="scope-x", pid=42, start=1234
+        )
+        store = knowledge.Store(tmp(), {})
+        with (
+            mock.patch.object(cli, "_target_candidates", return_value=[target]),
+            mock.patch.object(cli.inspect, "starttime", return_value=1234),
+        ):
+            rc, _out, _err = self.run_cli_offline(["do-not-kill", "pid:42"], store)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.queued(store)[0]["target"]["start"], 1234)
+
+        stale = knowledge.Store(tmp(), {})
+        with (
+            mock.patch.object(cli, "_target_candidates", return_value=[target]),
+            mock.patch.object(cli.inspect, "starttime", return_value=5678),
+        ):
+            rc, _out, err = self.run_cli_offline(["do-not-kill", "pid:42"], stale)
+        self.assertEqual(rc, 2)
+        self.assertIn("changed since target selection", err)
+        self.assertFalse(os.path.exists(stale.feedback_path))
 
 
 class DaemonStopPaths(unittest.TestCase):

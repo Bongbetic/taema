@@ -8,6 +8,7 @@ GLOBAL_OPTIONS = (
     (("--no-color",), {"action": "store_true", "help": "disable color output"}),
     (("--quiet",), {"action": "store_true", "help": "suppress successful output"}),
     (("--yes",), {"action": "store_true", "help": "assume yes for confirmations"}),
+    (("--pick",), {"action": "store_true", "help": "use fzf for ambiguous targets"}),
     (("--socket",), {"metavar": "PATH", "help": "connect to this daemon socket"}),
     (("--config",), {"metavar": "PATH", "help": "load this configuration file"}),
     (("--verbose",), {"action": "store_true", "help": "show additional details"}),
@@ -21,6 +22,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_run",
         "arguments": (
             (("--join",), {"action": "store_true"}),
+            (("--dry-run",), {"action": "store_true"}),
             (("--owner",), {"type": int, "help": "stop the scope when this pid exits"}),
             (
                 ("--bind",),
@@ -39,7 +41,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "help": "stop a scope; shared members are moved aside, not killed",
         "handler": "cmd_kill",
         "arguments": (
-            (("-t", "--timeout"), {"type": float}),
+            (("-t", "--timeout"), {"type_name": "duration", "metavar": "DURATION"}),
             (("--dry-run",), {"action": "store_true"}),
             (
                 ("--do-not-kill",),
@@ -60,7 +62,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
                 ("--keep",),
                 {"help": "comma list of exe names to move aside instead of killing"},
             ),
-            (("name",), {}),
+            (("name",), {"nargs": "?"}),
         ),
     },
     {
@@ -83,7 +85,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "aliases": ("allow",),
         "help": "keep an executable",
         "handler": "cmd_keep",
-        "arguments": ((("exe",), {}),),
+        "arguments": ((("--dry-run",), {"action": "store_true"}), (("exe",), {})),
     },
     {
         "name": "forget",
@@ -92,6 +94,7 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_forget",
         "arguments": (
             (("--veto",), {"action": "store_true"}),
+            (("--dry-run",), {"action": "store_true"}),
             (("exe",), {}),
         ),
     },
@@ -100,13 +103,17 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "aliases": ("dnk", "never"),
         "help": "veto a target or the latest automatic stop",
         "handler": "cmd_do_not_kill",
-        "arguments": ((("target",), {"nargs": "?"}),),
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (("target",), {"nargs": "?"}),
+        ),
     },
     {
         "name": "undo",
         "aliases": (),
         "help": "undo the latest automatic stop",
         "handler": "cmd_undo",
+        "arguments": ((("--dry-run",), {"action": "store_true"}),),
     },
     {
         "name": "status",
@@ -165,5 +172,18 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "aliases": (),
         "help": "run the per-user daemon",
         "handler": "cmd_daemon",
+    },
+    {
+        "name": "__complete",
+        "aliases": (),
+        "help": "internal shell completion interface",
+        "handler": "cmd_complete",
+        "hidden": True,
+        "arguments": (
+            (("--shell",), {"choices": ("bash", "zsh", "fish"), "required": True}),
+            (("--word",), {"default": ""}),
+            (("--line",), {"default": ""}),
+            (("--cursor",), {"type": int}),
+        ),
     },
 )

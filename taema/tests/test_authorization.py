@@ -15,6 +15,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 import taema.cli.commands as cli
+from taema.cli import targets
 from taema.model import authorization
 from taema.core import cgroup, process as inspect
 from taema.governor import engine
@@ -465,6 +466,13 @@ class ManualKillRouting(unittest.TestCase):
         )
         with (
             mock.patch.object(cli, "_load", return_value=(cfg, store, [])),
+            mock.patch.object(
+                cli,
+                "_target_candidates",
+                return_value=[
+                    targets.Target("scope", "scope-x", "scope:scope-x", scope="scope-x")
+                ],
+            ),
             mock.patch.object(cgroup, "resolve", return_value="/cg/user/1/scope-x"),
             mock.patch.object(engine, "stop", return_value=rep),
             mock.patch.object(

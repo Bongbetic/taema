@@ -6,6 +6,8 @@ from .registry import COMMANDS, GLOBAL_OPTIONS
 def help_text():
     commands = []
     for spec in COMMANDS:
+        if spec.get("hidden"):
+            continue
         names = [spec["name"], *spec["aliases"]]
         commands.append("  %-30s %s" % (", ".join(names), spec["help"]))
     options = [

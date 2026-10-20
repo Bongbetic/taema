@@ -289,6 +289,117 @@ def die(msg, code=1, hint=None, suggestion=None):
     return code
 
 
+def _choose_target(query, candidates, pick=False, label=None):
+    from . import targets
+
+    try:
+        if query is None:
+            selected = targets.select_candidates(
+                label or "target", candidates, pick=pick
+            )
+        else:
+            selected = targets.select_target(query, candidates, pick=pick)
+    except targets.TargetNotFound:
+        if not candidates:
+            return die("no %s candidates are available" % (label or "target"), 2)
+        return die(
+            "no target matches %r" % query,
+            2,
+            hint="Choose a live scope, app key, pid, or desktop id.",
+            suggestion="Try one of: %s"
+            % ", ".join(item.label for item in candidates[:5]),
+        )
+    except targets.TargetAmbiguous as error:
+        return die(
+            "target %r is ambiguous: %s"
+            % (error.query, ", ".join(item.label for item in error.candidates)),
+            2,
+            hint="Choose one candidate, or run the command in a terminal to pick it.",
+            suggestion="Use a kind prefix such as `scope:`, `app:`, `pid:`, or `desktop:`.",
+        )
+    except targets.TargetError as error:
+        return die(
+            str(error),
+            1,
+            hint="Install fzf or retry without `--pick`.",
+            suggestion="Use the numbered picker in a terminal.",
+        )
+    if selected is None:
+        return die(
+            "target selection cancelled", 1, hint="Choose a listed target to continue."
+        )
+    return selected
+
+
+def _target_candidates(query=None, store=None):
+    from . import targets
+
+    candidates = targets.live_targets()
+    if store is not None:
+        live_apps = {item.value for item in candidates if item.kind == "app"}
+        candidates.extend(
+            item
+            for item in targets.known_app_targets(store)
+            if item.value not in live_apps
+        )
+    value = query.split(":", 1)[1] if isinstance(query, str) and ":" in query else query
+    prefix = query.split(":", 1)[0] if isinstance(query, str) and ":" in query else None
+    if (
+        prefix == "app"
+        and value
+        and not any(item.kind == "app" and item.value == value for item in candidates)
+    ):
+        candidates.append(targets.Target("app", value, "app:" + value, app_key=value))
+    if isinstance(value, str) and value.isdigit() and prefix in (None, "pid"):
+        try:
+            candidate = targets.process_target(value)
+        except targets.TargetNotFound:
+            pass
+        else:
+            if not any(
+                item.kind == "pid" and item.value == candidate.value
+                for item in candidates
+            ):
+                candidates.append(candidate)
+    return candidates
+
+
+def _target_scope_path(target):
+    """Revalidate a selected target's scope and protect against pid reuse or movement."""
+    if not target.scope:
+        die("pid %s is not inside a managed scope" % target.value, 2)
+        return None
+    path = cgroup.resolve(target.scope)
+    if not path:
+        die("scope %s disappeared; resolve the target again" % target.scope, 2)
+        return None
+    if target.pid is not None:
+        if inspect.starttime(target.pid) != target.start:
+            die("pid %s changed since target selection" % target.pid, 2)
+            return None
+        current = cgroup.proc_cgroup(target.pid)
+        if not current or not cgroup.is_prefix(path, current):
+            die("pid %s moved since target selection" % target.pid, 2)
+            return None
+    return path
+
+
+def _confirm_bulk(action, rows, args):
+    print("plan: %s affects %d targets" % (action, len(rows)))
+    for row in rows:
+        print("  %s" % row)
+    if getattr(args, "yes", False):
+        return True
+    if not sys.stdin.isatty():
+        print("hint: rerun with --yes to approve this plan", file=sys.stderr)
+        return False
+    try:
+        answer = input("Proceed? [y/N] ").strip().lower()
+    except (EOFError, OSError):
+        return False
+    return answer in ("y", "yes")
+
+
 # ---- run ----------------------------------------------------------------------------------
 
 
@@ -320,6 +431,9 @@ def cmd_run(a):
     owner = os.getpid() if a.bind else a.owner
     if owner and inspect.uid_of(owner) == -1:
         return die("owner pid %d is gone; not starting scope-%s" % (owner, name))
+    if getattr(a, "dry_run", False):
+        print("dry run: create scope-%s and attach %s" % (name, " ".join(a.cmd)))
+        return 0
     os.makedirs(leaf, exist_ok=True)
     # register before attaching: the daemon must be watching when this process enters the scope
     reply = (
@@ -403,9 +517,22 @@ def cmd_kill(a):
     if getattr(a, "do_not_kill", False):
         return die("kill and --do-not-kill cannot be combined", 2)
     cfg, store, units = _load(a)
-    path = cgroup.resolve(a.name)
-    if not path:
-        return die("no scope %s" % a.name, 2)
+    from . import targets
+
+    query = getattr(a, "name", None)
+    candidates = _target_candidates(query)
+    if query is None:
+        candidates = targets.leftover_targets(candidates)
+        selected = _choose_target(
+            None, candidates, pick=getattr(a, "pick", False), label="leftover scope"
+        )
+    else:
+        selected = _choose_target(query, candidates, pick=getattr(a, "pick", False))
+    if not isinstance(selected, targets.Target):
+        return selected
+    path = _target_scope_path(selected)
+    if path is None:
+        return 2
     veto = engine.veto_for_scope(store, path)
     scope = cgroup.rel(path)
     facts = authorization.Facts(
@@ -558,10 +685,30 @@ def cmd_ls(a):
 
 def cmd_explain(a):
     from . import view
+    from . import targets
 
     cfg, store, units = _load(a)
-    if a.target.isdigit():
-        pid = int(a.target)
+    candidates = _target_candidates(a.target, store)
+    matches = targets.matching_targets(a.target, candidates)
+    explicit_kind = a.target.split(":", 1)[0] if ":" in a.target else None
+    if not matches and (
+        explicit_kind in ("scope", "app", "pid", "desktop") or a.target.isdigit()
+    ):
+        return die("no target matches %r" % a.target, 2)
+    if matches:
+        selected = _choose_target(a.target, candidates, pick=getattr(a, "pick", False))
+        if not isinstance(selected, targets.Target):
+            return selected
+    else:
+        selected = None
+
+    if selected is None:
+        explanation = store.explain(a.target)
+        human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
+    elif selected.kind == "pid":
+        pid = selected.pid
+        if pid is None or inspect.starttime(pid) != selected.start:
+            return die("pid target changed; resolve it again", 2)
         pp = inspect.ppid_map()
         members = set(inspect.descendants([pid], pp))
         edges = inspect.edges(members, inspect.Snapshot()).get(pid, [])
@@ -594,22 +741,32 @@ def cmd_explain(a):
                 json.dumps(info, indent=1),
             )
         )
-    else:
-        path = cgroup.resolve(a.target)
-        if path:
-            unit = engine.unit_for_leaf(units, os.path.basename(path))
-            decisions = engine.plan_stop(path, cfg, store, unit)
-            explanation = {"plan": decisions}
-            human = (
-                "".join(
-                    "%-5s %7d %-18s %s\n"
-                    % (d["action"], d["pid"], d["comm"][:18], d["why"][:140])
-                    for d in decisions
-                )
-                or "no planned actions\n"
+    elif selected.kind == "scope":
+        path = _target_scope_path(selected)
+        if path is None:
+            return 2
+        unit = engine.unit_for_leaf(units, os.path.basename(path))
+        decisions = engine.plan_stop(path, cfg, store, unit)
+        explanation = {"plan": decisions}
+        human = (
+            "".join(
+                "%-5s %7d %-18s %s\n"
+                % (d["action"], d["pid"], d["comm"][:18], d["why"][:140])
+                for d in decisions
             )
+            or "no planned actions\n"
+        )
+    else:
+        key = selected.app_key or selected.value
+        explanation = store.explain(key)
+        if selected.kind == "desktop":
+            explanation = {
+                "desktop_id": selected.value,
+                "app_key": key,
+                "learning": explanation,
+            }
+            human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
         else:
-            explanation = store.explain(a.target)
             human = json.dumps(explanation, indent=1, ensure_ascii=False) + "\n"
     model = view.record("explain", {"target": a.target, "explanation": explanation})
     view.emit(model, a, human)
@@ -618,19 +775,72 @@ def cmd_explain(a):
 
 def cmd_keep(a):
     cfg, store, units = _load(a)
-    how = feedback(cfg, store, "keep", a.exe)
-    store.bump(a.exe, "user_keep", 3.0)  # local view only: read-only store, never saved
-    print("%s: %s (%s)" % (a.exe, store.default_action(a.exe)[0], how))
+    from . import targets
+
+    key = a.exe
+    candidates = _target_candidates(a.exe, store)
+    matches = targets.matching_targets(a.exe, candidates)
+    if matches:
+        selected = _choose_target(a.exe, candidates, pick=getattr(a, "pick", False))
+        if not isinstance(selected, targets.Target):
+            return selected
+        if selected.kind not in ("app", "desktop"):
+            return die("keep requires an app key or desktop id", 2)
+        key = selected.app_key or selected.value
+    elif a.exe.startswith("desktop:"):
+        return die("no live desktop id matches %r" % a.exe, 2)
+    if getattr(a, "dry_run", False):
+        print("dry run: remember keep for %s" % key)
+        return 0
+    how = feedback(cfg, store, "keep", key)
+    store.bump(key, "user_keep", 3.0)  # local view only: read-only store, never saved
+    print("%s: %s (%s)" % (key, store.default_action(key)[0], how))
     return 0
 
 
 def cmd_do_not_kill(a):
     cfg, store, _units = _load(a)
     if a.target:
-        try:
-            targets = [veto_target(a.target, store)]
-        except ValueError as e:
-            return die(str(e))
+        from . import targets
+
+        candidates = _target_candidates(a.target, store)
+        matches = targets.matching_targets(a.target, candidates)
+        if matches:
+            selected = _choose_target(
+                a.target, candidates, pick=getattr(a, "pick", False)
+            )
+            if not isinstance(selected, targets.Target):
+                return selected
+            try:
+                if selected.kind == "scope":
+                    vetoes = [{"kind": "scope", "value": selected.value, "start": None}]
+                elif selected.kind == "pid":
+                    if (
+                        selected.pid is None
+                        or inspect.starttime(selected.pid) != selected.start
+                    ):
+                        return die(
+                            "pid %s changed since target selection" % selected.value, 2
+                        )
+                    vetoes = [
+                        {
+                            "kind": "pid",
+                            "value": selected.value,
+                            "start": selected.start,
+                        }
+                    ]
+                else:
+                    value = selected.app_key or selected.value
+                    vetoes = [{"kind": "app", "value": value, "start": None}]
+            except ValueError as e:
+                return die(str(e))
+        else:
+            if a.target.startswith("desktop:"):
+                return die("no live desktop id matches %r" % a.target, 2)
+            try:
+                vetoes = [veto_target(a.target, store)]
+            except ValueError as e:
+                return die(str(e))
     else:
         action = store.auto_action()
         if not action:
@@ -640,7 +850,7 @@ def cmd_do_not_kill(a):
             for pair in action.get("pairs", [])
             if isinstance(pair, list) and len(pair) == 2
         ]
-        targets = (
+        vetoes = (
             [
                 {"kind": "app", "value": app, "start": None}
                 for app in dict.fromkeys(apps)
@@ -648,7 +858,15 @@ def cmd_do_not_kill(a):
             if apps
             else [{"kind": "scope", "value": action["scope"], "start": None}]
         )
-    for target in targets:
+    if getattr(a, "dry_run", False):
+        for target in vetoes:
+            print("dry run: veto %s" % veto_label(target))
+        return 0
+    if len(vetoes) > 1 and not _confirm_bulk(
+        "veto", [veto_label(target) for target in vetoes], a
+    ):
+        return 1
+    for target in vetoes:
         how, reply = feedback_action(cfg, store, "veto", target=target)
         if not reply or not reply.get("ok"):
             return die(reply.get("error", "could not add veto"))
@@ -662,6 +880,9 @@ def cmd_undo(a):
     if not action:
         return die("no automatic stop to undo", 2)
     target_id = action.get("decision_id") or action["id"]
+    if getattr(a, "dry_run", False):
+        print("dry run: undo automatic stop %s" % target_id)
+        return 0
     how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
     if not reply or not reply.get("ok"):
         return die(reply.get("error", "could not undo automatic stop"))
@@ -681,16 +902,51 @@ def cmd_undo(a):
 def cmd_forget(a):
     cfg, store, units = _load(a)
     if getattr(a, "veto", False):
-        try:
-            target = veto_target(a.exe, store, for_removal=True)
-        except ValueError as e:
-            return die(str(e))
+        from . import targets
+
+        candidates = _target_candidates(a.exe, store)
+        matches = targets.matching_targets(a.exe, candidates)
+        if matches:
+            selected = _choose_target(a.exe, candidates, pick=getattr(a, "pick", False))
+            if not isinstance(selected, targets.Target):
+                return selected
+            if selected.kind == "scope":
+                target = {"kind": "scope", "value": selected.value, "start": None}
+            elif selected.kind == "pid":
+                if (
+                    selected.pid is None
+                    or inspect.starttime(selected.pid) != selected.start
+                ):
+                    return die(
+                        "pid %s changed since target selection" % selected.value, 2
+                    )
+                target = {
+                    "kind": "pid",
+                    "value": selected.value,
+                    "start": selected.start,
+                }
+            else:
+                target = {
+                    "kind": "app",
+                    "value": selected.app_key or selected.value,
+                    "start": None,
+                }
+        else:
+            if a.exe.startswith("desktop:"):
+                return die("no live desktop id matches %r" % a.exe, 2)
+            try:
+                target = veto_target(a.exe, store, for_removal=True)
+            except ValueError as e:
+                return die(str(e))
         existed = any(
             v.get("kind") == target["kind"]
             and v.get("value") == str(target["value"])
             and (target.get("start") is None or v.get("start") == target.get("start"))
             for v in store._active_vetoes()
         )
+        if getattr(a, "dry_run", False):
+            print("dry run: remove veto for %s" % veto_label(target))
+            return 0
         how, reply = feedback_action(cfg, store, "unveto", target=target)
         if not reply or not reply.get("ok"):
             return die(reply.get("error", "could not remove veto"))
@@ -700,6 +956,9 @@ def cmd_forget(a):
             if removed
             else "no veto for %s (%s)" % (veto_label(target), how)
         )
+        return 0
+    if getattr(a, "dry_run", False):
+        print("dry run: forget %s" % a.exe)
         return 0
     known = store.forget(a.exe)
     feedback(cfg, store, "forget", a.exe)
@@ -885,6 +1144,69 @@ def cmd_gc(a):
     return 0 if available else 3
 
 
+def cmd_complete(a):
+    """Return registry-backed commands and live target names for shell completion."""
+    import shlex
+
+    from . import targets
+    from .registry import COMMANDS, GLOBAL_OPTIONS
+
+    _cfg, store, _units = _load(a)
+    candidates = targets.live_targets()
+    candidates.extend(targets.known_app_targets(store))
+    reviews = [str(item.get("id")) for item in store.open_reviews()]
+    line = getattr(a, "line", "") or ""
+    cursor = getattr(a, "cursor", None)
+    prefix = line[:cursor] if cursor is not None else line
+    try:
+        words = shlex.split(prefix)
+    except ValueError:
+        words = prefix.split()
+    if prefix and not prefix[-1].isspace() and words:
+        words = words[:-1]
+    if words and words[0] in ("taema", "tæma"):
+        words = words[1:]
+    command_names = [
+        name
+        for spec in COMMANDS
+        if not spec.get("hidden")
+        for name in (spec["name"], *spec["aliases"])
+    ]
+    command = next((word for word in words if word in command_names), None)
+    word = getattr(a, "word", "") or ""
+    if word.startswith("-"):
+        values = [name[0] for name, _options in GLOBAL_OPTIONS]
+        for spec in COMMANDS:
+            if command not in (spec["name"], *spec["aliases"]):
+                continue
+            for names, _options in spec.get("arguments", ()):
+                values.extend(name for name in names if name.startswith("-"))
+            for child in spec.get("children", ()):
+                for names, _options in child.get("arguments", ()):
+                    values.extend(name for name in names if name.startswith("-"))
+    elif command in (
+        "kill",
+        "stop",
+        "explain",
+        "why",
+        "do-not-kill",
+        "dnk",
+        "never",
+        "keep",
+        "forget",
+    ):
+        values = targets.completion_values(candidates, reviews)
+    elif command == "review":
+        values = ["review:%s" % item for item in reviews]
+    else:
+        values = command_names + [name[0] for name, _options in GLOBAL_OPTIONS]
+    folded = word.casefold()
+    for value in sorted(set(values), key=str.casefold):
+        if value.casefold().startswith(folded):
+            print(value)
+    return 0
+
+
 def cmd_adopt(a):
     cfg, store, units = _load(a)
     if a.all:
@@ -897,6 +1219,16 @@ def cmd_adopt(a):
     else:
         ops = engine.adopt_plan(cfg, units) + engine.carve_plan(cfg, units)
         decision = authorization.authorize(authorization.UNIT_ADOPT, cfg["mode"])
+    if a.all and len(ops) > 1 and not a.dry_run:
+        if not _confirm_bulk(
+            "adopt",
+            [
+                "%s %s (%d pids)" % (op["op"], op["scope"], len(op["pids"]))
+                for op in ops
+            ],
+            a,
+        ):
+            return 1
     execute = (not a.dry_run) and decision.verdict == authorization.ACT
     ops = engine.run_ops(cfg, store, ops, execute)
     for op in ops:

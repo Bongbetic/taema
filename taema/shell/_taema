@@ -1,0 +1,10 @@
+#compdef taema
+
+_taema_completion() {
+    local -a matches
+    matches=("${(@f)$(taema __complete --shell zsh --word "$PREFIX" \
+        --line "$BUFFER" --cursor "$CURSOR" 2>/dev/null)}")
+    _describe 'taema' matches
+}
+
+compdef _taema_completion taema

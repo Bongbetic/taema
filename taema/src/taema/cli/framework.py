@@ -43,7 +43,12 @@ def _add_output_options(parser, defaults):
 
 
 def command_names():
-    return tuple(name for spec in COMMANDS for name in (spec["name"], *spec["aliases"]))
+    return tuple(
+        name
+        for spec in COMMANDS
+        if not spec.get("hidden")
+        for name in (spec["name"], *spec["aliases"])
+    )
 
 
 def _parser(selected=None, include_all=True):
@@ -82,7 +87,7 @@ def _parser(selected=None, include_all=True):
         command_parser = subparsers.add_parser(
             spec["name"],
             aliases=list(spec["aliases"]),
-            help=spec["help"],
+            help=argparse.SUPPRESS if spec.get("hidden") else spec["help"],
             allow_abbrev=False,
         )
         _add_options(command_parser, GLOBAL_OPTIONS, defaults=False)
@@ -154,6 +159,11 @@ def _add_arguments(parser, definitions):
     for names, options in definitions:
         values = dict(options)
         remainder = values.pop("remainder", False)
+        type_name = values.pop("type_name", None)
+        if type_name == "duration":
+            from .inputs import parse_duration
+
+            values["type"] = parse_duration
         if remainder:
             values["nargs"] = argparse.REMAINDER
         parser.add_argument(*names, **values)

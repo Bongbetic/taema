@@ -79,7 +79,7 @@ class ProcTableTests(unittest.TestCase):
         self.assertEqual(sorted(inspect.descendants([2], {2: 1, 3: 2})), [2, 3])
         self.assertEqual(inspect.ancestors(3, pt), [2, 1])
 
-    def test_one_scan_per_adopt_pass(self):
+    def test_queued_reconciliation_scans_proc_once(self):
         cg = FakeCg()
         with cg:
             d = daemon.Daemon(make_cfg(tmp()))
@@ -97,8 +97,10 @@ class ProcTableTests(unittest.TestCase):
                     return_value=inspect.ProcTable.from_ppid({}),
                 ) as sc,
                 mock.patch.object(inspect, "ppid_map") as old,
+                mock.patch.object(d, "session_ended", return_value=False),
             ):
-                d.adopt_pass()
+                d.queue_collector_event(daemon.ProcessReconcile())
+                d.drain_collector_events()
             self.assertEqual(sc.call_count, 1)
             old.assert_not_called()
 
@@ -244,6 +246,80 @@ class DeadlineLoop(unittest.TestCase):
         d.iv_adopt = d.iv_gc = 10**6
         self.assertEqual(d.next_timeout(now=101.0), daemon.MAX_SLEEP)
 
+    def test_pending_collector_event_wakes_loop_without_idle_spin(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.last = {"adopt": 1000.0, "gc": 1000.0}
+        d.iv_adopt = d.iv_gc = 10**6
+        now = 1001.0
+        self.assertEqual(d.next_timeout(now=now), daemon.MAX_SLEEP)
+        with mock.patch.object(d, "adopt_pass"):
+            d.queue_collector_event(daemon.ProcessReconcile())
+            self.assertEqual(d.next_timeout(now=now), 0.0)
+            d.drain_collector_events()
+        self.assertEqual(d.next_timeout(now=now), daemon.MAX_SLEEP)
+
+    def test_duplicate_process_reconciliation_events_are_coalesced(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        with (
+            mock.patch.object(d, "adopt_pass") as adopt,
+            mock.patch.object(d, "session_ended", return_value=False),
+        ):
+            event = daemon.ProcessReconcile()
+            d.queue_collector_event(event)
+            d.queue_collector_event(event)
+            d.drain_collector_events()
+        adopt.assert_called_once_with()
+
+    def test_duplicate_owner_exit_events_stop_the_leaf_once(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        fd = os.open(os.devnull, os.O_RDONLY)
+        watch = ("scope-owned", 7001, 42)
+        d.owners[fd] = watch
+        event = daemon.OwnerExited(fd, watch)
+        with (
+            mock.patch.object(d.sel, "unregister"),
+            mock.patch.object(d, "stop_leaf") as stop,
+        ):
+            d.queue_collector_event(event)
+            d.queue_collector_event(event)
+            d.drain_collector_events()
+        stop.assert_called_once_with("scope-owned", "owner 7001 exited", owner=7001)
+        self.assertNotIn(fd, d.owners)
+
+    def test_stale_owner_exit_event_does_not_stop_reused_watch(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        fd = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        old_watch = ("scope-old", 7001, 42)
+        current_watch = ("scope-new", 7002, 99)
+        d.owners[fd] = current_watch
+        with mock.patch.object(d, "stop_leaf") as stop:
+            d.queue_collector_event(daemon.OwnerExited(fd, old_watch))
+            d.drain_collector_events()
+        stop.assert_not_called()
+        self.assertEqual(d.owners[fd], current_watch)
+
+    def test_collector_event_queue_has_a_fixed_bound(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        accepted = [
+            d.queue_collector_event(daemon.LeafFrozen(i, "leaf-%d" % i, True))
+            for i in range(daemon.MAX_COLLECTOR_EVENTS + 1)
+        ]
+        self.assertEqual(len(d.collector_events), daemon.MAX_COLLECTOR_EVENTS)
+        self.assertEqual(accepted[-1], False)
+        self.assertEqual(d.collector_event_drops, 1)
+
+    def test_tick_runs_proc_reconciliation_through_event_queue(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.last = {"adopt": time.time() - d.iv_adopt - 1, "gc": time.time()}
+        with (
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "adopt_pass") as adopt,
+            mock.patch.object(d, "session_ended", return_value=False),
+        ):
+            d.tick()
+        adopt.assert_called_once_with()
+
     def test_session_state_file(self):
         root = tmp()
         write("%s/%d" % (root, UID), "NAME=x\nSTATE=active\nSESSIONS=3 4\nREALTIME=1\n")
@@ -375,6 +451,58 @@ class EmptyLeaves(unittest.TestCase):
         d.on_leaf_events()
         self.assertTrue(self.exists("app-busy"))
         self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_stale_empty_event_does_not_remove_a_repopulated_leaf(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-busy/cgroup.events"
+        write(ev, "populated 1\nfrozen 1\n")
+        f = open(ev)
+        self.addCleanup(f.close)
+        d.leaf_ep = mock.Mock()
+        d.leaf_watch[f.fileno()] = ("app-busy", f)
+        d.queue_collector_event(daemon.LeafEmpty(f.fileno(), "app-busy"))
+        with mock.patch.object(d, "remove_leaf") as remove:
+            d.drain_collector_events()
+        remove.assert_not_called()
+        self.assertTrue(self.exists("app-busy"))
+        self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_frozen_event_uses_current_leaf_state(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-busy/cgroup.events"
+        write(ev, "populated 1\nfrozen 1\n")
+        f = open(ev)
+        self.addCleanup(f.close)
+        d.leaf_ep = mock.Mock()
+        d.leaf_watch[f.fileno()] = ("app-busy", f)
+        d.queue_collector_event(daemon.LeafFrozen(f.fileno(), "app-busy", False))
+        d.drain_collector_events()
+        self.assertIs(d.leaf_frozen["app-busy"], True)
+        self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_duplicate_leaf_empty_event_is_harmless(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-gone/cgroup.events"
+        write(ev, "populated 0\nfrozen 0\n")
+        f = open(ev)
+        fd = f.fileno()
+        d.leaf_ep = mock.Mock()
+        d.leaf_watch[fd] = ("app-gone", f)
+        event = daemon.LeafEmpty(fd, "app-gone")
+        d.queue_collector_event(event)
+        d.queue_collector_event(event)
+        with mock.patch.object(d, "remove_leaf", return_value=True) as remove:
+            d.drain_collector_events()
+        remove.assert_called_once_with(self.cg.base + "/app-gone", "populated 0")
+        self.assertNotIn(fd, d.leaf_watch)
+
+    def test_reconciliation_removes_leaf_after_empty_event_is_missed(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-gone/cgroup.events"
+        write(ev, "populated 0\nfrozen 0\n")
+        d.gc_pass()
+        d.gc_pass()
+        self.assertFalse(self.exists("app-gone"))
 
     def test_regular_file_cannot_be_epolled_falls_back(self):
         """cgroupfs files accept EPOLLPRI; a regular file does not (EPERM) and must fall back."""

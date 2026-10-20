@@ -7,7 +7,7 @@ a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re
 """
 
 import collections
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hmac
 import json
 import os
@@ -56,6 +56,48 @@ MAX_SUBSCRIBER_QUEUE = 4096
 RESTORE_START_TIMEOUT = 15.0
 MAX_EVENT_REPLAY = 1000
 SUBSCRIBER_CLOSE_TTL = 1.0
+MAX_COLLECTOR_EVENTS = 4096
+
+
+@dataclass(frozen=True)
+class OwnerExited:
+    fd: int
+    watch: tuple
+
+
+@dataclass(frozen=True)
+class LeafChanged:
+    fd: int
+    leaf: str
+
+
+@dataclass(frozen=True)
+class LeafEmpty:
+    fd: int
+    leaf: str
+
+
+@dataclass(frozen=True)
+class LeafFrozen:
+    fd: int
+    leaf: str
+    frozen: bool
+
+
+@dataclass(frozen=True)
+class LeafWatchLost:
+    fd: int
+    leaf: str
+
+
+@dataclass(frozen=True)
+class ProcessReconcile:
+    pass
+
+
+@dataclass(frozen=True)
+class LeafReconcile:
+    pass
 
 
 class Daemon:
@@ -100,9 +142,13 @@ class Daemon:
             None  # epoll on leaf cgroup.events (EPOLLPRI), itself in self.sel
         )
         self.leaf_watch = {}  # fd -> (leaf rel, open cgroup.events file)
+        self.leaf_frozen = {}  # leaf rel -> latest cgroup.events frozen state
         self.leaf_nowatch = (
             set()
         )  # leaves that could not be watched: the GC pass checks them
+        self.collector_events = collections.deque()
+        self._collector_event_set = set()
+        self.collector_event_drops = 0
         self.empty_seen = set()  # leaves seen empty by the previous GC pass
         self.last_result = {"adopt": None, "gc": None}
         self.lineage = lineage.Lineage(
@@ -326,6 +372,55 @@ class Daemon:
         return dec
 
     # ---- owner watch ----
+    def queue_collector_event(self, event):
+        """Queue one immutable collector event, coalescing duplicates within the pending batch."""
+        if not isinstance(
+            event,
+            (
+                OwnerExited,
+                LeafChanged,
+                LeafEmpty,
+                LeafFrozen,
+                LeafWatchLost,
+                ProcessReconcile,
+                LeafReconcile,
+            ),
+        ):
+            raise TypeError("unsupported collector event: %s" % type(event).__name__)
+        if event in self._collector_event_set:
+            return True
+        if len(self.collector_events) >= MAX_COLLECTOR_EVENTS:
+            self.collector_event_drops += 1
+            return False
+        self.collector_events.append(event)
+        self._collector_event_set.add(event)
+        return True
+
+    def drain_collector_events(self):
+        """Apply queued collector events; each handler rechecks current state before acting."""
+        while self.collector_events:
+            event = self.collector_events.popleft()
+            self._collector_event_set.discard(event)
+            self.guarded(lambda event=event: self._dispatch_collector_event(event))
+
+    def _dispatch_collector_event(self, event):
+        if isinstance(event, OwnerExited):
+            self.on_owner_exit(event.fd, expected=event.watch)
+        elif isinstance(event, LeafChanged):
+            self._on_leaf_changed(event)
+        elif isinstance(event, LeafEmpty):
+            self._on_leaf_empty(event)
+        elif isinstance(event, LeafFrozen):
+            self._on_leaf_frozen(event)
+        elif isinstance(event, LeafWatchLost):
+            self._on_leaf_watch_lost(event)
+        elif isinstance(event, ProcessReconcile):
+            self.guarded(self.adopt_pass)
+            if self.session_ended():
+                self.guarded(self.end_session)
+        elif isinstance(event, LeafReconcile):
+            self.guarded(self.gc_pass)
+
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
             return True  # already watched (first owner wins)
@@ -347,11 +442,15 @@ class Daemon:
         self.store.log(event="owner_watch", scope=leaf, owner=pid)
         return True
 
-    def on_owner_exit(self, fd):
+    def on_owner_exit(self, fd, expected=None):
+        watch = self.owners.get(fd)
+        if watch is None or (expected is not None and watch != expected):
+            return False
         leaf, pid, _st = self.owners.pop(fd)
         self.sel.unregister(fd)
         os.close(fd)
         self.stop_leaf(leaf, "owner %d exited" % pid, owner=pid)
+        return True
 
     def stop_leaf(self, leaf, why, owner=None):
         path = "%s/%s" % (cgroup.base(), leaf)
@@ -2031,7 +2130,8 @@ class Daemon:
         ]
 
     def _drop_leaf_watch(self, fd):
-        _rel, f = self.leaf_watch.pop(fd)
+        rel, f = self.leaf_watch.pop(fd)
+        self.leaf_frozen.pop(rel, None)
         try:
             self.leaf_ep.unregister(fd)
         except (OSError, ValueError):
@@ -2070,22 +2170,81 @@ class Daemon:
             except OSError:
                 self.leaf_nowatch.add(rel)
 
-    def on_leaf_events(self):
-        """A watched leaf changed: remove it when cgroup.events says 'populated 0'."""
+    def collect_leaf_events(self):
+        """Turn ready cgroup.events watches into typed queue entries."""
+        if self.leaf_ep is None:
+            return
         for fd, _ev in self.leaf_ep.poll(0):
-            if fd not in self.leaf_watch:
+            watch = self.leaf_watch.get(fd)
+            if watch is None:
                 continue
-            rel, f = self.leaf_watch[fd]
-            try:
-                f.seek(0)
-                text = f.read()
-            except OSError:
-                text = ""
-            if "populated 0" in text:
-                self._drop_leaf_watch(fd)
-                self.remove_leaf(cgroup.base() + "/" + rel, "populated 0")
-            elif not text:
-                self._drop_leaf_watch(fd)
+            self.queue_collector_event(LeafChanged(fd, watch[0]))
+
+    @staticmethod
+    def _leaf_event_values(text):
+        return {
+            fields[0]: fields[1]
+            for line in text.splitlines()
+            if len(fields := line.split()) == 2
+        }
+
+    def _read_leaf_event_values(self, fd, leaf):
+        watch = self.leaf_watch.get(fd)
+        if watch is None or watch[0] != leaf:
+            return None
+        f = watch[1]
+        try:
+            f.seek(0)
+            text = f.read()
+        except OSError:
+            text = ""
+        return self._leaf_event_values(text) if text else {}
+
+    def _on_leaf_changed(self, event):
+        values = self._read_leaf_event_values(event.fd, event.leaf)
+        if values is None:
+            return
+        if not values:
+            self.queue_collector_event(LeafWatchLost(event.fd, event.leaf))
+            return
+        if values.get("populated") == "0":
+            self.queue_collector_event(LeafEmpty(event.fd, event.leaf))
+        if values.get("frozen") in ("0", "1"):
+            self.queue_collector_event(
+                LeafFrozen(event.fd, event.leaf, values["frozen"] == "1")
+            )
+
+    def _on_leaf_empty(self, event):
+        values = self._read_leaf_event_values(event.fd, event.leaf)
+        if values is None:
+            return
+        if not values:
+            self._drop_leaf_watch(event.fd)
+        elif values.get("populated") == "0":
+            self._drop_leaf_watch(event.fd)
+            self.remove_leaf(cgroup.base() + "/" + event.leaf, "populated 0")
+
+    def _on_leaf_frozen(self, event):
+        values = self._read_leaf_event_values(event.fd, event.leaf)
+        if values is None:
+            return
+        if not values:
+            self.queue_collector_event(LeafWatchLost(event.fd, event.leaf))
+            return
+        if values.get("populated") == "0":
+            self.queue_collector_event(LeafEmpty(event.fd, event.leaf))
+        if values.get("frozen") in ("0", "1"):
+            self.leaf_frozen[event.leaf] = values["frozen"] == "1"
+
+    def _on_leaf_watch_lost(self, event):
+        watch = self.leaf_watch.get(event.fd)
+        if watch is not None and watch[0] == event.leaf:
+            self._drop_leaf_watch(event.fd)
+
+    def on_leaf_events(self):
+        """Collect and drain cgroup.events changes for direct callers and tests."""
+        self.collect_leaf_events()
+        self.drain_collector_events()
 
     def remove_leaf(self, path, why):
         if self.authorize(authorization.GC_REMOVE_EMPTY).verdict != authorization.ACT:
@@ -3502,6 +3661,8 @@ class Daemon:
 
     def next_timeout(self, now=None):
         """Seconds until the next timer is due (adopt, gc), capped at MAX_SLEEP."""
+        if self.collector_events:
+            return 0.0
         now = time.time() if now is None else now
         due_times = [
             self.last["adopt"] + self.iv_adopt,
@@ -3537,13 +3698,12 @@ class Daemon:
             self.run_deadlines()
             now = time.time()
             if now - self.last["adopt"] >= self.iv_adopt:
-                self.last["adopt"] = now
-                self.guarded(self.adopt_pass)
-                if self.session_ended():
-                    self.guarded(self.end_session)
+                if self.queue_collector_event(ProcessReconcile()):
+                    self.last["adopt"] = now
             if now - self.last["gc"] >= self.iv_gc:
-                self.last["gc"] = now
-                self.guarded(self.gc_pass)
+                if self.queue_collector_event(LeafReconcile()):
+                    self.last["gc"] = now
+            self.drain_collector_events()
         finally:
             self._in_tick = False
             self.store.defer_writes = False
@@ -3580,7 +3740,7 @@ class Daemon:
                     except OSError:
                         pass
                 elif key.data == "leaves":
-                    self.guarded(self.on_leaf_events)
+                    self.guarded(self.collect_leaf_events)
                 elif isinstance(key.data, tuple) and key.data[0] == "subscriber":
                     conn = key.data[1]
                     if mask & selectors.EVENT_READ:
@@ -3589,7 +3749,10 @@ class Daemon:
                         self.guarded(lambda: self._write_subscriber(conn))
                 else:
                     fd = key.fd
-                    self.guarded(lambda: self.on_owner_exit(fd))
+                    watch = self.owners.get(fd)
+                    if watch is not None:
+                        self.queue_collector_event(OwnerExited(fd, watch))
+            self.drain_collector_events()
             self.tick()
         for conn in tuple(self.subscribers):
             self._drop_subscriber(conn)

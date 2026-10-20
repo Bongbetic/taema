@@ -161,9 +161,23 @@ COMMANDS: tuple[dict[str, Any], ...] = (
     {
         "name": "undo",
         "aliases": (),
-        "help": "undo the latest automatic stop",
+        "help": "undo the latest automatic action or a decision by id",
         "handler": "cmd_undo",
-        "arguments": ((("--dry-run",), {"action": "store_true"}),),
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (
+                ("--restore",),
+                {"action": "store_true", "help": "relaunch a stopped root"},
+            ),
+            (("decision_id",), {"nargs": "?", "metavar": "ID"}),
+        ),
+    },
+    {
+        "name": "restore",
+        "aliases": (),
+        "help": "relaunch a stopped root by decision id",
+        "handler": "cmd_restore",
+        "arguments": ((("decision_id",), {"metavar": "ID"}),),
     },
     {
         "name": "doctor",

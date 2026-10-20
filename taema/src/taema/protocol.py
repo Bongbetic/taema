@@ -155,6 +155,7 @@ def _validate_feedback(args):
         "key",
         "target",
         "action_id",
+        "restore",
         "reason",
         "trigger",
         "owner",
@@ -204,7 +205,7 @@ def _validate_feedback(args):
             "kill": common | {"key"},
             "veto": common | {"target", "reason", "expires"},
             "unveto": common | {"target"},
-            "undo": common | {"action_id"},
+            "undo": common | {"action_id", "restore"},
             "answer": common | {"owner", "leftovers", "choice"},
             "teach": common | {"owner", "leftovers", "choice"},
             "review_answer": common | {"review_id", "choice", "owner"},
@@ -226,6 +227,8 @@ def _validate_feedback(args):
         not _is_type(args.get("action_id"), "string") or not args["action_id"]
     ):
         _fail("undo requires an action id")
+    if op == "undo" and "restore" in args and not _is_type(args["restore"], "boolean"):
+        _fail("undo restore must be a boolean")
     for field in ("action_id", "reason", "trigger"):
         if field in args and not _is_type(args[field], "string"):
             _fail("feedback %s must be a string" % field)

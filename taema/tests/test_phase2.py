@@ -1015,6 +1015,8 @@ class JobFlow(ProcCase):
         self.assertEqual(self.d.store.signature_decision(first)[0], "stop")
         self.fp.remove(30)
         self.d.cfg["mode"] = "auto"
+        self.d.cfg["learn"] = {"remember_argv": True}
+        snapshot = {"pid": 30, "argv": ["/usr/bin/vite"], "cwd": "/tmp"}
 
         def safe_members(pids, origin=None):
             return [
@@ -1035,6 +1037,9 @@ class JobFlow(ProcCase):
             mock.patch.object(
                 daemon.engine, "signal_survivors", return_value=[30]
             ) as signal,
+            mock.patch.object(
+                daemon.engine, "restore_snapshot", return_value=snapshot
+            ) as capture,
             mock.patch.object(self.d, "guarded", side_effect=lambda fn: fn()),
             mock.patch.object(
                 self.d, "auto_stop_survivors", wraps=self.d.auto_stop_survivors
@@ -1062,6 +1067,10 @@ class JobFlow(ProcCase):
         )
         self.assertEqual(signal.call_count, 1, self.log())
         self.assertEqual([item["key"] for item in signal.call_args.args[1]], ["vite"])
+        capture.assert_called_once()
+        stop_decision = self.d.store.decision(self.d.store.auto_action()["decision_id"])
+        self.assertEqual(stop_decision["argv"], ["/usr/bin/vite"])
+        self.assertEqual(stop_decision["cwd"], "/tmp")
         signature_id = question["signature"]["id"]
         pair = self.d.store.data["pairs"][self.d.store.pkey("npm", "vite")]
         self.assertEqual(pair["probation"], 1)

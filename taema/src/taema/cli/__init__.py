@@ -39,6 +39,7 @@ __all__ = (
     "cmd_keep",
     "cmd_do_not_kill",
     "cmd_undo",
+    "cmd_restore",
     "cmd_forget",
     "print_pairs",
     "print_auto",

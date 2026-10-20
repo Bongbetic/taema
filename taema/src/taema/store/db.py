@@ -997,10 +997,10 @@ def _prune(connection, now):
         "AND CASE WHEN json_valid(undo) AND "
         "json_type(undo, '$._taema_audit') = 'object' THEN "
         "CASE WHEN coalesce(json_extract(undo, '$._taema_audit.undoable'), 0) = 1 "
-        "THEN CASE WHEN kind IN ('stop', 'auto_stop') THEN NOT EXISTS ("
+        "AND undone IS NULL THEN CASE WHEN kind IN ('stop', 'auto_stop') THEN NOT EXISTS ("
         "SELECT 1 FROM auto_actions WHERE "
         "json_extract(auto_actions.payload, '$.id') = "
-        "json_extract(decisions.undo, '$.payload.action_id')) ELSE 0 END "
+        "json_extract(decisions.undo, '$.payload.action_id')) ELSE 1 END "
         "ELSE 1 END ELSE undo IS NULL END"
     )
     expired_ids = [
@@ -2038,8 +2038,11 @@ class StateDB:
             "why": row["why"] or "",
             "mode": mode,
             "corr": corr,
-            "undoable": undoable,
+            "undoable": undoable and row["undone"] is None,
             "undo": payload,
+            "argv": _load(row["argv"], None),
+            "cwd": row["cwd"],
+            "undone": row["undone"],
         }
 
     def decision(self, identifier):
@@ -2052,32 +2055,74 @@ class StateDB:
             return None
         with self.connection() as connection:
             row = connection.execute(
-                "SELECT id, ts, kind, scope, owner, authority, why, undo "
+                "SELECT id, ts, kind, scope, owner, authority, why, undo, argv, cwd, undone "
                 "FROM decisions WHERE id = ?",
                 (identifier,),
             ).fetchone()
         return self._decision(row) if row else None
 
-    def decisions(self, limit=50, undoable=False):
+    def decisions(self, limit=50, undoable=False, kinds=None):
         """Read recent decisions, optionally limiting the result to undo targets."""
         if not self.available:
             return []
-        predicate = (
-            "WHERE kind IN ('stop', 'auto_stop') AND json_valid(undo) AND "
-            "coalesce(json_extract(undo, '$._taema_audit.undoable'), 0) = 1 AND "
-            "EXISTS (SELECT 1 FROM auto_actions WHERE "
-            "json_extract(auto_actions.payload, '$.id') = "
-            "json_extract(decisions.undo, '$.payload.action_id'))"
-            if undoable
-            else ""
-        )
+        clauses, params = [], []
+        if undoable:
+            clauses.append(
+                "undone IS NULL AND json_valid(undo) AND "
+                "coalesce(json_extract(undo, '$._taema_audit.undoable'), "
+                "CASE WHEN json_type(undo, '$._taema_audit') = 'object' "
+                "THEN 0 ELSE 1 END) = 1"
+            )
+        if kinds:
+            kinds = tuple(kinds)
+            if not kinds:
+                return []
+            clauses.append("kind IN (%s)" % ",".join("?" for _ in kinds))
+            params.extend(kinds)
+        predicate = "WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT id, ts, kind, scope, owner, authority, why, undo "
+                "SELECT id, ts, kind, scope, owner, authority, why, undo, argv, cwd, undone "
                 "FROM decisions %s ORDER BY id DESC LIMIT ?" % predicate,
-                (limit,),
+                params,
             ).fetchall()
         return [self._decision(row) for row in rows]
+
+    def mark_decision_undone(self, identifier, at):
+        """Mark one retained decision as undone without adding a schema migration."""
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE decisions SET undone = ? WHERE id = ? AND undone IS NULL",
+                (at, identifier),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def mark_decision_restored(self, identifier, at):
+        """Mark a stopped decision's one-shot relaunch in its existing undo payload."""
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE decisions SET undo = json_set(undo, '$.payload.restored_at', ?) "
+                "WHERE id = ? AND json_valid(undo) "
+                "AND json_type(undo, '$.payload') = 'object' "
+                "AND json_type(undo, '$.payload.restored_at') IS NULL",
+                (at, identifier),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def clear_decision_restored(self, identifier, at):
+        """Release a restore reservation after the launcher could not be created."""
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE decisions SET undo = json_remove(undo, '$.payload.restored_at') "
+                "WHERE id = ? AND json_valid(undo) "
+                "AND json_extract(undo, '$.payload.restored_at') = ?",
+                (identifier, at),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
 
     def save_state(
         self,
@@ -2137,12 +2182,13 @@ class StateDB:
                     )
                 connection.executemany(
                     """INSERT INTO decisions
-                       (id, ts, kind, scope, owner, authority, why, undo)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       (id, ts, kind, scope, owner, authority, why, undo, argv, cwd, undone)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(id) DO UPDATE SET
                          ts=excluded.ts, kind=excluded.kind, scope=excluded.scope,
                          owner=excluded.owner, authority=excluded.authority,
-                         why=excluded.why, undo=excluded.undo""",
+                         why=excluded.why, undo=excluded.undo, argv=excluded.argv,
+                         cwd=excluded.cwd, undone=coalesce(decisions.undone, excluded.undone)""",
                     [
                         (
                             decision["id"],
@@ -2162,6 +2208,11 @@ class StateDB:
                                     "payload": decision.get("undo"),
                                 }
                             ),
+                            _dump(decision.get("argv"))
+                            if decision.get("argv") is not None
+                            else None,
+                            decision.get("cwd"),
+                            decision.get("undone"),
                         )
                         for decision in decisions
                     ],

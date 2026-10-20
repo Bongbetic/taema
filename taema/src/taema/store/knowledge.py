@@ -472,6 +472,8 @@ class Store:
         why="",
         undo=None,
         corr=None,
+        argv=None,
+        cwd=None,
     ):
         """Record one durable lifecycle decision and return its trace identifiers."""
         correlation = corr or uuid.uuid4().hex
@@ -490,8 +492,11 @@ class Store:
             "mode": mode or self.mode,
             "why": str(why)[:1024],
             "corr": correlation,
-            "undoable": undo is not None,
+            "undoable": undo is not None and kind != "undo",
             "undo": undo,
+            "argv": argv,
+            "cwd": cwd,
+            "undone": None,
         }
         if not self.read_only:
             self._pending_decisions.append(decision)
@@ -509,6 +514,8 @@ class Store:
         why="",
         undo=None,
         corr=None,
+        argv=None,
+        cwd=None,
     ):
         """Attach related audit events to one decision for the duration of an action."""
         decision = self.record_decision(
@@ -520,6 +527,8 @@ class Store:
             why=why,
             undo=undo,
             corr=corr,
+            argv=argv,
+            cwd=cwd,
         )
         previous = self._audit_context
         self._audit_context = decision
@@ -549,24 +558,23 @@ class Store:
             return dict(pending)
         return committed[0] if committed else None
 
-    def latest_undoable_decision(self):
-        action_ids = {
-            action.get("id")
-            for action in self.data.get("auto_actions", [])
-            if isinstance(action, dict)
-        }
+    def latest_undoable_decision(self, kinds=None):
+        allowed = set(kinds) if kinds is not None else None
         pending = next(
             (
                 item
                 for item in reversed(self._pending_decisions)
                 if item["undoable"]
-                and item["kind"] in ("stop", "auto_stop")
-                and isinstance(item.get("undo"), dict)
-                and item["undo"].get("action_id") in action_ids
+                and item.get("undone") is None
+                and (allowed is None or item["kind"] in allowed)
             ),
             None,
         )
-        committed = self.db.decisions(limit=1, undoable=True)
+        committed = self.db.decisions(
+            limit=1,
+            undoable=True,
+            kinds=tuple(allowed) if allowed is not None else None,
+        )
         if pending and (not committed or pending["id"] > committed[0]["id"]):
             return dict(pending)
         return committed[0] if committed else None
@@ -1234,7 +1242,16 @@ class Store:
         )
 
     def record_auto_action(
-        self, scope, why, pairs=(), apps=(), decision=None, owner=None, authority="mode"
+        self,
+        scope,
+        why,
+        pairs=(),
+        apps=(),
+        decision=None,
+        owner=None,
+        authority="mode",
+        signature_id=None,
+        restore=None,
     ):
         """Keep enough durable context to target the latest automatic stop after restart."""
         normalized_pairs = []
@@ -1266,6 +1283,8 @@ class Store:
             "apps": action["apps"],
             "ts": action["ts"],
         }
+        if isinstance(signature_id, str) and signature_id:
+            undo["signature_id"] = signature_id
         if decision is None:
             decision = self.record_decision(
                 "auto_stop",
@@ -1282,6 +1301,21 @@ class Store:
                 item["id"] == decision["id"] for item in self._pending_decisions
             ):
                 self._pending_decisions.append(decision)
+        if isinstance(restore, dict):
+            argv, cwd = restore.get("argv"), restore.get("cwd")
+            if (
+                isinstance(argv, list)
+                and 0 < len(argv) <= 256
+                and all(
+                    isinstance(arg, str) and "\0" not in arg and len(arg) <= 4096
+                    for arg in argv
+                )
+                and isinstance(cwd, str)
+                and cwd.startswith("/")
+                and len(cwd) <= 4096
+            ):
+                decision["argv"] = argv
+                decision["cwd"] = cwd
         action["decision_id"] = decision["id"]
         action["corr"] = decision["corr"]
         actions = self.data.setdefault("auto_actions", [])
@@ -1301,7 +1335,7 @@ class Store:
     def auto_action(self, identifier=None):
         actions = [a for a in self.data.get("auto_actions", []) if isinstance(a, dict)]
         if identifier is None:
-            decision = self.latest_undoable_decision()
+            decision = self.latest_undoable_decision(kinds=("stop", "auto_stop"))
             if decision:
                 return self._action_for_decision(decision, actions)
             action = actions[-1] if actions else None
@@ -1312,7 +1346,11 @@ class Store:
         if isinstance(identifier, str) and identifier.isdecimal():
             decision_id = int(identifier)
         decision = self.decision(decision_id)
-        if decision and decision.get("undoable"):
+        if (
+            decision
+            and decision.get("undoable")
+            and decision.get("kind") in ("stop", "auto_stop")
+        ):
             return self._action_for_decision(decision, actions)
         action = next((a for a in actions if a.get("id") == identifier), None)
         return dict(action) if action else None
@@ -1373,71 +1411,290 @@ class Store:
         )
         return dict(action)
 
-    def undo_auto_action(self, identifier=None, feedback_id=None):
-        """Veto the apps from one automatic stop and add explicit keep evidence to its pairs."""
-        action = self.auto_action(identifier)
-        if not action:
+    def undo_candidate(self, identifier=None):
+        """Resolve an undoable decision by retained decision id or legacy action id."""
+        if identifier is None:
+            return self.latest_undoable_decision()
+        decision_id = identifier
+        if isinstance(identifier, str) and identifier.isdecimal():
+            decision_id = int(identifier)
+        decision = self.decision(decision_id)
+        if decision and decision.get("undoable"):
+            return decision
+        action = next(
+            (
+                item
+                for item in self.data.get("auto_actions", [])
+                if isinstance(item, dict) and item.get("id") == identifier
+            ),
+            None,
+        )
+        if action:
+            if not action.get("decision_id") and not self.read_only:
+                action = self._record_legacy_action(action)
+            return self.decision(action.get("decision_id"))
+        return None
+
+    def _mark_decision_undone(self, decision):
+        timestamp = self.now()
+        pending = next(
+            (item for item in self._pending_decisions if item["id"] == decision["id"]),
+            None,
+        )
+        if pending is not None:
+            pending["undone"] = timestamp
+            pending["undoable"] = False
+        elif not self.read_only:
+            self.db.mark_decision_undone(decision["id"], timestamp)
+        decision["undone"] = timestamp
+        decision["undoable"] = False
+        self.dirty = True
+
+    def mark_decision_restored(self, identifier, at=None):
+        """Record that an opted-in stopped command has been relaunched once."""
+        decision = self.undo_candidate(identifier)
+        if decision is None:
+            decision_id = int(identifier) if str(identifier).isdecimal() else None
+            decision = self.decision(decision_id) if decision_id else None
+        if not decision or not isinstance(decision.get("undo"), dict):
+            return False
+        if decision["undo"].get("restored_at") is not None:
+            return False
+        timestamp = self.now() if at is None else at
+        pending = next(
+            (item for item in self._pending_decisions if item["id"] == decision["id"]),
+            None,
+        )
+        if pending is not None:
+            pending["undo"]["restored_at"] = timestamp
+        elif not self.read_only:
+            if not self.db.mark_decision_restored(decision["id"], timestamp):
+                return False
+        else:
+            return False
+        self.log(
+            event="restore",
+            decision_id=decision["id"],
+            scope=decision.get("scope"),
+        )
+        self.dirty = True
+        return True
+
+    def clear_decision_restored(self, identifier, at):
+        """Clear a restore reservation only when its launcher failed to start."""
+        decision_id = int(identifier) if str(identifier).isdecimal() else None
+        decision = self.decision(decision_id) if decision_id is not None else None
+        if not decision or not isinstance(decision.get("undo"), dict):
+            return False
+        if decision["undo"].get("restored_at") != at:
+            return False
+        pending = next(
+            (item for item in self._pending_decisions if item["id"] == decision_id),
+            None,
+        )
+        if pending is not None:
+            pending["undo"].pop("restored_at", None)
+        elif not self.read_only:
+            if not self.db.clear_decision_restored(decision_id, at):
+                return False
+        else:
+            return False
+        self.dirty = True
+        return True
+
+    def mark_standalone(self, key):
+        """Remember that a contained app is independent after undoing its containment."""
+        if not isinstance(key, str) or not key or len(key) > 256 or SEP in key:
+            return False
+        entry = self.data["standalone"].setdefault(key, {"n": 0})
+        entry["n"] = int(entry.get("n", 0)) + 1
+        entry["ts"] = self.now()
+        self.dirty = True
+        return True
+
+    def undo_decision(
+        self,
+        identifier=None,
+        feedback_id=None,
+        external_apply=None,
+        allow_already_undone=False,
+    ):
+        """Undo one retained action, applying stop learning or a caller-owned kernel reversal."""
+        decision = self.undo_candidate(identifier)
+        if decision is None and allow_already_undone and identifier is not None:
+            decision_id = int(identifier) if str(identifier).isdecimal() else None
+            candidate = self.decision(decision_id) if decision_id else None
+            if candidate and candidate.get("undone") is not None:
+                decision = candidate
+        if not decision:
             with self.decision_context(
                 "refusal",
                 authority="user",
-                why="no retained automatic stop is available to undo",
+                why="no retained automatic action is available to undo",
             ):
-                self.log(event="undo_refused")
+                self.log(event="undo_refused", action_id=identifier)
             return None
-        if not action.get("decision_id") and not self.read_only:
-            action = self._record_legacy_action(action)
-        apps = action.get("apps") or [
-            pair[1]
-            for pair in action.get("pairs", [])
-            if isinstance(pair, list) and len(pair) == 2
-        ]
-        targets = [("app", app) for app in dict.fromkeys(apps)]
-        if not targets and action.get("scope"):
-            targets = [("scope", action["scope"])]
-        self._prune_vetoes()
-        if len(self.data["vetoes"]) + len(targets) > MAX_VETOES:
+        already_undone = decision.get("undone") is not None
+        if already_undone and not allow_already_undone:
+            return None
+        kind = decision.get("kind")
+        payload = decision.get("undo")
+        if not isinstance(payload, dict):
+            return None
+        if kind in ("stop", "auto_stop"):
+            action = self._action_for_decision(
+                decision,
+                [a for a in self.data.get("auto_actions", []) if isinstance(a, dict)],
+            )
+            if not action:
+                return None
+            if already_undone:
+                return {
+                    "action": action,
+                    "decision": decision,
+                    "already_undone": True,
+                }
+            apps = action.get("apps") or [
+                pair[1]
+                for pair in action.get("pairs", [])
+                if isinstance(pair, list) and len(pair) == 2
+            ]
+            signature_id = payload.get("signature_id")
+            targets = (
+                [("signature", signature_id)]
+                if isinstance(signature_id, str) and signature_id
+                else [("app", app) for app in dict.fromkeys(apps)]
+            )
+            if not targets and action.get("scope"):
+                targets = [("scope", action["scope"])]
+            self._prune_vetoes()
+            if len(self.data["vetoes"]) + len(targets) > MAX_VETOES:
+                with self.decision_context(
+                    "refusal",
+                    scope=action.get("scope"),
+                    authority="user",
+                    why="veto capacity prevents undo",
+                ):
+                    self.log(event="undo_refused", action_id=action.get("id"))
+                return None
+
+            target_id = decision["id"]
+            undo_corr = None
             with self.decision_context(
-                "refusal",
+                "undo",
                 scope=action.get("scope"),
                 authority="user",
-                why="veto capacity prevents undo",
-            ):
-                self.log(event="undo_refused", action_id=action.get("id"))
+                why="undo automatic stop",
+                corr=action.get("corr"),
+                undo={"target_decision_id": target_id},
+            ) as undo_record:
+                undo_corr = undo_record["corr"]
+                vetoes = []
+                for index, (target_kind, value) in enumerate(targets):
+                    veto = self.add_veto(
+                        target_kind,
+                        value,
+                        identifier=("%s:%d" % (feedback_id, index))
+                        if feedback_id
+                        else None,
+                        reason="undo automatic stop",
+                        corr=undo_corr,
+                    )
+                    if veto:
+                        vetoes.append(veto)
+                signature_ids = set()
+                for pair in action.get("pairs", []):
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        continue
+                    owner, leftover = pair
+                    self.answer(owner, leftover, "keep", source="undo")
+                    record = self.data.get("pairs", {}).get(self.pkey(owner, leftover))
+                    if isinstance(record, dict):
+                        record["last_auto_stop"] = 0.0
+                        record.pop("pending_stop", None)
+                        record["suspended_until"] = self.now() + self.regret_suspend
+                        if isinstance(record.get("sig"), str) and record["sig"]:
+                            signature_ids.add(record["sig"])
+                        self.dirty = True
+                if isinstance(signature_id, str) and signature_id:
+                    signature_ids.add(signature_id)
+                for current_signature in signature_ids:
+                    self.db.suspend_signature(
+                        current_signature,
+                        self.now() + self.regret_suspend,
+                        now=self.now(),
+                    )
+                self.log(
+                    event="undo",
+                    action_id=action.get("id"),
+                    target_decision_id=target_id,
+                    scope=action.get("scope"),
+                    vetoes=[self._target(v) for v in vetoes],
+                    pairs=action.get("pairs", [])[:8],
+                )
+                self._mark_decision_undone(decision)
+            return {
+                "action": action,
+                "decision": decision,
+                "vetoes": vetoes,
+                "already_undone": False,
+                "restore_available": bool(decision.get("argv") and decision.get("cwd")),
+            }
+
+        if already_undone:
+            return {
+                "action": decision,
+                "decision": decision,
+                "already_undone": True,
+            }
+        if not callable(external_apply):
             return None
-        target_id = action.get("decision_id")
+        effect = external_apply(decision)
+        if not isinstance(effect, dict) or effect.get("ok") is not True:
+            with self.decision_context(
+                "refusal",
+                scope=decision.get("scope"),
+                authority="user",
+                why=(effect or {}).get("error", "undo action is unavailable"),
+            ):
+                self.log(
+                    event="undo_refused",
+                    target_decision_id=decision["id"],
+                )
+            return None
+        if payload.get("operation") == "adopt_standalone":
+            for member in payload.get("members", []):
+                if isinstance(member, dict):
+                    self.mark_standalone(member.get("key"))
         with self.decision_context(
             "undo",
-            scope=action.get("scope"),
+            scope=decision.get("scope"),
             authority="user",
-            why="undo automatic stop",
-            corr=action.get("corr"),
+            why="undo automatic %s action" % kind,
+            corr=decision.get("corr"),
+            undo={"target_decision_id": decision["id"]},
         ):
-            vetoes = []
-            for index, (kind, value) in enumerate(targets):
-                veto = self.add_veto(
-                    kind,
-                    value,
-                    identifier=("%s:%d" % (feedback_id, index))
-                    if feedback_id
-                    else None,
-                    reason="undo automatic stop",
-                    corr=self._audit_context["corr"],
-                )
-                if veto:
-                    vetoes.append(veto)
-            for pair in action.get("pairs", []):
-                if isinstance(pair, list) and len(pair) == 2:
-                    self.answer(pair[0], pair[1], "keep")
             self.log(
                 event="undo",
-                action_id=action.get("id"),
-                target_decision_id=target_id,
-                scope=action.get("scope"),
-                vetoes=[self._target(v) for v in vetoes],
-                pairs=action.get("pairs", [])[:8],
+                target_decision_id=decision["id"],
+                scope=decision.get("scope"),
+                operation=payload.get("operation"),
+                effect={key: value for key, value in effect.items() if key != "ok"},
             )
-            self.dirty = True
-            return {"action": action, "vetoes": vetoes}
+            self._mark_decision_undone(decision)
+        return {
+            "action": decision,
+            "decision": decision,
+            "effect": effect,
+            "already_undone": False,
+        }
+
+    def undo_auto_action(self, identifier=None, feedback_id=None):
+        """Compatibility wrapper for the original automatic-stop-only undo API."""
+        result = self.undo_decision(identifier, feedback_id=feedback_id)
+        if result and result.get("vetoes") is not None:
+            return result
+        return None
 
     # ---- feedback ----
     def apply_op(self, op, key):
@@ -1461,7 +1718,7 @@ class Store:
             self.log(event=op, exe=key)
         return True
 
-    def apply_feedback_command(self, msg):
+    def apply_feedback_command(self, msg, undo_handler=None):
         """Apply one supported feedback operation once, keyed by its versioned id."""
         try:
             protocol.validate_feedback(msg)
@@ -1497,13 +1754,39 @@ class Store:
             result = {"removed": [self._target(v) for v in removed]}
         elif msg["v"] in (1, 2) and op == "undo":
             action_id = msg.get("action_id")
-            undone = self.undo_auto_action(action_id, feedback_id=op_id)
+            restore = msg.get("restore") is True
+            if restore:
+                candidate = self.undo_candidate(action_id)
+                if (
+                    candidate is None
+                    and isinstance(action_id, str)
+                    and action_id.isdecimal()
+                ):
+                    candidate = self.decision(int(action_id))
+                if not candidate or candidate.get("kind") not in ("stop", "auto_stop"):
+                    return None
+            undone = self.undo_decision(
+                action_id,
+                feedback_id=op_id,
+                external_apply=undo_handler,
+                allow_already_undone=restore,
+            )
             if not undone:
                 return None
+            decision = undone["decision"]
             result = {
                 "action_id": action_id,
-                "targets": [self._target(v) for v in undone["vetoes"]],
-                "pairs": undone["action"].get("pairs", []),
+                "target_decision_id": decision["id"],
+                "kind": decision.get("kind"),
+                "targets": [self._target(v) for v in undone.get("vetoes", [])],
+                "pairs": undone.get("action", {}).get("pairs", []),
+                "already_undone": undone.get("already_undone", False),
+                "restore_available": bool(
+                    decision.get("argv")
+                    and decision.get("cwd")
+                    and isinstance(decision.get("undo"), dict)
+                    and decision["undo"].get("restored_at") is None
+                ),
             }
         elif msg["v"] == 1 and op == "vetoed":
             target, trigger = msg.get("target"), msg.get("trigger")

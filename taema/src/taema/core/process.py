@@ -10,6 +10,7 @@ import re
 import subprocess
 
 PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
+MAX_RESTORE_ARGV_BYTES = 16 << 10
 _USERS = re.compile(r'\("([^"]*)",pid=(\d+)')
 _UNIX = re.compile(
     r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(users:\(.*\))?\s*$"
@@ -45,6 +46,42 @@ def exe(pid):
 
 def cmdline(pid):
     return read(pid, "cmdline").replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def restore_command(pid):
+    """Capture only argv and cwd for an explicitly opted-in, still-live process."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return None
+    start = starttime(pid)
+    raw = read(pid, "cmdline")
+    if start is None or not raw or len(raw) > MAX_RESTORE_ARGV_BYTES:
+        return None
+    parts = raw.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    if not parts or not parts[0]:
+        return None
+    argv = [part.decode(errors="surrogateescape") for part in parts]
+    try:
+        cwd = os.readlink("%s/%d/cwd" % (PROC, pid))
+    except OSError:
+        return None
+    if not cwd or not os.path.isabs(cwd) or len(cwd) > 4096:
+        return None
+    if starttime(pid) != start:
+        return None
+    return {"pid": pid, "start": start, "argv": argv, "cwd": cwd}
+
+
+def restore_environment(environ):
+    """Build the documented restore environment without inheriting app or daemon secrets."""
+    return {
+        key: value
+        for key, value in environ.items()
+        if isinstance(key, str)
+        and isinstance(value, str)
+        and (key in ("PATH", "HOME", "LANG") or key.startswith(("LC_", "XDG_")))
+    }
 
 
 def environ(pid):

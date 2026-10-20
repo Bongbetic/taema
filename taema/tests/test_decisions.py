@@ -227,6 +227,8 @@ class DecisionTraceTests(unittest.TestCase):
             mock.patch.object(engine.cgroup, "mkleaf", return_value="/fake/app"),
             mock.patch.object(engine.cgroup, "base", return_value="/fake"),
             mock.patch.object(engine.cgroup, "move"),
+            mock.patch.object(engine.inspect, "starttime", return_value=456),
+            mock.patch.object(engine.policy, "app_key", return_value="test-app"),
         ):
             engine.run_ops(
                 cfg,
@@ -235,7 +237,17 @@ class DecisionTraceTests(unittest.TestCase):
                 True,
             )
         self.store.save()
-        self.assertEqual(self.store.latest_decision()["kind"], "adopt_move")
+        decision = self.store.latest_decision()
+        self.assertEqual(decision["kind"], "adopt_move")
+        self.assertTrue(decision["undoable"])
+        self.assertEqual(
+            decision["undo"],
+            {
+                "operation": "adopt_standalone",
+                "scope": "app-test",
+                "members": [{"pid": 123, "start": 456, "key": "test-app"}],
+            },
+        )
 
         with mock.patch.object(
             engine, "self_guard", side_effect=engine.Refused("protected scope")

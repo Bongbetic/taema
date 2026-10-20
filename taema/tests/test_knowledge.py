@@ -414,6 +414,8 @@ class KnowledgeTests(unittest.TestCase):
         for operation in operations:
             self.assertTrue(self.s.apply_feedback_command(operation)["ok"])
 
+        pair = self.s.data["pairs"][self.s.pkey("npm", "vite")]
+        self.assertEqual(pair["ex_keep"], 3.0)
         self.assertEqual(self.s.pair_decision("npm", "vite")[0], "keep")
         self.assertEqual(self.s.pair_decision("npm", "webpack")[0], "stop")
         self.assertEqual(self.s.data["muted_apps"], ["firefox"])
@@ -434,7 +436,10 @@ class KnowledgeTests(unittest.TestCase):
             ],
             "app",
         )
-        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "keep")
+        pair = self.s.data["pairs"][self.s.pkey("npm", "vite")]
+        self.assertEqual(pair["ex_keep"], 3.0)
+        self.assertGreater(pair["suspended_until"], self.s.now())
+        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "ask")
 
     def test_offline_unveto_replay_removes_only_the_named_veto(self):
         veto = self.s.add_veto("app", "firefox")
@@ -502,7 +507,10 @@ class KnowledgeTests(unittest.TestCase):
             self.s.match_veto(members=[{"pid": 7, "apps": ["vite"]}])["value"], "vite"
         )
         self.assertEqual(self.s.apply_feedback(), 1)
-        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "keep")
+        pair = self.s.data["pairs"][self.s.pkey("npm", "vite")]
+        self.assertEqual(pair["ex_keep"], 3.0)
+        self.assertGreater(pair["suspended_until"], self.s.now())
+        self.assertEqual(self.s.pair_decision("npm", "vite")[0], "ask")
         self.assertEqual(
             self.s.match_veto(members=[{"pid": 7, "apps": ["vite"]}])["value"], "vite"
         )

@@ -18,6 +18,8 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import time
 
@@ -383,7 +385,14 @@ class Daemon:
                 stopped_pids = self.note_stop(rep)
                 stopped = self.stopped_apps(rep, stopped_pids)
                 if stopped:
-                    self.note_auto_stop(leaf, why, [], apps=stopped, decision=decision)
+                    self.note_auto_stop(
+                        leaf,
+                        why,
+                        [],
+                        apps=stopped,
+                        decision=decision,
+                        restore=rep.get("restore"),
+                    )
                 self.store.log(event="stopped", scope=leaf, why=why)
         except engine.Refused as e:
             self.store.log(event="stop_refused", scope=leaf, why=str(e))
@@ -732,7 +741,15 @@ class Daemon:
                     )
 
     def note_auto_stop(
-        self, scope, why, pairs, apps=(), decision=None, owner=None, signature_id=None
+        self,
+        scope,
+        why,
+        pairs,
+        apps=(),
+        decision=None,
+        owner=None,
+        signature_id=None,
+        restore=None,
     ):
         """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
@@ -763,6 +780,8 @@ class Daemon:
             decision=decision,
             owner=owner,
             authority=(decision or {}).get("authority", "mode"),
+            signature_id=signature_id,
+            restore=restore,
         )
         self._save_if_idle()
         self.auto_stops.append(
@@ -933,6 +952,9 @@ class Daemon:
             return set()
 
         good_items = [item for item, _decision in good]
+        restore = engine.restore_snapshot(
+            [item["pid"] for item in good_items], self.cfg
+        )
         explicit = all(self.store.explicit_stop(decision) for _, decision in good)
         matched_signature = self.store.match_signature(
             signature or self.survivor_signature(owner, good_items)
@@ -977,6 +999,11 @@ class Daemon:
                     decision=audit_decision,
                     owner=owner,
                     signature_id=signature_id,
+                    restore=(
+                        {"argv": restore["argv"], "cwd": restore["cwd"]}
+                        if restore and restore["pid"] in sent
+                        else None
+                    ),
                 )
         return {item["pid"] for item in sent_items}
 
@@ -1277,6 +1304,7 @@ class Daemon:
                     apps=stopped_apps,
                     decision=decision,
                     owner=decision["owner"],
+                    restore=rep.get("restore"),
                 )
             return rep["removed"]
 
@@ -1364,6 +1392,7 @@ class Daemon:
                     )
         if not good:
             return
+        restore = engine.restore_snapshot([item["pid"] for item in good], self.cfg)
         pairs = list(dict.fromkeys((owner, l["key"]) for l in good))
         explicit = bool(pairs) and all(
             self.store.explicit_stop(dec.get(k)) or self.store.pair_explicit(o, k)
@@ -1458,6 +1487,11 @@ class Daemon:
                     decision=decision,
                     owner=owner,
                     signature_id=signature_id,
+                    restore=(
+                        {"argv": restore["argv"], "cwd": restore["cwd"]}
+                        if restore and restore["pid"] in stopped
+                        else None
+                    ),
                 )
 
     def attribute(self, owner, leftovers, root=None, job=None, signature=None):
@@ -2269,7 +2303,14 @@ class Daemon:
                 stopped_pids = self.note_stop(rep)
                 stopped = self.stopped_apps(rep, stopped_pids)
                 if stopped:
-                    self.note_auto_stop(leaf, why, [], apps=stopped, decision=decision)
+                    self.note_auto_stop(
+                        leaf,
+                        why,
+                        [],
+                        apps=stopped,
+                        decision=decision,
+                        restore=rep.get("restore"),
+                    )
                 if rep["removed"]:
                     self.store.log(event="gc_stopped", scope=leaf, why=why)
                 elif any(d["action"] == "skip" for d in rep["decisions"]):
@@ -2374,7 +2415,12 @@ class Daemon:
                     stopped = self.stopped_apps(rep, stopped_pids)
                     if stopped:
                         self.note_auto_stop(
-                            scope, "session ended", [], apps=stopped, decision=decision
+                            scope,
+                            "session ended",
+                            [],
+                            apps=stopped,
+                            decision=decision,
+                            restore=rep.get("restore"),
                         )
                 except engine.Refused as error:
                     self.store.log(event="stop_refused", scope=scope, why=str(error))
@@ -2395,6 +2441,219 @@ class Daemon:
         if not self._in_tick:
             self.store.save_if_dirty()
             self._write_summary_if_dirty()
+
+    def _undo_action_effect(self, decision):
+        """Reverse one non-stop action from its bounded, typed decision payload."""
+        payload = decision.get("undo")
+        if not isinstance(payload, dict):
+            return {"ok": False, "error": "undo payload is unavailable"}
+        operation = payload.get("operation")
+        scope = payload.get("scope") or decision.get("scope")
+        if not isinstance(scope, str) or not cgroup.valid_rel(scope):
+            return {"ok": False, "error": "undo scope is invalid"}
+        if scope == "manager" or scope.startswith("manager/"):
+            return {"ok": False, "error": "managed service scope cannot be undone"}
+        path = os.path.join(cgroup.base(), scope)
+
+        if operation == "thaw":
+            freeze = os.path.join(path, "cgroup.freeze")
+            try:
+                with open(freeze, encoding="ascii") as source:
+                    frozen = source.read().strip() == "1"
+                if frozen:
+                    with open(freeze, "w", encoding="ascii") as target:
+                        target.write("0\n")
+                    self.store.log(
+                        event="thaw",
+                        scope=scope,
+                        source="undo",
+                        target_decision_id=decision["id"],
+                    )
+                return {"ok": True, "thawed": frozen, "scope": scope}
+            except FileNotFoundError:
+                return {"ok": True, "thawed": False, "scope": scope, "gone": True}
+            except OSError as error:
+                return {"ok": False, "error": "could not thaw %s: %s" % (scope, error)}
+
+        if operation == "restore_priorities":
+            resources = payload.get("resources", [])
+            oom_values = payload.get("oom_score_adj", [])
+            if (
+                not isinstance(resources, list)
+                or len(resources) > 16
+                or not isinstance(oom_values, list)
+                or len(oom_values) > 64
+                or not resources
+                and not oom_values
+            ):
+                return {"ok": False, "error": "priority undo payload is invalid"}
+            allowed_files = {"cpu.idle", "cpu.weight", "io.weight", "io.bfq.weight"}
+            for item in resources:
+                if not isinstance(item, dict) or item.get("file") not in allowed_files:
+                    return {"ok": False, "error": "priority resource is invalid"}
+                value = item.get("value")
+                if not isinstance(value, str) or not value or len(value) > 128:
+                    return {"ok": False, "error": "priority value is invalid"}
+                name = item["file"]
+                if name == "cpu.idle":
+                    valid_value = value.strip() in ("0", "1")
+                elif name == "cpu.weight":
+                    valid_value = (
+                        value.strip().isdecimal() and 1 <= int(value.strip()) <= 10000
+                    )
+                else:
+                    lines = value.strip().splitlines()
+                    valid_value = bool(lines) and len(lines) <= 16
+                    for line in lines:
+                        fields = line.split()
+                        if len(fields) != 2 or not fields[1].isdecimal():
+                            valid_value = False
+                            break
+                        weight = int(fields[1])
+                        device = fields[0]
+                        if not 1 <= weight <= 10000:
+                            valid_value = False
+                            break
+                        if device != "default":
+                            major, separator, minor = device.partition(":")
+                            if (
+                                not separator
+                                or not major.isdecimal()
+                                or not minor.isdecimal()
+                                or len(major) > 10
+                                or len(minor) > 10
+                            ):
+                                valid_value = False
+                                break
+                if not valid_value:
+                    return {"ok": False, "error": "priority value is invalid"}
+            safe_oom_values = []
+            for item in oom_values:
+                if not isinstance(item, dict):
+                    return {"ok": False, "error": "oom priority value is invalid"}
+                pid, start, value = (
+                    item.get("pid"),
+                    item.get("start"),
+                    item.get("value"),
+                )
+                if (
+                    not isinstance(pid, int)
+                    or isinstance(pid, bool)
+                    or pid <= 1
+                    or not isinstance(start, int)
+                    or isinstance(start, bool)
+                    or start <= 0
+                    or not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not -1000 <= value <= 1000
+                    or inspect.starttime(pid) != start
+                ):
+                    return {"ok": False, "error": "oom priority target is stale"}
+                safe_oom_values.append((pid, value))
+            try:
+                for item in resources:
+                    with open(
+                        os.path.join(path, item["file"]), "w", encoding="ascii"
+                    ) as target:
+                        target.write(item["value"].rstrip() + "\n")
+                for pid, value in safe_oom_values:
+                    engine.helper_oom_restore(self.cfg, pid, value)
+            except (OSError, engine.Refused) as error:
+                return {
+                    "ok": False,
+                    "error": "could not restore priorities: %s" % error,
+                }
+            self.store.log(event="priority_restored", scope=scope)
+            return {"ok": True, "scope": scope, "resources": len(resources)}
+
+        if operation == "adopt_standalone":
+            members = payload.get("members")
+            if not isinstance(members, list) or len(members) > 64:
+                return {"ok": False, "error": "standalone undo payload is invalid"}
+            safe = [
+                member
+                for member in members
+                if isinstance(member, dict)
+                and isinstance(member.get("pid"), int)
+                and not isinstance(member.get("pid"), bool)
+                and isinstance(member.get("start"), int)
+                and not isinstance(member.get("start"), bool)
+                and isinstance(member.get("key"), str)
+                and member.get("key")
+            ]
+            live = self._live_standalone_members(safe, scope=scope)
+            if live:
+                self.adopt_standalone(live)
+            return {"ok": True, "scope": scope, "adopted": len(live)}
+
+        return {"ok": False, "error": "undo operation is unsupported"}
+
+    def _launch_restored(self, decision_id):
+        """Relaunch one opted-in root through `taema run` with a fresh scope and safe env."""
+        decision = self.store.decision(decision_id)
+        if not decision or decision.get("kind") not in ("stop", "auto_stop"):
+            return {"error": "restore requires a retained stop decision"}
+        payload = decision.get("undo")
+        if not isinstance(payload, dict):
+            return {"error": "restore data is unavailable"}
+        if payload.get("restored_at") is not None:
+            return {"error": "this decision has already been restored"}
+        argv, cwd = decision.get("argv"), decision.get("cwd")
+        if not argv or not cwd:
+            return {
+                "restore_unavailable": "[learn].remember_argv was false when the app stopped"
+            }
+        if (
+            not isinstance(argv, list)
+            or not 0 < len(argv) <= 256
+            or not isinstance(argv[0], str)
+            or not argv[0]
+            or not all(isinstance(arg, str) and "\0" not in arg for arg in argv)
+            or not isinstance(cwd, str)
+            or not os.path.isabs(cwd)
+            or not os.path.isdir(cwd)
+        ):
+            return {"error": "saved command or working directory is invalid"}
+        if not isinstance(decision_id, int) or isinstance(decision_id, bool):
+            return {"error": "restore decision id is invalid"}
+        scope = "restore-%d" % decision_id
+        package_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        runner_env = inspect.restore_environment(os.environ)
+        runner_env["PYTHONPATH"] = package_root
+        runner_env["TAEMA_RESTORE_LAUNCH"] = "1"
+        runner = [
+            sys.executable,
+            "-m",
+            "taema",
+            "run",
+            "--bind",
+            scope,
+            "--",
+            *argv,
+        ]
+        restored_at = self.store.now()
+        if not self.store.mark_decision_restored(decision_id, at=restored_at):
+            return {"error": "this decision has already been restored"}
+        self.store.save()
+        try:
+            child = subprocess.Popen(
+                runner,
+                cwd=cwd,
+                env=runner_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as error:
+            self.store.clear_decision_restored(decision_id, restored_at)
+            self.store.log(
+                event="restore_failed", decision_id=decision_id, error=str(error)
+            )
+            self.store.save()
+            return {"error": "could not relaunch stopped app: %s" % error}
+        return {"restored": True, "pid": child.pid, "scope": "scope-" + scope}
 
     # ---- socket API ----
     def handle(self, msg):
@@ -2498,7 +2757,10 @@ class Daemon:
         if c == "feedback":
             if msg.get("v") in (1, 2):
                 result = self.store.apply_feedback_command(
-                    {key: value for key, value in msg.items() if key != "cmd"}
+                    {key: value for key, value in msg.items() if key != "cmd"},
+                    undo_handler=(
+                        self._undo_action_effect if msg.get("op") == "undo" else None
+                    ),
                 )
                 if result is None:
                     return {"error": "bad request"}
@@ -2506,7 +2768,17 @@ class Daemon:
                     self.store.save()
                 self._adopt_answered_standalones()
                 self.store.save_if_dirty()
-                if msg.get("op") == "veto" and not result.get("duplicate"):
+                if msg.get("op") == "undo" and not result.get("duplicate"):
+                    target = self.store.decision(result.get("target_decision_id"))
+                    if target and target.get("kind") in ("stop", "auto_stop"):
+                        action = target.get("undo") or {}
+                        for app in action.get("apps", []):
+                            self.stopped.pop(app, None)
+                    if msg.get("restore") is True:
+                        result.update(
+                            self._launch_restored(result.get("target_decision_id"))
+                        )
+                if msg.get("op") in ("veto", "undo") and not result.get("duplicate"):
                     self.thaw_held_scopes()
                 return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):

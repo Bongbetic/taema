@@ -261,7 +261,7 @@ def feedback(cfg, store, op, key):
     return how if reply and reply.get("ok") else "refused"
 
 
-def feedback_action(cfg, store, op, **fields):
+def feedback_action(cfg, store, op, queue_if_down=True, **fields):
     """Send a versioned policy action to the daemon or append it for offline replay."""
     import uuid
 
@@ -269,6 +269,8 @@ def feedback_action(cfg, store, op, **fields):
     reply = ask(cfg, {"cmd": "feedback", **msg})
     if reply is not None:
         return "daemon", reply
+    if not queue_if_down:
+        return "offline", {"error": "daemon is not running"}
     fd = os.open(store.feedback_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as f:
         f.write(json.dumps(msg) + "\n")
@@ -803,6 +805,7 @@ def _sudo_denied(msg):
 
 def cmd_run(a):
     cfg, store, units = _load(a)
+    restore_launch = os.environ.pop("TAEMA_RESTORE_LAUNCH", None) == "1"
     name = a.name
     if not cgroup.valid_rel(name) or "/" in name or len(name) > 32:
         return die("bad name (use a-z 0-9 _ -, max 32)")
@@ -894,6 +897,8 @@ def cmd_run(a):
             "taema: daemon not running; scope-%s is not auto-managed" % name,
             file=sys.stderr,
         )
+    if restore_launch:
+        os.execvpe(a.cmd[0], a.cmd, inspect.restore_environment(os.environ))
     os.execvp(a.cmd[0], a.cmd)
 
 
@@ -1757,27 +1762,133 @@ def cmd_do_not_kill(a):
 
 def cmd_undo(a):
     cfg, store, _units = _load(a)
-    action = store.auto_action()
-    if not action:
-        return die("no automatic stop to undo", 2)
-    target_id = action.get("decision_id") or action["id"]
+    decision = store.undo_candidate(getattr(a, "decision_id", None))
+    if not decision:
+        return die("no retained automatic action to undo", 2)
+    target_id = decision["id"]
+    kind = decision.get("kind", "automatic action")
+    stop = kind in ("stop", "auto_stop")
+    restore_requested = bool(getattr(a, "restore", False))
     if getattr(a, "dry_run", False):
-        print("dry run: undo automatic stop %s" % target_id)
+        suffix = " and restore" if restore_requested else ""
+        print("dry run: undo %s decision %s%s" % (kind, target_id, suffix))
         return 0
-    how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
-    if not reply or not reply.get("ok"):
-        return die(reply.get("error", "could not undo automatic stop"))
-    targets = reply.get("targets") or [
-        {"kind": "app", "value": app} for app in action.get("apps", [])
-    ]
-    print(
-        "undo: %s; vetoed %s"
-        % (
-            action.get("scope", "automatic stop"),
-            ", ".join(veto_label(t) for t in targets) or "the stopped scope",
+    if (
+        restore_requested
+        and stop
+        and not (decision.get("argv") and decision.get("cwd"))
+    ):
+        how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
+        if not reply or not reply.get("ok"):
+            return die((reply or {}).get("error", "could not undo automatic stop"))
+        print(
+            "undo: %s; restore unavailable because [learn].remember_argv was false when it stopped"
+            % (decision.get("scope") or "automatic stop")
         )
+        return 0
+
+    if restore_requested and stop:
+        how, reply = feedback_action(
+            cfg,
+            store,
+            "undo",
+            action_id=str(target_id),
+            restore=True,
+            queue_if_down=False,
+        )
+        if how == "offline":
+            how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
+            if not reply or not reply.get("ok"):
+                return die((reply or {}).get("error", "could not queue undo"))
+            print(
+                "undo: %s; restore deferred because the daemon is not running"
+                % (decision.get("scope") or "automatic stop")
+            )
+            return 0
+        if not reply or not reply.get("ok"):
+            return die((reply or {}).get("error", "could not undo automatic stop"))
+        if reply.get("error"):
+            return die("undo completed, but restore failed: %s" % reply["error"], 1)
+        if reply.get("restored"):
+            print(
+                "undo: %s; restored in %s (pid %s)"
+                % (
+                    decision.get("scope", "automatic stop"),
+                    reply["scope"],
+                    reply["pid"],
+                )
+            )
+        else:
+            print(
+                "undo: %s; %s"
+                % (
+                    decision.get("scope", "automatic action"),
+                    reply.get("restore_unavailable", "restore was not started"),
+                )
+            )
+        return 0
+
+    how, reply = feedback_action(
+        cfg,
+        store,
+        "undo",
+        action_id=str(target_id),
+        queue_if_down=stop,
+    )
+    if not reply or not reply.get("ok"):
+        return die((reply or {}).get("error", "could not undo automatic action"))
+    targets = reply.get("targets", [])
+    details = (
+        "; vetoed %s"
+        % (", ".join(veto_label(target) for target in targets) or "the stopped scope")
+        if stop
+        else ""
+    )
+    if restore_requested and not stop:
+        details += "; restore applies only to a stopped process"
+    print(
+        "undo: %s%s (%s)" % (decision.get("scope") or "automatic action", details, how)
     )
     return 0
+
+
+def cmd_restore(a):
+    cfg, store, _units = _load(a)
+    identifier = getattr(a, "decision_id", None)
+    if not isinstance(identifier, str) or not identifier.isdecimal():
+        return die("restore requires a numeric decision id", 2)
+    decision = store.decision(int(identifier))
+    if not decision or decision.get("kind") not in ("stop", "auto_stop"):
+        return die("no retained stop decision matches %s" % identifier, 2)
+    if not decision.get("argv") or not decision.get("cwd"):
+        return die(
+            "restore unavailable: [learn].remember_argv was false when the app stopped",
+            2,
+        )
+    payload = decision.get("undo") or {}
+    if payload.get("restored_at") is not None:
+        return die("decision %s has already been restored" % identifier, 2)
+    how, reply = feedback_action(
+        cfg,
+        store,
+        "undo",
+        action_id=identifier,
+        restore=True,
+        queue_if_down=False,
+    )
+    if how == "offline":
+        return die("restore requires the taema daemon to be running", 2)
+    if not reply or not reply.get("ok"):
+        return die((reply or {}).get("error", "could not restore stopped app"))
+    if reply.get("error"):
+        return die(reply["error"], 1)
+    if reply.get("restored"):
+        print(
+            "restored decision %s in %s (pid %s)"
+            % (identifier, reply["scope"], reply["pid"])
+        )
+        return 0
+    return die(reply.get("restore_unavailable", "restore was not started"), 2)
 
 
 def _cmd_hold(a, held):

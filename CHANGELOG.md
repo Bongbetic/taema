@@ -1,3 +1,15 @@
+# 0.4.0
+
+## Behaviour changes
+
+### undo retained automatic actions and opt-in restore
+
+`taema undo [ID]` now reverses retained containment, priority, freeze, and stop actions. Stop undo
+adds keep evidence and a veto, clears pending stop state, and suspends automatic authority for the
+regret window. With `[learn].remember_argv = true`, a stopped root's argv and cwd can be relaunched
+once in a fresh scope; the relaunch receives only the documented environment allowlist and no
+inherited stdin. The option remains off by default.
+
 # 0.3.0
 
 ## Behaviour changes

@@ -48,6 +48,26 @@ def helper_attach(cfg, pid, name):
         raise Refused(r.stderr.strip() or "attach failed")
 
 
+def helper_oom_restore(cfg, pid, value):
+    """Restore a recorded oom_score_adj value through the root helper."""
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 1
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or not -1000 <= value <= 1000
+    ):
+        raise Refused("invalid OOM priority restore target")
+    result = subprocess.run(
+        ["sudo", "-n", helper_path(cfg), "oom-restore", str(pid), str(value)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise Refused(result.stderr.strip() or "OOM priority restore failed")
+
+
 def helper_move(cfg, relpath, pids):
     pids = [str(p) for p in pids]
     for i in range(0, len(pids), 64):
@@ -310,6 +330,28 @@ def veto_for_scope(store, path, unit=None, owner=None, signature=None, leftover=
     return matches[0] if matches else None
 
 
+def restore_snapshot(pids, cfg, pt=None):
+    """Return argv/cwd for a stopped root only when the user opted in to remembering argv."""
+    if not cfg.get("learn", {}).get("remember_argv"):
+        return None
+    pids = {
+        pid
+        for pid in pids
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1
+    }
+    if not pids:
+        return None
+    pt = pt or inspect.ProcTable.scan()
+    roots = sorted(
+        pid for pid in pids if not any(parent in pids for parent in pt.ancestors(pid))
+    )
+    for pid in roots:
+        snapshot = inspect.restore_command(pid)
+        if snapshot:
+            return snapshot
+    return None
+
+
 def _stop_impl(
     path,
     cfg,
@@ -368,8 +410,10 @@ def _stop_impl(
         "removed": False,
         "left": [],
         "stopped": [],
+        "restore": None,
     }
     stopped_pids = set()
+    restore = None
     ran_hook = False
     counted, killed_keys, sigkill_keys = set(), set(), set()
     snap = (
@@ -394,6 +438,11 @@ def _stop_impl(
             break
         shared = [d for d in plan if d["action"] == "share"]
         kill = [d for d in plan if d["action"] == "kill"]
+        restore = (
+            restore_snapshot([d["pid"] for d in kill], cfg, pt=pt)
+            if not dry_run
+            else None
+        )
         shared_pids = {d["pid"] for d in shared}
         roots = [
             d
@@ -487,6 +536,8 @@ def _stop_impl(
             killed = _wait_each(path, survivors, 5)
             stopped_pids.update(set(kill_sent) & set(killed))
     report["stopped"] = sorted(stopped_pids)
+    if restore and restore["pid"] in stopped_pids:
+        report["restore"] = {"argv": restore["argv"], "cwd": restore["cwd"]}
     if not dry_run:
         try:
             cgroup.rmdir_tree(path)
@@ -787,6 +838,24 @@ def run_ops(
                     for p in inside:
                         cgroup.move(p, dest)
                 op["done"] = True
+                if (
+                    isinstance(decision, dict)
+                    and decision_kind in ("adopt_move", "containment")
+                    and authority != "user"
+                ):
+                    members = []
+                    for pid in pids:
+                        start = inspect.starttime(pid)
+                        key = policy.app_key(pid)
+                        if start is not None and key:
+                            members.append({"pid": pid, "start": start, "key": key})
+                    if members:
+                        decision["undo"] = {
+                            "operation": "adopt_standalone",
+                            "scope": op["scope"],
+                            "members": members,
+                        }
+                        decision["undoable"] = True
             fields = dict(
                 op=op["op"],
                 scope=op["scope"],

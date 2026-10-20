@@ -788,23 +788,33 @@ def _why_identity(key, cfg, store, live=None):
     }
 
 
-def _why_outcomes(trigger, facts):
+def _why_outcomes(trigger, facts, cfg):
     if not trigger:
         return {"trigger": "unknown", "modes": []}
-    return {
-        "trigger": trigger,
-        "modes": [
+    from dataclasses import replace
+
+    modes = []
+    for mode in authorization.MODES:
+        mode_cfg = dict(cfg)
+        mode_cfg["mode"] = mode
+        effective = policy.effective_authority(mode_cfg)
+        decision = authorization.authorize(
+            trigger,
+            mode,
+            replace(facts, learn_authority=effective["value"]),
+        )
+        modes.append(
             {
                 "mode": mode,
-                "verdict": (
-                    decision := authorization.authorize(trigger, mode, facts)
-                ).verdict,
+                "verdict": decision.verdict,
                 "slot": decision.slot,
                 "authority": decision.authority,
                 "reason": decision.reason,
             }
-            for mode in authorization.MODES
-        ],
+        )
+    return {
+        "trigger": trigger,
+        "modes": modes,
     }
 
 
@@ -888,10 +898,11 @@ def _why_report(
             "reason": reason,
         },
         "authority_source": authority_source or "unknown",
+        "learn_authority": policy.effective_authority(cfg),
         "vetoes": vetoes,
         "hold": {"active": bool(hold), "reason": hold},
         "protected": {"blocked": bool(protected_reason), "reason": protected_reason},
-        "mode_outcomes": _why_outcomes(trigger, facts or authorization.Facts()),
+        "mode_outcomes": _why_outcomes(trigger, facts or authorization.Facts(), cfg),
         "learning": learning or {},
         "plan": list(plan),
         "unknown": unknown,
@@ -925,6 +936,7 @@ def _why_pair_report(owner, leftover, cfg, store):
         leftover=True,
         pair_action=action,
         pair_reason=reason,
+        pair_explicit=store.explicit_stop((action, confidence, reason)),
         suppress_stops=bool(cfg.get("_profile_suppress_stops")),
     )
     members = ({"apps": [owner]}, {"apps": [leftover]})
@@ -1636,12 +1648,15 @@ def cmd_status(a):
     if store is None:
         store = _status_store(cfg, pending_only=reply is not None)
     if reply is None:
+        effective_authority = policy.effective_authority(cfg)
         invalid = int(store.data.get("feedback_invalid", 0)) if store else 0
         hold = store.hold_reason() if store else ""
         hold_state = store.hold_status() if store else empty_hold_state
         status = {
             "daemon": "unavailable",
             "mode": cfg["mode"],
+            "authority": effective_authority["value"],
+            "authority_source": effective_authority["source"],
             "profile": cfg.get("_profile_name", "auto"),
             "profile_reason": cfg.get("_profile_reason", "automatic profile selection"),
             "feedback_invalid": invalid
@@ -1670,6 +1685,12 @@ def cmd_status(a):
         status = {
             "daemon": "running",
             "mode": reply.get("mode", cfg["mode"]),
+            "authority": reply.get(
+                "authority", policy.effective_authority(cfg)["value"]
+            ),
+            "authority_source": reply.get(
+                "authority_source", policy.effective_authority(cfg)["source"]
+            ),
             "profile": reply.get("profile", cfg.get("_profile_name", "auto")),
             "profile_reason": reply.get(
                 "profile_reason",

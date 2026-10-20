@@ -160,6 +160,8 @@ class Facts:
     hard_safety: str = ""
     pair_action: str = ""
     pair_reason: str = ""
+    pair_explicit: bool = False
+    learn_authority: str = "learned"
 
 
 @dataclass(frozen=True)
@@ -272,9 +274,9 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
             "leftover leaves: only auto treats leftover/* as scopes (0.2.1)",
         ),
         "adopt": (
-            KEEP,
-            "",
-            "leftover leaves: only auto treats leftover/* as scopes (0.2.1)",
+            ACT,
+            AUTHORITY_MODE,
+            "leftover leaves: adopt checks answered pairs individually",
         ),
         "enforce": (
             KEEP,
@@ -346,8 +348,40 @@ def _capability(
     trigger: str, mode: str, facts: Facts
 ) -> tuple[Verdict, Authority, str]:
     """Slot 4: fact rules first, then the per-trigger, per-mode table above."""
+    if (
+        trigger == JOB_SURVIVORS
+        and mode in ("adopt", "auto")
+        and facts.pair_action == "stop"
+    ):
+        return ACT, AUTHORITY_PAIR, "job survivors: adopt stops an authorized pair"
+    if trigger == GC_STOP and mode == "adopt" and facts.leftover:
+        if facts.pair_action == "expiry":
+            return ACT, AUTHORITY_MODE, "gc stop: configured leftover expiry elapsed"
+        if facts.pair_action == "stop":
+            return (
+                ACT,
+                AUTHORITY_PAIR,
+                "gc stop: adopt stops an authorized leftover pair",
+            )
+        if facts.pair_action:
+            return KEEP, "", "gc stop: adopt leaves an unauthorized pair in review"
+    if trigger == SESSION_END and mode == "adopt" and facts.leftover:
+        if facts.pair_action == "stop":
+            return (
+                ACT,
+                AUTHORITY_PAIR,
+                "session end: adopt stops an authorized leftover pair",
+            )
+        if facts.pair_action:
+            return KEEP, "", "session end: adopt leaves an unauthorized pair"
     if trigger == GC_STOP and mode == "auto":
         if facts.leftover:
+            if facts.pair_action == "expiry":
+                return (
+                    ACT,
+                    AUTHORITY_MODE,
+                    "gc stop: configured leftover expiry elapsed",
+                )
             return (
                 ACT,
                 AUTHORITY_PAIR,
@@ -405,16 +439,18 @@ def _authority(trigger: str, mode: str, facts: Facts) -> tuple[Vote, str]:
     if trigger == SESSION_END and facts.unit_survive_logout:
         return "deny", "unit authority: unit sets kill.survive_logout"
     if (
-        trigger == GC_STOP
-        and mode == "auto"
-        and facts.leftover
+        mode in ("adopt", "auto")
+        and trigger in (GC_STOP, JOB_SURVIVORS, SESSION_END)
         and facts.pair_action
-        and facts.pair_action != "stop"
+        and facts.pair_action != "expiry"
     ):
-        return (
-            "deny",
-            facts.pair_reason or "pair authority: pair does not authorize stop",
-        )
+        if facts.pair_action != "stop":
+            return (
+                "deny",
+                facts.pair_reason or "pair authority: pair does not authorize stop",
+            )
+        if facts.learn_authority == "answered" and not facts.pair_explicit:
+            return "deny", "pair authority: this mode requires an explicit stop answer"
     return "pass", ""
 
 

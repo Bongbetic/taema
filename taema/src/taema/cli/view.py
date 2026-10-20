@@ -146,6 +146,11 @@ def render_status(model, args, summary=False):
         _styled("tæma status", "1", color),
         "daemon: %s" % daemon,
         "mode: %s" % status.get("mode", "unknown"),
+        "authority: %s (%s)"
+        % (
+            status.get("authority", "unknown"),
+            status.get("authority_source", "unknown"),
+        ),
         "profile: %s (%s)"
         % (
             status.get("profile", "auto"),
@@ -179,7 +184,7 @@ def render_status(model, args, summary=False):
             )
         )
     if summary:
-        return "\n".join(lines[:7]) + "\n"
+        return "\n".join(lines[:8]) + "\n"
     if status.get("config"):
         lines.append(
             "config: %s" % (", ".join(status["config"]) or "built-in defaults")
@@ -375,6 +380,15 @@ def render_explanation(target, explanation):
         )
     )
     lines.append("authority: %s" % explanation.get("authority_source", "unknown"))
+    learn_authority = explanation.get("learn_authority") or {}
+    if learn_authority:
+        lines.append(
+            "effective authority: %s (%s)"
+            % (
+                learn_authority.get("value", "unknown"),
+                learn_authority.get("source", "unknown"),
+            )
+        )
     provenance = explanation.get("provenance") or {}
     chain = provenance.get("chain") or []
     if chain:

@@ -460,6 +460,32 @@ class JobSurvivors(AutoCase):
         self.assertIn("answered stop", st["auto_stops"][0]["why"])
         self.assertEqual(self.d.auto_recent["vite"][0], "npm")
 
+    def test_adopt_stops_an_explicitly_answered_pair_on_job_close(self):
+        self.d.cfg["mode"] = "adopt"
+        self.d.store.answer("npm", "vite", "stop")
+
+        self.job()
+
+        self.stopm.assert_called_once()
+        self.assertTrue(self.stopm.call_args.kwargs["allow_sigkill"])
+        self.assertEqual(self.stopm.call_args.kwargs["decision_authority"], "pair")
+
+    def test_adopt_answered_default_does_not_stop_a_learned_pair_on_close(self):
+        self.d.cfg["mode"] = "adopt"
+        store = self.d.store
+        store.data["created"] -= 30 * knowledge.DAY
+        for day in range(4):
+            for _ in range(2):
+                store.observe_kill_inferred("npm", "vite", day=day)
+        store.data["pairs"][store.pkey("npm", "vite")]["first_seen"] -= (
+            5 * knowledge.DAY
+        )
+
+        self.job()
+
+        self.assertEqual(store.pair_decision("npm", "vite")[0], "stop")
+        self.stopm.assert_not_called()
+
     def test_silent_pair_never_sigkills(self):
         s = self.d.store
         s.data["created"] -= 30 * DAY
@@ -581,6 +607,39 @@ class GuiClose(AutoCase):
         dest = self.cg.base + "/leftover/firefox-200"
         with open(dest + "/cgroup.procs") as f:
             self.assertEqual(f.read().split(), ["201"])
+
+    def test_adopt_stops_an_explicitly_answered_pair_on_gui_close(self):
+        self.d.cfg["mode"] = "adopt"
+        self.d.store.answer("firefox", "helper", "stop")
+        self.close_gui()
+        self.idle(201)
+
+        with mock.patch.object(engine, "signal_survivors", return_value=[201]) as stop:
+            self.d.after_observe()
+
+        stop.assert_called_once()
+        self.assertTrue(stop.call_args.args[3])
+        self.assertEqual(self.d.store.open_reviews(), [])
+        self.assertFalse(os.path.exists(self.cg.base + "/leftover/firefox-200"))
+
+    def test_adopt_stops_an_explicitly_answered_signature_on_gui_close(self):
+        self.d.cfg["mode"] = "adopt"
+        self.close_gui()
+        entry = self.d.lineage.entry(201)
+        signature = self.d.survivor_signature(
+            "firefox",
+            [{"pid": 201, "start": entry["start"], "key": "helper"}],
+        )
+        self.assertTrue(self.d.store.answer_signature("firefox", signature, "stop"))
+        self.idle(201)
+
+        with mock.patch.object(engine, "signal_survivors", return_value=[201]) as stop:
+            self.d.after_observe()
+
+        stop.assert_called_once()
+        self.assertTrue(stop.call_args.args[3])
+        self.assertEqual(self.d.store.pair_decision("firefox", "helper")[0], "ask")
+        self.assertEqual(self.d.store.open_reviews(), [])
 
     def test_enforce_mode_contains_gui_survivors_in_one_pass(self):
         self.d.cfg["mode"] = "enforce"
@@ -910,6 +969,61 @@ class LeftoverGc(AutoCase):
         self.assertTrue(self.stopm.call_args[1]["allow_sigkill"])
         self.assertEqual(len(self.d.auto_stops), 1)
         self.assertFalse(self.d.may_kill())
+
+    def test_adopt_stops_an_explicitly_answered_leftover(self):
+        self.d.cfg["mode"] = "adopt"
+        self.leaf()
+        self.d.store.answer("foo", "vite", "stop")
+
+        result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "stop")
+        self.stopm.assert_called_once()
+        self.assertTrue(self.stopm.call_args.kwargs["allow_sigkill"])
+        self.assertEqual(self.stopm.call_args.kwargs["decision_authority"], "pair")
+
+    def test_adopt_answered_authority_refuses_a_learned_stop(self):
+        self.d.cfg["mode"] = "adopt"
+        self.leaf()
+        self.d.cfg["learn"] = {"authority": "answered"}
+        pair = self.d.store._pair("foo", "vite")
+        now = self.d.store.now()
+        pair.update(
+            {
+                "stop": 5.0,
+                "kills": 5,
+                "days": [int(now // knowledge.DAY) - day for day in (2, 1, 0)],
+                "first_seen": now - 2 * knowledge.DAY,
+            }
+        )
+        self.d.store.data["closes"] = 20
+
+        result = self.d.gc_pass()
+
+        self.assertNotIn("stop", [row[2] for row in result])
+        self.stopm.assert_not_called()
+
+    def test_adopt_learned_authority_allows_learned_stop_without_sigkill(self):
+        self.d.cfg["mode"] = "adopt"
+        self.d.cfg["learn"] = {"authority": "learned"}
+        self.leaf()
+        pair = self.d.store._pair("foo", "vite")
+        now = self.d.store.now()
+        pair.update(
+            {
+                "stop": 5.0,
+                "kills": 5,
+                "days": [int(now // knowledge.DAY) - day for day in (2, 1, 0)],
+                "first_seen": now - 2 * knowledge.DAY,
+            }
+        )
+        self.d.store.data["closes"] = 20
+
+        result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "stop")
+        self.stopm.assert_called_once()
+        self.assertFalse(self.stopm.call_args.kwargs["allow_sigkill"])
 
     def test_gc_keeps_and_reviews_unlearned_idle_leftover(self):
         self.leaf()
@@ -1496,6 +1610,8 @@ class StatusAndModes(ProcCase):
             d.note_auto_stop("s%d" % i, "why %d" % i, [("npm", "vite")])
         r = d.handle({"cmd": "status"})
         self.assertEqual(r["mode"], "auto")
+        self.assertEqual(r["authority"], "learned")
+        self.assertEqual(r["authority_source"], "mode default for auto")
         self.assertEqual(
             [s["scope"] for s in r["auto"]["auto_stops"]],
             ["s%d" % i for i in range(2, 7)],
@@ -1512,6 +1628,12 @@ class StatusAndModes(ProcCase):
         self.assertIn("why 6", out.getvalue())
 
     def test_status_prints_auto_scope_count_in_every_mode(self):
+        expected_authorities = {
+            "observe": "learned",
+            "adopt": "answered",
+            "enforce": "unit",
+            "auto": "learned",
+        }
         for mode in ("observe", "adopt", "enforce", "auto"):
             cfg = make_cfg(tmp(), mode=mode)
             d = daemon.Daemon(cfg)
@@ -1526,6 +1648,10 @@ class StatusAndModes(ProcCase):
                 rc = cli.cmd_status(argparse.Namespace())
             self.assertEqual(rc, 0, mode)
             self.assertIn("1 auto-adopted scopes", out.getvalue(), mode)
+            self.assertIn("authority: " + expected_authorities[mode], out.getvalue())
+            self.assertIn(
+                "mode default" if mode != "enforce" else "unit rules", out.getvalue()
+            )
 
     def test_mode_gates(self):
         want = {

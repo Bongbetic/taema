@@ -94,6 +94,8 @@ def _unknown_config(cfg):
             allowed.update(dict.fromkeys(_PATH_KEYS))
         elif base_section == "timers":
             allowed.update(dict.fromkeys(_TIMER_KEYS))
+        elif base_section == "learn":
+            allowed["authority"] = None
         elif base_section == "protected":
             allowed.update(dict.fromkeys(_PROTECTED_KEYS))
         elif base_section == "seeds":

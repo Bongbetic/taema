@@ -2687,8 +2687,19 @@ class Store:
     def pair_explicit(self, owner, leftover):
         """True when the pair decision is "stop" because the user answered it (SIGKILL is allowed
         only then). An invalid owner is never explicit."""
-        action, _conf, why = self.pair_decision(owner, leftover)
-        return action == "stop" and why.startswith("answered stop")
+        return self.explicit_stop(self.pair_decision(owner, leftover))
+
+    @staticmethod
+    def explicit_stop(decision):
+        """Whether a stop decision came from an explicit pair or signature answer."""
+        if not isinstance(decision, (tuple, list)) or len(decision) < 3:
+            return False
+        action, _confidence, why = decision[:3]
+        return (
+            action == "stop"
+            and isinstance(why, str)
+            and why.startswith(("answered stop", "signature answered stop"))
+        )
 
     def _signature_ask_key(self, signature):
         if isinstance(signature, dict):

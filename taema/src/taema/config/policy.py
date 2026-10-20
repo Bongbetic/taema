@@ -18,6 +18,7 @@ SYSTEM_UNITS = "/etc/taema/units"
 USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
 MODES = ("observe", "adopt", "enforce", "auto")
+LEARN_AUTHORITIES = ("answered", "learned", "aggressive")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
 
 _DEFAULTS = {
@@ -29,7 +30,6 @@ _DEFAULTS = {
     "learner": {"deny_owners": []},
     "learn": {
         "enabled": True,
-        "authority": "learned",
         "silent_kills": 5,
         "silent_days": 3,
         "silent_ratio": 0.9,
@@ -298,6 +298,21 @@ def _validate_config(cfg, sources):
     if cfg.get("mode") not in MODES:
         source = sources.get("mode", "built-in defaults")
         raise ValueError("%s:1:1: mode must be one of %s" % (source, MODES))
+    learn = cfg.get("learn")
+    learn_source = sources.get("learn", "built-in defaults")
+    if not isinstance(learn, dict):
+        raise ValueError("%s:1:1: learn must be a table" % learn_source)
+    authority = learn.get("authority")
+    if authority is not None and authority not in LEARN_AUTHORITIES:
+        source = sources.get("learn.authority", learn_source)
+        raise ValueError(
+            "%s:1:1: learn.authority must be one of %s" % (source, LEARN_AUTHORITIES)
+        )
+    if type(learn.get("allow_self_authority", False)) is not bool:
+        source = sources.get("learn.allow_self_authority", learn_source)
+        raise ValueError(
+            "%s:1:1: learn.allow_self_authority must be a boolean" % source
+        )
     protected = cfg.get("protected")
     if not isinstance(protected, dict):
         source = sources.get("protected", "built-in defaults")
@@ -338,6 +353,21 @@ def _validate_config(cfg, sources):
         raise ValueError(
             "%s:1:1: profile.runtime_mode must be one of %s" % (source, MODES)
         )
+
+
+def effective_authority(cfg):
+    """Return the authority used by this mode and where that choice came from."""
+    mode = cfg.get("mode", "observe")
+    if mode == "enforce":
+        return {"value": "unit", "source": "enforce mode unit rules"}
+    learn = cfg.get("learn") or {}
+    configured = learn.get("authority") if isinstance(learn, dict) else None
+    if configured in LEARN_AUTHORITIES:
+        source = (cfg.get("_source_map") or {}).get("learn.authority", "configuration")
+        return {"value": configured, "source": source}
+    if mode == "adopt":
+        return {"value": "answered", "source": "mode default for adopt"}
+    return {"value": "learned", "source": "mode default for %s" % mode}
 
 
 def _load_files(files, required=()):

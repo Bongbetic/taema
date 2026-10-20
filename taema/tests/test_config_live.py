@@ -116,8 +116,13 @@ class ConfigLayering(unittest.TestCase):
             source = Path(root) / "taema.toml"
             source.write_text('mode = "observe"\n', encoding="utf-8")
             cfg = policy.load_config(str(source))
-        self.assertEqual(cfg["learn"]["authority"], "learned")
+        self.assertIsNone(cfg["learn"].get("authority"))
+        self.assertEqual(
+            policy.effective_authority(cfg),
+            {"value": "learned", "source": "mode default for observe"},
+        )
         self.assertEqual(cfg["learn"]["remember_argv"], False)
+        self.assertFalse(cfg["learn"]["allow_self_authority"])
         self.assertEqual(cfg["mem"]["manage"], "soft")
         self.assertEqual(cfg["agent"]["window_backend"], "auto")
         self.assertEqual(cfg["profile"]["game"]["freeze"]["after"], 30)
@@ -129,6 +134,58 @@ class ConfigLayering(unittest.TestCase):
             "limits": [{"name": "cpu", "weight": 50}],
         }
         self.assertEqual(tomllib.loads(management.dump_toml(values)), values)
+
+    def test_learn_authority_defaults_by_mode_and_reports_its_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            adopt = Path(root) / "adopt.toml"
+            adopt.write_text('mode = "adopt"\n', encoding="utf-8")
+            auto = Path(root) / "auto.toml"
+            auto.write_text('mode = "auto"\n', encoding="utf-8")
+            explicit = Path(root) / "explicit.toml"
+            explicit.write_text(
+                'mode = "adopt"\n[learn]\nauthority = "aggressive"\n',
+                encoding="utf-8",
+            )
+            enforce = Path(root) / "enforce.toml"
+            enforce.write_text(
+                'mode = "enforce"\n[learn]\nauthority = "answered"\n',
+                encoding="utf-8",
+            )
+
+            adopt_cfg = policy.load_config(str(adopt))
+            auto_cfg = policy.load_config(str(auto))
+            explicit_cfg = policy.load_config(str(explicit))
+            enforce_cfg = policy.load_config(str(enforce))
+
+        self.assertEqual(
+            policy.effective_authority(adopt_cfg),
+            {"value": "answered", "source": "mode default for adopt"},
+        )
+        self.assertEqual(
+            policy.effective_authority(auto_cfg),
+            {"value": "learned", "source": "mode default for auto"},
+        )
+        self.assertEqual(
+            policy.effective_authority(explicit_cfg),
+            {"value": "aggressive", "source": str(explicit)},
+        )
+        self.assertEqual(doctor._unknown_config(explicit_cfg), [])
+        self.assertEqual(
+            policy.effective_authority(enforce_cfg),
+            {"value": "unit", "source": "enforce mode unit rules"},
+        )
+
+    def test_invalid_learn_authority_and_self_authority_types_are_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "taema.toml"
+            for setting, message in (
+                ('authority = "guess"', "learn.authority"),
+                ('allow_self_authority = "false"', "allow_self_authority"),
+            ):
+                source.write_text("[learn]\n%s\n" % setting, encoding="utf-8")
+                with self.subTest(setting=setting):
+                    with self.assertRaisesRegex(ValueError, message):
+                        policy.load_config(str(source))
 
     def test_malformed_unit_is_skipped_without_dropping_valid_units(self):
         with tempfile.TemporaryDirectory() as root:

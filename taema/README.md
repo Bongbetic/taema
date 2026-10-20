@@ -244,6 +244,19 @@ for 7 days and asks you again. You never need a command to undo it.
 | `observe` | Logs what it *would* do and leaves scopes and processes in place. |
 | `enforce` | Applies unit and lifecycle rules, including GC for `stop_when_unneeded` scopes, with safety and veto checks. |
 
+Pair-stop authority is separate from mode. `adopt` defaults to `answered`, so it stops
+survivors only when you explicitly answered "stop" for their pair or survivor signature;
+`auto` defaults to `learned`. To let `adopt` stop pairs supported by learned evidence, set:
+
+```toml
+[learn]
+authority = "learned" # answered | learned | aggressive
+```
+
+`aggressive` currently grants the same authority as `learned`; `allow_self_authority` defaults
+to `false`. `enforce` keeps using unit rules. `taema status` and `taema explain` show the
+effective authority and its source.
+
 Leftover expiry is opt-in. `leftover_expire_days = 0` (the default) keeps unlearned
 leftovers indefinitely. A positive value allows an aged, idle leftover to expire after that many
 days, subject to the usual safety checks; an explicit keep or veto still wins. Review timeouts

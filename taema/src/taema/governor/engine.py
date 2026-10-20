@@ -679,6 +679,7 @@ def gc_candidates(
     pt=None,
     lin=None,
     auto=False,
+    authority="learned",
 ):
     """Scopes that are unused: [(path, reason)]. Updates idle_since {rel: first-idle-ts}.
 
@@ -784,6 +785,7 @@ def gc_candidates(
                 scope=rel,
                 expiry_days=expiry_days,
                 at=now(),
+                authority=authority,
             )
             if verdict[0] == "held":
                 if rel not in noted:
@@ -847,7 +849,16 @@ def gc_candidates(
 
 
 def _leftover_verdict(
-    cfg, store, lin, pids, snap, protect, scope="", expiry_days=0, at=None
+    cfg,
+    store,
+    lin,
+    pids,
+    snap,
+    protect,
+    scope="",
+    expiry_days=0,
+    at=None,
+    authority="learned",
 ):
     """("stop", why) when every member passes auto_stop_ok, ("held", why) when a member must not be
     stopped by the idle rule, else ("idle", "")."""
@@ -869,7 +880,10 @@ def _leftover_verdict(
                 i["origin"], i["key"], scope, expiry_days, now=at
             ):
                 return "held", "pair decided keep: %s>%s" % (i["origin"], i["key"])
-    res = [auto_stop_ok(store, i["origin"], i["key"], i) for i in infos]
+    res = [
+        auto_stop_ok(store, i["origin"], i["key"], i, authority=authority)
+        for i in infos
+    ]
     if infos and all(r[0] for r in res):
         return "stop", res[0][1]
     return "idle", ""
@@ -904,7 +918,9 @@ def member_info(cfg, lin, pid, edge_map, edges_ok=True, origin=None):
     }
 
 
-def auto_stop_ok(store, owner_key, leftover_key, mi, decision=None):
+def auto_stop_ok(
+    store, owner_key, leftover_key, mi, decision=None, authority="learned"
+):
     """May auto mode stop this member? (ok, why). A pair or matched survivor signature must decide
     "stop", and the member must be plainly idle and known: no edges, not protected / a pty host / a
     persist seed / a share seed the user keeps, <= 1 % CPU over the last minute, origin known.
@@ -914,6 +930,8 @@ def auto_stop_ok(store, owner_key, leftover_key, mi, decision=None):
     )
     if action != "stop":
         return False, "learning decision is %s" % action
+    if authority == "answered" and not store.explicit_stop((action, _conf, why)):
+        return False, "learning authority requires an explicit stop answer"
     if not mi.get("origin"):
         return False, "origin unknown"
     if mi.get("edges") is None:

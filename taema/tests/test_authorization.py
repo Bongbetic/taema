@@ -83,7 +83,7 @@ TRUTH = [
         authorization.Facts(),
         {
             "observe": ("keep", ""),
-            "adopt": ("keep", ""),
+            "adopt": ("act", "mode"),
             "enforce": ("keep", ""),
             "auto": ("act", "mode"),
         },
@@ -237,6 +237,110 @@ class TruthTable(unittest.TestCase):
         self.assertEqual(
             (answered_pair.verdict, answered_pair.authority), ("act", "pair")
         )
+
+    def test_pair_authority_matrix_covers_every_mode_and_setting(self):
+        levels = ("answered", "learned", "aggressive")
+        pair_triggers = (
+            authorization.GC_STOP,
+            authorization.JOB_SURVIVORS,
+            authorization.SESSION_END,
+        )
+        for mode in MODES:
+            for level in levels:
+                for explicit in (False, True):
+                    for trigger in pair_triggers:
+                        facts = authorization.Facts(
+                            leftover=True,
+                            pair_action="stop",
+                            pair_reason="answered stop"
+                            if explicit
+                            else "silent evidence",
+                            pair_explicit=explicit,
+                            learn_authority=level,
+                        )
+                        with self.subTest(
+                            mode=mode,
+                            authority=level,
+                            explicit=explicit,
+                            trigger=trigger,
+                        ):
+                            result = authorization.authorize(trigger, mode, facts)
+                            if mode == "enforce":
+                                want = (
+                                    ("act", "unit")
+                                    if trigger != authorization.JOB_SURVIVORS
+                                    else ("keep", "")
+                                )
+                            elif mode == "observe":
+                                want = (
+                                    ("would", "")
+                                    if trigger
+                                    in (
+                                        authorization.GC_STOP,
+                                        authorization.SESSION_END,
+                                    )
+                                    else ("keep", "")
+                                )
+                            elif level == "answered" and not explicit:
+                                want = ("keep", "")
+                            else:
+                                want = ("act", "pair")
+                            self.assertEqual((result.verdict, result.authority), want)
+
+    def test_enforce_uses_unit_rules_even_when_pair_authority_is_unavailable(self):
+        for level in ("answered", "learned", "aggressive"):
+            for trigger in (authorization.GC_STOP, authorization.SESSION_END):
+                with self.subTest(authority=level, trigger=trigger):
+                    result = authorization.authorize(
+                        trigger,
+                        "enforce",
+                        authorization.Facts(
+                            leftover=True,
+                            pair_action="invalid",
+                            pair_reason="invalid legacy owner",
+                            learn_authority=level,
+                        ),
+                    )
+                    self.assertEqual(
+                        (result.verdict, result.authority), ("act", "unit")
+                    )
+
+    def test_invalid_legacy_pairs_never_authorize_a_stop(self):
+        for mode in ("adopt", "auto"):
+            for level in ("answered", "learned", "aggressive"):
+                for trigger in (
+                    authorization.GC_STOP,
+                    authorization.JOB_SURVIVORS,
+                    authorization.SESSION_END,
+                ):
+                    with self.subTest(mode=mode, authority=level, trigger=trigger):
+                        result = authorization.authorize(
+                            trigger,
+                            mode,
+                            authorization.Facts(
+                                leftover=True,
+                                pair_action="invalid",
+                                pair_reason="invalid legacy owner",
+                                learn_authority=level,
+                            ),
+                        )
+                        self.assertNotEqual(result.verdict, "act")
+                        self.assertNotEqual(result.authority, "pair")
+
+    def test_configured_leftover_expiry_uses_mode_authority(self):
+        for mode in ("adopt", "auto"):
+            with self.subTest(mode=mode):
+                result = authorization.authorize(
+                    authorization.GC_STOP,
+                    mode,
+                    authorization.Facts(
+                        leftover=True,
+                        pair_action="expiry",
+                        pair_reason="leftover expired after 20 days",
+                        learn_authority="answered",
+                    ),
+                )
+                self.assertEqual((result.verdict, result.authority), ("act", "mode"))
 
     def test_veto_denies_every_stop_trigger_before_mode_authority(self):
         facts = authorization.Facts(scope="leftover/firefox", vetoed="app firefox")

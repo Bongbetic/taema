@@ -7,6 +7,7 @@ a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re
 """
 
 import collections
+from dataclasses import replace
 import hmac
 import json
 import os
@@ -189,6 +190,10 @@ class Daemon:
         """Global kill switch: enforce only. Auto stops go through engine.auto_stop_ok per pair."""
         return self.mode == "enforce"
 
+    @property
+    def effective_authority(self):
+        return policy.effective_authority(self.cfg)
+
     def log_would_stop(self, event, scope, why):
         """Log a would-stop decision only when its scope, mode, or reason signature changes."""
         path = scope if os.path.isabs(scope) else os.path.join(cgroup.base(), scope)
@@ -216,18 +221,13 @@ class Daemon:
     def authorize(self, trigger, facts=None):
         """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
-        f = facts or authorization.Facts()
+        f = facts if facts is not None else authorization.Facts()
         suppress_stops = bool(self.cfg.get("_profile_suppress_stops"))
-        if f.suppress_stops != suppress_stops:
-            f = authorization.Facts(
-                scope=f.scope,
-                leftover=f.leftover,
-                shared=f.shared,
-                unit_survive_logout=f.unit_survive_logout,
-                vetoed=f.vetoed,
-                held=f.held,
-                suppress_stops=suppress_stops,
-            )
+        f = replace(
+            f,
+            suppress_stops=suppress_stops,
+            learn_authority=self.effective_authority["value"],
+        )
         if f.scope:
             path = (
                 f.scope
@@ -237,14 +237,10 @@ class Daemon:
             veto = engine.veto_for_scope(self.store, path) if not f.vetoed else None
             held = self.store.hold_reason(f.scope) if not f.held else ""
             if veto or held:
-                f = authorization.Facts(
-                    scope=f.scope,
-                    leftover=f.leftover,
-                    shared=f.shared,
-                    unit_survive_logout=f.unit_survive_logout,
+                f = replace(
+                    f,
                     vetoed=f.vetoed or (self.store.describe_veto(veto) if veto else ""),
                     held=f.held or held,
-                    suppress_stops=f.suppress_stops,
                 )
         dec = authorization.authorize(trigger, self.mode, f)
         if dec.slot == authorization.VETO:
@@ -545,9 +541,12 @@ class Daemon:
                         owner, key, launcher=False
                     )  # weight 0: only counts closes
                 signature = None
+                decisions = {}
                 if valid_owner and left:
                     signature = self.survivor_signature(owner, left)
-                    self.attribute(owner, left, root=rid[0], signature=signature)
+                    decisions = self.attribute(
+                        owner, left, root=rid[0], signature=signature
+                    )
                     if not terminal:
                         self.store.observe_signature_close(signature)
                 elif left and not terminal:
@@ -566,6 +565,7 @@ class Daemon:
                                 left,
                                 authority=dec.authority or "mode",
                                 signature=signature,
+                                decisions=decisions,
                             )
                         )
                     elif dec.verdict == authorization.WOULD_ACT:
@@ -762,13 +762,134 @@ class Daemon:
                 changed = True
         return changed
 
-    def gui_close(self, rid, owner, left, authority="mode", signature=None):
+    def _stop_gui_survivors(self, owner, items, decisions, scope, signature=None):
+        """Stop only pair-authorized GUI survivors; contain every survivor left behind."""
+        if self.mode != "adopt" or not owner:
+            return set()
+        effective = self.effective_authority["value"]
+        good = []
+        for item in items:
+            decision = decisions.get(item["key"]) or self.store.pair_decision(
+                owner, item["key"]
+            )
+            if not decision or decision[0] != "stop":
+                continue
+            explicit = self.store.explicit_stop(decision)
+            veto = self.store.match_veto(
+                scope=scope,
+                members=[
+                    {
+                        "pid": item["pid"],
+                        "start": item.get("start"),
+                        "apps": [item["key"]],
+                    }
+                ],
+            )
+            facts = authorization.Facts(
+                scope=scope,
+                leftover=True,
+                pair_action="stop",
+                pair_reason=decision[2],
+                pair_explicit=explicit,
+                vetoed=self.store.describe_veto(veto) if veto else "",
+            )
+            gate = self.authorize(authorization.JOB_SURVIVORS, facts)
+            if gate.verdict != authorization.ACT:
+                continue
+            info = self._infos([item["pid"]], origin=owner)[0]
+            ok, why = engine.auto_stop_ok(
+                self.store,
+                owner,
+                item["key"],
+                info,
+                decision=decision,
+                authority=effective,
+            )
+            if ok:
+                good.append((item, decision))
+            else:
+                with self.store.decision_context(
+                    "refusal",
+                    scope=scope,
+                    owner=owner,
+                    authority="pair",
+                    mode=self.mode,
+                    why=why,
+                ):
+                    self.store.log(
+                        event="auto_stop_refused",
+                        scope=scope,
+                        pid=item["pid"],
+                        key=item["key"],
+                        why=why,
+                    )
+        if not good:
+            return set()
+
+        good_items = [item for item, _decision in good]
+        explicit = all(self.store.explicit_stop(decision) for _, decision in good)
+        why = "closed app %s: %s" % (owner, good[0][1][2])
+        matched_signature = self.store.match_signature(
+            signature or self.survivor_signature(owner, good_items)
+        )
+        with self.store.decision_context(
+            "stop",
+            scope=scope,
+            owner=owner,
+            authority="pair",
+            mode=self.mode,
+            why=why,
+        ) as audit_decision:
+            sent = engine.signal_survivors(
+                self.cfg,
+                good_items,
+                engine.auto_grace(self.store, {item["key"] for item in good_items}),
+                explicit,
+            )
+            sent_items = [item for item in good_items if item["pid"] in sent]
+            if sent_items:
+                sent_pairs = list(
+                    dict.fromkeys((owner, item["key"]) for item in sent_items)
+                )
+                self.store.log(
+                    event="stop",
+                    scope=scope,
+                    owner=owner,
+                    pids=[item["pid"] for item in sent_items],
+                    why=why,
+                )
+                self.note_auto_stop(
+                    scope,
+                    why,
+                    sent_pairs,
+                    apps=[item["key"] for item in sent_items],
+                    decision=audit_decision,
+                    owner=owner,
+                    signature_id=(matched_signature or {}).get("id"),
+                )
+        return {item["pid"] for item in sent_items}
+
+    def gui_close(
+        self, rid, owner, left, authority="mode", signature=None, decisions=None
+    ):
         """A GUI root vanished (not a terminal job): standalone leftovers get their own scope, the rest
         go to leftover/<owner>-<id> with a pending review that holds the scope until answered or expiry."""
+        decisions = decisions or {}
         standalone = [l for l in left if self.store.standalone(l["key"])]
         rest = [l for l in left if not self.store.standalone(l["key"])]
         if standalone:
             self.adopt_standalone(standalone, owner)
+        if rest:
+            valid_owner = bool(owner) and not policy.bad_owner(owner, self.deny)
+            name = (
+                "%s/%s" % (engine.LEFTOVER, engine.leaf_slug(owner, rid[0]))
+                if valid_owner
+                else self._provenance_scope(rid)
+            )
+            stopped = self._stop_gui_survivors(
+                owner if valid_owner else "", rest, decisions, name, signature
+            )
+            rest = [item for item in rest if item["pid"] not in stopped]
         if rest:
             valid_owner = bool(owner) and not policy.bad_owner(owner, self.deny)
             name = (
@@ -863,7 +984,38 @@ class Daemon:
             for p in pids
         ]
 
-    def auto_stop_path(self, path, why, require_pair):
+    def _pair_scope_facts(self, path):
+        """Resolve all member decisions for a pair-authorized scope stop."""
+        infos = self._infos(cgroup.tree_procs(path))
+        decisions = [
+            self.store.pair_decision(info.get("origin"), info["key"])
+            if info.get("origin")
+            else ("ask", 0.0, "pair authority: owner is unknown")
+            for info in infos
+        ]
+        if not decisions:
+            action, reason, explicit = (
+                "ask",
+                "pair authority: scope has no members",
+                False,
+            )
+        elif all(item[0] == "stop" for item in decisions):
+            action = "stop"
+            reason = "; ".join(item[2] for item in decisions[:3])
+            explicit = all(self.store.explicit_stop(item) for item in decisions)
+        else:
+            denied = next(item for item in decisions if item[0] != "stop")
+            action, reason, explicit = denied[0], denied[2], False
+        scope = cgroup.rel(path)
+        return authorization.Facts(
+            scope=scope,
+            leftover=scope.startswith(engine.LEFTOVER + "/"),
+            pair_action=action,
+            pair_reason=reason,
+            pair_explicit=explicit,
+        )
+
+    def auto_stop_path(self, path, why, require_pair, authority=None):
         """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
         decided stop); otherwise only the idle checks (known CPU, no edges, no pty host, not protected) apply.
         SIGKILL only when every pair was answered explicitly. Returns True when the scope was removed."""
@@ -873,7 +1025,13 @@ class Daemon:
             return False
         for i in infos:
             if require_pair:
-                ok, w = engine.auto_stop_ok(self.store, i["origin"], i["key"], i)
+                ok, w = engine.auto_stop_ok(
+                    self.store,
+                    i["origin"],
+                    i["key"],
+                    i,
+                    authority=authority or self.effective_authority["value"],
+                )
             else:
                 cpu = i.get("cpu")
                 ok = not (
@@ -956,7 +1114,9 @@ class Daemon:
             )
             return rep["removed"]
 
-    def auto_stop_survivors(self, tag, owner, left, dec, signature_id=None):
+    def auto_stop_survivors(
+        self, tag, owner, left, dec, signature_id=None, authority=None
+    ):
         """Survivors whose pair or matched signature says stop: those passing auto_stop_ok
         are carved into <host scope>/job-<id> (when the host scope is under user/<uid>, no sudo) and
         stopped there, else signalled in place. Everyone else is left alone."""
@@ -999,6 +1159,7 @@ class Daemon:
                 l["key"],
                 infos[l["pid"]],
                 decision=dec.get(l["key"]),
+                authority=authority or self.effective_authority["value"],
             )
             if ok:
                 good.append(l)
@@ -1021,8 +1182,7 @@ class Daemon:
             return
         pairs = list(dict.fromkeys((owner, l["key"]) for l in good))
         explicit = all(
-            dec.get(k, ("", 0.0, ""))[2].startswith("signature answered stop")
-            or self.store.pair_explicit(o, k)
+            self.store.explicit_stop(dec.get(k)) or self.store.pair_explicit(o, k)
             for o, k in pairs
         )
         grace = engine.auto_grace(self.store, {k for _o, k in pairs})
@@ -1247,8 +1407,16 @@ class Daemon:
         veto = self.store.match_veto(members=members)
         if veto and any(action == "stop" for action, _confidence, _why in dec.values()):
             self.store.signature_outcome(signature["id"], "veto")
+        stop_keys = [key for key, decision in dec.items() if decision[0] == "stop"]
         facts = authorization.Facts(
-            vetoed=self.store.describe_veto(veto) if veto else ""
+            vetoed=self.store.describe_veto(veto) if veto else "",
+            pair_action="stop" if stop_keys else "",
+            pair_reason=dec[stop_keys[0]][2] if stop_keys else "",
+            pair_explicit=any(
+                self.store.explicit_stop(dec[key])
+                or self.store.pair_explicit(owner, key)
+                for key in stop_keys
+            ),
         )
         if (
             self.authorize(authorization.JOB_SURVIVORS, facts).verdict
@@ -1256,7 +1424,12 @@ class Daemon:
         ):
             self.guarded(
                 lambda: self.auto_stop_survivors(
-                    tag, owner, left, dec, signature_id=signature["id"]
+                    tag,
+                    owner,
+                    left,
+                    dec,
+                    signature_id=signature["id"],
+                    authority=self.effective_authority["value"],
                 )
             )
         ask = [
@@ -1764,6 +1937,7 @@ class Daemon:
             noted=self.gc_noted,
             lin=self.lineage,
             auto=leftover_leaves,
+            authority=self.effective_authority["value"],
         )
         res, now_empty = [], set()
         remove_empty = (
@@ -1776,12 +1950,17 @@ class Daemon:
             if why == "empty":
                 self._gc_empty(path, leaf, dry_run, res, now_empty)
                 continue
-            dec = self.authorize(
-                authorization.GC_STOP,
-                authorization.Facts(
+            facts = (
+                self._pair_scope_facts(path)
+                if leaf.startswith(engine.LEFTOVER + "/")
+                and self.mode in ("adopt", "auto")
+                else authorization.Facts(
                     scope=leaf, leftover=leaf.startswith(engine.LEFTOVER + "/")
-                ),
+                )
             )
+            if why.startswith("leftover expired after"):
+                facts = replace(facts, pair_action="expiry", pair_reason=why)
+            dec = self.authorize(authorization.GC_STOP, facts)
             res.append(
                 [
                     leaf,
@@ -1798,6 +1977,10 @@ class Daemon:
                 if self.mode == "adopt" and (
                     leaf.startswith("shared/")
                     or engine.unit_for_leaf(self.units, os.path.basename(path))
+                    or (
+                        leaf.startswith(engine.LEFTOVER + "/")
+                        and why.startswith("idle")
+                    )
                 ):
                     res[-1][2] = "review"
                     self._queue_gc_review(path, leaf, why)
@@ -1805,6 +1988,13 @@ class Daemon:
             if (
                 dec.verdict != authorization.ACT
             ):  # keep: a future veto/hold blocks silently here
+                if (
+                    self.mode in ("adopt", "auto")
+                    and leaf.startswith(engine.LEFTOVER + "/")
+                    and why.startswith("idle")
+                ):
+                    res[-1][2] = "review"
+                    self._queue_gc_review(path, leaf, why)
                 continue
             if (
                 self.mode == "auto"
@@ -1814,12 +2004,31 @@ class Daemon:
                 res[-1][2] = "review"
                 self._queue_gc_review(path, leaf, why)
                 continue
+            if dec.authority == authorization.AUTHORITY_PAIR and why.startswith(
+                "pair stop"
+            ):
+                self.guarded(
+                    lambda: self.auto_stop_path(
+                        path,
+                        why,
+                        True,
+                        authority=self.effective_authority["value"],
+                    )
+                )
+                continue
             if self.mode == "auto":
                 require_pair = (
                     dec.authority == authorization.AUTHORITY_PAIR
                     and why.startswith("pair stop")
                 )
-                self.guarded(lambda: self.auto_stop_path(path, why, require_pair))
+                self.guarded(
+                    lambda: self.auto_stop_path(
+                        path,
+                        why,
+                        require_pair,
+                        authority=self.effective_authority["value"],
+                    )
+                )
                 continue
             with self.store.decision_context(
                 "stop",
@@ -1896,10 +2105,18 @@ class Daemon:
             if os.path.basename(d) == "manager":
                 continue
             unit = engine.unit_for_leaf(self.units, os.path.basename(d))
+            scope = cgroup.rel(d)
+            pair_facts = (
+                self._pair_scope_facts(d)
+                if self.mode == "auto"
+                or (self.mode == "adopt" and scope.startswith(engine.LEFTOVER + "/"))
+                else authorization.Facts()
+            )
             dec = self.authorize(
                 authorization.SESSION_END,
-                authorization.Facts(
-                    scope=cgroup.rel(d),
+                replace(
+                    pair_facts,
+                    scope=scope,
                     shared=os.path.basename(d) == "shared",
                     unit_survive_logout=bool(
                         unit and unit.get("kill", {}).get("survive_logout")
@@ -1914,7 +2131,12 @@ class Daemon:
                 continue
             if dec.authority == authorization.AUTHORITY_PAIR:
                 # keep everything unless every member's pair is confidently "stop"
-                if not self.auto_stop_path(d, "session ended", True):
+                if not self.auto_stop_path(
+                    d,
+                    "session ended",
+                    True,
+                    authority=self.effective_authority["value"],
+                ):
                     self.store.log(event="session_end_kept", scope=cgroup.rel(d))
                 continue
             scope = cgroup.rel(d)
@@ -1990,8 +2212,11 @@ class Daemon:
         if c == "status":
             self.store.expire_reviews()
             self._save_if_idle()
+            effective_authority = self.effective_authority
             return {
                 "mode": self.mode,
+                "authority": effective_authority["value"],
+                "authority_source": effective_authority["source"],
                 "profile": self.cfg.get("_profile_name", "auto"),
                 "profile_reason": self.profile_reason,
                 "uptime_s": int(time.time() - self.started),

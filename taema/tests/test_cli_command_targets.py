@@ -168,6 +168,11 @@ class TargetCommands(unittest.TestCase):
         explanation = record["explanation"]
         self.assertEqual(explanation["current_decision"]["action"], "stop")
         self.assertEqual(explanation["authority_source"], "explicit")
+        self.assertEqual(
+            explanation["learn_authority"],
+            {"value": "learned", "source": "mode default for observe"},
+        )
+        self.assertIn("effective authority: learned", emit.call_args.args[2])
         self.assertIn("learned pair: npm -> vite", emit.call_args.args[2])
         auto = next(
             item

@@ -69,6 +69,8 @@
       "properties": {
         "daemon": { "enum": ["running", "unavailable"] },
         "mode": { "type": "string" },
+        "authority": { "type": "string" },
+        "authority_source": { "type": "string" },
         "profile": { "type": "string" },
         "profile_reason": { "type": "string" },
         "feedback_invalid": { "type": "integer", "minimum": 0 },
@@ -166,6 +168,12 @@
         "provenance": { "type": "object" },
         "current_decision": { "$ref": "#/$defs/explanation-decision" },
         "authority_source": { "type": "string" },
+        "learn_authority": {
+          "type": "object",
+          "required": ["value", "source"],
+          "properties": { "value": { "type": "string" }, "source": { "type": "string" } },
+          "additionalProperties": false
+        },
         "vetoes": { "type": "array", "items": { "type": "object" } },
         "hold": { "$ref": "#/$defs/explanation-hold" },
         "protected": { "$ref": "#/$defs/explanation-protected" },

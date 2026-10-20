@@ -357,45 +357,98 @@ class DeadlineLoop(unittest.TestCase):
         )
         self.assertNotIn(pidfd, d.owners)
 
-    def test_idle_run_uses_only_bounded_selector_wakeups(self):
-        d = daemon.Daemon(make_cfg(tmp()))
-        now = [1000.0]
-        d.last = {"adopt": now[0], "gc": now[0]}
-        d.iv_adopt = d.iv_gc = 10**9
-        waits = []
+    def test_idle_run_uses_bounded_wakeups_for_periodic_reconciliation(self):
+        with FakeCg() as cg:
+            d = daemon.Daemon(make_cfg(tmp()))
+            now = [1000.0]
+            d.last = {"adopt": now[0], "gc": now[0]}
+            d.iv_adopt = 120
+            d.iv_gc = 180
+            leaf_dir = cg.leaf("app-busy", [5])
+            events_path = leaf_dir + "/cgroup.events"
+            write(events_path, "populated 1\nfrozen 0\n")
+            leaf_file = open(events_path)
+            self.addCleanup(leaf_file.close)
+            d.leaf_watch[leaf_file.fileno()] = ("app-busy", leaf_file)
+            d.leaf_frozen["app-busy"] = False
 
-        class IdleSelector:
-            def register(self, *_args, **_kwargs):
-                pass
+            owner_fd, owner_writer = os.pipe()
+            os.write(owner_writer, b"ready")
+            os.close(owner_writer)
 
-            def select(self, timeout):
-                waits.append(timeout)
-                now[0] += timeout
-                if len(waits) == 3:
-                    d.stopping = True
-                return []
+            def close_if_open(fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
-        d.sel = IdleSelector()
-        wake_r, wake_w = daemon.socket.socketpair()
-        self.addCleanup(wake_r.close)
-        self.addCleanup(wake_w.close)
-        d.stopping = False
-        with (
-            mock.patch.object(daemon.signal, "signal"),
-            mock.patch.object(daemon.signal, "set_wakeup_fd"),
-            mock.patch.object(daemon.time, "time", side_effect=lambda: now[0]),
-            mock.patch.object(
-                daemon.socket, "socketpair", return_value=(wake_r, wake_w)
-            ),
-            mock.patch.object(d, "check_socket"),
-            mock.patch.object(d, "tick"),
-            mock.patch.object(d.store, "log"),
-            mock.patch.object(d.store, "save"),
-            mock.patch.object(d, "_write_summary_if_dirty"),
-        ):
-            self.assertEqual(d.run(), 0)
-        self.assertEqual(waits, [daemon.MAX_SLEEP] * 3)
-        self.assertFalse(d.collector_events)
+            self.addCleanup(close_if_open, owner_fd)
+            d.owners[owner_fd] = ("scope-owned", 7001, 42)
+            waits = []
+
+            class IdleSelector:
+                def register(self, *_args, **_kwargs):
+                    pass
+
+                def unregister(self, *_args, **_kwargs):
+                    pass
+
+                def select(self, timeout):
+                    waits.append(timeout)
+                    now[0] += timeout
+                    if now[0] >= 1180.0:
+                        # Simulate a cgroup transition whose EPOLLPRI event is missed.
+                        write(events_path, "populated 1\nfrozen 1\n")
+                    if len(waits) == 3:
+                        d.stopping = True
+                    return []
+
+            real_selector = d.sel
+            self.addCleanup(real_selector.close)
+            d.sel = IdleSelector()
+            wake_r, wake_w = daemon.socket.socketpair()
+            self.addCleanup(wake_r.close)
+            self.addCleanup(wake_w.close)
+            d.stopping = False
+            with (
+                mock.patch.object(daemon.signal, "signal"),
+                mock.patch.object(daemon.signal, "set_wakeup_fd"),
+                mock.patch.object(daemon.time, "time", side_effect=lambda: now[0]),
+                mock.patch.object(
+                    daemon.socket, "socketpair", return_value=(wake_r, wake_w)
+                ),
+                mock.patch.object(d, "check_socket"),
+                mock.patch.object(d, "session_ended", return_value=False),
+                mock.patch.object(d, "stop_leaf"),
+                mock.patch.object(engine, "gc_candidates", return_value=[]),
+                mock.patch.object(
+                    inspect.ProcTable,
+                    "scan",
+                    return_value=inspect.ProcTable.from_ppid({}),
+                ),
+                mock.patch.object(d, "adopt_pass", wraps=d.adopt_pass) as adopt,
+                mock.patch.object(d, "gc_pass", wraps=d.gc_pass) as gc_pass,
+                mock.patch.object(
+                    d, "poll_owner_watches", wraps=d.poll_owner_watches
+                ) as poll_owners,
+                mock.patch.object(d.store, "log"),
+                mock.patch.object(d.store, "save"),
+                mock.patch.object(d.store, "save_if_dirty"),
+                mock.patch.object(d.store, "export_daily_if_due"),
+                mock.patch.object(d, "_write_summary_if_dirty"),
+            ):
+                self.assertEqual(d.run(), 0)
+
+            # Over 180 simulated idle seconds, select blocks for exactly three bounded
+            # intervals: one wake per minute, with no zero-timeout busy-spin iterations.
+            self.assertEqual(waits, [daemon.MAX_SLEEP] * 3)
+            self.assertEqual(now[0], 1180.0)
+            adopt.assert_called_once()
+            gc_pass.assert_called_once()
+            poll_owners.assert_called_once_with()
+            self.assertIs(d.leaf_frozen["app-busy"], True)
+            self.assertNotIn(owner_fd, d.owners)
+            self.assertFalse(d.collector_events)
 
     def test_session_state_file(self):
         root = tmp()
@@ -555,6 +608,25 @@ class EmptyLeaves(unittest.TestCase):
         d.leaf_frozen["app-busy"] = False
         d.queue_collector_event(daemon.LeafFrozen(f.fileno(), "app-busy"))
         d.drain_collector_events()
+        self.assertIs(d.leaf_frozen["app-busy"], True)
+        self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_gc_reconciliation_repairs_a_missed_frozen_transition(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-busy/cgroup.events"
+        write(ev, "populated 1\nfrozen 0\n")
+        f = open(ev)
+        self.addCleanup(f.close)
+        d.leaf_watch[f.fileno()] = ("app-busy", f)
+        d.leaf_frozen["app-busy"] = False
+
+        # The source changes without a LeafFrozen event reaching the collector queue.
+        write(ev, "populated 1\nfrozen 1\n")
+        self.assertFalse(d.collector_events)
+        with mock.patch.object(engine, "gc_candidates", return_value=[]):
+            d.queue_collector_event(daemon.LeafReconcile())
+            d.drain_collector_events()
+
         self.assertIs(d.leaf_frozen["app-busy"], True)
         self.assertIn(f.fileno(), d.leaf_watch)
 

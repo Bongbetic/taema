@@ -62,7 +62,7 @@ MAX_COLLECTOR_EVENTS = 4096
 @dataclass(frozen=True, slots=True)
 class OwnerExited:
     fd: int
-    watch: tuple
+    watch: tuple[str, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2243,6 +2243,15 @@ class Daemon:
         if values.get("frozen") in ("0", "1"):
             self.leaf_frozen[event.leaf] = values["frozen"] == "1"
 
+    def _reconcile_leaf_frozen(self):
+        """Refresh watched frozen state from cgroup.events during each GC interval."""
+        for fd, (leaf, _f) in tuple(self.leaf_watch.items()):
+            values = self._current_leaf_event_values(fd, leaf)
+            if values is None:
+                continue
+            if values.get("frozen") in ("0", "1"):
+                self.leaf_frozen[leaf] = values["frozen"] == "1"
+
     def on_leaf_events(self):
         """Collect and drain cgroup.events changes for direct callers and tests."""
         self.collect_leaf_events()
@@ -2357,6 +2366,10 @@ class Daemon:
         )
         if not dry_run and remove_empty:
             self.sync_leaf_watches()
+        # EPOLLPRI is edge-triggered from the last read. A missed readiness event can
+        # otherwise leave this cache stale until another transition, so reconcile it
+        # once per scheduled GC pass (normally every 60 seconds).
+        self._reconcile_leaf_frozen()
         for path, why in cands:
             leaf = cgroup.rel(path)
             if why == "empty":

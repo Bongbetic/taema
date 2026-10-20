@@ -261,12 +261,12 @@ def feedback(cfg, store, op, key):
     return how if reply and reply.get("ok") else "refused"
 
 
-def feedback_action(cfg, store, op, queue_if_down=True, **fields):
+def feedback_action(cfg, store, op, queue_if_down=True, timeout=3.0, **fields):
     """Send a versioned policy action to the daemon or append it for offline replay."""
     import uuid
 
     msg = {"v": 2, "id": uuid.uuid4().hex, "op": op, **fields}
-    reply = ask(cfg, {"cmd": "feedback", **msg})
+    reply = ask(cfg, {"cmd": "feedback", **msg}, timeout=timeout)
     if reply is not None:
         return "daemon", reply
     if not queue_if_down:
@@ -804,23 +804,44 @@ def _sudo_denied(msg):
 
 
 def cmd_run(a):
-    cfg, store, units = _load(a)
     restore_launch = os.environ.pop("TAEMA_RESTORE_LAUNCH", None) == "1"
+    restore_ack_fd = None
+    if restore_launch:
+        raw_ack_fd = os.environ.pop("TAEMA_RESTORE_ACK_FD", "")
+        if raw_ack_fd.isdecimal():
+            restore_ack_fd = int(raw_ack_fd)
+
+    def restore_fail(message, code=1):
+        if restore_launch and restore_ack_fd is not None:
+            try:
+                os.write(
+                    restore_ack_fd,
+                    b"E" + str(message).encode("utf-8", errors="replace")[:2048],
+                )
+            except OSError:
+                pass
+        return die(message, code)
+
+    if restore_launch and restore_ack_fd is None:
+        return die("restore startup acknowledgment is unavailable")
+    cfg, store, units = _load(a)
     name = a.name
     if not cgroup.valid_rel(name) or "/" in name or len(name) > 32:
-        return die("bad name (use a-z 0-9 _ -, max 32)")
+        return restore_fail("bad name (use a-z 0-9 _ -, max 32)")
     base = cgroup.base()
     if not os.path.isdir(base):
-        return die(
+        return restore_fail(
             "%s missing; is the taema service running and are you in the taema group? (sv status taema)"
             % base
         )
     leaf = "%s/scope-%s" % (base, name)
     if os.path.isdir(leaf) and cgroup.tree_procs(leaf) and not a.join:
-        return die("scope %s already has processes (use --join to add)" % name)
+        return restore_fail("scope %s already has processes (use --join to add)" % name)
     owner = os.getpid() if a.bind else a.owner
     if owner and inspect.uid_of(owner) == -1:
-        return die("owner pid %d is gone; not starting scope-%s" % (owner, name))
+        return restore_fail(
+            "owner pid %d is gone; not starting scope-%s" % (owner, name)
+        )
     if getattr(a, "dry_run", False):
         print("dry run: create scope-%s and attach %s" % (name, " ".join(a.cmd)))
         return 0
@@ -836,7 +857,7 @@ def cmd_run(a):
             os.rmdir(leaf)
         except OSError:
             pass
-        return die("register failed: %s" % reply["error"])
+        return restore_fail("register failed: %s" % reply["error"])
     try:
         trace = (
             store.decision_context(
@@ -886,7 +907,7 @@ def cmd_run(a):
             os.rmdir(leaf)
         except OSError:
             pass
-        return die("attach failed: %s" % e)
+        return restore_fail("attach failed: %s" % e)
     if owner and reply is None:
         print(
             "taema: daemon not running; no owner watch for scope-%s" % name,
@@ -898,7 +919,20 @@ def cmd_run(a):
             file=sys.stderr,
         )
     if restore_launch:
-        os.execvpe(a.cmd[0], a.cmd, inspect.restore_environment(os.environ))
+        try:
+            target_env = inspect.restore_environment(os.environ)
+            os.set_inheritable(restore_ack_fd, False)
+            os.write(restore_ack_fd, b"R")
+            os.execvpe(a.cmd[0], a.cmd, target_env)
+        except OSError as error:
+            try:
+                os.write(
+                    restore_ack_fd,
+                    b"E" + str(error).encode("utf-8", errors="replace")[:2048],
+                )
+            except OSError:
+                pass
+            return die("could not exec restored command: %s" % error)
     os.execvp(a.cmd[0], a.cmd)
 
 
@@ -1795,6 +1829,7 @@ def cmd_undo(a):
             action_id=str(target_id),
             restore=True,
             queue_if_down=False,
+            timeout=20.0,
         )
         if how == "offline":
             how, reply = feedback_action(cfg, store, "undo", action_id=str(target_id))
@@ -1875,6 +1910,7 @@ def cmd_restore(a):
         action_id=identifier,
         restore=True,
         queue_if_down=False,
+        timeout=20.0,
     )
     if how == "offline":
         return die("restore requires the taema daemon to be running", 2)

@@ -3,6 +3,7 @@
 
     taema-attach attach PID NAME           move PID into /sys/fs/cgroup/user/<uid>/scope-NAME
     taema-attach move RELPATH PID...       move PIDs into /sys/fs/cgroup/user/<uid>/RELPATH
+    taema-attach oom-restore PID START VALUE restore one caller-owned process priority
 
 An unprivileged process cannot move a task out of its login-session cgroup: the lowest
 common ancestor of the source and the destination is the root cgroup. This helper does only
@@ -193,6 +194,47 @@ def move_one(pid, caller, rel, dest, rules):
         os.close(fd)
 
 
+def restore_oom(pid, caller, expected_start, value):
+    """Restore one caller-owned process's oom_score_adj after validating its identity."""
+    if pid <= 1 or expected_start <= 0 or not -1000 <= value <= 1000:
+        raise Refused("invalid OOM priority restore target")
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        raise Refused("OOM priority target is gone")
+    except OSError as error:
+        raise Refused("pidfd_open(%d) failed: %s" % (pid, error.strerror))
+    try:
+        try:
+            if pid_uid(pid) != caller or starttime(pid) != expected_start:
+                raise Refused("OOM priority target changed identity")
+            target_fd = os.open(
+                "/proc/%d/oom_score_adj" % pid,
+                os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            raise Refused("OOM priority target is gone")
+        except OSError as error:
+            raise Refused("could not open OOM priority target: %s" % error.strerror)
+        try:
+            if (
+                pidfd_gone(pidfd)
+                or pid_uid(pid) != caller
+                or starttime(pid) != expected_start
+            ):
+                raise Refused("OOM priority target changed identity")
+            os.write(target_fd, (str(value) + "\n").encode("ascii"))
+        except (FileNotFoundError, ProcessLookupError):
+            raise Refused("OOM priority target is gone")
+        except OSError as error:
+            raise Refused("could not restore OOM priority: %s" % error.strerror)
+        finally:
+            os.close(target_fd)
+        log("%d uid=%d pid=%d oom_score_adj=%d RESTORED" % (time.time(), caller, pid, value))
+    finally:
+        os.close(pidfd)
+
+
 def main(argv):
     caller = os.environ.get("SUDO_UID", "")
     if os.geteuid() != 0 or not caller.isdigit():
@@ -200,6 +242,17 @@ def main(argv):
     caller = int(caller)
     if caller == 0:
         raise Refused("refusing uid 0")
+    if len(argv) == 4 and argv[0] == "oom-restore":
+        _, pid_s, start_s, value_s = argv
+        if not re.fullmatch(r"[0-9]+", pid_s) or not re.fullmatch(r"[0-9]+", start_s):
+            raise Refused("bad OOM priority target")
+        if not re.fullmatch(r"-?[0-9]+", value_s):
+            raise Refused("bad OOM priority value")
+        pid, expected_start, value = int(pid_s), int(start_s), int(value_s)
+        if pid <= 1 or expected_start <= 0 or not -1000 <= value <= 1000:
+            raise Refused("bad OOM priority target or value")
+        restore_oom(pid, caller, expected_start, value)
+        return 0
     if len(argv) >= 3 and argv[0] == "attach" and len(argv) == 3:
         _, pid_s, name = argv
         if not NAME.fullmatch(name):
@@ -208,7 +261,10 @@ def main(argv):
     elif len(argv) >= 3 and argv[0] == "move":
         rel, pids = argv[1], argv[2:]
     else:
-        raise Refused("usage: taema-attach attach PID NAME | move RELPATH PID...")
+        raise Refused(
+            "usage: taema-attach attach PID NAME | move RELPATH PID... | "
+            "oom-restore PID START VALUE"
+        )
     if not valid_rel(rel):
         raise Refused("bad path")
     dest = "%s/user/%d/%s" % (CG, caller, rel)

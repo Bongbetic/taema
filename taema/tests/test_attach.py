@@ -68,6 +68,55 @@ class AttachTests(unittest.TestCase):
                 self.h.main(["move", "scope-x", "50"])
         self.assertIn("unavailable", str(cm.exception))
 
+    def test_main_dispatches_oom_restore_with_starttime(self):
+        with (
+            mock.patch.object(self.h.os, "geteuid", return_value=0),
+            mock.patch.dict(os.environ, {"SUDO_UID": "1000"}),
+            mock.patch.object(self.h, "restore_oom") as restore_oom,
+        ):
+            self.assertEqual(self.h.main(["oom-restore", "42", "987", "-200"]), 0)
+        restore_oom.assert_called_once_with(42, 1000, 987, -200)
+
+    def test_main_rejects_invalid_oom_restore_arguments(self):
+        with (
+            mock.patch.object(self.h.os, "geteuid", return_value=0),
+            mock.patch.dict(os.environ, {"SUDO_UID": "1000"}),
+            mock.patch.object(self.h, "restore_oom") as restore_oom,
+        ):
+            with self.assertRaises(self.h.Refused):
+                self.h.main(["oom-restore", "42", "987", "1001"])
+        restore_oom.assert_not_called()
+
+    def test_restore_oom_checks_identity_and_writes_requested_value(self):
+        target = os.path.join(self.tmp.name, "oom_score_adj")
+        with open(target, "w", encoding="ascii"):
+            pass
+        target_fd = os.open(target, os.O_WRONLY)
+        pidfd = os.open("/dev/null", os.O_RDONLY)
+        with (
+            mock.patch.object(self.h.os, "pidfd_open", return_value=pidfd),
+            mock.patch.object(self.h.os, "open", return_value=target_fd),
+            mock.patch.object(self.h, "pid_uid", return_value=1000),
+            mock.patch.object(self.h, "starttime", return_value=987),
+            mock.patch.object(self.h, "pidfd_gone", return_value=False),
+            mock.patch.object(self.h, "log"),
+        ):
+            self.h.restore_oom(42, 1000, 987, -200)
+        with open(target, encoding="ascii") as source:
+            self.assertEqual(source.read(), "-200\n")
+
+    def test_restore_oom_refuses_reused_pid_before_opening_target(self):
+        pidfd = os.open("/dev/null", os.O_RDONLY)
+        with (
+            mock.patch.object(self.h.os, "pidfd_open", return_value=pidfd),
+            mock.patch.object(self.h.os, "open") as open_target,
+            mock.patch.object(self.h, "pid_uid", return_value=1000),
+            mock.patch.object(self.h, "starttime", return_value=988),
+        ):
+            with self.assertRaises(self.h.Refused):
+                self.h.restore_oom(42, 1000, 987, -200)
+        open_target.assert_not_called()
+
     def test_starttime_parser(self):
         stat = b"123 (we ) ird (name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99 20\n"
         # fields after ')': state=3 ... field 22 is index 19 of the remainder

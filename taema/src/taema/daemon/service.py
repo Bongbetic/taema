@@ -53,6 +53,7 @@ SHELL_KEYS = ("sh", "bash", "dash", "zsh", "fish")
 MAX_GATE_SKIPS = 4  # fork gate: at most 4 skipped adopt passes, so every 5th one runs
 MAX_SUBSCRIBERS = 16
 MAX_SUBSCRIBER_QUEUE = 4096
+RESTORE_START_TIMEOUT = 15.0
 MAX_EVENT_REPLAY = 1000
 SUBSCRIBER_CLOSE_TTL = 1.0
 
@@ -2549,15 +2550,15 @@ class Daemon:
                     or inspect.starttime(pid) != start
                 ):
                     return {"ok": False, "error": "oom priority target is stale"}
-                safe_oom_values.append((pid, value))
+                safe_oom_values.append((pid, start, value))
             try:
                 for item in resources:
                     with open(
                         os.path.join(path, item["file"]), "w", encoding="ascii"
                     ) as target:
                         target.write(item["value"].rstrip() + "\n")
-                for pid, value in safe_oom_values:
-                    engine.helper_oom_restore(self.cfg, pid, value)
+                for pid, start, value in safe_oom_values:
+                    engine.helper_oom_restore(self.cfg, pid, start, value)
             except (OSError, engine.Refused) as error:
                 return {
                     "ok": False,
@@ -2582,11 +2583,66 @@ class Daemon:
                 and member.get("key")
             ]
             live = self._live_standalone_members(safe, scope=scope)
-            if live:
-                self.adopt_standalone(live)
+            if live and not self.adopt_standalone(live):
+                return {"ok": False, "error": "could not adopt standalone members"}
             return {"ok": True, "scope": scope, "adopted": len(live)}
 
         return {"ok": False, "error": "undo operation is unsupported"}
+
+    def _await_restore_startup(self, fd):
+        """Wait for the runner to confirm attachment and successful exec via close-on-exec pipe."""
+        data = bytearray()
+        deadline = time.monotonic() + RESTORE_START_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, "timed out waiting for restored command startup"
+            try:
+                server = self.srv
+                wait_fds = [fd] + ([server] if server is not None else [])
+                ready, _, _ = select.select(wait_fds, [], [], remaining)
+                if not ready:
+                    return False, "timed out waiting for restored command startup"
+                if server is not None and server in ready:
+                    # The restore runner registers and attaches through this socket before
+                    # exec. Service that RPC while waiting so the single-threaded daemon
+                    # does not deadlock against its own child.
+                    self.guarded(lambda: self.serve(server))
+                if fd not in ready:
+                    continue
+                chunk = os.read(fd, 4096)
+            except OSError as error:
+                return False, "could not confirm restored command startup: %s" % error
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > 4096:
+                return False, "restored command startup response was too large"
+        if data == b"R":
+            return True, None
+        if data.startswith(b"E"):
+            detail = data[1:].decode("utf-8", errors="replace").strip()
+            return False, detail or "restored command failed during startup"
+        if data.startswith(b"R"):
+            detail = data[1:].decode("utf-8", errors="replace").strip()
+            return False, detail or "restored command failed after attaching"
+        return False, "launcher exited before confirming attachment and exec"
+
+    @staticmethod
+    def _stop_restore_launcher(child):
+        """Stop a launcher that failed to reach the exec acknowledgment."""
+        poll = getattr(child, "poll", None)
+        if not callable(poll) or poll() is not None:
+            return
+        try:
+            child.terminate()
+            try:
+                child.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=1.0)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _launch_restored(self, decision_id):
         """Relaunch one opted-in root through `taema run` with a fresh scope and safe env."""
@@ -2631,10 +2687,18 @@ class Daemon:
             "--",
             *argv,
         ]
+        try:
+            read_fd, write_fd = os.pipe()
+        except OSError as error:
+            return {"error": "could not prepare restored command startup: %s" % error}
+        runner_env["TAEMA_RESTORE_ACK_FD"] = str(write_fd)
         restored_at = self.store.now()
         if not self.store.mark_decision_restored(decision_id, at=restored_at):
+            os.close(read_fd)
+            os.close(write_fd)
             return {"error": "this decision has already been restored"}
         self.store.save()
+        child = None
         try:
             child = subprocess.Popen(
                 runner,
@@ -2645,14 +2709,33 @@ class Daemon:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
+                pass_fds=(write_fd,),
             )
-        except OSError as error:
+        except (OSError, ValueError) as error:
+            os.close(read_fd)
             self.store.clear_decision_restored(decision_id, restored_at)
             self.store.log(
                 event="restore_failed", decision_id=decision_id, error=str(error)
             )
             self.store.save()
             return {"error": "could not relaunch stopped app: %s" % error}
+        finally:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+        try:
+            started, startup_error = self._await_restore_startup(read_fd)
+        finally:
+            os.close(read_fd)
+        if not started:
+            self._stop_restore_launcher(child)
+            self.store.clear_decision_restored(decision_id, restored_at)
+            self.store.log(
+                event="restore_failed", decision_id=decision_id, error=startup_error
+            )
+            self.store.save()
+            return {"error": "could not relaunch stopped app: %s" % startup_error}
         return {"restored": True, "pid": child.pid, "scope": "scope-" + scope}
 
     # ---- socket API ----

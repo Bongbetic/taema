@@ -48,19 +48,30 @@ def helper_attach(cfg, pid, name):
         raise Refused(r.stderr.strip() or "attach failed")
 
 
-def helper_oom_restore(cfg, pid, value):
+def helper_oom_restore(cfg, pid, start, value):
     """Restore a recorded oom_score_adj value through the root helper."""
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
         or pid <= 1
+        or not isinstance(start, int)
+        or isinstance(start, bool)
+        or start <= 0
         or not isinstance(value, int)
         or isinstance(value, bool)
         or not -1000 <= value <= 1000
     ):
         raise Refused("invalid OOM priority restore target")
     result = subprocess.run(
-        ["sudo", "-n", helper_path(cfg), "oom-restore", str(pid), str(value)],
+        [
+            "sudo",
+            "-n",
+            helper_path(cfg),
+            "oom-restore",
+            str(pid),
+            str(start),
+            str(value),
+        ],
         capture_output=True,
         text=True,
     )

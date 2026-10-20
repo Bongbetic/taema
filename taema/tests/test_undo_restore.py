@@ -5,6 +5,7 @@ import io
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
@@ -377,7 +378,7 @@ class UndoDaemonTests(unittest.TestCase):
         self.assertEqual(
             Path(os.path.join(qos_path, "io.weight")).read_text(), "default 100\n"
         )
-        restore_oom.assert_called_once_with(self.daemon.cfg, 42, 0)
+        restore_oom.assert_called_once_with(self.daemon.cfg, 42, 99, 0)
 
     def test_undo_containment_adopts_live_members_as_standalone(self):
         decision = self.daemon.store.record_decision(
@@ -407,6 +408,35 @@ class UndoDaemonTests(unittest.TestCase):
         adopt.assert_called_once()
         self.assertEqual(self.daemon.store.data["standalone"]["app"]["n"], 1)
 
+    def test_refused_standalone_adoption_does_not_consume_undo(self):
+        decision = self.daemon.store.record_decision(
+            "containment",
+            scope="leftover/app",
+            undo={
+                "operation": "adopt_standalone",
+                "scope": "leftover/app",
+                "members": [{"pid": 42, "start": 99, "key": "app"}],
+            },
+        )
+        self.daemon.store.save()
+        with (
+            mock.patch.object(
+                self.daemon,
+                "_live_standalone_members",
+                return_value=[{"pid": 42, "start": 99, "key": "app"}],
+            ),
+            mock.patch.object(
+                service.engine,
+                "run_ops",
+                side_effect=service.engine.Refused("helper refused move"),
+            ),
+        ):
+            result = self.daemon.store.undo_decision(
+                str(decision["id"]), external_apply=self.daemon._undo_action_effect
+            )
+        self.assertIsNone(result)
+        self.assertFalse(self.daemon.store.decision(decision["id"])["undone"])
+
     def test_restore_launch_uses_fresh_scope_devnull_and_filtered_environment(self):
         cwd = tempfile.mkdtemp()
         action = self.daemon.store.record_auto_action(
@@ -433,7 +463,10 @@ class UndoDaemonTests(unittest.TestCase):
             mock.patch.object(
                 service.subprocess,
                 "Popen",
-                return_value=SimpleNamespace(pid=9876),
+                side_effect=lambda _command, **options: (
+                    os.write(options["pass_fds"][0], b"R"),
+                    SimpleNamespace(pid=9876),
+                )[1],
             ) as popen,
         ):
             result = self.daemon.handle(
@@ -467,6 +500,7 @@ class UndoDaemonTests(unittest.TestCase):
         self.assertIs(options["stdout"], service.subprocess.DEVNULL)
         self.assertIs(options["stderr"], service.subprocess.DEVNULL)
         self.assertTrue(options["start_new_session"])
+        self.assertEqual(len(options["pass_fds"]), 1)
         env = options["env"]
         self.assertEqual(env["PATH"], "/usr/bin")
         self.assertEqual(env["HOME"], "/home/alice")
@@ -487,25 +521,35 @@ class UndoDaemonTests(unittest.TestCase):
             dry_run=False,
             cmd=["/usr/bin/example"],
         )
-        with (
-            mock.patch.object(cli, "_load", return_value=(cfg, store, [])),
-            mock.patch.object(cli, "ask", return_value=None),
-            mock.patch.object(cli.engine, "helper_attach"),
-            mock.patch.object(cli.os, "execvpe", side_effect=SystemExit) as execvpe,
-            mock.patch.dict(
-                os.environ,
-                {
-                    "PATH": "/usr/bin",
-                    "HOME": "/home/alice",
-                    "TAEMA_RESTORE_LAUNCH": "1",
-                    "TAEMA_CONFIG": "/tmp/secret.toml",
-                    "API_TOKEN": "secret",
-                },
-                clear=True,
-            ),
-        ):
-            with self.assertRaises(SystemExit):
-                cli.cmd_run(args)
+        read_fd, write_fd = os.pipe()
+        try:
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, store, [])),
+                mock.patch.object(cli, "ask", return_value=None),
+                mock.patch.object(cli.engine, "helper_attach"),
+                mock.patch.object(
+                    cli.os, "execvpe", side_effect=OSError("executable unavailable")
+                ) as execvpe,
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "PATH": "/usr/bin",
+                        "HOME": "/home/alice",
+                        "TAEMA_RESTORE_LAUNCH": "1",
+                        "TAEMA_RESTORE_ACK_FD": str(write_fd),
+                        "TAEMA_CONFIG": "/tmp/secret.toml",
+                        "API_TOKEN": "secret",
+                    },
+                    clear=True,
+                ),
+            ):
+                self.assertNotEqual(cli.cmd_run(args), 0)
+        finally:
+            os.close(write_fd)
+        ack = os.read(read_fd, 4096)
+        os.close(read_fd)
+        self.assertTrue(ack.startswith(b"RE"))
+        self.assertIn(b"executable unavailable", ack)
         env = execvpe.call_args.args[2]
         self.assertEqual(env, {"PATH": "/usr/bin", "HOME": "/home/alice"})
         self.assertEqual(execvpe.call_args.args[0], "/usr/bin/example")
@@ -518,10 +562,15 @@ class UndoDaemonTests(unittest.TestCase):
             restore={"argv": ["/usr/bin/editor"], "cwd": tempfile.gettempdir()},
         )
         self.daemon.store.save()
+
+        def start_runner(_command, **options):
+            if popen.call_count == 1:
+                raise OSError("launcher unavailable")
+            os.write(options["pass_fds"][0], b"R")
+            return SimpleNamespace(pid=21)
+
         with mock.patch.object(
-            service.subprocess,
-            "Popen",
-            side_effect=[OSError("launcher unavailable"), SimpleNamespace(pid=21)],
+            service.subprocess, "Popen", side_effect=start_runner
         ) as popen:
             failed = self.daemon.handle(
                 {
@@ -548,6 +597,165 @@ class UndoDaemonTests(unittest.TestCase):
             )
         self.assertTrue(retried["restored"])
         self.assertEqual(popen.call_count, 2)
+
+    def test_restore_startup_without_exec_ack_releases_reservation(self):
+        action = self.daemon.store.record_auto_action(
+            "scope-old",
+            "automatic stop",
+            apps=["editor"],
+            restore={"argv": ["/usr/bin/editor"], "cwd": tempfile.gettempdir()},
+        )
+        self.daemon.store.save()
+        with mock.patch.object(
+            service.subprocess,
+            "Popen",
+            return_value=SimpleNamespace(pid=23),
+        ):
+            result = self.daemon._launch_restored(action["decision_id"])
+        self.assertIn("before confirming", result["error"])
+        decision = self.daemon.store.decision(action["decision_id"])
+        self.assertIsNone(decision["undo"].get("restored_at"))
+
+    def test_restore_startup_services_child_rpc_through_live_daemon_socket(self):
+        action = self.daemon.store.record_auto_action(
+            "scope-old",
+            "automatic stop",
+            apps=["editor"],
+            restore={"argv": ["/usr/bin/editor"], "cwd": tempfile.gettempdir()},
+        )
+        self.daemon.store.save()
+        self.daemon.bind(self.daemon.cfg["paths"]["socket"])
+
+        def close_daemon_sockets():
+            for fd in tuple(self.daemon.owners):
+                try:
+                    self.daemon.sel.unregister(fd)
+                except (KeyError, OSError, ValueError):
+                    pass
+                os.close(fd)
+            self.daemon.owners.clear()
+            if self.daemon.srv is not None:
+                self.daemon.srv.close()
+            self.daemon.sel.close()
+
+        self.addCleanup(close_daemon_sockets)
+        response = []
+        runner_thread = []
+
+        def start_runner(_command, **options):
+            write_fd = os.dup(options["pass_fds"][0])
+
+            def run_child_rpc():
+                try:
+                    result = cli.ask(
+                        self.daemon.cfg,
+                        {
+                            "cmd": "register",
+                            "scope": "scope-restore-%d" % action["decision_id"],
+                            "owner": os.getpid(),
+                        },
+                    )
+                    response.append(result)
+                    os.write(
+                        write_fd, b"R" if result and result.get("watching") else b"E"
+                    )
+                finally:
+                    os.close(write_fd)
+
+            thread = threading.Thread(target=run_child_rpc, daemon=True)
+            thread.start()
+            runner_thread.append(thread)
+            return SimpleNamespace(pid=90001)
+
+        with mock.patch.object(service.subprocess, "Popen", side_effect=start_runner):
+            result = self.daemon._launch_restored(action["decision_id"])
+        runner_thread[0].join(timeout=4)
+        self.assertFalse(runner_thread[0].is_alive())
+        self.assertEqual(response, [{"watching": True}])
+        self.assertTrue(result["restored"])
+
+    def test_restore_startup_timeout_is_bounded(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with (
+                mock.patch.object(service.time, "monotonic", return_value=0.0),
+                mock.patch.object(service.select, "select", return_value=([], [], [])),
+            ):
+                started, error = self.daemon._await_restore_startup(read_fd)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+        self.assertFalse(started)
+        self.assertIn("timed out", error)
+
+    def test_restore_startup_ack_reports_runner_errors_and_rejects_bad_payloads(self):
+        for payload, expected in (
+            (b"Eexec failed", "exec failed"),
+            (b"Rattach then failed", "attach then failed"),
+            (b"unexpected", "before confirming"),
+        ):
+            with self.subTest(payload=payload):
+                read_fd, write_fd = os.pipe()
+                os.write(write_fd, payload)
+                os.close(write_fd)
+                try:
+                    started, error = self.daemon._await_restore_startup(read_fd)
+                finally:
+                    os.close(read_fd)
+                self.assertFalse(started)
+                self.assertIn(expected, error)
+
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"x" * 5000)
+        os.close(write_fd)
+        try:
+            started, error = self.daemon._await_restore_startup(read_fd)
+        finally:
+            os.close(read_fd)
+        self.assertFalse(started)
+        self.assertIn("too large", error)
+
+    def test_restore_startup_ack_handles_read_errors_and_expired_deadline(self):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        try:
+            with (
+                mock.patch.object(
+                    service.select, "select", return_value=([read_fd], [], [])
+                ),
+                mock.patch.object(
+                    service.os, "read", side_effect=OSError("read failed")
+                ),
+            ):
+                started, error = self.daemon._await_restore_startup(read_fd)
+        finally:
+            os.close(read_fd)
+        self.assertFalse(started)
+        self.assertIn("read failed", error)
+
+        read_fd, write_fd = os.pipe()
+        try:
+            with mock.patch.object(service.time, "monotonic", side_effect=[0.0, 16.0]):
+                started, error = self.daemon._await_restore_startup(read_fd)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+        self.assertFalse(started)
+        self.assertIn("timed out", error)
+
+    def test_restore_launcher_is_killed_after_shutdown_timeout(self):
+        child = SimpleNamespace(
+            poll=mock.Mock(return_value=None),
+            terminate=mock.Mock(),
+            wait=mock.Mock(
+                side_effect=[service.subprocess.TimeoutExpired("runner", 1), None]
+            ),
+            kill=mock.Mock(),
+        )
+        service.Daemon._stop_restore_launcher(child)
+        child.terminate.assert_called_once()
+        child.kill.assert_called_once()
+        self.assertEqual(child.wait.call_count, 2)
 
 
 class RestoreCliTests(unittest.TestCase):

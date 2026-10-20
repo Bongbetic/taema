@@ -2058,7 +2058,9 @@ def cmd_forget(a):
             "forget requires an executable; use --veto TARGET to remove a veto", 2
         )
     if getattr(a, "dry_run", False):
-        action = "forget all learned records for" if getattr(a, "all", False) else "forget"
+        action = (
+            "forget all learned records for" if getattr(a, "all", False) else "forget"
+        )
         print("dry run: %s %s" % (action, a.exe))
         return 0
     if getattr(a, "all", False):
@@ -2067,7 +2069,10 @@ def cmd_forget(a):
         if not reply or not reply.get("ok"):
             return die((reply or {}).get("error", "could not forget learned records"))
         if known:
-            print("forgot all learned records for %s (%s); vetoes preserved" % (a.exe, how))
+            print(
+                "forgot all learned records for %s (%s); vetoes preserved"
+                % (a.exe, how)
+            )
         else:
             print("no learned records for %s (%s); vetoes preserved" % (a.exe, how))
         return 0
@@ -2788,6 +2793,14 @@ def cmd_learn_export(a):
     return 0
 
 
+def _learn_evidence_text(record):
+    evidence = record.get("evidence") or {}
+    return (
+        ", ".join("%s=%s" % (name, evidence[name]) for name in sorted(evidence))
+        or "none"
+    )
+
+
 def cmd_learn(a):
     """Show the read-only learning views shared with status and why."""
     from . import view
@@ -2795,33 +2808,9 @@ def cmd_learn(a):
     _cfg, store, _units = _load(a)
     selected = getattr(a, "_command", "learn show").partition(" ")[2] or "show"
     if selected == "show" and getattr(a, "legacy", False):
-        reviews = [
-            review
-            for review in store.open_reviews()
-            if review.get("kind") == "legacy-invalid"
-        ]
-        reviews = store.review_details(reviews)
-        reviews_by_pair = {
-            (review.get("owner"), survivor): review
-            for review in reviews
-            for survivor in review.get("survivors", [])
-        }
-        records = []
-        for pair in store.pairs_summary(limit=1000):
-            raw = store.data.get("pairs", {}).get(
-                store.pkey(pair["owner"], pair["leftover"]), {}
-            )
-            if raw.get("source") != "legacy-invalid":
-                continue
-            review = reviews_by_pair.get((pair["owner"], pair["leftover"]))
-            records.append(
-                {
-                    **pair,
-                    "source": "legacy-invalid",
-                    "legacy_answer": (review or {}).get("answer"),
-                    "review_id": (review or {}).get("id"),
-                }
-            )
+        legacy = store.legacy_invalid_summary(limit=1000)
+        records = legacy["records"]
+        reviews = legacy["reviews"]
         human_lines = ["legacy-invalid pairs: %d" % len(records)]
         for pair in records:
             human_lines.append(
@@ -2856,13 +2845,6 @@ def cmd_learn(a):
         pairs = store.pairs_summary(limit=1000)
         signatures = store.signatures_summary(limit=2000)
 
-        def evidence_text(record):
-            evidence = record.get("evidence") or {}
-            return ", ".join(
-                "%s=%s" % (name, evidence[name])
-                for name in sorted(evidence)
-            ) or "none"
-
         def outcome_text(record):
             outcome = record.get("last_outcome") or {}
             if not outcome:
@@ -2871,7 +2853,10 @@ def cmd_learn(a):
             label = outcome.get("outcome") or "unknown"
             return "%s (%s)" % (label, decision) if decision else label
 
-        human_lines = ["apps: %d" % len(apps), "  app  decision  confidence  evidence  last outcome"]
+        human_lines = [
+            "apps: %d" % len(apps),
+            "  app  decision  confidence  evidence  last outcome",
+        ]
         for app in apps:
             human_lines.append(
                 "  %s (%s)  %s  %.2f  %s  %s"
@@ -2880,12 +2865,15 @@ def cmd_learn(a):
                     lineage.clean(app["key"], 32),
                     app["decision"],
                     app["confidence"],
-                    evidence_text(app),
+                    _learn_evidence_text(app),
                     outcome_text(app),
                 )
             )
         human_lines.extend(
-            ["pairs: %d" % len(pairs), "  owner -> leftover  decision  confidence  evidence  last outcome"]
+            [
+                "pairs: %d" % len(pairs),
+                "  owner -> leftover  decision  confidence  evidence  last outcome",
+            ]
         )
         for pair in pairs:
             human_lines.append(
@@ -2895,7 +2883,7 @@ def cmd_learn(a):
                     lineage.clean(pair["leftover"], 32),
                     pair.get("decision", pair.get("action", "ask")),
                     pair.get("confidence", 0.0),
-                    evidence_text(pair),
+                    _learn_evidence_text(pair),
                     outcome_text(pair),
                 )
             )
@@ -2913,7 +2901,7 @@ def cmd_learn(a):
                     lineage.clean(signature["owner"], 32),
                     signature["decision"],
                     signature["confidence"],
-                    evidence_text(signature),
+                    _learn_evidence_text(signature),
                     outcome_text(signature),
                 )
             )
@@ -2943,7 +2931,6 @@ def cmd_learn(a):
             )
         ]
         for app in records:
-            evidence = app["evidence"]
             last = app.get("last_outcome") or {}
             outcome = last.get("outcome") or "none"
             lines.append(
@@ -2952,9 +2939,7 @@ def cmd_learn(a):
                     lineage.clean(app["display"], 28),
                     app["decision"],
                     app["confidence"],
-                    ", ".join(
-                        "%s=%s" % (name, evidence[name]) for name in sorted(evidence)
-                    ),
+                    _learn_evidence_text(app),
                     outcome,
                 )
             )

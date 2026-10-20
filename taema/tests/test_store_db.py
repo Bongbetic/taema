@@ -48,7 +48,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 7
+                    connection.execute("PRAGMA user_version").fetchone()[0], 8
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -119,7 +119,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     ("signature-1",),
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 7
+                    connection.execute("PRAGMA user_version").fetchone()[0], 8
                 )
 
             self.assertTrue({"suspended_until", "suspended_at"}.issubset(columns))
@@ -154,7 +154,7 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 7
+                    connection.execute("PRAGMA user_version").fetchone()[0], 8
                 )
                 self.assertTrue(
                     connection.execute(
@@ -194,7 +194,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     "SELECT id, owner, runtime_hash, veto FROM signatures"
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 7
+                    connection.execute("PRAGMA user_version").fetchone()[0], 8
                 )
 
             self.assertEqual(
@@ -202,6 +202,43 @@ class StoreDatabaseTests(unittest.TestCase):
                 ("42:100", "app", 42, 100, 500.0, "[]", None),
             )
             self.assertEqual(tuple(signature_row), ("old-signature", "app", None, 0))
+
+    def test_schema_seven_migration_adds_signature_last_outcome(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE signatures (
+                        id TEXT PRIMARY KEY,
+                        owner TEXT NOT NULL,
+                        members TEXT NOT NULL,
+                        last_seen REAL,
+                        ex_last TEXT
+                    );
+                    INSERT INTO signatures(id, owner, members, last_seen, ex_last)
+                    VALUES ('signature-1', 'app-0001', '[]', 123.0, 'stop');
+                    PRAGMA user_version = 7;
+                    """
+                )
+
+            StateDB(path)
+
+            with StateDB(path, read_only=True).connection() as connection:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(signatures)")
+                }
+                row = connection.execute(
+                    "SELECT ex_last, last_outcome, last_outcome_at "
+                    "FROM signatures WHERE id = ?",
+                    ("signature-1",),
+                ).fetchone()
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+            self.assertEqual(version, 8)
+            self.assertTrue({"last_outcome", "last_outcome_at"}.issubset(columns))
+            self.assertEqual(tuple(row), ("stop", None, None))
 
     def test_pruning_retains_long_lived_instances_while_they_are_observed(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -271,6 +271,10 @@ _MIGRATIONS = {
     7: """
         ALTER TABLE signatures ADD COLUMN suspended_until REAL NOT NULL DEFAULT 0;
         ALTER TABLE signatures ADD COLUMN suspended_at REAL NOT NULL DEFAULT 0;
+    """,
+    8: """
+        ALTER TABLE signatures ADD COLUMN last_outcome TEXT;
+        ALTER TABLE signatures ADD COLUMN last_outcome_at REAL;
     """,
 }
 
@@ -1851,7 +1855,9 @@ class StateDB:
                     "WHERE json_extract(member.value, '$.key') = ?) ",
                     (key, key),
                 ).fetchall()
-                identifiers = list(dict.fromkeys([row["id"] for row in rows] + list(include)))
+                identifiers = list(
+                    dict.fromkeys([row["id"] for row in rows] + list(include))
+                )
                 if not self.read_only:
                     protected = set(preserve)
                     for identifier in identifiers:
@@ -1860,7 +1866,8 @@ class StateDB:
                                 "UPDATE signatures SET closes = 0, stop_ok = 0, "
                                 "respawn = 0, ex_stop = 0, ex_keep = 0, ex_last = NULL, "
                                 "probation = 0, veto = 0, suspended_until = 0, "
-                                "suspended_at = 0 WHERE id = ?",
+                                "suspended_at = 0, last_outcome = NULL, "
+                                "last_outcome_at = NULL WHERE id = ?",
                                 (identifier,),
                             )
                         else:
@@ -1885,9 +1892,10 @@ class StateDB:
             try:
                 cursor = connection.execute(
                     "UPDATE signatures SET %s = coalesce(%s, 0) + ?, ex_last = ?, "
-                    "last_seen = ?, suspended_until = 0, suspended_at = 0 WHERE id = ?"
+                    "last_seen = ?, suspended_until = 0, suspended_at = 0, "
+                    "last_outcome = 'answered', last_outcome_at = ? WHERE id = ?"
                     % (column, column),
-                    (weight, choice, now, identifier),
+                    (weight, choice, now, now, identifier),
                 )
                 connection.commit()
             except Exception:
@@ -1936,11 +1944,19 @@ class StateDB:
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                cursor = connection.execute(
-                    "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
-                    "last_seen = ? WHERE id = ?" % (counter, counter),
-                    (amount, now, identifier),
-                )
+                if counter in ("stop_ok", "respawn"):
+                    cursor = connection.execute(
+                        "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
+                        "last_seen = ?, last_outcome = ?, last_outcome_at = ? "
+                        "WHERE id = ?" % (counter, counter),
+                        (amount, now, counter, now, identifier),
+                    )
+                else:
+                    cursor = connection.execute(
+                        "UPDATE signatures SET %s = coalesce(%s, 0) + ?, "
+                        "last_seen = ? WHERE id = ?" % (counter, counter),
+                        (amount, now, identifier),
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()

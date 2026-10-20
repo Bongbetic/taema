@@ -2050,13 +2050,10 @@ class Store:
         kept_reviews = []
         for review in reviews:
             survivors = review.get("survivors", [])
-            related = (
-                review.get("state", "open") == "open"
-                and (
-                    review.get("owner") == key
-                    or (isinstance(survivors, (list, tuple, set)) and key in survivors)
-                    or review.get("sig") in signature_ids
-                )
+            related = review.get("state", "open") == "open" and (
+                review.get("owner") == key
+                or (isinstance(survivors, (list, tuple, set)) and key in survivors)
+                or review.get("sig") in signature_ids
             )
             if related:
                 known = True
@@ -3208,6 +3205,27 @@ class Store:
             )
         return result
 
+    @staticmethod
+    def _signature_last_outcome(item):
+        """Return the latest durable explicit answer or automatic signature outcome."""
+        outcome = item.get("last_outcome")
+        at = item.get("last_outcome_at")
+        if outcome == "stop_ok":
+            return {"decision": "stop", "outcome": outcome, "at": at}
+        if outcome == "respawn":
+            return {"decision": "keep", "outcome": outcome, "at": at}
+        if outcome == "answered":
+            answer = item.get("ex_last")
+            if answer in ("stop", "keep"):
+                return {"decision": answer, "outcome": "answered", "at": at}
+
+        # Rows predating schema 8 cannot order old automatic counters against answers.
+        # Preserve their prior answer view while all new events carry durable timestamps.
+        answer = item.get("ex_last")
+        if answer in ("stop", "keep"):
+            return {"decision": answer, "outcome": "answered", "at": None}
+        return None
+
     def signatures_summary(self, limit=2000):
         """List signature records with the same evidence names used by ``why``."""
         result = []
@@ -3219,11 +3237,6 @@ class Store:
                 action, confidence, reason = decision
             answer = item.get("ex_last")
             answer = answer if answer in ("stop", "keep") else "none"
-            outcome = (
-                {"decision": answer, "outcome": "answered", "at": None}
-                if answer != "none"
-                else None
-            )
             result.append(
                 {
                     "id": item["id"],
@@ -3245,10 +3258,44 @@ class Store:
                         "veto": item.get("veto", 0),
                         "probation": item.get("probation", 0),
                     },
-                    "last_outcome": outcome,
+                    "last_outcome": self._signature_last_outcome(item),
                 }
             )
         return result
+
+    def legacy_invalid_summary(self, limit=1000):
+        """List quarantined legacy pairs with their pending re-confirmation reviews."""
+        reviews = [
+            review
+            for review in self.open_reviews()
+            if review.get("kind") == "legacy-invalid"
+        ]
+        reviews = self.review_details(reviews)
+        reviews_by_pair = {
+            (review.get("owner"), survivor): review
+            for review in reviews
+            for survivor in review.get("survivors", [])
+        }
+        records = []
+        for pair in self.pairs_summary(limit=MAX_PAIRS):
+            raw = self.data.get("pairs", {}).get(
+                self.pkey(pair["owner"], pair["leftover"]), {}
+            )
+            if raw.get("source") != "legacy-invalid":
+                continue
+            review = reviews_by_pair.get((pair["owner"], pair["leftover"]))
+            records.append(
+                {
+                    **pair,
+                    "source": "legacy-invalid",
+                    "legacy_answer": (review or {}).get("answer"),
+                    "review_id": (review or {}).get("id"),
+                }
+            )
+        return {
+            "records": records[: max(1, min(MAX_PAIRS, int(limit)))],
+            "reviews": reviews,
+        }
 
     def apps_summary(self, limit=2000):
         """List app identities and learned evidence in the shared CLI/dashboard shape."""
@@ -3283,7 +3330,11 @@ class Store:
             )
             related_pairs = pairs_by_key.get(key, [])
             outcomes = [
-                {"owner": pair["owner"], "leftover": pair["leftover"], **pair["last_outcome"]}
+                {
+                    "owner": pair["owner"],
+                    "leftover": pair["leftover"],
+                    **pair["last_outcome"],
+                }
                 for pair in related_pairs
                 if isinstance(pair.get("last_outcome"), dict)
                 and pair["last_outcome"].get("outcome")
@@ -3303,9 +3354,15 @@ class Store:
                         "instances": int(identity.get("instances") or 0),
                         "pairs": len(related_pairs),
                         "signatures": len(self.signature_summaries(key, limit=100)),
-                        "closes": sum(int(pair.get("closes", 0) or 0) for pair in related_pairs),
-                        "stop_ok": sum(int(pair.get("stop_ok", 0) or 0) for pair in related_pairs),
-                        "respawn": sum(int(pair.get("respawn", 0) or 0) for pair in related_pairs),
+                        "closes": sum(
+                            int(pair.get("closes", 0) or 0) for pair in related_pairs
+                        ),
+                        "stop_ok": sum(
+                            int(pair.get("stop_ok", 0) or 0) for pair in related_pairs
+                        ),
+                        "respawn": sum(
+                            int(pair.get("respawn", 0) or 0) for pair in related_pairs
+                        ),
                         "shared_hits": round(counters["shared_hits"], 2),
                         "user_keep": round(counters["user_keep"], 2),
                         "user_kill": round(counters["user_kill"], 2),
@@ -3433,6 +3490,12 @@ class Store:
             return False
         pair["stop_ok"] = int(pair.get("stop_ok", 0)) + 1
         pair["self_stop"] = float(pair.get("self_stop", 0.0)) + W_STOP_OK
+        outcome_at = self.now()
+        pair["last_auto_outcome"] = {
+            "decision": "stop",
+            "outcome": "stop_ok",
+            "at": outcome_at,
+        }
         pending["stop_ok_recorded"] = True
         if recorded_signature:
             stop_id = pending.get("stop_id")
@@ -3460,10 +3523,16 @@ class Store:
         recorded_signature = pending.get("signature_id")
         if signature_id and recorded_signature and signature_id != recorded_signature:
             return False
+        outcome_at = self.now()
         pair["respawn"] = int(pair.get("respawn", 0)) + 1
         pair["respawn_weight"] = float(pair.get("respawn_weight", 0.0)) + W_RESPAWN
         pair["keep"] = float(pair.get("keep", 0.0)) + W_RESPAWN
-        pair["last_keep"] = self.now()
+        pair["last_keep"] = outcome_at
+        pair["last_auto_outcome"] = {
+            "decision": "keep",
+            "outcome": "respawn",
+            "at": outcome_at,
+        }
         pending["respawn_recorded"] = True
         if recorded_signature:
             stop_id = pending.get("stop_id")
@@ -3762,27 +3831,66 @@ class Store:
     @staticmethod
     def _pair_last_outcome(pair):
         pending = pair.get("pending_stop")
-        if isinstance(pending, dict):
-            outcome = (
-                "respawn"
-                if pending.get("respawn_recorded")
-                else "stop_ok"
-                if pending.get("stop_ok_recorded")
-                else "pending"
+        candidates = []
+
+        def add(decision, outcome, at, priority):
+            timestamp = (
+                float(at)
+                if isinstance(at, (int, float))
+                and not isinstance(at, bool)
+                and math.isfinite(at)
+                else None
             )
-            return {"decision": "stop", "outcome": outcome, "at": pending.get("ts")}
+            candidates.append(
+                (
+                    timestamp is not None,
+                    timestamp or 0.0,
+                    priority,
+                    decision,
+                    outcome,
+                    timestamp,
+                )
+            )
+
         answer = pair.get("ex_last")
         if answer in ("stop", "keep"):
-            return {
-                "decision": answer,
-                "outcome": "answered",
-                "at": pair.get("ex_ts"),
-            }
-        if pair.get("respawn", 0):
-            return {"decision": "keep", "outcome": "respawn", "at": pair.get("last_keep")}
-        if pair.get("stop_ok", 0):
-            return {"decision": "stop", "outcome": "stop_ok", "at": pair.get("last_auto_stop")}
-        return {"decision": "ask", "outcome": None, "at": None}
+            add(answer, "answered", pair.get("ex_ts"), 0)
+
+        automatic = pair.get("last_auto_outcome")
+        if (
+            isinstance(automatic, dict)
+            and automatic.get("decision") in ("stop", "keep")
+            and automatic.get("outcome") in ("stop_ok", "respawn")
+        ):
+            add(
+                automatic["decision"],
+                automatic["outcome"],
+                automatic.get("at"),
+                1,
+            )
+        elif isinstance(pending, dict):
+            if pending.get("respawn_recorded"):
+                add("keep", "respawn", pending.get("ts"), 1)
+            elif pending.get("stop_ok_recorded"):
+                add("stop", "stop_ok", pending.get("ts"), 1)
+            else:
+                add("stop", "pending", pending.get("ts"), 1)
+        else:
+            # Older state lacks last_auto_outcome; the persisted action timestamps still
+            # establish ordering against explicit answers and provide a best-effort label.
+            if pair.get("respawn", 0):
+                add("keep", "respawn", pair.get("last_keep"), 1)
+            if pair.get("stop_ok", 0):
+                add("stop", "stop_ok", pair.get("last_auto_stop"), 1)
+
+        if not candidates:
+            return {"decision": "ask", "outcome": None, "at": None}
+        latest = max(candidates)
+        return {
+            "decision": latest[3],
+            "outcome": latest[4],
+            "at": latest[5],
+        }
 
     # ---- derived defaults ----
     def default_action(self, key):

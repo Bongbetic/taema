@@ -62,6 +62,88 @@ class LearnCliTests(unittest.TestCase):
         self.assertIn("npm", output.getvalue())
         self.assertIn("keep", output.getvalue())
 
+    def test_pair_last_outcome_prefers_later_completed_stop_after_pending_expires(self):
+        now = [100.0]
+        self.store.now = lambda: now[0]
+        self.store.answer("browser", "worker", "keep")
+        now[0] = 200.0
+        self.store.auto_stopped("browser", "worker", stop_id="stop-1")
+        now[0] = 220.0
+        self.store.expire_auto_stops(now=now[0], respawn_window=10, revive_window=20)
+        self.assertNotIn(
+            "pending_stop",
+            self.store.data["pairs"][self.store.pkey("browser", "worker")],
+        )
+        self.store.save()
+
+        reopened = Store(self.temporary.name, {}, now=lambda: now[0], read_only=True)
+        pair = reopened.pairs_summary()[0]
+        self.assertEqual(
+            pair["last_outcome"],
+            {"decision": "stop", "outcome": "stop_ok", "at": 220.0},
+        )
+
+    def test_pair_last_outcome_prefers_later_respawn_after_pending_expires(self):
+        now = [100.0]
+        self.store.now = lambda: now[0]
+        self.store.answer("browser", "worker", "stop")
+        now[0] = 200.0
+        self.store.auto_stopped("browser", "worker", stop_id="stop-2")
+        now[0] = 201.0
+        self.store.auto_stop_respawn("browser", "worker")
+        now[0] = 220.0
+        self.store.expire_auto_stops(now=now[0], respawn_window=10, revive_window=20)
+        self.store.save()
+
+        reopened = Store(self.temporary.name, {}, now=lambda: now[0], read_only=True)
+        pair = reopened.pairs_summary()[0]
+        self.assertEqual(
+            pair["last_outcome"],
+            {"decision": "keep", "outcome": "respawn", "at": 201.0},
+        )
+
+    def test_signature_last_outcome_tracks_auto_stop_results_after_answers(self):
+        now = [100.0]
+        self.store.now = lambda: now[0]
+        signatures = (
+            {
+                "id": "signature-stop-ok",
+                "owner": "browser",
+                "members": [{"key": "worker", "count": 1}],
+                "runtime_class": "node",
+                "runtime_hash": "runtime-hash",
+                "tty": False,
+            },
+            {
+                "id": "signature-respawn",
+                "owner": "browser",
+                "members": [{"key": "worker", "count": 2}],
+                "runtime_class": "node",
+                "runtime_hash": "runtime-hash",
+                "tty": False,
+            },
+        )
+        for signature in signatures:
+            self.store.db.record_signature(signature, now=now[0], close=True)
+            self.store.db.answer_signature(signature["id"], "stop", 3.0, now=101.0)
+        now[0] = 200.0
+        self.store.signature_outcome("signature-stop-ok", "stop_ok")
+        now[0] = 201.0
+        self.store.signature_outcome("signature-respawn", "respawn")
+
+        reopened = Store(self.temporary.name, {}, now=lambda: now[0], read_only=True)
+        summaries = {
+            item["id"]: item["last_outcome"] for item in reopened.signatures_summary()
+        }
+        self.assertEqual(
+            summaries["signature-stop-ok"],
+            {"decision": "stop", "outcome": "stop_ok", "at": 200.0},
+        )
+        self.assertEqual(
+            summaries["signature-respawn"],
+            {"decision": "keep", "outcome": "respawn", "at": 201.0},
+        )
+
     def test_apps_json_lists_identity_and_learning_evidence(self):
         now = self.store.now()
         identity = AppIdentity(
@@ -132,6 +214,11 @@ class LearnCliTests(unittest.TestCase):
         self.assertIn("browser", rendered)
         self.assertIn("worker", rendered)
         self.assertIn("signature-browser-worker", rendered)
+        self.assertIn("user_keep=3.0", rendered)
+        self.assertIn("browser -> worker  stop  1.00", rendered)
+        self.assertIn("stop=3.0", rendered)
+        self.assertIn("signature-browser-worker  browser  stop  1.00", rendered)
+        self.assertIn("closes=1", rendered)
         self.assertIn("decision", rendered)
         self.assertIn("confidence", rendered)
         self.assertIn("evidence", rendered)
@@ -151,9 +238,7 @@ class LearnCliTests(unittest.TestCase):
         self.assertEqual(document["counts"]["signatures"], 1)
         self.assertEqual(document["apps"][0]["decision"], "share")
         self.assertEqual(document["pairs"][0]["last_outcome"]["outcome"], "answered")
-        self.assertEqual(
-            document["signatures"][0]["evidence"]["closes"], 1
-        )
+        self.assertEqual(document["signatures"][0]["evidence"]["closes"], 1)
 
     def test_signatures_json_matches_why_signature_evidence(self):
         signature = {
@@ -214,12 +299,22 @@ class LearnCliTests(unittest.TestCase):
             }
         ]
         self.store.save()
+        summary = self.store.legacy_invalid_summary()
+        self.assertEqual(summary["records"][0]["source"], "legacy-invalid")
+        self.assertEqual(summary["records"][0]["legacy_answer"], "stop")
+        self.assertEqual(summary["reviews"][0]["id"], 7)
         output = io.StringIO()
         with (
+            mock.patch.object(
+                self.store,
+                "legacy_invalid_summary",
+                wraps=self.store.legacy_invalid_summary,
+            ) as legacy_summary,
             mock.patch.object(commands, "_load", return_value=({}, self.store, [])),
             redirect_stdout(output),
         ):
             self.assertEqual(commands.main(["learn", "show", "--legacy", "--json"]), 0)
+        legacy_summary.assert_called_once_with(limit=1000)
 
         document = json.loads(output.getvalue())
         self.assertTrue(matches(document, READ_SCHEMA, READ_SCHEMA))
@@ -290,9 +385,7 @@ class LearnCliTests(unittest.TestCase):
             ordinary_signature["id"], "keep", 3.0, now=self.store.now()
         )
         self.store.add_veto("app", "browser", identifier="app-veto")
-        self.store.add_veto(
-            "signature", signature["id"], identifier="signature-veto"
-        )
+        self.store.add_veto("signature", signature["id"], identifier="signature-veto")
         self.store.save()
 
         readonly = Store(self.temporary.name, {}, read_only=True)
@@ -316,13 +409,17 @@ class LearnCliTests(unittest.TestCase):
         self.assertNotIn("browser", reopened.data["exes"])
         self.assertNotIn("browser", reopened.data["standalone"])
         self.assertNotIn("browser", reopened.data["noise"])
-        self.assertFalse(any(key.startswith("browser\0") for key in reopened.data["pairs"]))
+        self.assertFalse(
+            any(key.startswith("browser\0") for key in reopened.data["pairs"])
+        )
         self.assertEqual([review["id"] for review in reopened.data["reviews"]], [2])
         veto_ids = {veto["id"] for veto in reopened.data["vetoes"]}
         self.assertEqual(veto_ids, {"app-veto", "signature-veto"})
         retained = reopened.db.signature(signature["id"])
         self.assertIsNotNone(retained)
         self.assertEqual((retained["ex_stop"], retained["closes"]), (0, 0))
+        self.assertIsNone(retained["last_outcome"])
+        self.assertIsNone(retained["last_outcome_at"])
         self.assertEqual(
             reopened.match_veto(signature=signature["id"])["id"], "signature-veto"
         )

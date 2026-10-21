@@ -168,6 +168,23 @@ def render_status(model, args, summary=False):
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),
     ]
+    guard = status.get("guard") or details.get("guard") or {}
+    if guard.get("active") is True:
+        lines.append(
+            "guard: ACTIVE (%s; %s reclaimed)"
+            % (
+                guard.get("trigger") or "pressure",
+                _format_memory(guard.get("bytes_freed", 0)),
+            )
+        )
+    elif guard.get("last_trigger"):
+        lines.append(
+            "guard: inactive; last %s, %s reclaimed"
+            % (
+                guard.get("last_trigger"),
+                _format_memory(guard.get("last_bytes_freed", 0)),
+            )
+        )
     memory = model.get("memory") or {}
     host = memory.get("host") or {}
     if memory.get("enabled") and host:

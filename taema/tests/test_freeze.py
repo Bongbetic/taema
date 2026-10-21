@@ -2,6 +2,7 @@
 
 import io
 import os
+import tempfile
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -12,11 +13,9 @@ from unittest import mock
 
 from taema.cli import commands
 from taema.cli import view
-from taema.core import cgroup
 from taema.daemon import service
 from taema.governor import engine, freezing
-from taema.store import knowledge
-from tests.test_phase0 import FakeCg, make_cfg, tmp
+from tests.test_phase0 import FakeCg, make_cfg
 from tests.test_phase1 import write
 
 
@@ -79,7 +78,9 @@ class FreezeTests(unittest.TestCase):
         self.patches = [
             mock.patch.object(service.inspect, "PROC", self.proc_root),
             mock.patch.object(service.inspect.ProcTable, "scan", return_value=None),
-            mock.patch.object(service.inspect, "Snapshot", return_value=EmptySnapshot()),
+            mock.patch.object(
+                service.inspect, "Snapshot", return_value=EmptySnapshot()
+            ),
             mock.patch.object(service.inspect, "edges", return_value={}),
             mock.patch.object(service.policy, "protected_reason", return_value=None),
             mock.patch.object(
@@ -105,11 +106,106 @@ class FreezeTests(unittest.TestCase):
         self.assertNotIn(self.scope, self.daemon.freeze_usage)
         self.assertNotIn(self.scope, self.daemon.freeze_idle_since)
 
+    def test_pressure_guard_freezes_an_idle_leftover_in_enforce_mode(self):
+        self.daemon.cfg["mem"] = {"enabled": True}
+        self.daemon.mem_enabled = True
+        self.daemon.cfg["experimental"]["guard"] = True
+        self.daemon.cfg["guard"] = {"enabled": True, "freeze_in_adopt": False}
+        self.cg.set_cpu(self.scope, 0)
+
+        self.assertEqual(self.daemon.freeze_pass(now=0, guard=True), [])
+        self.assertEqual(self.daemon.freeze_pass(now=60, guard=True), [])
+        results = self.daemon.freeze_pass(now=120, guard=True)
+
+        self.assertTrue(results[0]["ok"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
+        self.assertEqual(
+            self.daemon.store.data["frozen_scopes"][self.scope]["source"], "auto"
+        )
+
+    def test_pressure_guard_freeze_in_adopt_requires_explicit_opt_in(self):
+        self.daemon.cfg["mode"] = "adopt"
+        self.daemon.cfg["mem"] = {"enabled": True}
+        self.daemon.mem_enabled = True
+        self.daemon.cfg["experimental"]["guard"] = True
+        self.daemon.cfg["guard"] = {"enabled": True, "freeze_in_adopt": False}
+        self.cg.set_cpu(self.scope, 0)
+
+        for now in (0, 60, 120):
+            self.assertEqual(self.daemon.freeze_pass(now=now, guard=True), [])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+
+        self.daemon.cfg["guard"]["freeze_in_adopt"] = True
+        self.daemon.freeze_pass(now=180, guard=True)
+        self.daemon.freeze_pass(now=240, guard=True)
+        results = self.daemon.freeze_pass(now=300, guard=True)
+
+        self.assertTrue(results[0]["ok"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
+
+    def test_socket_safety_rejects_unreadable_descriptors_audio_and_unknown_peers(self):
+        self.assertIsNone(freezing.ListenerDescriptor.from_record("invalid"))
+        self.assertIsNone(
+            freezing.ListenerDescriptor.from_record({"transport": "tcp", "inode": 0})
+        )
+        with tempfile.TemporaryDirectory() as proc_root:
+            reason, sockets, pty = freezing.member_fd_facts(
+                [9], EmptySnapshot(), proc_root
+            )
+        self.assertEqual(reason, "process descriptor state unknown")
+        self.assertEqual(sockets, set())
+        self.assertFalse(pty)
+
+        with (
+            mock.patch.object(freezing.os, "listdir", return_value=["4"]),
+            mock.patch.object(freezing.os, "readlink", side_effect=OSError("gone")),
+        ):
+            reason, _sockets, _pty = freezing.member_fd_facts(
+                [9], EmptySnapshot(), "/proc"
+            )
+        self.assertEqual(reason, "process descriptor state unknown")
+
+        audio = EmptySnapshot()
+        audio.unix = ({"state": "ESTAB", "pids": {4242}, "peer_inode": 10, "path": ""},)
+        audio.by_inode = {
+            10: {"path": "/run/user/1000/pipewire-0", "peer_path": "", "pids": {10}}
+        }
+        self.assertEqual(
+            freezing.socket_safety_reason({4242}, audio),
+            "connected to an audio or video client socket",
+        )
+
+        unknown_peer = EmptySnapshot()
+        unknown_peer.unix = (
+            {"state": "ESTAB", "pids": {4242}, "peer_inode": 99, "path": ""},
+        )
+        self.assertEqual(
+            freezing.socket_safety_reason({4242}, unknown_peer),
+            "Unix socket peer unknown",
+        )
+
+        udp = EmptySnapshot()
+        udp.udp = ({"pids": {4242}, "inode": 12},)
+        self.assertEqual(freezing.socket_safety_reason({4242}, udp), "UDP socket")
+
+    def test_socket_safety_fails_closed_for_unknown_listener_queue_and_identity(self):
+        listener = EmptySnapshot()
+        listener.tcp_listen = (
+            {"state": "LISTEN", "pids": {4242}, "recv_q": True, "inode": True},
+        )
+        self.assertEqual(
+            freezing.socket_safety_reason({4242}, listener, wake_on_connect=True),
+            "listener queue unknown",
+        )
+        descriptors, reason = freezing.listener_descriptors(
+            {4242}, listener, member_socket_inodes=()
+        )
+        self.assertEqual(descriptors, ())
+        self.assertEqual(reason, "listener identity unknown")
+
     def test_unknown_socket_state_keeps_the_scope_running(self):
         bad_snapshot = SimpleNamespace(ok=False)
-        with mock.patch.object(
-            service.inspect, "Snapshot", return_value=bad_snapshot
-        ):
+        with mock.patch.object(service.inspect, "Snapshot", return_value=bad_snapshot):
             reason = self.daemon._freeze_safety_reason(self.scope, self.path)
         self.assertEqual(reason, "socket state unknown")
         self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
@@ -126,7 +222,9 @@ class FreezeTests(unittest.TestCase):
             mock.patch.object(
                 self.daemon, "_wait_for_cgroup_frozen", return_value=False
             ),
-            mock.patch.object(service.inspect, "Snapshot", return_value=EmptySnapshot()),
+            mock.patch.object(
+                service.inspect, "Snapshot", return_value=EmptySnapshot()
+            ),
         ):
             result = self.daemon.freeze_scope(
                 self.scope, manual=False, cpu_verified=True
@@ -199,6 +297,7 @@ class FreezeTests(unittest.TestCase):
             self.daemon.store.data["frozen_scopes"][self.scope]["listeners"],
             [{"transport": "tcp", "inode": 9101}],
         )
+
     def test_listener_descriptors_are_immutable(self):
         listener = {
             "state": "LISTEN",
@@ -316,8 +415,12 @@ class FreezeTests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(service.inspect, "Snapshot", return_value=snapshot) as take,
-            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+            mock.patch.object(
+                service.inspect, "Snapshot", return_value=snapshot
+            ) as take,
+            mock.patch.object(
+                self.daemon.store, "log", wraps=self.daemon.store.log
+            ) as log,
         ):
             self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
             self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
@@ -384,7 +487,9 @@ class FreezeTests(unittest.TestCase):
         )
         with (
             mock.patch.object(service.inspect, "Snapshot", return_value=snapshot),
-            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+            mock.patch.object(
+                self.daemon.store, "log", wraps=self.daemon.store.log
+            ) as log,
         ):
             result = self.daemon.listener_wake_pass(now=1000.0)
 
@@ -399,9 +504,7 @@ class FreezeTests(unittest.TestCase):
         )
 
     def test_accept_queue_poll_is_scheduled_only_for_frozen_listeners(self):
-        self.daemon.last.update(
-            {"adopt": 1000.0, "gc": 1000.0, "freeze": 1000.0}
-        )
+        self.daemon.last.update({"adopt": 1000.0, "gc": 1000.0, "freeze": 1000.0})
         self.daemon.last_listener_check = 1000.0
         without_listener = self.daemon.next_timeout(now=1000.0)
         self.daemon.store.set_frozen_scope(
@@ -462,9 +565,7 @@ class FreezeTests(unittest.TestCase):
 
         self.assertTrue(frozen["ok"])
         record = self.daemon.store.data["frozen_scopes"][self.scope]
-        self.assertEqual(
-            record["listeners"], [{"transport": "tcp", "inode": inode}]
-        )
+        self.assertEqual(record["listeners"], [{"transport": "tcp", "inode": inode}])
 
         with mock.patch.object(service.inspect, "Snapshot", return_value=snapshot):
             self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
@@ -472,7 +573,9 @@ class FreezeTests(unittest.TestCase):
         listener["recv_q"] = 1
         with (
             mock.patch.object(service.inspect, "Snapshot", return_value=snapshot),
-            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+            mock.patch.object(
+                self.daemon.store, "log", wraps=self.daemon.store.log
+            ) as log,
         ):
             result = self.daemon.listener_wake_pass(now=1002.0)
 
@@ -535,7 +638,9 @@ class FreezeTests(unittest.TestCase):
                 "edges",
                 side_effect=[{}, {4242: [{"kind": "tcp_server"}]}],
             ),
-            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+            mock.patch.object(
+                self.daemon.store, "log", wraps=self.daemon.store.log
+            ) as log,
         ):
             result = self.daemon.freeze_scope(
                 self.scope, manual=False, cpu_verified=True
@@ -585,15 +690,16 @@ class FreezeTests(unittest.TestCase):
 
         with (
             mock.patch.object(service.inspect, "Snapshot", return_value=snapshot),
-            mock.patch.object(self.daemon.store.db, "write_available", return_value=False),
+            mock.patch.object(
+                self.daemon.store.db, "write_available", return_value=False
+            ),
         ):
             self.daemon.tick()
 
         self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
         self.assertTrue(
             any(
-                event["event"] == "thaw"
-                and event["data"].get("reason") == "connect"
+                event["event"] == "thaw" and event["data"].get("reason") == "connect"
                 for event in self.daemon.store.events_since(0)["events"]
             )
         )
@@ -761,8 +867,12 @@ class FreezeTests(unittest.TestCase):
         output = io.StringIO()
         args = SimpleNamespace(wide=True, _width=120, _color=False)
         with (
-            mock.patch.object(commands, "_load", return_value=(self.cfg, self.daemon.store, [])),
-            mock.patch.object(commands, "_memory_snapshot", return_value={"scopes": []}),
+            mock.patch.object(
+                commands, "_load", return_value=(self.cfg, self.daemon.store, [])
+            ),
+            mock.patch.object(
+                commands, "_memory_snapshot", return_value={"scopes": []}
+            ),
             mock.patch.object(commands.inspect, "comm", return_value="browser"),
             redirect_stdout(output),
         ):

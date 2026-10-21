@@ -49,6 +49,19 @@ def snapshot(*scopes, cap=6 * GIB, total=8 * GIB):
 
 
 class MemoryBudgetArithmeticTests(unittest.TestCase):
+    def test_budget_headroom_and_alignment_reject_invalid_boundaries(self):
+        self.assertEqual(memory_budget.budget_bytes(-1, None), 0)
+        self.assertEqual(memory_budget.budget_bytes(GIB, None, True), 0)
+        self.assertEqual(memory_budget.budget_bytes(GIB, -1), 0)
+        self.assertEqual(memory_budget.budget_bytes(GIB, None, explicit=-1), 0)
+        self.assertIsNone(memory_budget.headroom_bytes(None))
+        self.assertIsNone(memory_budget.headroom_bytes(10, minimum=True))
+        self.assertIsNone(memory_budget.headroom_bytes(10, percent=float("nan")))
+        with self.assertRaises(ValueError):
+            memory_budget.align_up(10, 0)
+        self.assertTrue(memory_budget.materially_changed("max", 100))
+        self.assertTrue(memory_budget.materially_changed("invalid", 100))
+
     def test_budget_and_headroom_hold_for_a_range_of_inputs(self):
         for total in (0, MIB, 512 * MIB, GIB, 16 * GIB):
             for cap in (None, 0, MIB, 4 * GIB, 32 * GIB):

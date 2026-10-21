@@ -18,6 +18,10 @@ _REVIEW = {"review_created", "review_expired", "gc_review_created"}
 _GUARD = {
     "action_held",
     "authorization_refused",
+    "guard_finished",
+    "guard_started",
+    "guard_step",
+    "guard_trigger_unavailable",
     "hold",
     "snooze",
     "unit_vetoed",

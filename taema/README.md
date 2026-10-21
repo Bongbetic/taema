@@ -396,6 +396,37 @@ The `[mem]` settings `reclaim`, `reclaim_interval`, `idle_reclaim_grace`, `recla
 conservative; disabling `reclaim` leaves accounting and the rest of lifecycle management
 available.
 
+### Pressure guard
+
+The experimental pressure guard reacts to user-cgroup PSI triggers (`some = 150ms/2s` and
+`full = 50ms/2s`) and to host `MemAvailable` dropping below `guard.available_floor`. The `auto`
+floor is earlyoom's configured `-m` threshold plus four percentage points, or 12% of installed
+memory when earlyoom is not running. It is gated by `[experimental] guard` and `[guard] enabled`.
+
+During pressure, tæma tries page-cache reclaim from idle scopes first, freezes eligible leftovers,
+reclaims anonymous memory only from scopes it froze, then stops one authorized scope at a time,
+largest first. Each ladder step has a 10-second cooldown by default. The guard exits the episode as
+soon as PSI and the available-memory floor clear. It never stops an unlearned scope; `observe` only
+records would-actions. In `adopt`, freezing also requires `guard.freeze_in_adopt = true`. Set
+`freeze.enabled = false` to prevent guard-triggered freezing.
+
+```toml
+[experimental]
+guard = true
+
+[guard]
+enabled = true
+available_floor = "auto"
+psi_some = "150ms/2s"
+psi_full = "50ms/2s"
+cooldown = 10
+freeze_in_adopt = false
+```
+
+`taema status` shows an active or most recent guard episode. `taema doctor` reports running
+earlyoom, nohang, and systemd-oomd settings and warns when earlyoom's `--prefer` pattern matches a
+foreground workload. It never edits their configurations.
+
 ### Freeze idle leftovers
 
 Freezing is experimental and off until `[experimental] freeze = true`. In `auto` and `enforce`,

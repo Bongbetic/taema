@@ -2539,6 +2539,17 @@ def cmd_status(a):
         "snooze_remaining_s": 0,
         "reason": "",
     }
+    empty_guard_state = {
+        "active": False,
+        "trigger": None,
+        "triggers": [],
+        "started_at": None,
+        "steps": [],
+        "bytes_freed": 0,
+        "last_trigger": None,
+        "last_bytes_freed": 0,
+        "last_duration_ms": None,
+    }
     if store is None:
         store = _status_store(cfg, pending_only=reply is not None)
     if reply is None:
@@ -2557,6 +2568,7 @@ def cmd_status(a):
             + (store.pending_feedback_invalid() if store else 0),
             "hold": hold or "",
             "hold_state": hold_state,
+            "guard": empty_guard_state,
             "config": list(cfg["_sources"]),
             "config_error": client_config_error,
             "details": {
@@ -2593,6 +2605,7 @@ def cmd_status(a):
             "feedback_invalid": int(reply["feedback_invalid"]),
             "hold": reply["hold"] or "",
             "hold_state": reply["hold_state"],
+            "guard": reply.get("guard", empty_guard_state),
             "config": list(reply.get("config", cfg["_sources"])),
             "config_error": reply.get("config_error") or client_config_error,
             "details": reply,
@@ -2613,7 +2626,9 @@ def cmd_status(a):
         if getattr(a, "json", False) or getattr(a, "jsonl", False):
             scopes = []
             for path in sorted(cgroup.subdirs(base)):
-                _walk(path, 0, scopes, memory_scopes, deprioritized_scopes, frozen_scopes)
+                _walk(
+                    path, 0, scopes, memory_scopes, deprioritized_scopes, frozen_scopes
+                )
             scope_count = len(scopes)
         else:
             scopes = []

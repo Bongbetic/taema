@@ -35,7 +35,7 @@ from ..core import (
     lineage,
     signature as survivor_signature,
 )
-from ..governor import engine, freezing, memory_budget
+from ..governor import engine, freezing, guard as pressure_guard, memory_budget
 from ..store import knowledge
 from ..config import policy
 from .. import events as event_views, protocol
@@ -115,6 +115,11 @@ class MemoryReconcile:
 @dataclass(frozen=True, slots=True)
 class ReclaimReconcile:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class PressureHigh:
+    trigger: str
 
 
 class Daemon:
@@ -199,9 +204,29 @@ class Daemon:
         self.leaf_nowatch = (
             set()
         )  # leaves that could not be watched: the GC pass checks them
+        self.pressure_monitor = None
+        self.pressure_watch_signature = None
+        self.pressure_watch_failures = ()
         self.collector_events = collections.deque()
         self._collector_event_set = set()
         self.collector_event_drops = 0
+        self.last_guard_check = 0.0
+        self.guard_last_steps = {}
+        self.guard_state = {
+            "active": False,
+            "trigger": None,
+            "triggers": [],
+            "started_at": None,
+            "steps": [],
+            "bytes_freed": 0,
+            "last_trigger": None,
+            "last_bytes_freed": 0,
+            "last_duration_ms": None,
+        }
+        self.guard_trigger_until = 0.0
+        self.guard_started_monotonic = 0.0
+        self.oom_handlers_cache = None
+        self.oom_handlers_checked_at = 0.0
         self.empty_seen = set()  # leaves seen empty by the previous GC pass
         self.last_result = {"adopt": None, "gc": None}
         self.lineage = lineage.Lineage(
@@ -451,6 +476,7 @@ class Daemon:
                 LeafReconcile,
                 MemoryReconcile,
                 ReclaimReconcile,
+                PressureHigh,
             ),
         ):
             raise TypeError("unsupported collector event: %s" % type(event).__name__)
@@ -489,6 +515,8 @@ class Daemon:
             self.guarded(self.memory_pass)
         elif isinstance(event, ReclaimReconcile):
             self.guarded(self.reclaim_pass)
+        elif isinstance(event, PressureHigh):
+            self.guarded(lambda: self.guard_pass(event.trigger))
 
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
@@ -4002,6 +4030,7 @@ class Daemon:
                 "config": list(self.cfg.get("_sources", [])),
                 "unit_errors": list(self.cfg.get("_unit_errors", [])),
                 "auto": self.auto_status(),
+                "guard": self.guard_status(),
             }
         if c == "review":
             self.store.expire_reviews()
@@ -4115,6 +4144,21 @@ class Daemon:
             "auto_adopted_scopes": len(self.auto_scopes),
             "leftover_leaves": len(cgroup.subdirs(base + "/" + engine.LEFTOVER)),
             "auto_stops": list(self.auto_stops),
+        }
+
+    def guard_status(self):
+        """Return only the guard state intended for the status view model."""
+        state = self.guard_state
+        return {
+            "active": state.get("active") is True,
+            "trigger": state.get("trigger"),
+            "triggers": list(state.get("triggers", [])),
+            "started_at": state.get("started_at"),
+            "steps": list(state.get("steps", [])),
+            "bytes_freed": int(state.get("bytes_freed", 0)),
+            "last_trigger": state.get("last_trigger"),
+            "last_bytes_freed": int(state.get("last_bytes_freed", 0)),
+            "last_duration_ms": state.get("last_duration_ms"),
         }
 
     def attach(self, msg):
@@ -4758,7 +4802,10 @@ class Daemon:
             return []
         results = []
         for scope, record in list(managed.items()):
-            if sources is not None and (record or {}).get("source", "auto") not in sources:
+            if (
+                sources is not None
+                and (record or {}).get("source", "auto") not in sources
+            ):
                 continue
             result = self._thaw_scope(scope, reason, managed_only=True)
             results.append(result)
@@ -4835,7 +4882,9 @@ class Daemon:
         results = []
         for scope, path, record in frozen:
             if cgroup.subdirs(path):
-                results.append(self._thaw_scope(scope, "frozen scope is no longer a leaf"))
+                results.append(
+                    self._thaw_scope(scope, "frozen scope is no longer a leaf")
+                )
                 continue
             members = cgroup.tree_procs(path)
             if not members:
@@ -4858,9 +4907,7 @@ class Daemon:
             )
             if socket_reason:
                 results.append(
-                    self._thaw_scope(
-                        scope, self._listener_thaw_reason(socket_reason)
-                    )
+                    self._thaw_scope(scope, self._listener_thaw_reason(socket_reason))
                 )
                 continue
             saved_listeners = record.get("listeners", [])
@@ -4882,9 +4929,7 @@ class Daemon:
             )
             if listener_error:
                 results.append(
-                    self._thaw_scope(
-                        scope, "listener state unknown: " + listener_error
-                    )
+                    self._thaw_scope(scope, "listener state unknown: " + listener_error)
                 )
                 continue
             current_descriptors = set(listeners)
@@ -4898,7 +4943,11 @@ class Daemon:
                     reason = "listener disappeared"
                     break
                 recv_q = row.get("recv_q")
-                if not isinstance(recv_q, int) or isinstance(recv_q, bool) or recv_q < 0:
+                if (
+                    not isinstance(recv_q, int)
+                    or isinstance(recv_q, bool)
+                    or recv_q < 0
+                ):
                     reason = "listener state unknown"
                     break
                 if recv_q > 0:
@@ -4984,9 +5033,10 @@ class Daemon:
                 return {"ok": True, "scope": scope, "frozen": True, "already": True}
             return {"ok": False, "error": "scope is already frozen outside taema"}
         maximum = self.cfg.get("freeze", {}).get("max_frozen", 32)
-        if scope not in self.store.data.get("frozen_scopes", {}) and len(
-            self.store.data.get("frozen_scopes", {})
-        ) >= maximum:
+        if (
+            scope not in self.store.data.get("frozen_scopes", {})
+            and len(self.store.data.get("frozen_scopes", {})) >= maximum
+        ):
             return {"ok": False, "error": "managed freeze limit reached"}
         source = "manual" if manual else "auto"
         why = reason or "eligible idle leftover"
@@ -5051,17 +5101,43 @@ class Daemon:
         self._save_if_idle()
         return {"ok": True, "scope": scope, "frozen": True}
 
-    def freeze_pass(self, now=None):
+    def freeze_pass(self, now=None, guard=False):
         """Sample leftover CPU and freeze only scopes idle for the configured grace."""
         now = time.time() if now is None else now
         managed = self.store.data.get("frozen_scopes", {})
-        if not self._freeze_config_enabled():
+        freeze_config = self.cfg.get("freeze", {})
+        freeze_allowed = (
+            isinstance(freeze_config, dict)
+            and freeze_config.get("enabled", True) is True
+        )
+        guard_config = self.cfg.get("guard", {})
+        guard_freeze = (
+            guard
+            and self._guard_enabled()
+            and freeze_allowed
+            and (
+                self.mode in ("auto", "enforce")
+                or (
+                    self.mode == "adopt"
+                    and isinstance(guard_config, dict)
+                    and guard_config.get("freeze_in_adopt", False) is True
+                )
+            )
+        )
+        if not self._freeze_config_enabled() and not guard_freeze:
             self.freeze_usage.clear()
             self.manual_freeze_usage.clear()
             self.freeze_idle_since.clear()
             self.thaw_all_managed_scopes("freezing disabled by profile or flag")
             return []
-        if not self._freeze_auto_enabled():
+        guard_adopt = (
+            guard
+            and self.mode == "adopt"
+            and isinstance(guard_config, dict)
+            and guard_config.get("freeze_in_adopt", False) is True
+        )
+        guard_auto = guard and self.mode in ("auto", "enforce") and guard_freeze
+        if not self._freeze_auto_enabled() and not guard_adopt and not guard_auto:
             self.freeze_usage.clear()
             self.freeze_idle_since.clear()
             self.thaw_all_managed_scopes(
@@ -5112,9 +5188,9 @@ class Daemon:
             if isinstance(record, dict) and record.get("source", "auto") == "auto"
         ]
         maximum = self.cfg.get("freeze", {}).get("max_frozen", 32)
-        for scope, _record in sorted(automatic, key=lambda item: item[1].get("since", 0))[
-            : max(0, len(managed) - maximum)
-        ]:
+        for scope, _record in sorted(
+            automatic, key=lambda item: item[1].get("since", 0)
+        )[: max(0, len(managed) - maximum)]:
             self._thaw_scope(scope, "automatic freeze limit reduced")
         managed = self.store.data.get("frozen_scopes", {})
         automatic_count = len(managed)
@@ -5347,6 +5423,541 @@ class Daemon:
             }
         )
 
+    def _guard_enabled(self):
+        guard = self.cfg.get("guard", {})
+        experimental = self.cfg.get("experimental", {})
+        return (
+            self.mem_enabled
+            and isinstance(guard, dict)
+            and guard.get("enabled", True) is True
+            and isinstance(experimental, dict)
+            and experimental.get("guard", False) is True
+        )
+
+    def _guard_handlers(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        if (
+            self.oom_handlers_cache is None
+            or now - self.oom_handlers_checked_at >= 30.0
+        ):
+            self.oom_handlers_cache = pressure_guard.detect_oom_handlers()
+            self.oom_handlers_checked_at = now
+        return self.oom_handlers_cache
+
+    def _guard_floor(self):
+        available, total = pressure_guard.host_memory()
+        handlers = self._guard_handlers()
+        earlyoom = handlers.get("earlyoom", ())
+        baseline = (
+            max(
+                pressure_guard.earlyoom_memory_percent(item, total) for item in earlyoom
+            )
+            if earlyoom
+            else None
+        )
+        configured = self.cfg.get("guard", {}).get("available_floor", "auto")
+        try:
+            floor = pressure_guard.available_floor_bytes(
+                total,
+                configured,
+                earlyoom_present=bool(earlyoom),
+                earlyoom_memory_percent=baseline,
+            )
+        except ValueError:
+            floor = None
+        return available, floor
+
+    def _close_pressure_monitor(self):
+        monitor = self.pressure_monitor
+        if monitor is None:
+            self.pressure_watch_signature = None
+            return
+        try:
+            self.sel.unregister(monitor.fileno())
+        except (KeyError, OSError, ValueError):
+            pass
+        monitor.close()
+        self.pressure_monitor = None
+        self.pressure_watch_signature = None
+
+    def _sync_pressure_monitor(self):
+        """Watch user-cgroup PSI trigger fds, keeping unsupported kernels on floor sampling."""
+        if not self._guard_enabled():
+            self._close_pressure_monitor()
+            return
+        config = self.cfg.get("guard", {})
+        path = os.path.join(cgroup.base(), "memory.pressure")
+        settings = {
+            "some": config.get("psi_some", policy._DEFAULTS["guard"]["psi_some"]),
+            "full": config.get("psi_full", policy._DEFAULTS["guard"]["psi_full"]),
+        }
+        signature = (path, tuple(sorted(settings.items())))
+        if self.pressure_watch_signature == signature:
+            return
+        self._close_pressure_monitor()
+        monitor = pressure_guard.PsiTriggerMonitor()
+        failures = monitor.open_triggers(path, settings)
+        self.pressure_watch_failures = tuple(failures)
+        for failure in failures:
+            if self.store.changed("guard_trigger_unavailable:" + failure, failure):
+                self.store.log(
+                    event="guard_trigger_unavailable",
+                    source="memory.pressure",
+                    reason=failure,
+                )
+        if not monitor.metrics:
+            monitor.close()
+            self.pressure_watch_signature = signature
+            return
+        try:
+            self.sel.register(monitor.fileno(), selectors.EVENT_READ, "pressure")
+        except (KeyError, OSError, ValueError) as error:
+            monitor.close()
+            failure = "memory.pressure: selector registration failed: %s" % error
+            self.pressure_watch_failures = self.pressure_watch_failures + (failure,)
+            if self.store.changed("guard_trigger_unavailable:" + failure, failure):
+                self.store.log(
+                    event="guard_trigger_unavailable",
+                    source="memory.pressure",
+                    reason=failure,
+                )
+            self.pressure_watch_signature = signature
+            return
+        self.pressure_monitor = monitor
+        self.pressure_watch_signature = signature
+
+    def _collect_pressure_events(self):
+        if self.pressure_monitor is None:
+            return
+        try:
+            metrics = self.pressure_monitor.poll()
+        except OSError as error:
+            self.store.log(event="guard_trigger_unavailable", reason=str(error))
+            self._close_pressure_monitor()
+            return
+        for metric in metrics:
+            self.queue_collector_event(PressureHigh(metric))
+
+    def _guard_pressure_high(self):
+        if not self._guard_enabled():
+            return False
+        if time.monotonic() < self.guard_trigger_until:
+            return True
+        available, floor = self._guard_floor()
+        if available is not None and floor is not None and available < floor:
+            return True
+        config = self.cfg.get("guard", {})
+        psi_path = os.path.join(cgroup.base(), "memory.pressure")
+        psi = memory.pressure(psi_path)
+        for metric, key in (("some", "psi_some"), ("full", "psi_full")):
+            value = psi.get(metric + "_avg10")
+            setting = config.get(key, policy._DEFAULTS["guard"][key])
+            try:
+                threshold = pressure_guard.psi_threshold_percent(setting, metric)
+            except ValueError:
+                continue
+            if isinstance(value, (int, float)) and value >= threshold:
+                return True
+        return False
+
+    def _collect_available_floor_event(self, now=None):
+        """Sample the non-evented MemAvailable floor and queue it beside PSI events."""
+        if not self._guard_enabled():
+            return
+        now = time.time() if now is None else float(now)
+        if now - self.last_guard_check < 1.0:
+            return
+        self.last_guard_check = now
+        available, floor = self._guard_floor()
+        if available is None or floor is None or available >= floor:
+            return
+        if self.guard_state.get("active"):
+            retry_at = self.guard_state.get("retry_at", 0.0)
+            if now < retry_at:
+                return
+            trigger = "retry"
+        else:
+            trigger = "available"
+        self.queue_collector_event(PressureHigh(trigger))
+
+    def _guard_reclaim_step(self, stage):
+        managed = self.store.data.get("frozen_scopes", {})
+        managed = managed if isinstance(managed, dict) else {}
+        candidates = []
+        for scope, path in self._memory_paths().items():
+            resource_class = self._reclaim_class(scope, path)
+            frozen = scope in managed and self._freeze_value(path) == "1"
+            if stage == "page_cache":
+                if not (
+                    frozen
+                    or scope.startswith(engine.LEFTOVER + "/")
+                    or resource_class == "background"
+                ):
+                    continue
+            elif stage == "anonymous":
+                if not frozen:
+                    continue
+            else:
+                continue
+            counters = memory.scope_counters(path)
+            if not isinstance(counters, dict):
+                continue
+            size = (
+                counters.get("reclaimable_bytes")
+                if stage == "page_cache"
+                else counters.get("anon_bytes")
+            )
+            if not isinstance(size, int) or size <= 0:
+                continue
+            candidates.append((size, scope, path, resource_class or "leftover"))
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        results = []
+        measured = 0
+        for _size, scope, path, resource_class in candidates:
+            if not self._guard_pressure_high():
+                break
+            result = self._reclaim_one(
+                scope,
+                path,
+                time.time(),
+                memory.pressure(os.path.join(cgroup.base(), "memory.pressure")),
+                resource_class=resource_class,
+                guard=True,
+                stage=stage,
+            )
+            results.append(result)
+            field = (
+                "file_reclaimed_bytes"
+                if stage == "page_cache"
+                else "anonymous_reclaimed_bytes"
+            )
+            value = result.get(field)
+            if not isinstance(value, int):
+                value = result.get("reclaimed_bytes")
+            if isinstance(value, int) and value > 0:
+                measured += value
+        return {
+            "performed": sum(item.get("status") == "reclaimed" for item in results),
+            "bytes_freed": measured,
+            "scopes": [
+                item.get("scope")
+                for item in results
+                if item.get("status") == "reclaimed"
+            ],
+            "results": results,
+        }
+
+    def _guard_freeze_step(self):
+        if self.mode == "observe":
+            return {
+                "performed": 0,
+                "bytes_freed": 0,
+                "scopes": [],
+                "reason": "observe mode",
+            }
+        guard = self.cfg.get("guard", {})
+        freeze = self.cfg.get("freeze", {})
+        freeze_allowed = (
+            isinstance(freeze, dict) and freeze.get("enabled", True) is True
+        )
+        guard_auto = (
+            self.mode in ("auto", "enforce")
+            and freeze_allowed
+            and self._guard_enabled()
+        )
+        allowed_in_adopt = (
+            self.mode == "adopt"
+            and isinstance(guard, dict)
+            and guard.get("freeze_in_adopt", False) is True
+            and freeze_allowed
+            and self._guard_enabled()
+        )
+        if not self._freeze_auto_enabled() and not guard_auto and not allowed_in_adopt:
+            return {
+                "performed": 0,
+                "bytes_freed": 0,
+                "scopes": [],
+                "reason": "freezing is not authorized in this mode",
+            }
+        results = self.freeze_pass(guard=True)
+        scopes = [
+            item.get("scope")
+            for item in results
+            if isinstance(item, dict) and item.get("ok") is True
+        ]
+        return {
+            "performed": len(scopes),
+            "bytes_freed": 0,
+            "scopes": scopes,
+            "results": results,
+        }
+
+    def _guard_stop_step(self):
+        if self.mode not in ("auto", "enforce"):
+            return {
+                "performed": 0,
+                "bytes_freed": 0,
+                "scopes": [],
+                "reason": "stop authority is unavailable in this mode",
+            }
+        candidates = engine.gc_candidates(
+            self.cfg,
+            self.units,
+            self.store,
+            self.idle_since,
+            now=lambda: time.time(),
+            usage=self.gc_usage,
+            skip=self.gc_skip,
+            noted=self.gc_noted,
+            lin=self.lineage,
+            auto=True,
+            authority=self.effective_authority["value"],
+            signature_for_scope=self._gc_signature,
+        )
+        ranked = []
+        for path, why in candidates:
+            scope = cgroup.rel(path)
+            if why.startswith("pair stop"):
+                pair_authorized = True
+                unit = None
+            else:
+                pair_authorized = False
+                unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+                metadata = (unit or {}).get("unit", {})
+                if metadata.get("stop_when_unneeded") is not True:
+                    continue
+            counters = memory.scope_counters(path)
+            current = (
+                counters.get("current_bytes") if isinstance(counters, dict) else None
+            )
+            if not isinstance(current, int):
+                continue
+            ranked.append((current, scope, path, why, unit, pair_authorized))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+
+        attempted = []
+        for current, scope, path, why, unit, pair_authorized in ranked:
+            if not self._guard_pressure_high():
+                break
+            facts = (
+                self._pair_scope_facts(path)
+                if pair_authorized
+                else authorization.Facts(scope=scope)
+            )
+            decision = self.authorize(authorization.GC_STOP, facts)
+            if decision.verdict != authorization.ACT:
+                if decision.verdict == authorization.WOULD_ACT:
+                    self.log_would_stop("guard_would_stop", scope, why)
+                attempted.append(
+                    {"scope": scope, "status": "refused", "reason": decision.reason}
+                )
+                continue
+            guarded_reason = "pressure guard: " + why
+            if self.mode == "auto" or pair_authorized:
+                stopped = self.auto_stop_path(
+                    path,
+                    guarded_reason,
+                    pair_authorized,
+                    authority=self.effective_authority["value"],
+                    trigger=authorization.GC_STOP,
+                )
+                status = "stopped" if stopped else "refused"
+            else:
+                try:
+                    with self.store.decision_context(
+                        "stop",
+                        scope=scope,
+                        authority=decision.authority or "unit",
+                        mode=self.mode,
+                        why=guarded_reason,
+                    ) as audit:
+                        report = engine.stop(
+                            path,
+                            self.cfg,
+                            self.store,
+                            unit,
+                            hook=policy.hook_for(self.cfg, os.path.basename(path)),
+                            decision_authority=decision.authority,
+                            decision_why=guarded_reason,
+                            decision_owner=audit.get("owner"),
+                        )
+                    stopped_pids = self.note_stop(report)
+                    self.note_auto_stop(
+                        scope,
+                        guarded_reason,
+                        [],
+                        apps=self.stopped_apps(report, stopped_pids),
+                        decision=audit,
+                    )
+                    status = "stopped" if report.get("removed") else "incomplete"
+                except engine.Refused as error:
+                    status = "refused"
+                    attempted.append(
+                        {"scope": scope, "status": status, "reason": str(error)}
+                    )
+                    continue
+            attempted.append(
+                {"scope": scope, "status": status, "current_bytes": current}
+            )
+            if status == "stopped":
+                return {
+                    "performed": 1,
+                    "bytes_freed": current,
+                    "scopes": [scope],
+                    "results": attempted,
+                }
+        return {
+            "performed": 0,
+            "bytes_freed": 0,
+            "scopes": [],
+            "results": attempted,
+        }
+
+    def _finish_guard(self, outcome="pressure cleared"):
+        """Record the completed pressure episode once its triggering pressure clears."""
+        state = self.guard_state
+        trigger_name = state.get("trigger")
+        steps = list(state.get("steps", []))
+        bytes_freed = int(state.get("bytes_freed", 0))
+        duration_ms = round((time.monotonic() - self.guard_started_monotonic) * 1000, 2)
+        state.update(
+            active=False,
+            last_trigger=trigger_name,
+            last_bytes_freed=bytes_freed,
+            last_duration_ms=duration_ms,
+            retry_at=0.0,
+        )
+        state["trigger"] = None
+        self.store.log(
+            event="guard_finished",
+            trigger=trigger_name,
+            triggers=list(state.get("triggers", [])),
+            steps=steps,
+            bytes_freed=bytes_freed,
+            duration_ms=duration_ms,
+            outcome=outcome,
+        )
+        return state
+
+    def guard_pass(self, trigger="retry"):
+        """Run the ordered, cooldown-bounded memory-pressure ladder once."""
+        if not self._guard_enabled():
+            if self.guard_state.get("active"):
+                return self._finish_guard("guard disabled")
+            return None
+        guard = self.cfg.get("guard", {})
+        if not isinstance(guard, dict):
+            return None
+        if trigger in ("some", "full"):
+            setting = guard.get(
+                "psi_some" if trigger == "some" else "psi_full",
+                policy._DEFAULTS["guard"][
+                    "psi_some" if trigger == "some" else "psi_full"
+                ],
+            )
+            try:
+                _metric, _amount, window = pressure_guard.psi_trigger(trigger, setting)
+                self.guard_trigger_until = max(
+                    self.guard_trigger_until,
+                    time.monotonic() + window / 1_000_000,
+                )
+            except ValueError:
+                pass
+        now = time.time()
+        monotonic_now = time.monotonic()
+        if not self._guard_pressure_high():
+            if self.guard_state.get("active"):
+                return self._finish_guard()
+            return None
+        state = self.guard_state
+        if not state.get("active"):
+            state.update(
+                active=True,
+                trigger=trigger,
+                triggers=[trigger],
+                started_at=now,
+                steps=[],
+                bytes_freed=0,
+                retry_at=0.0,
+            )
+            self.guard_started_monotonic = monotonic_now
+            self.store.log(
+                event="guard_started",
+                trigger=trigger,
+                available_bytes=self._guard_floor()[0],
+            )
+        elif trigger not in state.get("triggers", []):
+            state.setdefault("triggers", []).append(trigger)
+
+        try:
+            cooldown = max(0.0, float(guard.get("cooldown", 10)))
+        except (TypeError, ValueError):
+            cooldown = 10.0
+        stages = (
+            ("page_cache", lambda: self._guard_reclaim_step("page_cache")),
+            ("freeze", self._guard_freeze_step),
+            ("anonymous", lambda: self._guard_reclaim_step("anonymous")),
+            ("stop", self._guard_stop_step),
+        )
+        for name, action in stages:
+            if not self._guard_pressure_high():
+                break
+            last = self.guard_last_steps.get(name)
+            if isinstance(last, (int, float)) and monotonic_now - last < cooldown:
+                continue
+            self.guard_last_steps[name] = monotonic_now
+            before_available, _floor = self._guard_floor()
+            started = time.monotonic()
+            result = action()
+            elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+            after_available, _floor = self._guard_floor()
+            freed = result.get("bytes_freed", 0)
+            if (
+                isinstance(before_available, int)
+                and isinstance(after_available, int)
+                and after_available > before_available
+            ):
+                freed = max(
+                    freed if isinstance(freed, int) else 0,
+                    after_available - before_available,
+                )
+            freed = freed if isinstance(freed, int) and freed >= 0 else 0
+            step = {
+                "step": name,
+                "status": "acted" if result.get("performed", 0) else "skipped",
+                "scopes": result.get("scopes", []),
+                "bytes_freed": freed,
+                "duration_ms": elapsed_ms,
+                "reason": result.get("reason"),
+            }
+            state.setdefault("steps", []).append(step)
+            state["bytes_freed"] = int(state.get("bytes_freed", 0)) + freed
+            self.store.log(
+                event="guard_step",
+                trigger=state.get("trigger"),
+                step=name,
+                status=step["status"],
+                scopes=step["scopes"],
+                bytes_freed=freed,
+                duration_ms=elapsed_ms,
+                reason=step["reason"],
+            )
+            if not self._guard_pressure_high():
+                break
+
+        if self._guard_pressure_high():
+            due = [
+                value + cooldown
+                for value in self.guard_last_steps.values()
+                if isinstance(value, (int, float)) and value + cooldown > monotonic_now
+            ]
+            state["retry_at"] = (
+                now + max(1.0, min(due) - monotonic_now) if due else now + 1.0
+            )
+            return state
+        return self._finish_guard()
+
     def next_timeout(self, now=None):
         """Seconds until the next scheduled lifecycle or resource pass is due."""
         if self.collector_events:
@@ -5385,6 +5996,12 @@ class Daemon:
             due_times.append(self.last.get("memory", now) + self.iv_memory)
         if self.memory_reclaim_enabled():
             due_times.append(self.last.get("reclaim", now) + self.iv_reclaim)
+        if self._guard_enabled():
+            due_times.append(self.last_guard_check + 1.0)
+            if self.guard_state.get("active"):
+                retry_at = self.guard_state.get("retry_at")
+                if isinstance(retry_at, (int, float)) and retry_at > 0:
+                    due_times.append(retry_at)
         monotonic_now = time.monotonic()
         due_times.extend(
             now + max(0, item["close_deadline"] - monotonic_now)
@@ -5409,12 +6026,18 @@ class Daemon:
                 self._run_listener_wake_if_due(now)
                 self.store.log(event="store_busy", where="tick", retry=True)
                 return
+            self.guarded(self._sync_pressure_monitor)
             self.guarded(self.check_socket)
             self.guarded(self.store.apply_feedback)
             self.guarded(self.toggle_hold)
             self.guarded(self.thaw_held_scopes)
             self.run_deadlines()
             now = time.time()
+            self._collect_available_floor_event(now)
+            if self.guard_state.get("active") and now >= self.guard_state.get(
+                "retry_at", float("inf")
+            ):
+                self.queue_collector_event(PressureHigh("retry"))
             self._run_listener_wake_if_due(now)
             if now - self.last["adopt"] >= self.iv_adopt:
                 self.guarded(self.poll_owner_watches)
@@ -5714,9 +6337,7 @@ class Daemon:
                     "high": self._memory_control(row["path"], "memory.high"),
                     "low": self._memory_control(row["path"], "memory.low"),
                     "max": self._memory_control(row["path"], "memory.max"),
-                    "swap_max": self._memory_control(
-                        row["path"], "memory.swap.max"
-                    ),
+                    "swap_max": self._memory_control(row["path"], "memory.swap.max"),
                     "owned": row["owned"],
                     "managed": sorted(
                         key
@@ -6239,7 +6860,11 @@ class Daemon:
         for row in rows:
             scope = row["name"]
             pids = row.get("pids")
-            if scope not in self.saved_vm_scopes or not isinstance(pids, list) or not pids:
+            if (
+                scope not in self.saved_vm_scopes
+                or not isinstance(pids, list)
+                or not pids
+            ):
                 continue
             expected = self.saved_vm_members.get(scope)
             current = frozenset(pids)
@@ -6254,8 +6879,7 @@ class Daemon:
         """Require the lifecycle stop policy before running a potentially destructive hook."""
         metadata = (unit or {}).get("unit", {})
         unit_stop_allowed = (
-            isinstance(metadata, dict)
-            and metadata.get("stop_when_unneeded") is True
+            isinstance(metadata, dict) and metadata.get("stop_when_unneeded") is True
         )
         leftover = scope.startswith(engine.LEFTOVER + "/")
         facts = (
@@ -6374,9 +6998,7 @@ class Daemon:
         unit_gc = (unit or {}).get("gc", {})
         resource_class = unit_mem.get(
             "class",
-            metadata.get(
-                "mem_class", metadata.get("qos_class", metadata.get("class"))
-            ),
+            metadata.get("mem_class", metadata.get("qos_class", metadata.get("class"))),
         )
         bundled_podman = (
             metadata.get("name") == "app-podman"
@@ -6520,7 +7142,15 @@ class Daemon:
         force_veto=False,
         dry_run=False,
         resource_class=None,
+        guard=False,
+        stage="all",
     ):
+        if stage not in ("all", "page_cache", "anonymous"):
+            return {
+                "scope": scope,
+                "status": "failed",
+                "reason": "invalid reclaim stage",
+            }
         config = self.cfg.get("mem", {})
         if (
             not memory.enabled(self.cfg)
@@ -6553,6 +7183,12 @@ class Daemon:
             and scope in self.store.data["frozen_scopes"]
             and self._freeze_value(path) == "1"
         )
+        if stage == "anonymous" and not managed_frozen:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "guard anonymous reclaim requires a taema-frozen scope",
+            }
         idle_eligible = managed_frozen
         idle_reason = "scope is frozen by taema" if managed_frozen else ""
         idle_grace_met = False
@@ -6571,7 +7207,7 @@ class Daemon:
 
         state = self.reclaim_state.get(scope, {})
         last = state.get("last_at") if isinstance(state, dict) else None
-        if isinstance(last, (int, float)) and now - last < cooldown:
+        if not guard and isinstance(last, (int, float)) and now - last < cooldown:
             remaining = int(cooldown - (now - last))
             return {
                 "scope": scope,
@@ -6580,32 +7216,33 @@ class Daemon:
             }
 
         pressure = host_pressure or memory.pressure()
-        full = pressure.get("full_avg10")
-        ceiling = config.get("pressure_ceiling", 60)
-        if full is None:
-            return {
-                "scope": scope,
-                "status": "skipped",
-                "reason": "full memory pressure is unavailable",
-            }
-        if full > ceiling:
-            return {
-                "scope": scope,
-                "status": "skipped",
-                "reason": "full memory pressure %.2f%% exceeds %.2f%%"
-                % (full, ceiling),
-            }
-        local_full = memory.pressure(os.path.join(path, "memory.pressure"))[
-            "full_avg10"
-        ]
-        if local_full is not None and local_full > ceiling:
-            return {
-                "scope": scope,
-                "status": "skipped",
-                "reason": "scope full memory pressure %.2f%% exceeds %.2f%%"
-                % (local_full, ceiling),
-            }
-        if not manual:
+        if not guard:
+            full = pressure.get("full_avg10")
+            ceiling = config.get("pressure_ceiling", 60)
+            if full is None:
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "full memory pressure is unavailable",
+                }
+            if full > ceiling:
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "full memory pressure %.2f%% exceeds %.2f%%"
+                    % (full, ceiling),
+                }
+            local_full = memory.pressure(os.path.join(path, "memory.pressure"))[
+                "full_avg10"
+            ]
+            if local_full is not None and local_full > ceiling:
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "scope full memory pressure %.2f%% exceeds %.2f%%"
+                    % (local_full, ceiling),
+                }
+        if not manual and not guard:
             some = pressure.get("some_avg10")
             gate = config.get("pressure_gate", 10)
             if some is None or some < gate:
@@ -6681,7 +7318,8 @@ class Daemon:
             "vm",
         }
         save_required = (
-            resource_class == "vm"
+            stage != "page_cache"
+            and resource_class == "vm"
             and unit_mem.get("swap_max") is None
             and unit_mem.get("save_state")
             and scope not in self.saved_vm_scopes
@@ -6720,9 +7358,7 @@ class Daemon:
                     "status": "skipped",
                     "reason": "VM save hook requires idle grace: " + idle_reason,
                 }
-            safety = self._reclaim_safety_reason(
-                scope, path, cgroup.tree_procs(path)
-            )
+            safety = self._reclaim_safety_reason(scope, path, cgroup.tree_procs(path))
             if safety:
                 return {
                     "scope": scope,
@@ -6774,15 +7410,21 @@ class Daemon:
                 "reason": "invalid memory reclaim configuration: %s" % error,
             }
         bounds = memory.ReclaimBounds(maximum, headroom, percent, minimum)
-        amount = memory.page_cache_budget(
-            counters.get("current_bytes"),
-            counters.get("anon_bytes"),
-            counters.get("reclaimable_bytes"),
-            bounds,
+        amount = (
+            0
+            if stage == "anonymous"
+            else memory.page_cache_budget(
+                counters.get("current_bytes"),
+                counters.get("anon_bytes"),
+                counters.get("reclaimable_bytes"),
+                bounds,
+            )
         )
         anon_amount = 0
         anon_block_reason = ""
-        if not swap_enabled:
+        if stage == "page_cache":
+            anon_block_reason = "anonymous reclaim is not part of the page-cache step"
+        elif not swap_enabled:
             anon_block_reason = (
                 "anonymous swap reclaim needs mem.swap_reclaim and, in adopt, "
                 "mem.swap_reclaim_adopt"
@@ -7076,6 +7718,7 @@ class Daemon:
         except ValueError:  # not the main thread
             pass
         self.guarded(self.check_socket)
+        self.guarded(self._sync_pressure_monitor)
         self.store.log(
             event="daemon_start", mode=self.mode, units=[u["_file"] for u in self.units]
         )
@@ -7091,6 +7734,8 @@ class Daemon:
                         pass
                 elif key.data == "leaves":
                     self.guarded(self.collect_leaf_events)
+                elif key.data == "pressure":
+                    self.guarded(self._collect_pressure_events)
                 elif isinstance(key.data, tuple) and key.data[0] == "subscriber":
                     conn = key.data[1]
                     if mask & selectors.EVENT_READ:
@@ -7108,6 +7753,7 @@ class Daemon:
             self._drop_subscriber(conn)
         for qid in list(self.pending):
             self.drop_question(qid)
+        self._close_pressure_monitor()
         self.guarded(lambda: self.thaw_all_managed_scopes("daemon shutdown"))
         self.guarded(lambda: self.memory_governor_pass(force_restore=True))
         self.store.log(event="daemon_stop")

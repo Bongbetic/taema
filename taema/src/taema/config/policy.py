@@ -326,8 +326,7 @@ def _validate_config(cfg, sources):
     maximum_source = sources.get("freeze.max_frozen", freeze_source)
     if type(maximum) is not int or maximum < 0:
         raise ValueError(
-            "%s:1:1: freeze.max_frozen must be a non-negative integer"
-            % maximum_source
+            "%s:1:1: freeze.max_frozen must be a non-negative integer" % maximum_source
         )
     cpu_limit = freeze.get("cpu_idle_max", _DEFAULTS["freeze"]["cpu_idle_max"])
     cpu_source = sources.get("freeze.cpu_idle_max", freeze_source)
@@ -351,10 +350,59 @@ def _validate_config(cfg, sources):
         raise ValueError(
             "%s:1:1: experimental.freeze must be a boolean" % experimental_source
         )
+    experimental_guard = experimental.get("guard", _DEFAULTS["experimental"]["guard"])
+    if type(experimental_guard) is not bool:
+        raise ValueError(
+            "%s:1:1: experimental.guard must be a boolean" % experimental_source
+        )
     guard = cfg.get("guard")
     guard_source = sources.get("guard", "built-in defaults")
     if not isinstance(guard, dict):
         raise ValueError("%s:1:1: guard must be a table" % guard_source)
+    for name in ("enabled", "freeze_in_adopt"):
+        value = guard.get(name, _DEFAULTS["guard"][name])
+        source = sources.get("guard." + name, guard_source)
+        if type(value) is not bool:
+            raise ValueError("%s:1:1: guard.%s must be a boolean" % (source, name))
+    available_floor = guard.get(
+        "available_floor", _DEFAULTS["guard"]["available_floor"]
+    )
+    available_source = sources.get("guard.available_floor", guard_source)
+    if available_floor != "auto" and (
+        isinstance(available_floor, bool)
+        or not isinstance(available_floor, (int, float))
+        or not math.isfinite(available_floor)
+        or not 0 <= available_floor <= 100
+    ):
+        raise ValueError(
+            "%s:1:1: guard.available_floor must be auto or between 0 and 100"
+            % available_source
+        )
+    cooldown = guard.get("cooldown", _DEFAULTS["guard"]["cooldown"])
+    cooldown_source = sources.get("guard.cooldown", guard_source)
+    if (
+        isinstance(cooldown, bool)
+        or not isinstance(cooldown, (int, float))
+        or not math.isfinite(cooldown)
+        or cooldown < 0
+    ):
+        raise ValueError(
+            "%s:1:1: guard.cooldown must be a non-negative number of seconds"
+            % cooldown_source
+        )
+    from ..governor import guard as guard_policy
+
+    for name in ("psi_some", "psi_full"):
+        value = guard.get(name, _DEFAULTS["guard"][name])
+        source = sources.get("guard." + name, guard_source)
+        if not isinstance(value, str):
+            raise ValueError("%s:1:1: guard.%s must be a PSI duration" % (source, name))
+        try:
+            guard_policy.psi_trigger("some" if name == "psi_some" else "full", value)
+        except ValueError as error:
+            raise ValueError(
+                "%s:1:1: guard.%s is invalid: %s" % (source, name, error)
+            ) from error
     mem = cfg.get("mem")
     mem_source = sources.get("mem", "built-in defaults")
     if not isinstance(mem, dict):

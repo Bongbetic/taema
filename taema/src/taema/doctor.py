@@ -1,6 +1,7 @@
 """Read-only checks that explain whether tæma can run safely on this machine."""
 
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -8,6 +9,7 @@ from urllib.parse import quote
 
 from .config import policy
 from .core import cgroup, memory, process
+from .governor import guard as pressure_guard
 from .store import db
 
 _CONFIG_KEYS = set(policy._DEFAULTS) | {
@@ -66,6 +68,20 @@ def _check(name, status, message, fix="No action required."):
 
 def _rooted(root, path):
     return os.path.join(root, path.lstrip("/")) if root != "/" else path
+
+
+def _rooted_config_path(root, path):
+    """Root an external config path without allowing it to escape a test/system root."""
+    if root == "/":
+        return path if os.path.isabs(path) else None
+    root_path = os.path.abspath(root)
+    candidate = os.path.abspath(os.path.join(root_path, path.lstrip("/")))
+    try:
+        if os.path.commonpath((root_path, candidate)) == root_path:
+            return candidate
+    except ValueError:
+        pass
+    return None
 
 
 def _read(path):
@@ -496,9 +512,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
     sys_block = _rooted(system_root, "/sys/block")
     try:
         zram_devices = sorted(
-            name
-            for name in os.listdir(sys_block)
-            if name.startswith("zram")
+            name for name in os.listdir(sys_block) if name.startswith("zram")
         )
     except OSError:
         zram_devices = None
@@ -516,7 +530,8 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
             _check(
                 "zram devices",
                 "ok",
-                "zram devices: %s" % (", ".join(zram_devices) if zram_devices else "none"),
+                "zram devices: %s"
+                % (", ".join(zram_devices) if zram_devices else "none"),
             )
         )
     memory_features = {
@@ -873,6 +888,190 @@ def _store_checks(cfg, store, store_error):
     return [store_check, recovery]
 
 
+def _foreground_prefer_matches(pattern, units, system_root, uid):
+    """Find current processes in explicitly foreground-classified unit scopes."""
+    try:
+        expression = re.compile(pattern)
+    except re.error:
+        return []
+    foreground_units = {}
+    for item in units or ():
+        metadata = item.get("unit", {}) if isinstance(item, dict) else {}
+        mem = item.get("mem", {}) if isinstance(item, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if not isinstance(mem, dict):
+            mem = {}
+        name = metadata.get("name")
+        resource_class = mem.get(
+            "class",
+            metadata.get("mem_class", metadata.get("qos_class", metadata.get("class"))),
+        )
+        if isinstance(name, str) and resource_class in ("foreground", "interactive"):
+            foreground_units[name] = resource_class
+
+    base = cgroup.base(uid)
+    matches = []
+    pending = list(cgroup.subdirs(base))
+    while pending:
+        path = pending.pop()
+        pending.extend(cgroup.subdirs(path))
+        scope = cgroup.rel(path, uid)
+        unit_name = os.path.basename(path)
+        if unit_name not in foreground_units:
+            continue
+        for pid in cgroup.tree_procs(path):
+            comm = _read(_rooted(system_root, "/proc/%d/comm" % pid))
+            if comm and expression.search(comm.strip()):
+                matches.append((scope, int(pid), comm.strip()))
+    return matches
+
+
+def _handler_option(argv, names):
+    for index, token in enumerate(argv[1:], 1):
+        for name in names:
+            if token == name and index + 1 < len(argv):
+                return argv[index + 1]
+            if token.startswith(name + "="):
+                return token.split("=", 1)[1]
+    return None
+
+
+def _nohang_settings(handler, system_root):
+    config = _handler_option(handler.argv, ("-c", "--config"))
+    candidates = (
+        [config]
+        if config
+        else (
+            "/etc/nohang/nohang.conf",
+            "/etc/nohang/nohang-desktop.conf",
+            "/usr/local/etc/nohang/nohang.conf",
+            "/usr/local/etc/nohang/nohang-desktop.conf",
+        )
+    )
+    keys = {
+        "psi_checking_enabled",
+        "psi_path",
+        "psi_metrics",
+        "psi_excess_duration",
+        "psi_post_action_delay",
+        "soft_threshold_min_mem",
+        "soft_threshold_min_swap",
+        "soft_threshold_max_psi",
+        "hard_threshold_min_mem",
+        "hard_threshold_min_swap",
+        "hard_threshold_max_psi",
+    }
+    selected = None
+    selected_path = None
+    for path in candidates:
+        rooted_path = _rooted_config_path(system_root, path)
+        text = _read(rooted_path) if rooted_path is not None else None
+        if text is None:
+            continue
+        values = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", "@")) or "=" not in line:
+                continue
+            key, value = (part.strip() for part in line.split("=", 1))
+            if key in keys:
+                values.append((key, value))
+        selected, selected_path = values, path
+        break
+    if selected_path is None:
+        return "config=%s; no settings file found" % (config or "default")
+    settings = ", ".join("%s=%s" % item for item in selected) or "no pressure settings"
+    return "config=%s; %s" % (selected_path, settings)
+
+
+def _systemd_oomd_settings(system_root):
+    directories = (
+        "/etc/systemd",
+        "/run/systemd",
+        "/usr/local/lib/systemd",
+        "/usr/lib/systemd",
+    )
+    paths = []
+    for directory in directories:
+        main = directory + "/oomd.conf"
+        if os.path.isfile(_rooted(system_root, main)):
+            paths.append(main)
+        dropin = _rooted(system_root, directory + "/oomd.conf.d")
+        try:
+            paths.extend(
+                directory + "/oomd.conf.d/" + name
+                for name in sorted(os.listdir(dropin))
+                if name.endswith(".conf")
+            )
+        except OSError:
+            pass
+    keys = {
+        "SwapUsedLimit",
+        "DefaultMemoryPressureLimit",
+        "DefaultMemoryPressureDurationSec",
+        "PrekillHookTimeoutSec",
+    }
+    settings = []
+    for path in paths:
+        text = _read(_rooted(system_root, path))
+        if text is None:
+            continue
+        section = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                continue
+            if section != "OOM" or not line or line.startswith(("#", ";")):
+                continue
+            key, separator, value = line.partition("=")
+            if separator and key.strip() in keys:
+                settings.append("%s:%s=%s" % (path, key.strip(), value.strip()))
+    return ", ".join(settings) if settings else "no explicit oomd.conf settings found"
+
+
+def _oom_handler_check(units, system_root, uid):
+    handlers = pressure_guard.detect_oom_handlers(_rooted(system_root, "/proc"))
+    descriptions = []
+    warnings = []
+    for name in ("earlyoom", "nohang", "systemd-oomd"):
+        for handler in handlers[name]:
+            if name == "earlyoom":
+                settings = pressure_guard.display_earlyoom(handler)
+                descriptions.append("earlyoom pid %d: %s" % (handler.pid, settings))
+                pattern = handler.option("--prefer")
+                if pattern:
+                    for scope, pid, comm in _foreground_prefer_matches(
+                        pattern, units, system_root, uid
+                    ):
+                        warnings.append(
+                            "earlyoom --prefer %r matches foreground scope %s "
+                            "process %s (pid %d)" % (pattern, scope, comm, pid)
+                        )
+            else:
+                if name == "nohang":
+                    details = _nohang_settings(handler, system_root)
+                else:
+                    details = _systemd_oomd_settings(system_root)
+                descriptions.append("%s pid %d: %s" % (name, handler.pid, details))
+    if not descriptions:
+        descriptions.append("no earlyoom, nohang, or systemd-oomd process detected")
+    if warnings:
+        return _check(
+            "OOM handlers",
+            "warn",
+            "; ".join(descriptions + warnings),
+            "Narrow earlyoom --prefer so it does not select a foreground workload; tæma never edits OOM-handler configuration.",
+        )
+    return _check(
+        "OOM handlers",
+        "ok",
+        "; ".join(descriptions),
+        "tæma reports external OOM handlers and never edits their configuration.",
+    )
+
+
 def diagnose(
     cfg,
     store=None,
@@ -927,6 +1126,7 @@ def diagnose(
     base, _root_controllers, controllers, cgroup_results = _cgroup_checks(uid)
     checks.extend(cgroup_results)
     checks.extend(_kernel_checks(base, controllers, system_root, cfg))
+    checks.append(_oom_handler_check(units, system_root, uid))
     checks.append(_socket_check(cfg, uid))
     checks.extend(_store_checks(cfg, store, store_error))
     mode = cfg.get("mode")

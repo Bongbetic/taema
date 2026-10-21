@@ -101,6 +101,22 @@
           },
           "additionalProperties": false
         },
+        "guard": {
+          "type": "object",
+          "required": ["active", "trigger", "triggers", "started_at", "steps", "bytes_freed", "last_trigger", "last_bytes_freed", "last_duration_ms"],
+          "properties": {
+            "active": { "type": "boolean" },
+            "trigger": { "type": ["string", "null"] },
+            "triggers": { "type": "array", "items": { "type": "string" } },
+            "started_at": { "type": ["number", "null"] },
+            "steps": { "type": "array", "items": { "type": "object" } },
+            "bytes_freed": { "type": "integer", "minimum": 0 },
+            "last_trigger": { "type": ["string", "null"] },
+            "last_bytes_freed": { "type": "integer", "minimum": 0 },
+            "last_duration_ms": { "type": ["number", "null"], "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
         "config": { "type": "array", "items": { "type": "string" } },
         "config_error": { "type": ["string", "null"] },
         "details": { "anyOf": [{ "type": "object" }, { "type": "null" }] }

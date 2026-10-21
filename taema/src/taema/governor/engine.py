@@ -1147,6 +1147,12 @@ def gc_candidates(
             None,
         )
         gc = (u or {}).get("gc", {})
+        no_attach_grace = gc.get("no_attach_grace")
+        has_no_attach_grace = (
+            isinstance(no_attach_grace, (int, float))
+            and not isinstance(no_attach_grace, bool)
+            and no_attach_grace >= 0
+        )
         # detector: pause process whose runtime directory is gone
         env_reason = None
         var = gc.get("env_dir_missing")
@@ -1179,7 +1185,7 @@ def gc_candidates(
         s = snap.get()
         edge_map = inspect.edges(set(pids), s)
         busy = bool(edge_map) or not getattr(s, "ok", True)
-        if gc.get("keep_while_children") and u:
+        if gc.get("keep_while_children") and u and not has_no_attach_grace:
             root_match = u.get("match") or {}
             busy = busy or any(not _matches(root_match, p) for p in pids)
         if busy:
@@ -1187,29 +1193,24 @@ def gc_candidates(
             usage.pop(rel, None)
             continue
         cpu = _cpu_usage(d)
-        cpu_moved = False
         if (
             rel in idle_since
             and cpu is not None
             and usage.get(rel) is not None
             and cpu != usage[rel]
+            and not has_no_attach_grace
+            and env_reason is None
         ):
             idle_since[rel] = now()  # CPU moved: not idle, restart the window
-            cpu_moved = True
         first = idle_since.setdefault(rel, now())
         if cpu is not None:
             usage[rel] = cpu
         if env_reason:
-            if not cpu_moved:
-                out.append((d, env_reason))
+            out.append((d, env_reason))
             continue
-        no_attach_grace = gc.get("no_attach_grace")
         if (
-            isinstance(no_attach_grace, (int, float))
-            and not isinstance(no_attach_grace, bool)
-            and no_attach_grace >= 0
+            has_no_attach_grace
             and now() - first >= no_attach_grace
-            and not cpu_moved
         ):
             out.append((d, "no attachment for %ds" % int(now() - first)))
             continue

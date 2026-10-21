@@ -485,7 +485,7 @@ class DaemonReclaimTests(unittest.TestCase):
         with mock.patch.object(
             service.subprocess, "Popen", return_value=process
         ) as popen:
-            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+            success, reason = self.daemon._run_runtime_hook(scope, unit, 1000)
         self.assertTrue(success)
         self.assertIn("succeeded", reason)
         self.assertIn(scope, self.daemon.saved_vm_scopes)
@@ -500,7 +500,7 @@ class DaemonReclaimTests(unittest.TestCase):
             "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
         }
         with mock.patch.object(service.subprocess, "Popen") as popen:
-            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+            success, reason = self.daemon._run_runtime_hook(scope, unit, 1000)
         self.assertFalse(success)
         self.assertIn("unit.domain", reason)
         popen.assert_not_called()
@@ -524,7 +524,7 @@ class DaemonReclaimTests(unittest.TestCase):
                 service.subprocess, "Popen", return_value=process
             ) as popen,
         ):
-            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+            success, reason = self.daemon._run_runtime_hook(scope, unit, 1000)
 
         self.assertTrue(success, reason)
         self.assertEqual(popen.call_args.args[0], ["virsh", "managedsave", "work-vm"])
@@ -537,7 +537,7 @@ class DaemonReclaimTests(unittest.TestCase):
             "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
         }
         with mock.patch.object(service.subprocess, "Popen") as popen:
-            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+            success, reason = self.daemon._run_runtime_hook(scope, unit, 1000)
 
         self.assertFalse(success)
         self.assertIn("valid unit.domain", reason)
@@ -546,7 +546,7 @@ class DaemonReclaimTests(unittest.TestCase):
     def test_runtime_hook_rejects_command_strings(self):
         unit = {"mem": {"pause": "podman pause %(container)s"}}
         with mock.patch.object(service.subprocess, "Popen") as popen:
-            success, reason = self.daemon._run_vm_save_hook(
+            success, reason = self.daemon._run_runtime_hook(
                 "podman-test", unit, 1000, field="pause"
             )
 
@@ -575,7 +575,7 @@ class DaemonReclaimTests(unittest.TestCase):
             mock.patch.object(
                 self.daemon, "_reclaim_idle", return_value=(False, "idle for 2s")
             ) as idle,
-            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook") as hook,
             mock.patch.object(service.memory, "reclaim_page_cache") as reclaim,
         ):
             result = self.daemon.reclaim_scope(scope, now=1000)
@@ -607,7 +607,7 @@ class DaemonReclaimTests(unittest.TestCase):
             for pid in pids
         ]
         with (
-            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook") as hook,
             mock.patch.object(service.memory, "reclaim_page_cache") as reclaim,
         ):
             result = self.daemon.reclaim_scope(scope, now=1000)
@@ -650,7 +650,7 @@ class DaemonReclaimTests(unittest.TestCase):
             mock.patch.object(
                 self.daemon, "_reclaim_idle", side_effect=attach_during_grace
             ),
-            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook") as hook,
         ):
             result = self.daemon.reclaim_scope(scope, now=1000)
         self.assertEqual(result["status"], "skipped")
@@ -670,7 +670,7 @@ class DaemonReclaimTests(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook") as hook,
             mock.patch.object(service.memory, "reclaim_page_cache") as reclaim,
         ):
             result = self.daemon.reclaim_scope(scope, now=1000)
@@ -690,10 +690,10 @@ class DaemonReclaimTests(unittest.TestCase):
             pair_reason="user answered stop",
             pair_explicit=True,
         )
-        with mock.patch.object(
-            self.daemon, "_pair_scope_facts", return_value=facts
-        ):
-            allowed, reason = self.daemon._vm_save_hook_authority(scope, self.path, unit)
+        with mock.patch.object(self.daemon, "_pair_scope_facts", return_value=facts):
+            allowed, reason = self.daemon._runtime_hook_authority(
+                scope, self.path, unit
+            )
         self.assertTrue(allowed, reason)
 
     def test_vm_save_hook_failure_blocks_all_reclaim(self):
@@ -719,7 +719,7 @@ class DaemonReclaimTests(unittest.TestCase):
             ),
             mock.patch.object(
                 self.daemon,
-                "_run_vm_save_hook",
+                "_run_runtime_hook",
                 return_value=(False, "VM save hook exited 1"),
             ),
             mock.patch.object(service.memory, "reclaim_page_cache") as file_reclaim,
@@ -750,7 +750,7 @@ class DaemonReclaimTests(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook") as hook,
             mock.patch.object(
                 service.memory, "reclaim_page_cache", return_value="memory.reclaim"
             ) as file_reclaim,
@@ -776,7 +776,7 @@ class DaemonReclaimTests(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook") as hook,
             mock.patch.object(
                 service.memory, "reclaim_page_cache", return_value="memory.reclaim"
             ),
@@ -814,7 +814,7 @@ class DaemonReclaimTests(unittest.TestCase):
             mock.patch.object(
                 self.daemon, "_reclaim_idle", return_value=(True, "idle for 300s")
             ),
-            mock.patch.object(self.daemon, "_run_vm_save_hook", side_effect=saved) as hook,
+            mock.patch.object(self.daemon, "_run_runtime_hook", side_effect=saved) as hook,
             mock.patch.object(service.memory, "reclaim_page_cache", return_value="memory.reclaim"),
             mock.patch.object(service.memory, "reclaim_anonymous", return_value="memory.reclaim") as anon,
         ):

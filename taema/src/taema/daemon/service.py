@@ -179,6 +179,7 @@ class Daemon:
         self.saved_vm_scopes = set()  # VM save success, until the guest resumes
         self.saved_vm_members = {}  # scope -> member pids observed after save
         self.memory_save_attempts = {}  # scope -> last save-state hook attempt
+        self.runtime_identity_seen = {}  # scope -> last observed runtime id values
         self.reclaim_cursor = 0
         self.qos_pending = {}  # scope -> (candidate class, first observed time)
         self.qos_usage = {}  # app scope -> (aggregate cpu usage_usec, sample time)
@@ -2549,12 +2550,32 @@ class Daemon:
             "domain": metadata.get("domain"),
             "container": metadata.get("container_id", metadata.get("container")),
         }
+        current = {}
         for pid in cgroup.tree_procs(path):
             identity = inspect.runtime_identity(pid)
             for field in ("domain", "container"):
-                if not fields[field] and identity.get(field):
-                    fields[field] = identity[field]
+                value = identity.get(field)
+                if isinstance(value, str) and value:
+                    current.setdefault(field, set()).add(value)
+        scope = cgroup.rel(path)
+        if current:
+            self.runtime_identity_seen.setdefault(scope, {}).update(current)
+        previous = self.runtime_identity_seen.get(scope, {})
+        for field in ("domain", "container"):
+            values = previous.get(field, set())
+            if not fields[field] and len(values) == 1:
+                fields[field] = next(iter(values))
         return fields
+
+    def _remember_runtime_identities(self):
+        """Retain live runtime IDs before a helper process exits from its scope."""
+        for path in cgroup.subdirs(cgroup.base()):
+            unit = self._runtime_gc_unit(path)
+            if unit is None:
+                continue
+            metadata = unit.get("unit", {})
+            if isinstance(metadata, dict):
+                self._runtime_hook_fields(path, metadata)
 
     def _log_runtime_gc_quit(
         self, path, leaf, why, memory_before, pids_before, hook, reclaim=None
@@ -2592,7 +2613,22 @@ class Daemon:
         )
         hook_result = "not configured"
         idle_grace_prevalidated = False
-        if hook_field and decision.verdict != authorization.KEEP:
+        if hook_field and decision.verdict == authorization.ACT:
+            allowed, authority_reason = self._runtime_hook_authority(
+                leaf, path, unit
+            )
+            if not allowed:
+                hook_result = "runtime hook blocked by stop authority: " + authority_reason
+                self.store.log(event="gc_refused", scope=leaf, why=hook_result)
+                self._log_runtime_gc_quit(
+                    path,
+                    leaf,
+                    why,
+                    memory_before,
+                    pids_before,
+                    {"field": hook_field, "success": False, "reason": hook_result},
+                )
+                return False
             mem_config = self.cfg.get("mem", {})
             mem_config = mem_config if isinstance(mem_config, dict) else {}
             now = time.time()
@@ -2640,7 +2676,7 @@ class Daemon:
                     {"field": hook_field, "success": False, "reason": hook_result},
                 )
                 return False
-            success, hook_result = self._run_vm_save_hook(
+            success, hook_result = self._run_runtime_hook(
                 leaf, unit, now, field=hook_field
             )
             if not success:
@@ -2658,6 +2694,8 @@ class Daemon:
                     {"field": hook_field, "success": False},
                 )
                 return False
+        elif hook_field and decision.verdict == authorization.WOULD_ACT:
+            hook_result = "skipped because stop authority is unavailable"
 
         reclaim_result = {"status": "skipped", "reason": "reclaim disabled"}
         if (
@@ -2699,6 +2737,7 @@ class Daemon:
             after={"memory_bytes": 0, "scope_present": False},
             freed_bytes=memory_before,
         )
+        self.runtime_identity_seen.pop(scope, None)
         states = self.store.data.get("memory_scopes", {})
         if scope in self.memory_scope_seen or (
             isinstance(states, dict) and scope in states
@@ -2723,6 +2762,7 @@ class Daemon:
             self._save_if_idle()
         self.store.decay()
         self.store.enforce_caps()
+        self._remember_runtime_identities()
         # candidate selection: leftover/* leaves are stop candidates only where the ladder allows
         leftover_leaves = (
             self.authorize(authorization.LEFTOVER_LEAVES).verdict == authorization.ACT
@@ -7190,7 +7230,7 @@ class Daemon:
                 resumed.add(scope)
         return resumed
 
-    def _vm_save_hook_authority(self, scope, path, unit):
+    def _runtime_hook_authority(self, scope, path, unit):
         """Require the lifecycle stop policy before running a potentially destructive hook."""
         metadata = (unit or {}).get("unit", {})
         unit_stop_allowed = (
@@ -7217,7 +7257,7 @@ class Daemon:
             )
         return True, decision.reason
 
-    def _run_vm_save_hook(self, scope, unit, now, field="save_state"):
+    def _run_runtime_hook(self, scope, unit, now, field="save_state"):
         """Run one explicitly configured runtime argv hook without invoking a shell."""
         unit_mem = (unit or {}).get("mem", {})
         metadata = (unit or {}).get("unit", {})
@@ -7653,7 +7693,7 @@ class Daemon:
             and scope not in self.saved_vm_scopes
         )
         if save_required and swap_enabled and eligible_class and not dry_run:
-            save_allowed, save_authority_reason = self._vm_save_hook_authority(
+            save_allowed, save_authority_reason = self._runtime_hook_authority(
                 scope, path, unit
             )
             if not save_allowed:
@@ -7693,7 +7733,7 @@ class Daemon:
                     "status": "skipped",
                     "reason": "VM save hook blocked by safety check: " + safety,
                 }
-            saved, save_reason = self._run_vm_save_hook(scope, unit, now)
+            saved, save_reason = self._run_runtime_hook(scope, unit, now)
             if saved:
                 self._memory_restore_control(scope, path, "memory.swap.max")
                 safety = self._reclaim_safety_reason(

@@ -1012,6 +1012,40 @@ class RuntimeGc(AutoCase):
         self.assertIs(self.d._runtime_gc_unit(path), unit)
         self.assertEqual(self.d._reclaim_class("app-libvirt-qemu-abcdef12", path), "vm")
 
+    def test_podman_hook_keeps_last_container_id_after_conmon_exits(self):
+        self.fp.add(330, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": self.rt})
+        self.fp.add(
+            331,
+            330,
+            comm="conmon",
+            argv=["conmon", "-c", "container-id"],
+            env={"XDG_RUNTIME_DIR": self.rt},
+        )
+        self.cg.leaf("app-podman-abcdef12", [330, 331])
+        unit = {
+            "unit": {
+                "name": "app-podman",
+                "kind": "app",
+                "class": "container",
+            }
+        }
+        self.d.units = [unit]
+
+        self.d._remember_runtime_identities()
+        self.cg.set_procs("app-podman-abcdef12", [330])
+        unit["mem"] = {"pause": ["podman", "pause", "%(container)s"]}
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ("paused\n", None)
+        with mock.patch.object(
+            daemon.subprocess, "Popen", return_value=process
+        ) as popen:
+            success, reason = self.d._run_runtime_hook(
+                "app-podman-abcdef12", unit, 1000, field="pause"
+            )
+
+        self.assertTrue(success, reason)
+        self.assertEqual(popen.call_args.args[0], ["podman", "pause", "container-id"])
+
     def test_cleanup_orders_hook_reclaim_stop_and_records_freed_state(self):
         path, _unit, pid = self.runtime_unit(
             hook=("save_state", ["virsh", "managedsave", "%(domain)s"])
@@ -1034,7 +1068,7 @@ class RuntimeGc(AutoCase):
             mock.patch.object(self.d, "_runtime_stop_preflight", return_value=True),
             mock.patch.object(
                 self.d,
-                "_run_vm_save_hook",
+                "_run_runtime_hook",
                 side_effect=lambda *args, **kwargs: (
                     order.append("hook") or True,
                     "saved",
@@ -1082,7 +1116,7 @@ class RuntimeGc(AutoCase):
             ),
             mock.patch.object(self.d, "_runtime_stop_preflight", return_value=True),
             mock.patch.object(
-                self.d, "_run_vm_save_hook", return_value=(False, "hook exited 1")
+                self.d, "_run_runtime_hook", return_value=(False, "hook exited 1")
             ),
             mock.patch.object(self.d, "_reclaim_one") as reclaim,
             mock.patch.object(engine, "stop") as stop,
@@ -1109,7 +1143,7 @@ class RuntimeGc(AutoCase):
                 return_value=(False, "idle for 120s; needs 300s"),
             ),
             mock.patch.object(self.d, "_runtime_stop_preflight") as preflight,
-            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_run_runtime_hook") as hook,
             mock.patch.object(self.d, "_reclaim_one") as reclaim,
             mock.patch.object(engine, "stop") as stop,
         ):
@@ -1134,7 +1168,7 @@ class RuntimeGc(AutoCase):
                 self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
             ),
             mock.patch.object(self.d, "_runtime_stop_preflight", return_value=False),
-            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_run_runtime_hook") as hook,
             mock.patch.object(self.d, "_reclaim_one") as reclaim,
             mock.patch.object(engine, "stop") as stop,
         ):
@@ -1146,9 +1180,9 @@ class RuntimeGc(AutoCase):
         stop.assert_not_called()
         self.assertTrue(any(event["event"] == "gc_refused" for event in self.log()))
 
-    def test_adopt_rechecks_attachments_before_preservation(self):
+    def test_runtime_hook_rechecks_attachments_before_preservation(self):
         path, _unit, pid = self.runtime_unit(
-            mode="adopt",
+            mode="enforce",
             hook=("pause", ["podman", "pause", "%(container)s"]),
         )
         with (
@@ -1164,7 +1198,7 @@ class RuntimeGc(AutoCase):
                 "_reclaim_safety_reason",
                 return_value="scope has external dependency edges",
             ) as safety,
-            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_run_runtime_hook") as hook,
             mock.patch.object(self.d, "_reclaim_one") as reclaim,
             mock.patch.object(engine, "stop") as stop,
         ):
@@ -1174,6 +1208,29 @@ class RuntimeGc(AutoCase):
         safety.assert_called_once_with("app-libvirt-qemu-abcdef12", path, [pid])
         hook.assert_not_called()
         reclaim.assert_not_called()
+        stop.assert_not_called()
+
+    def test_adopt_does_not_run_destructive_runtime_hook_without_stop_authority(self):
+        path, _unit, _pid = self.runtime_unit(
+            mode="adopt",
+            hook=("pause", ["podman", "stop", "%(container)s"]),
+        )
+        with (
+            mock.patch.object(
+                engine,
+                "gc_candidates",
+                return_value=[(path, "no attachment for 120s")],
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=2048),
+            mock.patch.object(self.d, "_run_runtime_hook") as hook,
+            mock.patch.object(self.d, "_contain_runtime_gc_review") as contain,
+            mock.patch.object(engine, "stop") as stop,
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "review")
+        hook.assert_not_called()
+        contain.assert_called_once()
         stop.assert_not_called()
 
     def test_reclaim_reuses_runtime_gc_idle_validation(self):
@@ -1214,7 +1271,7 @@ class RuntimeGc(AutoCase):
                 engine, "gc_candidates", return_value=[(path, "no attachment for 120s")]
             ),
             mock.patch.object(self.d, "_review_memory", return_value=1024),
-            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_run_runtime_hook") as hook,
             mock.patch.object(self.d, "_reclaim_one") as reclaim,
             mock.patch.object(self.d, "_contain_runtime_gc_review") as contain,
             mock.patch.object(engine, "stop") as stop,
@@ -1243,12 +1300,12 @@ class RuntimeGc(AutoCase):
             ),
             mock.patch.object(
                 self.d,
-                "_run_vm_save_hook",
+                "_run_runtime_hook",
                 side_effect=lambda *args, **kwargs: (
                     order.append("save") or True,
                     "saved",
                 ),
-            ),
+            ) as hook,
             mock.patch.object(
                 self.d,
                 "_reclaim_one",
@@ -1261,7 +1318,10 @@ class RuntimeGc(AutoCase):
             result = self.d.gc_pass()
 
         self.assertEqual(result[0][2], "review")
-        self.assertEqual(order, ["save", "reclaim"])
+        self.assertEqual(order, ["reclaim"])
+        hook.assert_not_called()
+        quit_event = next(event for event in self.log() if event["event"] == "gc_quit")
+        self.assertIn("stop authority is unavailable", quit_event["hook"]["result"])
         destination = "leftover/" + engine.leaf_slug("app-libvirt-qemu-abcdef12", pid)
         with open(os.path.join(self.cg.base, destination, "cgroup.procs")) as source:
             self.assertEqual(source.read().split(), [str(pid)])

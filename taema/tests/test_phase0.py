@@ -601,6 +601,31 @@ class GcRules(unittest.TestCase):
         candidates = self.run_gc(idle=idle, units=[unit])
         self.assertEqual(candidates, [(path, "no attachment for 120s")])
 
+    def test_detached_runtime_grace_ignores_cpu_activity_and_child_processes(self):
+        path = self.cg.leaf("app-podman-test", [42, 43], cpu=1)
+        unit = {
+            "unit": {
+                "name": "app-podman",
+                "kind": "app",
+                "stop_when_unneeded": True,
+            },
+            "match": {"comm": "catatonit"},
+            "children": [{"name": "conmon", "comm": "conmon"}],
+            "gc": {"keep_while_children": True, "no_attach_grace": 120},
+        }
+        idle, usage = {}, {}
+
+        self.assertEqual(self.run_gc(idle=idle, usage=usage, units=[unit]), [])
+        self.t[0] += 60
+        self.cg.set_cpu("app-podman-test", 10000)
+        self.assertEqual(self.run_gc(idle=idle, usage=usage, units=[unit]), [])
+        self.t[0] += 60
+
+        self.assertEqual(
+            self.run_gc(idle=idle, usage=usage, units=[unit]),
+            [(path, "no attachment for 120s")],
+        )
+
     def test_runtime_socket_peers_hold_the_scope_past_no_attachment_grace(self):
         self.cg.leaf("app-vm-test", [42], cpu=1)
         unit = {

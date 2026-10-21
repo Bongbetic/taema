@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 
 
 _X_SOCKET = re.compile(r"(?:^|/)\.x11-unix/x\d+$", re.IGNORECASE)
@@ -18,6 +19,30 @@ _MEDIA_SOCKET_PARTS = (
 )
 _SOCKET_FD = re.compile(r"^socket:\[(\d+)\]$")
 _MAX_FD_SCAN = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ListenerDescriptor:
+    transport: str
+    inode: int
+
+    @classmethod
+    def from_record(cls, record):
+        if not isinstance(record, dict):
+            return None
+        transport = record.get("transport")
+        inode = record.get("inode")
+        if (
+            transport not in ("tcp", "unix")
+            or not isinstance(inode, int)
+            or isinstance(inode, bool)
+            or inode <= 0
+        ):
+            return None
+        return cls(transport, inode)
+
+    def to_record(self):
+        return {"transport": self.transport, "inode": self.inode}
 
 
 def _socket_kind(path: str) -> str:
@@ -154,9 +179,6 @@ def listener_descriptors(members, snapshot, member_socket_inodes=()):
                 continue
             inode = row.get("inode")
             if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:
-                return [], "listener identity unknown"
-            descriptors[(transport, inode)] = {
-                "transport": transport,
-                "inode": inode,
-            }
-    return [descriptors[key] for key in sorted(descriptors)], ""
+                return (), "listener identity unknown"
+            descriptors[(transport, inode)] = ListenerDescriptor(transport, inode)
+    return tuple(descriptors[key] for key in sorted(descriptors)), ""

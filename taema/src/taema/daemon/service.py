@@ -4556,6 +4556,23 @@ class Daemon:
             return None
         return value if value in ("0", "1") else None
 
+    @staticmethod
+    def _wait_for_cgroup_frozen(path, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                with open(
+                    os.path.join(path, "cgroup.events"), encoding="ascii"
+                ) as source:
+                    values = Daemon._leaf_event_values(source.read())
+            except OSError:
+                return False
+            if values.get("frozen") == "1":
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
     def _freeze_safety_reason(self, scope, path, snapshot=None):
         """Return a fail-closed reason when a leftover cannot safely be frozen."""
         return self._freeze_safety_facts(scope, path, snapshot)[0]
@@ -4602,7 +4619,7 @@ class Daemon:
         )
         if socket_reason:
             return socket_reason, []
-        listeners = []
+        listeners = ()
         if wake_on_connect:
             listeners, listener_error = freezing.listener_descriptors(
                 pids, snapshot, member_socket_inodes
@@ -4763,6 +4780,29 @@ class Daemon:
                 out.append((scope, path, record))
         return out
 
+    def _listener_wake_due(self, now):
+        return bool(self._frozen_listener_scopes()) and (
+            now - self.last_listener_check >= 2.0
+        )
+
+    def _run_listener_wake_if_due(self, now):
+        if self._listener_wake_due(now):
+            self.guarded(lambda: self.listener_wake_pass(now=now))
+
+    @staticmethod
+    def _listener_thaw_reason(reason):
+        if reason in (
+            "listener has pending connections",
+            "established TCP connection",
+            "Unix socket peer unknown",
+            "Unix socket peer owner unknown",
+            "outside Unix socket peer",
+            "connected to a window compositor",
+            "connected to an audio or video client socket",
+        ):
+            return "connect"
+        return "listener state unknown: " + reason
+
     def listener_wake_pass(self, now=None):
         """Thaw frozen listeners with queued clients; unknown queue state thaws too."""
         now = time.time() if now is None else now
@@ -4812,40 +4852,44 @@ class Daemon:
                 wake_on_connect=True,
             )
             if socket_reason:
-                if socket_reason in (
-                    "listener has pending connections",
-                    "established TCP connection",
-                    "Unix socket peer unknown",
-                    "Unix socket peer owner unknown",
-                    "outside Unix socket peer",
-                    "connected to a window compositor",
-                    "connected to an audio or video client socket",
-                ):
-                    reason = "connect"
-                else:
-                    reason = "listener state unknown: " + socket_reason
-                results.append(self._thaw_scope(scope, reason))
+                results.append(
+                    self._thaw_scope(
+                        scope, self._listener_thaw_reason(socket_reason)
+                    )
+                )
                 continue
-            listeners = record.get("listeners")
-            if not isinstance(listeners, list) or not listeners:
+            saved_listeners = record.get("listeners", [])
+            if not isinstance(saved_listeners, list):
                 results.append(self._thaw_scope(scope, "listener state unknown"))
+                continue
+            saved_descriptors = []
+            for listener in saved_listeners:
+                descriptor = freezing.ListenerDescriptor.from_record(listener)
+                if descriptor is None:
+                    saved_descriptors = None
+                    break
+                saved_descriptors.append(descriptor)
+            if saved_descriptors is None:
+                results.append(self._thaw_scope(scope, "listener state unknown"))
+                continue
+            listeners, listener_error = freezing.listener_descriptors(
+                members, snapshot, member_socket_inodes
+            )
+            if listener_error:
+                results.append(
+                    self._thaw_scope(
+                        scope, "listener state unknown: " + listener_error
+                    )
+                )
+                continue
+            current_descriptors = set(listeners)
+            if not set(saved_descriptors).issubset(current_descriptors):
+                results.append(self._thaw_scope(scope, "listener disappeared"))
                 continue
             reason = ""
             for listener in listeners:
-                if not isinstance(listener, dict):
-                    reason = "listener state unknown"
-                    break
-                transport, inode = listener.get("transport"), listener.get("inode")
-                if (
-                    transport not in ("tcp", "unix")
-                    or not isinstance(inode, int)
-                    or isinstance(inode, bool)
-                    or inode <= 0
-                ):
-                    reason = "listener state unknown"
-                    break
-                row = current.get((transport, inode))
-                if row is None or inode not in member_socket_inodes:
+                row = current.get((listener.transport, listener.inode))
+                if row is None or listener.inode not in member_socket_inodes:
                     reason = "listener disappeared"
                     break
                 recv_q = row.get("recv_q")
@@ -4857,6 +4901,10 @@ class Daemon:
                     break
             if reason:
                 results.append(self._thaw_scope(scope, reason))
+                continue
+            self.store.set_frozen_listeners(
+                scope, [listener.to_record() for listener in listeners]
+            )
         return results
 
     def _manual_freeze_cpu_reason(self, scope, path, members):
@@ -4949,7 +4997,7 @@ class Daemon:
                     scope,
                     time.time(),
                     decision_id=audit["id"],
-                    listeners=listeners,
+                    listeners=[listener.to_record() for listener in listeners],
                     source=source,
                 )
                 # Persist the recovery intent before changing kernel state. A crash from here
@@ -4959,9 +5007,6 @@ class Daemon:
                     os.path.join(path, "cgroup.freeze"), "w", encoding="ascii"
                 ) as target:
                     target.write("1\n")
-                self.store.log(
-                    event="freeze", scope=scope, reason=why, source=source
-                )
         except OSError as error:
             if self._freeze_value(path) == "0":
                 self.store.clear_frozen_scope(scope)
@@ -4970,6 +5015,31 @@ class Daemon:
                 event="freeze_refused", scope=scope, reason="%s: %s" % (why, error)
             )
             return {"ok": False, "error": "could not freeze %s: %s" % (scope, error)}
+        if not self._wait_for_cgroup_frozen(path):
+            self._thaw_scope(scope, "freeze state unknown")
+            self.store.log(
+                event="freeze_refused",
+                scope=scope,
+                reason="kernel did not confirm the frozen state",
+            )
+            return {"ok": False, "error": "kernel did not confirm the frozen state"}
+        self.store.log(event="freeze", scope=scope, reason=why, source=source)
+        if self.cfg.get("freeze", {}).get("wake_on_connect", False) is True:
+            safety, listeners = self._freeze_safety_facts(scope, path)
+            if safety:
+                self._thaw_scope(scope, self._listener_thaw_reason(safety))
+                self.store.log(
+                    event="freeze_refused",
+                    scope=scope,
+                    reason="post-freeze safety check: " + safety,
+                )
+                return {
+                    "ok": False,
+                    "error": "post-freeze safety check failed: " + safety,
+                }
+            self.store.set_frozen_listeners(
+                scope, [listener.to_record() for listener in listeners]
+            )
         # A frozen interval is not an idle CPU sample. Drop both trackers so any later
         # thaw path, including one initiated by the stop engine, must begin afresh.
         self._clear_freeze_samples(scope)
@@ -5331,11 +5401,7 @@ class Daemon:
                 skip_pass = True
                 self.guarded(self.thaw_held_scopes)
                 now = time.time()
-                if (
-                    self._frozen_listener_scopes()
-                    and now - self.last_listener_check >= 2.0
-                ):
-                    self.guarded(lambda: self.listener_wake_pass(now=now))
+                self._run_listener_wake_if_due(now)
                 self.store.log(event="store_busy", where="tick", retry=True)
                 return
             self.guarded(self.check_socket)
@@ -5344,11 +5410,7 @@ class Daemon:
             self.guarded(self.thaw_held_scopes)
             self.run_deadlines()
             now = time.time()
-            if (
-                self._frozen_listener_scopes()
-                and now - self.last_listener_check >= 2.0
-            ):
-                self.guarded(lambda: self.listener_wake_pass(now=now))
+            self._run_listener_wake_if_due(now)
             if now - self.last["adopt"] >= self.iv_adopt:
                 self.guarded(self.poll_owner_watches)
                 if self.queue_collector_event(ProcessReconcile()):
@@ -5371,11 +5433,7 @@ class Daemon:
             if now - self.last.get("freeze", 0.0) >= 60.0:
                 self.last["freeze"] = now
                 self.guarded(self.freeze_pass)
-            if (
-                self._frozen_listener_scopes()
-                and now - self.last_listener_check >= 2.0
-            ):
-                self.guarded(lambda: self.listener_wake_pass(now=now))
+            self._run_listener_wake_if_due(now)
             self.drain_collector_events()
             self.guarded(self.qos_pass)
         finally:

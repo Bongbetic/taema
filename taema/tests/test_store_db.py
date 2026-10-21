@@ -50,7 +50,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-        self.assertEqual(version, 10)
+        self.assertEqual(version, store_db.SCHEMA_VERSION)
         self.assertEqual(row["source"], "auto")
 
     def test_read_only_schema_nine_state_defaults_freeze_source(self):
@@ -73,7 +73,10 @@ class StoreDatabaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(temporary, {})
             store.set_frozen_scope(
-                "leftover/browser", 123.0, listeners=listeners, source="auto"
+                "leftover/browser",
+                123.0,
+                listeners=listeners,
+                source="auto",
             )
             store.save()
             reopened = Store(temporary, {}, read_only=True)
@@ -109,7 +112,8 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 10
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    store_db.SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -184,7 +188,8 @@ class StoreDatabaseTests(unittest.TestCase):
                     ("signature-1",),
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 10
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    store_db.SCHEMA_VERSION,
                 )
 
             self.assertTrue({"suspended_until", "suspended_at"}.issubset(columns))
@@ -219,7 +224,8 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 10
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    store_db.SCHEMA_VERSION,
                 )
                 self.assertTrue(
                     connection.execute(
@@ -259,7 +265,8 @@ class StoreDatabaseTests(unittest.TestCase):
                     "SELECT id, owner, runtime_hash, veto FROM signatures"
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 10
+                    connection.execute("PRAGMA user_version").fetchone()[0],
+                    store_db.SCHEMA_VERSION,
                 )
 
             self.assertEqual(
@@ -301,7 +308,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-            self.assertEqual(version, 10)
+            self.assertEqual(version, store_db.SCHEMA_VERSION)
             self.assertTrue({"last_outcome", "last_outcome_at"}.issubset(columns))
             self.assertEqual(tuple(row), ("stop", None, None))
 
@@ -346,7 +353,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-        self.assertEqual(version, 10)
+        self.assertEqual(version, store_db.SCHEMA_VERSION)
         self.assertIn("peak", columns)
         self.assertEqual(
             tuple(row), ("app-browser", 123.0, 4096, 2048, 1024, 512, 0, 1.25, None)

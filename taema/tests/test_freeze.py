@@ -3,6 +3,7 @@
 import io
 import os
 import time
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -70,6 +71,11 @@ class FreezeTests(unittest.TestCase):
         )
         self.daemon = service.Daemon(self.cfg)
         self.daemon.lineage = FakeLineage()
+        freeze_confirmation = mock.patch.object(
+            self.daemon, "_wait_for_cgroup_frozen", return_value=True
+        )
+        freeze_confirmation.start()
+        self.addCleanup(freeze_confirmation.stop)
         self.patches = [
             mock.patch.object(service.inspect, "PROC", self.proc_root),
             mock.patch.object(service.inspect.ProcTable, "scan", return_value=None),
@@ -107,6 +113,28 @@ class FreezeTests(unittest.TestCase):
             reason = self.daemon._freeze_safety_reason(self.scope, self.path)
         self.assertEqual(reason, "socket state unknown")
         self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+
+    def test_freeze_confirmation_reads_kernel_event_state(self):
+        events = os.path.join(self.path, "cgroup.events")
+        write(events, "populated 1\nfrozen 1\n")
+        self.assertTrue(service.Daemon._wait_for_cgroup_frozen(self.path, timeout=0))
+        write(events, "populated 1\nfrozen 0\n")
+        self.assertFalse(service.Daemon._wait_for_cgroup_frozen(self.path, timeout=0))
+
+    def test_freeze_without_kernel_confirmation_is_thawed(self):
+        with (
+            mock.patch.object(
+                self.daemon, "_wait_for_cgroup_frozen", return_value=False
+            ),
+            mock.patch.object(service.inspect, "Snapshot", return_value=EmptySnapshot()),
+        ):
+            result = self.daemon.freeze_scope(
+                self.scope, manual=False, cpu_verified=True
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+        self.assertNotIn(self.scope, self.daemon.store.data["frozen_scopes"])
 
     def test_unmatched_socket_fd_and_new_pty_host_fail_closed(self):
         fd_dir = os.path.join(self.proc_root, "4242", "fd")
@@ -171,6 +199,25 @@ class FreezeTests(unittest.TestCase):
             self.daemon.store.data["frozen_scopes"][self.scope]["listeners"],
             [{"transport": "tcp", "inode": 9101}],
         )
+    def test_listener_descriptors_are_immutable(self):
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "inode": 9104,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            tcp=(),
+            tcp_listen=(listener,),
+            unix=(),
+        )
+
+        descriptors, error = freezing.listener_descriptors({4242}, snapshot)
+
+        self.assertEqual(error, "")
+        self.assertEqual(len(descriptors), 1)
+        with self.assertRaises(FrozenInstanceError):
+            descriptors[0].inode = 123
 
     def test_wake_on_connect_freeze_records_unix_listener(self):
         listener = {
@@ -368,10 +415,76 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(with_listener, 2.0)
 
     def test_no_accept_queue_snapshot_without_frozen_listener(self):
+        self.daemon.store.set_frozen_scope(self.scope, 1000.0, listeners=[])
+        write(os.path.join(self.path, "cgroup.freeze"), "1\n")
         with mock.patch.object(
             service.inspect, "Snapshot", side_effect=AssertionError("unexpected poll")
         ):
             self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
+
+    def test_listener_created_during_freeze_is_discovered_and_monitored(self):
+        inode = 9310
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "local": "127.0.0.1:8000",
+            "inode": inode,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(),
+            tcp_listen=(listener,),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={inode},
+        )
+        call_count = [0]
+
+        def snapshot_during_freeze():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return EmptySnapshot()
+            os.symlink(
+                "socket:[%d]" % inode,
+                os.path.join(self.proc_root, "4242", "fd", "5"),
+            )
+            return snapshot
+
+        with mock.patch.object(
+            service.inspect, "Snapshot", side_effect=snapshot_during_freeze
+        ):
+            frozen = self.daemon.freeze_scope(
+                self.scope, manual=False, cpu_verified=True
+            )
+
+        self.assertTrue(frozen["ok"])
+        record = self.daemon.store.data["frozen_scopes"][self.scope]
+        self.assertEqual(
+            record["listeners"], [{"transport": "tcp", "inode": inode}]
+        )
+
+        with mock.patch.object(service.inspect, "Snapshot", return_value=snapshot):
+            self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
+
+        listener["recv_q"] = 1
+        with (
+            mock.patch.object(service.inspect, "Snapshot", return_value=snapshot),
+            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+        ):
+            result = self.daemon.listener_wake_pass(now=1002.0)
+
+        self.assertTrue(result[0]["thawed"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+        self.assertTrue(
+            any(
+                call.kwargs.get("event") == "thaw"
+                and call.kwargs.get("reason") == "connect"
+                for call in log.call_args_list
+            )
+        )
 
     def test_listener_wake_still_thaws_when_store_writer_is_busy(self):
         inode = 9302

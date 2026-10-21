@@ -248,6 +248,16 @@ class Store:
         }
         self.dirty = True
 
+    def set_frozen_listeners(self, scope, listeners):
+        """Update a managed freeze's listener identities after reconciliation."""
+        record = self.data.setdefault("frozen_scopes", {}).get(scope)
+        listeners = list(listeners)
+        if not isinstance(record, dict) or record.get("listeners") == listeners:
+            return False
+        record["listeners"] = listeners
+        self.dirty = True
+        return True
+
     def clear_frozen_scope(self, scope):
         """Forget one managed freeze after a successful thaw or confirmed removal."""
         record = self.data.setdefault("frozen_scopes", {}).pop(scope, None)

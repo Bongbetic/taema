@@ -70,6 +70,16 @@ class ScopeMemory:
 
 
 @dataclass(frozen=True, slots=True)
+class ReclaimBounds:
+    """Shared limits for one page-cache and anonymous reclaim action."""
+
+    maximum_bytes: int
+    minimum_headroom_bytes: int
+    headroom_percent: float
+    minimum_bytes: int = MIN_USEFUL_RECLAIM
+
+
+@dataclass(frozen=True, slots=True)
 class MemorySample:
     """Immutable sample record shared by daemon sampling and SQLite serialization."""
 
@@ -234,12 +244,15 @@ def page_cache_budget(
     current_bytes,
     anon_bytes,
     reclaimable_bytes,
-    maximum_bytes,
-    minimum_headroom_bytes,
-    headroom_percent,
-    minimum_bytes=MIN_USEFUL_RECLAIM,
+    bounds,
 ):
     """Bound file-cache reclaim while retaining anonymous usage plus configured headroom."""
+    if not isinstance(bounds, ReclaimBounds):
+        return 0
+    maximum_bytes = bounds.maximum_bytes
+    minimum_headroom_bytes = bounds.minimum_headroom_bytes
+    headroom_percent = bounds.headroom_percent
+    minimum_bytes = bounds.minimum_bytes
     values = (
         current_bytes,
         anon_bytes,
@@ -266,6 +279,122 @@ def page_cache_budget(
     above_floor = max(0, current_bytes - anon_bytes - headroom)
     amount = min(reclaimable_bytes, maximum_bytes, above_floor)
     return amount if amount >= minimum_bytes else 0
+
+
+def anonymous_reclaim_budget(
+    current_bytes,
+    anon_bytes,
+    swap_bytes,
+    swap_max_bytes,
+    available_swap_bytes,
+    bounds,
+):
+    """Bound anon reclaim by resident headroom, free swap, and the cgroup swap cap."""
+    if not isinstance(bounds, ReclaimBounds):
+        return 0
+    maximum_bytes = bounds.maximum_bytes
+    minimum_headroom_bytes = bounds.minimum_headroom_bytes
+    headroom_percent = bounds.headroom_percent
+    minimum_bytes = bounds.minimum_bytes
+    values = (
+        current_bytes,
+        anon_bytes,
+        maximum_bytes,
+        minimum_headroom_bytes,
+        swap_bytes,
+        available_swap_bytes,
+        minimum_bytes,
+    )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in values
+    ):
+        return 0
+    if swap_max_bytes is not None and (
+        not isinstance(swap_max_bytes, int)
+        or isinstance(swap_max_bytes, bool)
+        or swap_max_bytes < 0
+    ):
+        return 0
+    if (
+        not isinstance(headroom_percent, (int, float))
+        or isinstance(headroom_percent, bool)
+        or not math.isfinite(headroom_percent)
+        or not 0 <= headroom_percent <= 100
+        or anon_bytes > current_bytes
+    ):
+        return 0
+    headroom = max(
+        minimum_headroom_bytes,
+        math.ceil(current_bytes * headroom_percent / 100),
+    )
+    resident_room = max(0, current_bytes - headroom)
+    swap_room = (
+        max(0, swap_max_bytes - swap_bytes)
+        if swap_max_bytes is not None
+        else available_swap_bytes
+    )
+    amount = min(
+        anon_bytes,
+        maximum_bytes,
+        resident_room,
+        swap_room,
+        available_swap_bytes,
+    )
+    return amount if amount >= minimum_bytes else 0
+
+
+def counter_delta(before, after, *, direction):
+    """Return a non-negative integer counter delta, or ``None`` if unknown."""
+    if direction not in ("increase", "decrease"):
+        raise ValueError("counter delta direction must be increase or decrease")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (before, after)
+    ):
+        return None
+    if direction == "increase":
+        return max(0, after - before)
+    return max(0, before - after)
+
+
+def swap_limit(path):
+    """Read memory.swap.max as an integer, ``max``, or ``None`` when unknown."""
+    value = _read(os.path.join(path, "memory.swap.max"))
+    if value is None:
+        return None
+    value = value.strip()
+    if value == "max":
+        return value
+    try:
+        number = int(value)
+    except ValueError:
+        return None
+    return number if number >= 0 else None
+
+
+def swap_available_bytes(proc_root=None):
+    """Return free host swap in bytes, or ``None`` when its capacity is unknown."""
+    proc_root = proc_root or os.environ.get("TAEMA_PROCROOT", "/proc")
+    text = _read(os.path.join(proc_root, "meminfo"))
+    if text is None:
+        return None
+    values = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        try:
+            amount = int(fields[1])
+        except ValueError:
+            continue
+        if fields[0].rstrip(":") in ("SwapTotal", "SwapFree"):
+            values[fields[0].rstrip(":")] = amount * 1024
+    total = values.get("SwapTotal")
+    free = values.get("SwapFree")
+    if total is None or free is None or total < 0 or free < 0 or free > total:
+        return None
+    return free
 
 
 def scope_counters(path):
@@ -297,6 +426,8 @@ def scope_counters(path):
         "current_bytes": current,
         "anon_bytes": stats.get("anon"),
         "file_bytes": file_bytes,
+        "swap_bytes": _integer(os.path.join(path, "memory.swap.current")),
+        "zswap_bytes": _integer(os.path.join(path, "memory.zswap.current")),
         "reclaimable_bytes": reclaimable,
         "workingset_refault_file": stats.get("workingset_refault_file"),
         "pgmajfault": stats.get("pgmajfault"),
@@ -406,6 +537,20 @@ def reclaim_page_cache(path, amount, high_target, pulse_seconds=0.05):
     return "memory.high"
 
 
+def reclaim_anonymous(path, amount):
+    """Ask memory.reclaim to swap anonymous pages without changing zswap policy."""
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        raise ValueError("anonymous reclaim request must be a positive integer")
+    try:
+        _write_control(path, "memory.reclaim", "%d swappiness=max" % amount)
+    except OSError as error:
+        if error.errno == errno.EAGAIN:
+            # Some pages may have moved before the kernel reported a shortfall.
+            return "memory.reclaim"
+        raise
+    return "memory.reclaim"
+
+
 def _host(proc_root, system_root, base):
     meminfo = _read(os.path.join(proc_root, "meminfo"))
     values = {}
@@ -458,6 +603,7 @@ def _host(proc_root, system_root, base):
         ),
         "pressure_avg10": _psi(os.path.join(proc_root, "pressure", "memory")),
         "swap_total_bytes": swap_total,
+        "swap_free_bytes": swap_free,
         "swap_used_bytes": swap_used,
         "zswap_bytes": zswap,
         "zswap_source": zswap_source,

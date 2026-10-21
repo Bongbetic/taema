@@ -11,10 +11,12 @@ from dataclasses import dataclass, replace
 import hmac
 import json
 import os
+import re
 import secrets
 import select
 import selectors
 import signal
+import shlex
 import socket
 import stat
 import struct
@@ -170,6 +172,9 @@ class Daemon:
         self.reclaim_usage = {}  # scope -> aggregate cpu usage_usec and sample time
         self.reclaim_idle_since = {}
         self.reclaim_state = {}  # scope -> cooldown/refault state
+        self.saved_vm_scopes = set()  # VM save success, until the guest resumes
+        self.saved_vm_members = {}  # scope -> member pids observed after save
+        self.memory_save_attempts = {}  # scope -> last save-state hook attempt
         self.reclaim_cursor = 0
         self.qos_pending = {}  # scope -> (candidate class, first observed time)
         self.qos_usage = {}  # app scope -> (aggregate cpu usage_usec, sample time)
@@ -5646,6 +5651,7 @@ class Daemon:
         )
         rendered = []
         for row in rows:
+            scope = row["name"]
             current = row["current_bytes"]
             headroom = (
                 memory_budget.headroom_bytes(
@@ -5674,6 +5680,16 @@ class Daemon:
                         hard_cap = memory.size_bytes(raw_cap)
                     except ValueError:
                         hard_cap = None
+            swap_cap = None
+            raw_swap_cap = row["unit_mem"].get("swap_max")
+            if raw_swap_cap is not None:
+                try:
+                    swap_cap = memory.size_bytes(raw_swap_cap)
+                except ValueError:
+                    if row["class"] == "vm" and scope not in self.saved_vm_scopes:
+                        swap_cap = 0
+            elif row["class"] == "vm" and scope not in self.saved_vm_scopes:
+                swap_cap = 0
             managed_state = self.store.data.get("memory_scopes", {})
             managed_scope = (
                 managed_state.get(row["name"], {})
@@ -5694,14 +5710,24 @@ class Daemon:
                     "desired_high_bytes": desired_high,
                     "desired_low_bytes": reservation,
                     "desired_max_bytes": hard_cap,
+                    "desired_swap_max_bytes": swap_cap,
                     "high": self._memory_control(row["path"], "memory.high"),
                     "low": self._memory_control(row["path"], "memory.low"),
                     "max": self._memory_control(row["path"], "memory.max"),
+                    "swap_max": self._memory_control(
+                        row["path"], "memory.swap.max"
+                    ),
                     "owned": row["owned"],
                     "managed": sorted(
                         key
                         for key in managed_scope
-                        if key in ("memory.high", "memory.low", "memory.max")
+                        if key
+                        in (
+                            "memory.high",
+                            "memory.low",
+                            "memory.max",
+                            "memory.swap.max",
+                        )
                     ),
                 }
             )
@@ -5862,7 +5888,12 @@ class Daemon:
         return True
 
     def _memory_restore_scope(self, scope, path):
-        for name in ("memory.high", "memory.low", "memory.max"):
+        for name in (
+            "memory.high",
+            "memory.low",
+            "memory.max",
+            "memory.swap.max",
+        ):
             self._memory_restore_control(scope, path, name)
 
     def _enable_memory_controllers(self, scope, path):
@@ -5899,7 +5930,12 @@ class Daemon:
 
         if not states and not any(
             os.path.isfile(os.path.join(cgroup.base(), name))
-            for name in ("memory.high", "memory.low", "memory.max")
+            for name in (
+                "memory.high",
+                "memory.low",
+                "memory.max",
+                "memory.swap.max",
+            )
         ):
             self.memory_scope_seen.clear()
             self.memory_scope_allocations.clear()
@@ -5909,6 +5945,15 @@ class Daemon:
             snapshot=snapshot, now=now, _details=True
         )
         row_data = {row["name"]: row for row in report["scopes"]}
+        resumed = self._reconcile_saved_vm_scopes(rows)
+        for row in rows:
+            scope = row["name"]
+            if (
+                scope in resumed
+                and row["class"] == "vm"
+                and row["unit_mem"].get("swap_max") is None
+            ):
+                row_data[scope]["desired_swap_max_bytes"] = 0
         active = {row["name"] for row in rows if row["pids"]}
         exited = self.memory_scope_seen - active
         stale = {scope for scope in states if scope not in observed_paths}
@@ -6013,6 +6058,7 @@ class Daemon:
                         plan_row.get("desired_high_bytes"),
                         plan_row.get("desired_low_bytes"),
                         plan_row.get("desired_max_bytes"),
+                        plan_row.get("desired_swap_max_bytes"),
                     ),
                 ):
                     self.store.log(
@@ -6021,6 +6067,7 @@ class Daemon:
                         high=plan_row.get("desired_high_bytes"),
                         low=plan_row.get("desired_low_bytes"),
                         max=plan_row.get("desired_max_bytes"),
+                        swap_max=plan_row.get("desired_swap_max_bytes"),
                         reason=decision.reason,
                     )
                 self._memory_restore_scope(scope, path)
@@ -6032,11 +6079,17 @@ class Daemon:
                     "desired_high_bytes",
                     "desired_low_bytes",
                     "desired_max_bytes",
+                    "desired_swap_max_bytes",
                 )
             )
             if wants_controls and not any(
                 os.path.isfile(os.path.join(path, name))
-                for name in ("memory.high", "memory.low", "memory.max")
+                for name in (
+                    "memory.high",
+                    "memory.low",
+                    "memory.max",
+                    "memory.swap.max",
+                )
             ):
                 self._enable_memory_controllers(scope, path)
 
@@ -6071,6 +6124,28 @@ class Daemon:
                 self._memory_apply_control(scope, path, "memory.max", desired_max)
             else:
                 self._memory_restore_control(scope, path, "memory.max")
+
+            raw_swap_max = row["unit_mem"].get("swap_max")
+            if raw_swap_max is not None:
+                try:
+                    memory.size_bytes(raw_swap_max)
+                except ValueError:
+                    if self.store.changed(
+                        "memory_swap_cap_invalid:" + scope, repr(raw_swap_max)
+                    ):
+                        self.store.log(
+                            event="memory_swap_cap_refused",
+                            scope=scope,
+                            value=raw_swap_max,
+                            reason="unit mem.swap_max must be a valid binary size",
+                        )
+            desired_swap_max = plan_row.get("desired_swap_max_bytes")
+            if desired_swap_max is not None:
+                self._memory_apply_control(
+                    scope, path, "memory.swap.max", desired_swap_max
+                )
+            else:
+                self._memory_restore_control(scope, path, "memory.swap.max")
 
             desired_low = plan_row.get("desired_low_bytes")
             if desired_low is not None and not row["background"]:
@@ -6138,6 +6213,151 @@ class Daemon:
             self.last_memory_prune = now
         return saved
 
+    def mark_vm_saved(self, scope):
+        """Allow anonymous reclaim for a VM after its configured save hook succeeds."""
+        if isinstance(scope, str) and cgroup.valid_rel(scope):
+            self.saved_vm_scopes.add(scope)
+            path = os.path.join(cgroup.base(), scope)
+            pids = cgroup.tree_procs(path) if os.path.isdir(path) else None
+            self.saved_vm_members[scope] = (
+                frozenset(pids) if isinstance(pids, list) else None
+            )
+
+    def mark_vm_resumed(self, scope):
+        """Restore the VM swap guard after a saved guest resumes."""
+        if isinstance(scope, str):
+            self.saved_vm_scopes.discard(scope)
+            self.saved_vm_members.pop(scope, None)
+
+    def _reconcile_saved_vm_scopes(self, rows):
+        """Forget save authorization when a VM scope is replaced by new members."""
+        observed = {row["name"] for row in rows}
+        resumed = set()
+        for scope in tuple(self.saved_vm_scopes):
+            if scope not in observed:
+                self.mark_vm_resumed(scope)
+        for row in rows:
+            scope = row["name"]
+            pids = row.get("pids")
+            if scope not in self.saved_vm_scopes or not isinstance(pids, list) or not pids:
+                continue
+            expected = self.saved_vm_members.get(scope)
+            current = frozenset(pids)
+            if expected is None:
+                self.saved_vm_members[scope] = current
+            elif current != expected:
+                self.mark_vm_resumed(scope)
+                resumed.add(scope)
+        return resumed
+
+    def _vm_save_hook_authority(self, scope, path, unit):
+        """Require the lifecycle stop policy before running a potentially destructive hook."""
+        metadata = (unit or {}).get("unit", {})
+        unit_stop_allowed = (
+            isinstance(metadata, dict)
+            and metadata.get("stop_when_unneeded") is True
+        )
+        leftover = scope.startswith(engine.LEFTOVER + "/")
+        facts = (
+            self._pair_scope_facts(path)
+            if leftover and self.mode in ("adopt", "auto")
+            else authorization.Facts(scope=scope, leftover=leftover)
+        )
+        decision = self.authorize(authorization.GC_STOP, facts)
+        pair_stop_allowed = (
+            leftover
+            and self.mode in ("adopt", "auto")
+            and facts.pair_action in ("stop", "expiry")
+        )
+        if decision.verdict != authorization.ACT:
+            return False, decision.reason
+        if not unit_stop_allowed and not pair_stop_allowed:
+            return (
+                False,
+                "unit stop_when_unneeded or authorized leftover stop is required",
+            )
+        return True, decision.reason
+
+    def _run_vm_save_hook(self, scope, unit, now):
+        """Run an explicitly configured save command without invoking a shell."""
+        unit_mem = (unit or {}).get("mem", {})
+        metadata = (unit or {}).get("unit", {})
+        if not isinstance(unit_mem, dict) or not isinstance(metadata, dict):
+            return False, "VM save hook configuration is invalid"
+        command = unit_mem.get("save_state")
+        if not isinstance(command, str) or not command.strip():
+            return False, "no VM save hook is configured"
+        previous = self.memory_save_attempts.get(scope)
+        cooldown = float(self.cfg.get("mem", {}).get("reclaim_cooldown", 300))
+        if isinstance(previous, (int, float)) and now - previous < cooldown:
+            return False, "VM save hook cooldown has %ds remaining" % int(
+                cooldown - (now - previous)
+            )
+        try:
+            argv = shlex.split(command)
+        except ValueError as error:
+            return False, "VM save hook command is invalid: %s" % error
+        fields = {
+            "name": metadata.get("name"),
+            "domain": metadata.get("domain"),
+            "container": metadata.get("container_id"),
+        }
+        for index, item in enumerate(argv):
+            for key, value in fields.items():
+                marker = "%%(%s)s" % key
+                if marker in item:
+                    if not isinstance(value, str) or not value:
+                        return False, "VM save hook needs unit.%s" % key
+                    item = item.replace(marker, value)
+            if re.search(r"%\([^)]*\)[a-zA-Z]", item):
+                return False, "VM save hook contains an unsupported template field"
+            argv[index] = item
+        if not argv:
+            return False, "VM save hook command is empty"
+        self.memory_save_attempts[scope] = now
+        try:
+            process = subprocess.Popen(
+                argv,
+                start_new_session=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                output, _ = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                output, _ = process.communicate()
+                reason = "VM save hook timed out after 30 seconds"
+                success = False
+            else:
+                reason = (
+                    ""
+                    if process.returncode == 0
+                    else "VM save hook exited %d" % process.returncode
+                )
+                success = process.returncode == 0
+        except OSError as error:
+            output = ""
+            reason = "VM save hook could not run: %s" % error
+            success = False
+        self.store.log(
+            event="memory_save_state",
+            scope=scope,
+            hook=argv[0],
+            success=success,
+            reason=reason or None,
+            output=(output or "")[:4096],
+            output_truncated=len(output or "") > 4096,
+        )
+        if success:
+            self.mark_vm_saved(scope)
+            return True, "VM save hook succeeded"
+        return False, reason
+
     def _reclaim_class(self, scope, path):
         """Resolve the deliberately small set of scope classes eligible for idle reclaim."""
         if scope == "manager" or scope.startswith("manager/"):
@@ -6146,8 +6366,18 @@ class Daemon:
             return "leftover"
         unit = engine.unit_for_leaf(self.units, os.path.basename(path))
         metadata = (unit or {}).get("unit", {})
+        unit_mem = (unit or {}).get("mem", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if not isinstance(unit_mem, dict):
+            unit_mem = {}
         unit_gc = (unit or {}).get("gc", {})
-        resource_class = metadata.get("qos_class", metadata.get("class"))
+        resource_class = unit_mem.get(
+            "class",
+            metadata.get(
+                "mem_class", metadata.get("qos_class", metadata.get("class"))
+            ),
+        )
         bundled_podman = (
             metadata.get("name") == "app-podman"
             and metadata.get("kind") == "app"
@@ -6155,6 +6385,8 @@ class Daemon:
             and unit_gc.get("keep_while_children") is True
             and scope.startswith("app-podman-")
         )
+        if resource_class == "vm" or metadata.get("kind") == "vm":
+            return "vm"
         if (
             resource_class == "container"
             or metadata.get("kind") == "container"
@@ -6212,6 +6444,7 @@ class Daemon:
         refaulted = False
         for name, stored in (
             ("workingset_refault_file", "refault_file"),
+            ("workingset_refault_anon", "refault_anon"),
             ("pgmajfault", "major_faults"),
             ("high_events", "high_events"),
         ):
@@ -6315,7 +6548,15 @@ class Daemon:
                 "reason": "scope is warm; reclaim suppressed for %ds"
                 % int(warm_until - now),
             }
-        if not manual:
+        managed_frozen = (
+            isinstance(self.store.data.get("frozen_scopes"), dict)
+            and scope in self.store.data["frozen_scopes"]
+            and self._freeze_value(path) == "1"
+        )
+        idle_eligible = managed_frozen
+        idle_reason = "scope is frozen by taema" if managed_frozen else ""
+        idle_grace_met = False
+        if not manual and not managed_frozen:
             idle, reason = self._reclaim_idle(
                 scope,
                 path,
@@ -6325,6 +6566,8 @@ class Daemon:
             )
             if not idle:
                 return {"scope": scope, "status": "skipped", "reason": reason}
+            idle_eligible, idle_reason = True, reason
+            idle_grace_met = True
 
         state = self.reclaim_state.get(scope, {})
         last = state.get("last_at") if isinstance(state, dict) else None
@@ -6415,6 +6658,110 @@ class Daemon:
                 "status": "skipped",
                 "reason": "file refault counters are unavailable",
             }
+        if manual and not managed_frozen:
+            idle_eligible, idle_reason = self._reclaim_idle(
+                scope,
+                path,
+                now,
+                warm,
+                float(config.get("idle_reclaim_grace", 300)),
+            )
+            idle_grace_met = idle_eligible
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        unit_mem = (unit or {}).get("mem", {})
+        if not isinstance(unit_mem, dict):
+            unit_mem = {}
+        swap_enabled = config.get("swap_reclaim", True) is True
+        if self.mode == "adopt" and config.get("swap_reclaim_adopt", False) is not True:
+            swap_enabled = False
+        eligible_class = resource_class in {
+            "background",
+            "leftover",
+            "container",
+            "vm",
+        }
+        save_required = (
+            resource_class == "vm"
+            and unit_mem.get("swap_max") is None
+            and unit_mem.get("save_state")
+            and scope not in self.saved_vm_scopes
+        )
+        if save_required and swap_enabled and eligible_class and not dry_run:
+            save_allowed, save_authority_reason = self._vm_save_hook_authority(
+                scope, path, unit
+            )
+            if not save_allowed:
+                if self.store.changed(
+                    "memory_save_state_refused:" + scope, save_authority_reason
+                ):
+                    self.store.log(
+                        event="memory_save_state_refused",
+                        scope=scope,
+                        reason=save_authority_reason,
+                    )
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "VM save hook lacks stop authority: "
+                    + save_authority_reason,
+                }
+            if not idle_grace_met:
+                idle_eligible, idle_reason = self._reclaim_idle(
+                    scope,
+                    path,
+                    now,
+                    warm,
+                    float(config.get("idle_reclaim_grace", 300)),
+                )
+                idle_grace_met = idle_eligible
+            if not idle_grace_met:
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "VM save hook requires idle grace: " + idle_reason,
+                }
+            safety = self._reclaim_safety_reason(
+                scope, path, cgroup.tree_procs(path)
+            )
+            if safety:
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "VM save hook blocked by safety check: " + safety,
+                }
+            saved, save_reason = self._run_vm_save_hook(scope, unit, now)
+            if saved:
+                self._memory_restore_control(scope, path, "memory.swap.max")
+                safety = self._reclaim_safety_reason(
+                    scope, path, cgroup.tree_procs(path)
+                )
+                if safety:
+                    return {
+                        "scope": scope,
+                        "status": "skipped",
+                        "reason": "save hook changed scope safety: " + safety,
+                    }
+                counters = memory.scope_counters(path)
+                if not isinstance(counters, dict):
+                    return {
+                        "scope": scope,
+                        "status": "skipped",
+                        "reason": "memory usage statistics are unavailable after VM save",
+                    }
+            else:
+                if self.store.changed(
+                    "memory_save_state_refused:" + scope, save_reason
+                ):
+                    self.store.log(
+                        event="memory_save_state_refused",
+                        scope=scope,
+                        reason=save_reason,
+                    )
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "VM save hook failed: " + save_reason,
+                }
         try:
             maximum = memory.size_bytes(config.get("reclaim_max", "2G"))
             minimum = memory.size_bytes(config.get("reclaim_minimum", "16M"))
@@ -6426,38 +6773,100 @@ class Daemon:
                 "status": "skipped",
                 "reason": "invalid memory reclaim configuration: %s" % error,
             }
+        bounds = memory.ReclaimBounds(maximum, headroom, percent, minimum)
         amount = memory.page_cache_budget(
             counters.get("current_bytes"),
             counters.get("anon_bytes"),
             counters.get("reclaimable_bytes"),
-            maximum,
-            headroom,
-            percent,
-            minimum,
+            bounds,
         )
-        if amount <= 0:
+        anon_amount = 0
+        anon_block_reason = ""
+        if not swap_enabled:
+            anon_block_reason = (
+                "anonymous swap reclaim needs mem.swap_reclaim and, in adopt, "
+                "mem.swap_reclaim_adopt"
+            )
+        elif not eligible_class:
+            anon_block_reason = "scope class is not eligible for anonymous reclaim"
+        elif not idle_eligible:
+            anon_block_reason = (
+                "anonymous reclaim requires an idle or taema-frozen scope"
+            )
+        elif counters.get("anon_bytes") is None or counters.get("swap_bytes") is None:
+            anon_block_reason = "anonymous or swap usage is unavailable"
+        else:
+            raw_swap_limit = memory.swap_limit(path)
+            if raw_swap_limit is None:
+                anon_block_reason = "scope swap limit is unavailable"
+            elif raw_swap_limit != "max" and not isinstance(raw_swap_limit, int):
+                anon_block_reason = "scope swap limit is invalid"
+            else:
+                swap_cap = None if raw_swap_limit == "max" else raw_swap_limit
+                if resource_class == "vm":
+                    raw_vm_swap_cap = unit_mem.get("swap_max")
+                    vm_saved = scope in self.saved_vm_scopes
+                    if raw_vm_swap_cap is None and not vm_saved:
+                        swap_cap = 0
+                        anon_block_reason = (
+                            "VM anonymous reclaim requires unit mem.swap_max or "
+                            "a successful save hook"
+                        )
+                    elif raw_vm_swap_cap is not None:
+                        try:
+                            configured_cap = memory.size_bytes(raw_vm_swap_cap)
+                            swap_cap = (
+                                configured_cap
+                                if swap_cap is None
+                                else min(swap_cap, configured_cap)
+                            )
+                        except ValueError:
+                            anon_block_reason = "VM mem.swap_max is invalid"
+                available_swap = memory.swap_available_bytes()
+                if not anon_block_reason and available_swap is None:
+                    anon_block_reason = "host swap availability is unknown"
+                if not anon_block_reason:
+                    anon_amount = memory.anonymous_reclaim_budget(
+                        max(0, counters["current_bytes"] - amount),
+                        counters.get("anon_bytes"),
+                        counters.get("swap_bytes"),
+                        swap_cap,
+                        available_swap,
+                        replace(bounds, maximum_bytes=max(0, maximum - amount)),
+                    )
+                    if anon_amount <= 0:
+                        anon_block_reason = (
+                            "no useful anonymous memory fits swap and headroom limits"
+                        )
+        if amount <= 0 and anon_amount <= 0:
             return {
                 "scope": scope,
                 "status": "skipped",
-                "reason": "no useful page cache remains above headroom",
+                "reason": anon_block_reason
+                or "no useful page cache remains above headroom",
             }
 
+        requested = amount + anon_amount
         result = {
             "scope": scope,
             "status": "would" if dry_run else "reclaimed",
-            "requested_bytes": amount,
+            "requested_bytes": requested,
+            "page_cache_requested_bytes": amount,
+            "anonymous_requested_bytes": anon_amount,
             "current_before": counters["current_bytes"],
             "reclaimable_before": counters["reclaimable_bytes"],
             "resource_class": resource_class,
+            "anonymous_reclaim_reason": anon_block_reason or None,
         }
         if dry_run:
             return result
 
-        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
         matched_veto = (
             engine.veto_for_scope(self.store, path, unit=unit) if force_veto else None
         )
         started = time.monotonic()
+        methods = []
+        errors = []
         try:
             with self.store.decision_context(
                 "reclaim",
@@ -6474,16 +6883,29 @@ class Daemon:
                         target=self.store.describe_veto(matched_veto),
                         source=matched_veto.get("source", "user"),
                     )
-                method = memory.reclaim_page_cache(
-                    path,
-                    amount,
-                    counters["current_bytes"] - amount,
-                )
+                if amount:
+                    try:
+                        methods.append(
+                            memory.reclaim_page_cache(
+                                path,
+                                amount,
+                                counters["current_bytes"] - amount,
+                            )
+                        )
+                    except (OSError, ValueError) as error:
+                        errors.append("page cache: %s" % error)
+                if anon_amount:
+                    try:
+                        methods.append(memory.reclaim_anonymous(path, anon_amount))
+                    except (OSError, ValueError) as error:
+                        errors.append("anonymous: %s" % error)
         except (OSError, ValueError) as error:
-            after = memory.scope_counters(path) or {}
+            errors.append(str(error))
+        after = memory.scope_counters(path) or {}
+        if not methods:
             result.update(
                 status="failed",
-                error=str(error),
+                error="; ".join(errors) or "reclaim did not complete",
                 current_after=after.get("current_bytes"),
                 reclaimable_after=after.get("reclaimable_bytes"),
             )
@@ -6496,28 +6918,56 @@ class Daemon:
                 current_after=after.get("current_bytes"),
                 reclaimable_before=counters["reclaimable_bytes"],
                 reclaimable_after=after.get("reclaimable_bytes"),
-                reason=str(error),
+                reason=result["error"],
             )
             return result
 
-        after = memory.scope_counters(path) or {}
-        measured = None
-        if isinstance(after.get("reclaimable_bytes"), int):
-            measured = max(
-                0, counters["reclaimable_bytes"] - after["reclaimable_bytes"]
-            )
+        current_after = after.get("current_bytes")
+        anon_after = after.get("anon_bytes")
+        file_after = after.get("file_bytes")
+        swap_after = after.get("swap_bytes")
+        zswap_after = after.get("zswap_bytes")
+        measured = memory.counter_delta(
+            counters["current_bytes"], current_after, direction="decrease"
+        )
+        anon_reclaimed = memory.counter_delta(
+            counters.get("anon_bytes"), anon_after, direction="decrease"
+        )
+        file_reclaimed = memory.counter_delta(
+            counters.get("file_bytes"), file_after, direction="decrease"
+        )
+        swap_delta = memory.counter_delta(
+            counters.get("swap_bytes"), swap_after, direction="increase"
+        )
+        zswap_delta = memory.counter_delta(
+            counters.get("zswap_bytes"), zswap_after, direction="increase"
+        )
+        unique_methods = list(dict.fromkeys(methods))
+        method = (
+            "memory.reclaim"
+            if "memory.reclaim" in unique_methods
+            else unique_methods[0]
+        )
         result.update(
             method=method,
-            current_after=after.get("current_bytes"),
+            methods=unique_methods,
+            current_after=current_after,
             reclaimable_after=after.get("reclaimable_bytes"),
             reclaimed_bytes=measured,
+            anonymous_reclaimed_bytes=anon_reclaimed,
+            file_reclaimed_bytes=file_reclaimed,
+            swap_delta_bytes=swap_delta,
+            zswap_delta_bytes=zswap_delta,
             elapsed_ms=round((time.monotonic() - started) * 1000, 2),
         )
+        if errors:
+            result["error"] = "; ".join(errors)
         self.reclaim_state[scope] = {
             "last_at": now,
             "warm": warm,
             "warm_until": state.get("warm_until") if isinstance(state, dict) else None,
             "refault_file": after.get("workingset_refault_file"),
+            "refault_anon": after.get("workingset_refault_anon"),
             "major_faults": after.get("pgmajfault"),
             "high_events": after.get("high_events"),
         }
@@ -6526,13 +6976,20 @@ class Daemon:
             scope=scope,
             resource_class=resource_class,
             method=method,
-            requested_bytes=amount,
+            requested_bytes=requested,
+            page_cache_requested_bytes=amount,
+            anonymous_requested_bytes=anon_amount,
             reclaimed_bytes=measured,
+            anonymous_reclaimed_bytes=anon_reclaimed,
+            file_reclaimed_bytes=file_reclaimed,
+            swap_delta_bytes=swap_delta,
+            zswap_delta_bytes=zswap_delta,
             current_before=counters["current_bytes"],
-            current_after=after.get("current_bytes"),
+            current_after=current_after,
             reclaimable_before=counters["reclaimable_bytes"],
             reclaimable_after=after.get("reclaimable_bytes"),
             elapsed_ms=result["elapsed_ms"],
+            reason=result.get("error"),
         )
         return result
 

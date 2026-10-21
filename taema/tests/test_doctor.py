@@ -95,6 +95,11 @@ class DoctorChecks(unittest.TestCase):
         os.makedirs(active_parent)
         os.symlink("../../etc/sv/taema", active_parent + "/taema")
         self.write(self.system_root + "/sys/module/zswap/parameters/enabled", "Y\n")
+        self.write(
+            self.system_root + "/proc/swaps",
+            "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1048576\t0\t-2\n",
+        )
+        os.makedirs(self.system_root + "/sys/block", exist_ok=True)
 
         self.cfg = make_cfg(self.state_dir, mode="auto")
         self.cfg["paths"]["socket"] = self.state_dir + "/taema.sock"
@@ -143,6 +148,34 @@ class DoctorChecks(unittest.TestCase):
         fallback = self.check(report, "CPU weight fallback")
         self.assertEqual(fallback["status"], "warn")
         self.assertIn("cpu.weight", fallback["message"])
+
+    def test_swap_zswap_and_zram_advice_is_read_only_and_reports_devices(self):
+        os.makedirs(self.system_root + "/sys/block/zram0")
+        self.write(self.system_root + "/sys/module/zswap/parameters/enabled", "N\n")
+        report = self.report()
+        swap = self.check(report, "swap devices")
+        zram = self.check(report, "zram devices")
+        zswap = self.check(report, "zswap")
+        self.assertIn("/swapfile", swap["message"])
+        self.assertIn("zram0", zram["message"])
+        self.assertEqual(zswap["status"], "warn")
+        self.assertIn("sudo sh -c", zswap["fix"])
+        self.assertIn("zswap.enabled=1", zswap["fix"])
+        self.assertIn("uncompressed", zswap["fix"])
+        self.assertEqual(
+            Path(self.system_root + "/sys/module/zswap/parameters/enabled").read_text(),
+            "N\n",
+        )
+
+    def test_no_swap_is_reported_without_triggering_system_changes(self):
+        self.write(
+            self.system_root + "/proc/swaps",
+            "Filename\tType\tSize\tUsed\tPriority\n",
+        )
+        report = self.report()
+        swap = self.check(report, "swap devices")
+        self.assertEqual(swap["status"], "warn")
+        self.assertIn("no active swap", swap["message"])
 
     def test_unknown_keys_and_parse_errors_are_reported(self):
         self.cfg["paths"]["not_a_setting"] = True
@@ -275,9 +308,10 @@ class DoctorChecks(unittest.TestCase):
             "memory accounting",
             "memory peak usage",
             "memory pressure",
-            "zswap",
         ):
             self.assertIn("disabled", self.check(report, name)["message"])
+        self.assertIn("enabled", self.check(report, "zswap")["message"])
+        self.assertIn("/swapfile", self.check(report, "swap devices")["message"])
 
     def test_foreign_process_and_insecure_socket_fail_safely(self):
         with mock.patch.object(doctor.process, "uid_of", return_value=self.uid + 1):

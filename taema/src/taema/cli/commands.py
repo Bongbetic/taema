@@ -1290,19 +1290,29 @@ def cmd_memory_reclaim(a):
         return 0
     if status == "would":
         print(
-            "would reclaim %s from %s"
-            % (_fmt_mem(reply.get("requested_bytes")), reply.get("scope", name))
+            "would reclaim %s from %s (anon %s; swap +%s; zswap +%s)"
+            % (
+                _fmt_mem(reply.get("requested_bytes")),
+                reply.get("scope", name),
+                _fmt_mem(reply.get("anonymous_requested_bytes")),
+                _fmt_mem(reply.get("swap_delta_bytes")),
+                _fmt_mem(reply.get("zswap_delta_bytes")),
+            )
         )
         return 0
     print(
-        "reclaim requested %s from %s (%s; observed %s)"
+        "reclaim requested %s from %s (%s; observed %s; swap +%s; zswap +%s)"
         % (
             _fmt_mem(reply.get("requested_bytes")),
             reply.get("scope", name),
             reply.get("method", "unknown method"),
             _fmt_mem(reply.get("reclaimed_bytes")),
+            _fmt_mem(reply.get("swap_delta_bytes")),
+            _fmt_mem(reply.get("zswap_delta_bytes")),
         )
     )
+    if reply.get("error"):
+        print("  partial reclaim: %s" % reply["error"])
     return 0
 
 

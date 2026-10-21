@@ -350,14 +350,16 @@ That unit cap is refused when it is below current use plus required headroom. OO
 does not cause the daemon to lower a cap. Holds, vetoes, protected processes, and unowned scopes
 prevent changes; `observe` reports planned limits without writing controls.
 
-### Reclaim idle page cache
+### Reclaim idle memory
 
-The daemon can reclaim file cache from eligible idle background, leftover, and container scopes.
-It waits for the configured idle grace, checks dependency and protection facts, and only runs when
-host memory pressure reaches its gate while full pressure stays below its ceiling. Each request is
-capped at 2 GiB by default and leaves at least the anonymous memory plus the larger of 128 MiB or
-10% of current usage. A refault during the cooldown marks a scope warm, doubles its idle grace,
-and suppresses further reclaim for twice the configured cooldown after the refault is detected.
+The daemon can reclaim file cache and, when enabled, anonymous memory from eligible idle or
+Taema-frozen background, leftover, container, and VM scopes. It checks dependency and protection
+facts, and automatic reclaim runs only when host memory pressure reaches its gate while full
+pressure stays below its ceiling. Each pass shares the 2 GiB default reclaim maximum and leaves at
+least the larger of 128 MiB or 10% of resident usage. Anonymous reclaim also requires available
+host swap and room under `memory.swap.max`; it uses `memory.reclaim` with `swappiness=max` and never
+changes `memory.zswap.writeback`. A refault during cooldown marks a scope warm, doubles its idle
+grace, and suppresses further reclaim for twice the configured cooldown after detection.
 
 ```sh
 taema memory reclaim browser       # ask the daemon to reclaim one managed scope
@@ -374,10 +376,25 @@ lowers that scope's `memory.high` and restores its previous value. This fallback
 usage is zero and the daemon can temporarily disable and restore swap for that scope, so the pulse
 cannot reclaim anonymous pages.
 
+`swap_reclaim = true` enables anonymous reclaim. `adopt` requires the additional
+`swap_reclaim_adopt = true` opt-in; it defaults to off. VM scopes get a managed
+`memory.swap.max = 0` unless their unit sets `[mem] swap_max` or a successful save hook has marked
+the guest safe to swap. Applying this guard can lower the cap below existing swap use; the kernel
+gradually reclaims existing swap entries while preventing further swap growth. A save hook runs
+only when the lifecycle policy authorizes stopping the unit or an eligible leftover pair, and only
+after the idle grace and a fresh safety check finds no outside dependency edge. Its failure blocks
+reclaim, and the swap opt-ins gate the hook itself. Replacing a saved VM's scope processes revokes
+that saved-state allowance and reapplies the default guard. Explicit reclaim replies and audit
+events report measured swap and zswap deltas; `taema memory` also shows current per-scope swap and
+zswap use. `taema doctor` lists active swap and zram devices and zswap state. When swap is active
+and zswap is off, it prints the current-boot and persistent root commands to enable zswap without
+running them.
+
 The `[mem]` settings `reclaim`, `reclaim_interval`, `idle_reclaim_grace`, `reclaim_cooldown`,
-`reclaim_max`, `reclaim_minimum`, `pressure_gate`, `pressure_ceiling`, `min_headroom`, and
-`headroom_percent` tune this pass. Defaults are conservative; disabling `reclaim` leaves accounting
-and the rest of lifecycle management available.
+`reclaim_max`, `reclaim_minimum`, `pressure_gate`, `pressure_ceiling`, `min_headroom`,
+`headroom_percent`, `swap_reclaim`, and `swap_reclaim_adopt` tune this pass. Defaults are
+conservative; disabling `reclaim` leaves accounting and the rest of lifecycle management
+available.
 
 ### Freeze idle leftovers
 

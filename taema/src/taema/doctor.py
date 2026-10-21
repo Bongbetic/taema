@@ -458,6 +458,67 @@ def _feature_check(name, path, controllers, required_controller=None):
 
 
 def _kernel_checks(base, controllers, system_root, cfg=None):
+    proc_swaps_path = _rooted(system_root, "/proc/swaps")
+    proc_swaps = _read(proc_swaps_path)
+    swap_devices = []
+    if proc_swaps is not None:
+        swap_devices = [
+            fields[0]
+            for line in proc_swaps.splitlines()[1:]
+            if (fields := line.split())
+        ]
+    if proc_swaps is None:
+        checks = [
+            _check(
+                "swap devices",
+                "warn",
+                "/proc/swaps is unavailable",
+                "Make /proc readable to inspect active swap devices.",
+            )
+        ]
+    elif swap_devices:
+        checks = [
+            _check(
+                "swap devices",
+                "ok",
+                "active swap devices: %s" % ", ".join(swap_devices),
+            )
+        ]
+    else:
+        checks = [
+            _check(
+                "swap devices",
+                "warn",
+                "no active swap devices were found",
+                "Configure an appropriate swap device before enabling anonymous reclaim.",
+            )
+        ]
+    sys_block = _rooted(system_root, "/sys/block")
+    try:
+        zram_devices = sorted(
+            name
+            for name in os.listdir(sys_block)
+            if name.startswith("zram")
+        )
+    except OSError:
+        zram_devices = None
+    if zram_devices is None:
+        checks.append(
+            _check(
+                "zram devices",
+                "warn",
+                "/sys/block could not be read for zram devices",
+                "Make sysfs readable to inspect zram devices.",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "zram devices",
+                "ok",
+                "zram devices: %s" % (", ".join(zram_devices) if zram_devices else "none"),
+            )
+        )
     memory_features = {
         "memory accounting": "memory.current and memory.stat",
         "memory peak usage": "memory.peak",
@@ -470,7 +531,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
         "memory OOM events": "memory.events or memory.events.local",
     }
     if not memory.enabled(cfg):
-        checks = [
+        checks.extend(
             _check(
                 name,
                 "warn",
@@ -478,9 +539,8 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "Enable memory collection to inspect this kernel feature.",
             )
             for name, feature in memory_features.items()
-        ]
+        )
     else:
-        checks = []
         if "memory" not in controllers:
             checks.append(
                 _check(
@@ -628,48 +688,41 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
             ),
         ]
     )
-    if not memory.enabled(cfg):
+    zswap_paths = (
+        "/sys/module/zswap/parameters/enabled",
+        "/sys/kernel/mm/zswap/enabled",
+    )
+    zswap_path = next(
+        (
+            _rooted(system_root, path)
+            for path in zswap_paths
+            if os.path.isfile(_rooted(system_root, path))
+        ),
+        None,
+    )
+    if zswap_path is None:
         checks.append(
             _check(
                 "zswap",
                 "warn",
-                "zswap state is not probed because memory collection is disabled",
-                "Enable memory collection to inspect zswap.",
+                "the kernel does not expose zswap state",
+                "Zswap is optional; enable it only if desired in kernel configuration.",
             )
         )
+    elif (_read(zswap_path) or "").strip().lower() in ("y", "1", "yes"):
+        checks.append(_check("zswap", "ok", "zswap is enabled"))
     else:
-        zswap_paths = (
-            "/sys/module/zswap/parameters/enabled",
-            "/sys/kernel/mm/zswap/enabled",
-        )
-        zswap_path = next(
-            (
-                _rooted(system_root, path)
-                for path in zswap_paths
-                if os.path.isfile(_rooted(system_root, path))
-            ),
-            None,
-        )
-        if zswap_path is None:
-            checks.append(
-                _check(
-                    "zswap",
-                    "warn",
-                    "the kernel does not expose zswap state",
-                    "Zswap is optional; enable it only if desired in kernel configuration.",
-                )
+        fix = "Enable for this boot: sudo sh -c 'echo Y > /sys/module/zswap/parameters/enabled'; persist by adding zswap.enabled=1 to the kernel command line."
+        if swap_devices:
+            fix = "Swap is active but uncompressed. " + fix
+        checks.append(
+            _check(
+                "zswap",
+                "warn",
+                "zswap is available but disabled",
+                fix,
             )
-        elif (_read(zswap_path) or "").strip().lower() in ("y", "1", "yes"):
-            checks.append(_check("zswap", "ok", "zswap is enabled"))
-        else:
-            checks.append(
-                _check(
-                    "zswap",
-                    "warn",
-                    "zswap is available but disabled",
-                    "Enable zswap only if desired.",
-                )
-            )
+        )
     return checks
 
 

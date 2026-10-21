@@ -459,13 +459,14 @@
     },
     "memory-host": {
       "type": "object",
-      "required": ["total_bytes", "available_bytes", "used_bytes", "pressure_avg10", "swap_total_bytes", "swap_used_bytes", "zswap_bytes", "zswap_source", "delegated_current_bytes"],
+      "required": ["total_bytes", "available_bytes", "used_bytes", "pressure_avg10", "swap_total_bytes", "swap_free_bytes", "swap_used_bytes", "zswap_bytes", "zswap_source", "delegated_current_bytes"],
       "properties": {
         "total_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "available_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "used_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "pressure_avg10": { "type": ["number", "null"], "minimum": 0 },
         "swap_total_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "swap_free_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "swap_used_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "zswap_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "zswap_source": { "type": ["string", "null"] },
@@ -532,8 +533,16 @@
         "reason": { "type": "string" },
         "error": { "type": "string" },
         "method": { "enum": ["memory.reclaim", "memory.high"] },
+        "methods": { "type": "array", "items": { "enum": ["memory.reclaim", "memory.high"] } },
         "requested_bytes": { "type": "integer", "minimum": 0 },
+        "page_cache_requested_bytes": { "type": "integer", "minimum": 0 },
+        "anonymous_requested_bytes": { "type": "integer", "minimum": 0 },
+        "anonymous_reclaim_reason": { "type": ["string", "null"] },
         "reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "anonymous_reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "file_reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "swap_delta_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "zswap_delta_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "current_before": { "type": ["integer", "null"], "minimum": 0 },
         "current_after": { "type": ["integer", "null"], "minimum": 0 },
         "reclaimable_before": { "type": ["integer", "null"], "minimum": 0 },
@@ -562,7 +571,7 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name", "class", "background", "current_bytes", "headroom_bytes", "share_bytes", "reservation_bytes", "desired_high_bytes", "desired_low_bytes", "desired_max_bytes", "high", "low", "max", "owned", "managed"],
+            "required": ["name", "class", "background", "current_bytes", "headroom_bytes", "share_bytes", "reservation_bytes", "desired_high_bytes", "desired_low_bytes", "desired_max_bytes", "desired_swap_max_bytes", "high", "low", "max", "swap_max", "owned", "managed"],
             "properties": {
               "name": { "type": "string", "minLength": 1 },
               "class": { "type": "string" },
@@ -574,11 +583,13 @@
               "desired_high_bytes": { "type": ["integer", "null"], "minimum": 0 },
               "desired_low_bytes": { "type": ["integer", "null"], "minimum": 0 },
               "desired_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "desired_swap_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
               "high": { "type": ["string", "null"] },
               "low": { "type": ["string", "null"] },
               "max": { "type": ["string", "null"] },
+              "swap_max": { "type": ["string", "null"] },
               "owned": { "type": "boolean" },
-              "managed": { "type": "array", "items": { "enum": ["memory.high", "memory.low", "memory.max"] } }
+              "managed": { "type": "array", "items": { "enum": ["memory.high", "memory.low", "memory.max", "memory.swap.max"] } }
             },
             "additionalProperties": false
           }

@@ -374,7 +374,11 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
     },
     RECLAIM: {
         "observe": (WOULD_ACT, "", "reclaim: observe records planned actions only"),
-        "adopt": (ACT, AUTHORITY_MODE, "reclaim: adopt reclaims page cache only"),
+        "adopt": (
+            ACT,
+            AUTHORITY_MODE,
+            "reclaim: adopt reclaims cache; anonymous swap needs its extra opt-in",
+        ),
         "enforce": (ACT, AUTHORITY_MODE, "reclaim: enforce reclaims eligible cache"),
         "auto": (ACT, AUTHORITY_MODE, "reclaim: auto reclaims eligible cache"),
     },

@@ -113,14 +113,24 @@ class ConfigLayering(unittest.TestCase):
                 "[mem]\nreclaim = true\nreclaim_interval = 5\n"
                 "reclaim_cooldown = 0\nidle_reclaim_grace = 1\n"
                 "pressure_gate = 10\npressure_ceiling = 60\n"
-                'reclaim_max = "1.5G"\nreclaim_minimum = "16M"\n',
+                'reclaim_max = "1.5G"\nreclaim_minimum = "16M"\n'
+                "swap_reclaim = true\nswap_reclaim_adopt = false\n",
             )
             cfg = policy._load_files([valid])
             self.assertEqual(cfg["mem"]["reclaim_interval"], 5)
             self.assertEqual(cfg["mem"]["reclaim_max"], "1.5G")
+            self.assertTrue(cfg["mem"]["swap_reclaim"])
+            self.assertFalse(cfg["mem"]["swap_reclaim_adopt"])
+
+            self.assertFalse(policy._load_files([])["mem"]["swap_reclaim_adopt"])
 
             invalid_values = (
                 ('reclaim = "yes"', "mem.reclaim must be a boolean"),
+                ('swap_reclaim = "yes"', "mem.swap_reclaim must be a boolean"),
+                (
+                    'swap_reclaim_adopt = "yes"',
+                    "mem.swap_reclaim_adopt must be a boolean",
+                ),
                 ("reclaim_interval = 0", "reclaim_interval must be a finite number"),
                 (
                     "pressure_ceiling = 101",

@@ -78,6 +78,7 @@ _DEFAULTS = {
         "pressure_gate": 10,
         "pressure_ceiling": 60,
         "swap_reclaim": True,
+        "swap_reclaim_adopt": False,
         "zswap": True,
         "oom_policy": "log",
         "probe": False,
@@ -360,7 +361,7 @@ def _validate_config(cfg, sources):
         raise ValueError("%s:1:1: mem must be a table" % mem_source)
     from ..core import memory
 
-    for name in ("enabled", "reclaim"):
+    for name in ("enabled", "reclaim", "swap_reclaim", "swap_reclaim_adopt"):
         value = mem.get(name, _DEFAULTS["mem"][name])
         source = sources.get("mem." + name, mem_source)
         if type(value) is not bool:

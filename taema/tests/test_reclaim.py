@@ -27,12 +27,21 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI_SCHEMA = json.loads((ROOT / "schema" / "cli" / "read-v1.json").read_text())
 
 
-def write_scope(path, *, current=1024 * MIB, anon=256 * MIB, file=640 * MIB):
+def write_scope(
+    path,
+    *,
+    current=1024 * MIB,
+    anon=256 * MIB,
+    file=640 * MIB,
+    swap=0,
+    zswap=0,
+):
     write(path + "/memory.current", "%d\n" % current)
     write(
         path + "/memory.stat",
         "anon %d\nfile %d\ninactive_file %d\nshmem %d\n"
-        "workingset_refault_file 4\npgmajfault 1\n" % (anon, file, 600 * MIB, 32 * MIB),
+        "workingset_refault_file 4\npgmajfault 1\n"
+        % (anon, file, 600 * MIB, 32 * MIB),
     )
     write(path + "/memory.events", "low 0\nhigh 2\nmax 0\nome 0\n")
     write(
@@ -40,8 +49,11 @@ def write_scope(path, *, current=1024 * MIB, anon=256 * MIB, file=640 * MIB):
     )
     write(path + "/memory.high", "max\n")
     write(path + "/memory.reclaim", "")
-    write(path + "/memory.swap.current", "0\n")
+    write(path + "/memory.swap.current", "%d\n" % swap)
     write(path + "/memory.swap.max", "max\n")
+    write(path + "/memory.zswap.current", "%d\n" % zswap)
+    write(path + "/memory.zswap.writeback", "1\n")
+    write(path + "/cgroup.freeze", "0\n")
 
 
 class ReclaimMemoryTests(unittest.TestCase):
@@ -59,10 +71,7 @@ class ReclaimMemoryTests(unittest.TestCase):
                 1024 * MIB,
                 256 * MIB,
                 800 * MIB,
-                300 * MIB,
-                128 * MIB,
-                10,
-                16 * MIB,
+                memory.ReclaimBounds(300 * MIB, 128 * MIB, 10, 16 * MIB),
             ),
             300 * MIB,
         )
@@ -71,12 +80,75 @@ class ReclaimMemoryTests(unittest.TestCase):
                 1024 * MIB,
                 900 * MIB,
                 800 * MIB,
-                2 * 1024 * MIB,
-                128 * MIB,
-                10,
+                memory.ReclaimBounds(2 * 1024 * MIB, 128 * MIB, 10),
             ),
             0,
         )
+
+    def test_anonymous_budget_obeys_resident_swap_and_request_bounds(self):
+        amount = memory.anonymous_reclaim_budget(
+            1000 * MIB,
+            500 * MIB,
+            60 * MIB,
+            100 * MIB,
+            200 * MIB,
+            memory.ReclaimBounds(400 * MIB, 128 * MIB, 10, MIB),
+        )
+        self.assertEqual(amount, 40 * MIB)
+        self.assertEqual(
+            memory.anonymous_reclaim_budget(
+                1000 * MIB,
+                500 * MIB,
+                100 * MIB,
+                100 * MIB,
+                200 * MIB,
+                memory.ReclaimBounds(400 * MIB, 128 * MIB, 10, MIB),
+            ),
+            0,
+        )
+        self.assertEqual(
+            memory.anonymous_reclaim_budget(
+                1000 * MIB,
+                500 * MIB,
+                0,
+                None,
+                0,
+                memory.ReclaimBounds(400 * MIB, 128 * MIB, 10, MIB),
+            ),
+            0,
+        )
+
+    def test_counter_delta_preserves_direction_and_unknown_values(self):
+        self.assertEqual(memory.counter_delta(100, 75, direction="decrease"), 25)
+        self.assertEqual(memory.counter_delta(75, 100, direction="decrease"), 0)
+        self.assertEqual(memory.counter_delta(75, 100, direction="increase"), 25)
+        self.assertIsNone(memory.counter_delta(None, 100, direction="increase"))
+
+    def test_swap_controls_and_available_host_swap_are_read_conservatively(self):
+        with tempfile.TemporaryDirectory() as root:
+            scope = os.path.join(root, "scope")
+            proc = os.path.join(root, "proc")
+            os.makedirs(scope)
+            os.makedirs(proc)
+            write(scope + "/memory.swap.max", "max\n")
+            write(proc + "/meminfo", "SwapTotal: 2097152 kB\nSwapFree: 1048576 kB\n")
+            self.assertEqual(memory.swap_limit(scope), "max")
+            self.assertEqual(memory.swap_available_bytes(proc), MIB * 1024)
+            write(proc + "/meminfo", "SwapTotal: 1024 kB\nSwapFree: 2048 kB\n")
+            self.assertIsNone(memory.swap_available_bytes(proc))
+
+    def test_anonymous_reclaim_requests_swap_without_changing_zswap_writeback(self):
+        with tempfile.TemporaryDirectory() as path:
+            write(path + "/memory.reclaim", "")
+            write(path + "/memory.zswap.writeback", "0\n")
+            self.assertEqual(
+                memory.reclaim_anonymous(path, 32 * MIB), "memory.reclaim"
+            )
+            self.assertEqual(
+                Path(path, "memory.reclaim").read_text(),
+                "%d swappiness=max\n" % (32 * MIB),
+            )
+            self.assertEqual(Path(path, "memory.zswap.writeback").read_text(), "0\n")
 
     def test_scope_counters_exclude_shmem_from_inactive_file(self):
         with tempfile.TemporaryDirectory() as path:
@@ -85,6 +157,8 @@ class ReclaimMemoryTests(unittest.TestCase):
         self.assertEqual(counters["reclaimable_bytes"], 600 * MIB)
         self.assertEqual(counters["workingset_refault_file"], 4)
         self.assertEqual(counters["pgmajfault"], 1)
+        self.assertEqual(counters["swap_bytes"], 0)
+        self.assertEqual(counters["zswap_bytes"], 0)
 
     def test_targeted_reclaim_requests_file_only_pages(self):
         with tempfile.TemporaryDirectory() as path:
@@ -224,7 +298,22 @@ class DaemonReclaimTests(unittest.TestCase):
         self.scope = "leftover/reclaim-test"
         self.path = self.cg.leaf(self.scope, [4242])
         write_scope(self.path)
-        self.daemon = service.Daemon(make_cfg(tmp(), mode="auto"))
+        cfg = make_cfg(tmp(), mode="auto")
+        cfg["mem"] = {
+            "enabled": True,
+            "reclaim": True,
+            "reclaim_max": "2G",
+            "reclaim_minimum": "16M",
+            "min_headroom": "128M",
+            "headroom_percent": 10,
+            "reclaim_cooldown": 300,
+            "idle_reclaim_grace": 300,
+            "pressure_gate": 10,
+            "pressure_ceiling": 60,
+            "swap_reclaim": True,
+            "swap_reclaim_adopt": False,
+        }
+        self.daemon = service.Daemon(cfg)
         self.daemon._infos = lambda pids: [
             {"pid": pid, "protected": "", "ptmx": False, "edges": []} for pid in pids
         ]
@@ -276,6 +365,414 @@ class DaemonReclaimTests(unittest.TestCase):
         event = next(row for row in events if row.get("event") == "memory_reclaimed")
         self.assertEqual(event["current_before"], result["current_before"])
         self.assertEqual(event["current_after"], result["current_after"])
+
+    def test_frozen_scope_reclaims_anon_and_reports_swap_destinations(self):
+        write(self.path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {self.scope: {"source": "test"}}
+        self.daemon.cfg["mem"]["reclaim_max"] = "1G"
+        start = memory.scope_counters(self.path)
+
+        def apply_file(target, amount, _high_target):
+            write_scope(
+                target,
+                current=start["current_bytes"] - amount,
+                anon=start["anon_bytes"],
+                file=start["file_bytes"] - amount,
+                swap=start["swap_bytes"],
+                zswap=start["zswap_bytes"],
+            )
+            return "memory.reclaim"
+
+        def apply_anon(target, amount):
+            after_file = memory.scope_counters(target)
+            write_scope(
+                target,
+                current=after_file["current_bytes"] - amount,
+                anon=after_file["anon_bytes"] - amount,
+                file=after_file["file_bytes"],
+                swap=after_file["swap_bytes"] + amount,
+                zswap=after_file["zswap_bytes"] + amount // 2,
+            )
+            return "memory.reclaim"
+
+        with (
+            mock.patch.object(
+                service.memory, "swap_available_bytes", return_value=2 * 1024 * MIB
+            ),
+            mock.patch.object(
+                service.memory, "reclaim_page_cache", side_effect=apply_file
+            ),
+            mock.patch.object(
+                service.memory, "reclaim_anonymous", side_effect=apply_anon
+            ) as anon_reclaim,
+        ):
+            result = self.daemon.handle({"cmd": "reclaim", "scope": self.scope})
+        self.assertEqual(result["status"], "reclaimed")
+        self.assertGreater(result["anonymous_requested_bytes"], 0)
+        self.assertGreater(result["anonymous_reclaimed_bytes"], 0)
+        self.assertEqual(
+            result["swap_delta_bytes"], result["anonymous_reclaimed_bytes"]
+        )
+        self.assertEqual(result["zswap_delta_bytes"], result["swap_delta_bytes"] // 2)
+        self.assertEqual(Path(self.path, "memory.zswap.writeback").read_text(), "1\n")
+        anon_reclaim.assert_called_once()
+
+    def test_adopt_requires_its_extra_anonymous_reclaim_opt_in(self):
+        write(self.path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {self.scope: {"source": "test"}}
+        self.daemon.cfg["mode"] = "adopt"
+        with mock.patch.object(
+            service.memory, "swap_available_bytes", return_value=2 * 1024 * MIB
+        ):
+            denied = self.daemon.reclaim_scope(self.scope, dry_run=True, now=1000)
+            self.daemon.cfg["mem"]["swap_reclaim_adopt"] = True
+            allowed = self.daemon.reclaim_scope(self.scope, dry_run=True, now=1000)
+        self.assertEqual(denied["anonymous_requested_bytes"], 0)
+        self.assertIn("adopt", denied["anonymous_reclaim_reason"])
+        self.assertGreater(allowed["anonymous_requested_bytes"], 0)
+
+    def test_frozen_scope_skips_idle_sampling_and_no_swap_blocks_only_anon(self):
+        write(self.path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {self.scope: {"source": "test"}}
+        with (
+            mock.patch.object(
+                self.daemon, "_reclaim_idle", side_effect=AssertionError
+            ),
+            mock.patch.object(service.memory, "swap_available_bytes", return_value=0),
+        ):
+            result = self.daemon._reclaim_one(
+                self.scope,
+                self.path,
+                1000,
+                {"some_avg10": 20.0, "full_avg10": 0.0},
+                dry_run=True,
+                resource_class="leftover",
+            )
+        self.assertEqual(result["status"], "would")
+        self.assertGreater(result["page_cache_requested_bytes"], 0)
+        self.assertEqual(result["anonymous_requested_bytes"], 0)
+        self.assertIn("swap and headroom", result["anonymous_reclaim_reason"])
+
+    def test_vm_swap_requires_a_unit_cap_or_successful_save(self):
+        scope = "vm-reclaim-test"
+        path = self.cg.leaf(scope, [4244])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [{"unit": {"name": scope, "kind": "vm"}}]
+        with mock.patch.object(
+            service.memory, "swap_available_bytes", return_value=2 * 1024 * MIB
+        ):
+            guarded = self.daemon.reclaim_scope(scope, dry_run=True, now=1000)
+            self.daemon.units[0]["mem"] = {"swap_max": "1G"}
+            configured = self.daemon.reclaim_scope(
+                scope, dry_run=True, now=1000
+            )
+            self.daemon.mark_vm_saved(scope)
+            saved = self.daemon.reclaim_scope(scope, dry_run=True, now=1000)
+        self.assertEqual(guarded["anonymous_requested_bytes"], 0)
+        self.assertGreater(configured["anonymous_requested_bytes"], 0)
+        self.assertGreater(saved["anonymous_requested_bytes"], 0)
+
+    def test_vm_save_hook_uses_validated_arguments_without_a_shell(self):
+        scope = "vm-reclaim-test"
+        unit = {
+            "unit": {"name": scope, "kind": "vm", "domain": "work vm"},
+            "mem": {"save_state": "virsh managedsave %(domain)s"},
+        }
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ("saved\n", None)
+        with mock.patch.object(service.subprocess, "Popen", return_value=process) as popen:
+            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+        self.assertTrue(success)
+        self.assertIn("succeeded", reason)
+        self.assertIn(scope, self.daemon.saved_vm_scopes)
+        self.assertEqual(
+            popen.call_args.args[0], ["virsh", "managedsave", "work vm"]
+        )
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertNotIn("shell", popen.call_args.kwargs)
+
+    def test_vm_save_hook_requires_configured_template_values(self):
+        scope = "vm-reclaim-test"
+        unit = {
+            "unit": {"name": scope, "kind": "vm"},
+            "mem": {"save_state": "virsh managedsave %(domain)s"},
+        }
+        with mock.patch.object(service.subprocess, "Popen") as popen:
+            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+        self.assertFalse(success)
+        self.assertIn("unit.domain", reason)
+        popen.assert_not_called()
+
+    def test_vm_save_hook_waits_for_idle_grace_even_when_taema_frozen(self):
+        scope = "vm-save-grace"
+        path = self.cg.leaf(scope, [4246])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [
+            {
+                "unit": {
+                    "name": scope,
+                    "kind": "vm",
+                    "domain": "test-vm",
+                    "stop_when_unneeded": True,
+                },
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+        with (
+            mock.patch.object(
+                self.daemon, "_reclaim_idle", return_value=(False, "idle for 2s")
+            ) as idle,
+            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(service.memory, "reclaim_page_cache") as reclaim,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("idle grace", result["reason"])
+        idle.assert_called_once()
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+
+    def test_vm_save_hook_is_blocked_by_management_client_dependency(self):
+        scope = "vm-save-attached"
+        path = self.cg.leaf(scope, [4250])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [
+            {
+                "unit": {
+                    "name": scope,
+                    "kind": "vm",
+                    "domain": "test-vm",
+                    "stop_when_unneeded": True,
+                },
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+        self.daemon._infos = lambda pids: [
+            {"pid": pid, "protected": "", "ptmx": False, "edges": [{"kind": "unix"}]}
+            for pid in pids
+        ]
+        with (
+            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(service.memory, "reclaim_page_cache") as reclaim,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("external dependency", result["reason"])
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+
+    def test_vm_save_hook_rechecks_dependencies_after_idle_grace(self):
+        scope = "vm-save-new-attachment"
+        path = self.cg.leaf(scope, [4251])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [
+            {
+                "unit": {
+                    "name": scope,
+                    "kind": "vm",
+                    "domain": "test-vm",
+                    "stop_when_unneeded": True,
+                },
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+
+        def attach_during_grace(*_args):
+            self.daemon._infos = lambda pids: [
+                {
+                    "pid": pid,
+                    "protected": "",
+                    "ptmx": False,
+                    "edges": [{"kind": "unix"}],
+                }
+                for pid in pids
+            ]
+            return True, "idle for 300s"
+
+        with (
+            mock.patch.object(
+                self.daemon, "_reclaim_idle", side_effect=attach_during_grace
+            ),
+            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("safety check", result["reason"])
+        hook.assert_not_called()
+
+    def test_vm_save_hook_requires_explicit_stop_authority(self):
+        scope = "vm-save-no-stop-authority"
+        path = self.cg.leaf(scope, [4252])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [
+            {
+                "unit": {"name": scope, "kind": "vm", "domain": "test-vm"},
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+        with (
+            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(service.memory, "reclaim_page_cache") as reclaim,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("stop authority", result["reason"])
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+
+    def test_adopt_allows_save_hook_for_pair_authorized_leftover(self):
+        scope = "leftover/vm-save-paired"
+        unit = {"mem": {"save_state": "virsh managedsave test-vm"}}
+        self.daemon.cfg["mode"] = "adopt"
+        facts = authorization.Facts(
+            scope=scope,
+            leftover=True,
+            pair_action="stop",
+            pair_reason="user answered stop",
+            pair_explicit=True,
+        )
+        with mock.patch.object(
+            self.daemon, "_pair_scope_facts", return_value=facts
+        ):
+            allowed, reason = self.daemon._vm_save_hook_authority(scope, self.path, unit)
+        self.assertTrue(allowed, reason)
+
+    def test_vm_save_hook_failure_blocks_all_reclaim(self):
+        scope = "vm-save-failure"
+        path = self.cg.leaf(scope, [4247])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [
+            {
+                "unit": {
+                    "name": scope,
+                    "kind": "vm",
+                    "domain": "test-vm",
+                    "stop_when_unneeded": True,
+                },
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+        with (
+            mock.patch.object(
+                self.daemon, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(
+                self.daemon,
+                "_run_vm_save_hook",
+                return_value=(False, "VM save hook exited 1"),
+            ),
+            mock.patch.object(service.memory, "reclaim_page_cache") as file_reclaim,
+            mock.patch.object(service.memory, "reclaim_anonymous") as anon_reclaim,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("save hook failed", result["reason"])
+        file_reclaim.assert_not_called()
+        anon_reclaim.assert_not_called()
+
+    def test_swap_reclaim_opt_out_prevents_vm_save_hook(self):
+        scope = "vm-save-opt-out"
+        path = self.cg.leaf(scope, [4248])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.cfg["mem"]["swap_reclaim"] = False
+        self.daemon.units = [
+            {
+                "unit": {
+                    "name": scope,
+                    "kind": "vm",
+                    "domain": "test-vm",
+                    "stop_when_unneeded": True,
+                },
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+        with (
+            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(
+                service.memory, "reclaim_page_cache", return_value="memory.reclaim"
+            ) as file_reclaim,
+            mock.patch.object(service.memory, "reclaim_anonymous") as anon_reclaim,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "reclaimed")
+        hook.assert_not_called()
+        file_reclaim.assert_called_once()
+        anon_reclaim.assert_not_called()
+
+    def test_adopt_extra_opt_in_prevents_vm_save_hook(self):
+        scope = "vm-save-adopt-opt-out"
+        path = self.cg.leaf(scope, [4249])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.cfg["mode"] = "adopt"
+        self.daemon.units = [
+            {
+                "unit": {"name": scope, "kind": "vm", "domain": "test-vm"},
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+        with (
+            mock.patch.object(self.daemon, "_run_vm_save_hook") as hook,
+            mock.patch.object(
+                service.memory, "reclaim_page_cache", return_value="memory.reclaim"
+            ),
+            mock.patch.object(service.memory, "reclaim_anonymous") as anon_reclaim,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        self.assertEqual(result["status"], "reclaimed")
+        hook.assert_not_called()
+        anon_reclaim.assert_not_called()
+
+    def test_successful_vm_save_hook_unlocks_anon_reclaim(self):
+        scope = "vm-save-reclaim"
+        path = self.cg.leaf(scope, [4245])
+        write_scope(path)
+        write(path + "/cgroup.freeze", "1\n")
+        self.daemon.store.data["frozen_scopes"] = {scope: {"source": "test"}}
+        self.daemon.units = [
+            {
+                "unit": {
+                    "name": scope,
+                    "kind": "vm",
+                    "domain": "test-vm",
+                    "stop_when_unneeded": True,
+                },
+                "mem": {"save_state": "virsh managedsave %(domain)s"},
+            }
+        ]
+
+        def saved(target, _unit, _now):
+            self.daemon.mark_vm_saved(target)
+            return True, "VM save hook succeeded"
+
+        with (
+            mock.patch.object(service.memory, "swap_available_bytes", return_value=2 * 1024 * MIB),
+            mock.patch.object(
+                self.daemon, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(self.daemon, "_run_vm_save_hook", side_effect=saved) as hook,
+            mock.patch.object(service.memory, "reclaim_page_cache", return_value="memory.reclaim"),
+            mock.patch.object(service.memory, "reclaim_anonymous", return_value="memory.reclaim") as anon,
+        ):
+            result = self.daemon.reclaim_scope(scope, now=1000)
+        hook.assert_called_once()
+        anon.assert_called_once()
+        self.assertGreater(result["anonymous_requested_bytes"], 0)
 
     def test_automatic_pass_reclaims_only_after_idle_and_pressure_gates(self):
         self.daemon.last["reclaim"] = 1000
@@ -580,6 +1077,12 @@ class ReclaimCliTests(unittest.TestCase):
                 "scope": "leftover/cli-target",
                 "status": "would",
                 "requested_bytes": 64 * MIB,
+                "page_cache_requested_bytes": 32 * MIB,
+                "anonymous_requested_bytes": 32 * MIB,
+                "anonymous_reclaim_reason": None,
+                "methods": ["memory.reclaim"],
+                "swap_delta_bytes": 0,
+                "zswap_delta_bytes": 0,
             }
             output = io.StringIO()
             with (
@@ -731,10 +1234,7 @@ class LivePageCacheReclaim(unittest.TestCase):
                     before["current_bytes"],
                     before.get("anon_bytes"),
                     before["reclaimable_bytes"],
-                    2 * 1024**3,
-                    128 * MIB,
-                    10,
-                    16 * MIB,
+                    memory.ReclaimBounds(2 * 1024**3, 128 * MIB, 10, 16 * MIB),
                 )
                 if amount < 16 * MIB:
                     self.skipTest("worker did not create enough reclaimable page cache")

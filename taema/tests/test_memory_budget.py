@@ -26,6 +26,9 @@ def scope_files(path, current, *, high="max", low="0", maximum="max"):
     write(path + "/memory.high", high + "\n")
     write(path + "/memory.low", low + "\n")
     write(path + "/memory.max", maximum + "\n")
+    write(path + "/memory.swap.max", "max\n")
+    write(path + "/memory.swap.current", "0\n")
+    write(path + "/memory.zswap.writeback", "1\n")
     write(path + "/memory.stat", "anon 1\nfile 1\ninactive_file 1\n")
 
 
@@ -158,6 +161,73 @@ class MemoryBudgetDaemonTests(unittest.TestCase):
         self.assertEqual(row["class"], "vm")
         self.assertGreater(row["reservation_bytes"], 0)
         self.assertEqual(Path(vm, "memory.max").read_text(), "%d\n" % (2 * GIB))
+
+    def test_vm_swap_limit_defaults_to_zero_even_above_current_usage(self):
+        vm = self.cg.leaf("my-vm", [93])
+        scope_files(vm, GIB)
+        write(vm + "/memory.swap.current", "%d\n" % (64 * MIB))
+        self.daemon.units = [{"unit": {"name": "my-vm", "kind": "vm"}}]
+        vm_snapshot = snapshot(("my-vm", GIB))
+        plan = self.daemon.memory_governor_pass(now=self.now, snapshot=vm_snapshot)
+        row = next(item for item in plan["scopes"] if item["name"] == "my-vm")
+        self.assertEqual(row["desired_swap_max_bytes"], 0)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "0\n")
+        self.assertEqual(Path(vm, "memory.zswap.writeback").read_text(), "1\n")
+
+        self.daemon.mark_vm_saved("my-vm")
+        self.daemon.memory_governor_pass(now=self.now + 60, snapshot=vm_snapshot)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "max\n")
+        self.daemon.mark_vm_resumed("my-vm")
+        self.daemon.memory_governor_pass(now=self.now + 120, snapshot=vm_snapshot)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "0\n")
+
+    def test_saved_vm_guard_returns_when_member_processes_are_replaced(self):
+        vm = self.cg.leaf("my-vm", [93])
+        scope_files(vm, GIB)
+        self.daemon.units = [{"unit": {"name": "my-vm", "kind": "vm"}}]
+        vm_snapshot = snapshot(("my-vm", GIB))
+        self.daemon.memory_governor_pass(now=self.now, snapshot=vm_snapshot)
+        self.daemon.mark_vm_saved("my-vm")
+        self.daemon.memory_governor_pass(now=self.now + 60, snapshot=vm_snapshot)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "max\n")
+
+        self.cg.set_procs("my-vm", [])
+        self.daemon.memory_governor_pass(
+            now=self.now + 120, snapshot=snapshot(("my-vm", GIB))
+        )
+        self.assertIn("my-vm", self.daemon.saved_vm_scopes)
+        self.cg.set_procs("my-vm", [94])
+        self.daemon.memory_governor_pass(
+            now=self.now + 180, snapshot=snapshot(("my-vm", GIB))
+        )
+        self.assertNotIn("my-vm", self.daemon.saved_vm_scopes)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "0\n")
+
+    def test_vm_unit_swap_max_is_applied_and_external_change_is_preserved(self):
+        vm = self.cg.leaf("my-vm", [93])
+        scope_files(vm, GIB)
+        self.daemon.units = [
+            {
+                "unit": {"name": "my-vm", "kind": "vm"},
+                "mem": {"swap_max": "2G"},
+            }
+        ]
+        vm_snapshot = snapshot(("my-vm", GIB))
+        plan = self.daemon.memory_governor_pass(now=self.now, snapshot=vm_snapshot)
+        row = next(item for item in plan["scopes"] if item["name"] == "my-vm")
+        self.assertEqual(row["desired_swap_max_bytes"], 2 * GIB)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "%d\n" % (2 * GIB))
+
+        write(vm + "/memory.swap.max", "%d\n" % (3 * GIB))
+        self.daemon.memory_governor_pass(now=self.now + 60, snapshot=vm_snapshot)
+        self.assertEqual(Path(vm, "memory.swap.max").read_text(), "%d\n" % (3 * GIB))
+        self.assertTrue(
+            any(
+                event["event"] == "memory_control_external_change"
+                and event.get("data", {}).get("control") == "memory.swap.max"
+                for event in self.daemon.store.events_since(0)["events"]
+            )
+        )
 
     def test_active_transition_restores_owned_high_and_leaves_external_change_alone(
         self,

@@ -618,6 +618,12 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "cpu.idle", os.path.join(base, "cpu.idle"), controllers, "cpu"
             ),
             _feature_check(
+                "CPU weight fallback",
+                os.path.join(base, "cpu.weight"),
+                controllers,
+                "cpu",
+            ),
+            _feature_check(
                 "io.weight", os.path.join(base, "io.weight"), controllers, "io"
             ),
         ]

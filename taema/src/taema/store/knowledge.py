@@ -192,6 +192,8 @@ class Store:
             "held_scopes": [],
             "snooze_until": 0.0,
             "muted_apps": [],
+            "qos_scopes": {},
+            "qos_exempt": {},
             "leftover_expiries": {},
         }
 
@@ -261,6 +263,8 @@ class Store:
             "held_scopes",
             "snooze_until",
             "muted_apps",
+            "qos_scopes",
+            "qos_exempt",
             "leftover_expiries",
         )
         return json.loads(json.dumps({field: self.data.get(field) for field in fields}))

@@ -2331,6 +2331,8 @@ class StateDB:
             "held_scopes": [],
             "snooze_until": 0.0,
             "muted_apps": [],
+            "qos_scopes": {},
+            "qos_exempt": {},
         }
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2348,6 +2350,8 @@ class StateDB:
                     "held_scopes",
                     "snooze_until",
                     "muted_apps",
+                    "qos_scopes",
+                    "qos_exempt",
                 ):
                     value = data.get(key, optional_meta_defaults.get(key))
                     if key not in optional_meta_defaults:

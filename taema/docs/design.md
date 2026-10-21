@@ -179,6 +179,13 @@ Standalone survivors get their own app scope. Terminal-job roots do not create l
 Persist seeds and share seeds are never drained. The scope is removed when empty
 (`cgroup.events` shows `populated 0`).
 
+In active modes, the daemon applies reversible resource priorities after a scope's class stays
+stable for two seconds. Leftovers use `cpu.idle=1` (CPU weight 10 when unsupported) and IO weight
+10 where available. Shared helpers and idle background app scopes use CPU and IO weight 50.
+Original control values are retained for undo and restored when a user answers keep or standalone.
+Observe mode logs planned changes without enabling controllers or writing controls. Missing
+controls are reported by `doctor`; leftover PID limits remain disabled.
+
 ## Resource budget
 
 Targets for an idle daemon (no app starting or stopping): RSS at most 25 MB, CPU at most

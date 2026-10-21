@@ -243,6 +243,14 @@ for 7 days and asks you again. You never need a command to undo it.
 | `observe` | Logs what it *would* do and leaves scopes and processes in place. |
 | `enforce` | Applies unit and lifecycle rules, including GC for `stop_when_unneeded` scopes, with safety and veto checks. |
 
+After a scope stays in one resource class for two seconds, active modes lower the priority of
+contained leftovers (`cpu.idle=1`, or CPU weight 10 as a fallback, and IO weight 10 where
+available). Shared helpers and idle background app scopes use CPU and IO weight 50. tæma records
+the original controls and restores them on undo, keep, or standalone answers. `observe` logs the
+planned changes without writing controls. `taema ls` and `taema explain scope:NAME` mark
+deprioritized scopes with `↓`; `taema doctor` reports missing controls. Leftover pid limits stay
+off by default.
+
 Pair-stop authority is separate from mode. `adopt` defaults to `answered`, so it stops
 survivors only when you explicitly answered "stop" for their pair or survivor signature;
 `auto` defaults to `learned`. To let `adopt` stop pairs supported by learned evidence, set:

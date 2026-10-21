@@ -1281,7 +1281,22 @@ def cmd_memory_watch(a):
     return 0
 
 
-def _walk(path, depth, out, memory_scopes=None):
+def _deprioritized_scopes(store):
+    if store is None:
+        return set()
+    states = store.data.get("qos_scopes", {})
+    if not isinstance(states, dict):
+        return set()
+    return {
+        scope
+        for scope, state in states.items()
+        if isinstance(scope, str)
+        and isinstance(state, dict)
+        and state.get("deprioritized") is True
+    }
+
+
+def _walk(path, depth, out, memory_scopes=None, deprioritized_scopes=None):
     pids = cgroup.procs(path)
     comms = []
     for p in pids:
@@ -1305,10 +1320,11 @@ def _walk(path, depth, out, memory_scopes=None):
             "psi_avg10": pressure,
             "memory": metrics,
             "commands": sorted(comms),
+            "deprioritized": cgroup.rel(path) in (deprioritized_scopes or set()),
         }
     )
     for d in sorted(cgroup.subdirs(path)):
-        _walk(d, depth + 1, out, memory_scopes)
+        _walk(d, depth + 1, out, memory_scopes, deprioritized_scopes)
 
 
 def _count_scopes(base):
@@ -1325,11 +1341,12 @@ def cmd_ls(a):
     from . import view
 
     try:
-        cfg = policy.load_config(path=getattr(a, "config", None))
+        cfg, store, _units = _load(a)
     except (OSError, ValueError):
-        cfg = None
-    memory_view = _memory_snapshot(cfg)
+        cfg, store = None, None
+    memory_view = _memory_snapshot(cfg, store)
     memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
+    deprioritized_scopes = _deprioritized_scopes(store)
     base = cgroup.base()
     if not os.path.isdir(base):
         model = view.snapshot("ls", scopes=(), memory=memory_view)
@@ -1337,7 +1354,7 @@ def cmd_ls(a):
         return 3
     rows = []
     for d in sorted(cgroup.subdirs(base)):
-        _walk(d, 0, rows, memory_scopes)
+        _walk(d, 0, rows, memory_scopes, deprioritized_scopes)
     model = view.snapshot("ls", scopes=rows, memory=memory_view)
     records = [view.record("scope", row) for row in rows]
     if getattr(a, "jsonl", False):
@@ -1470,7 +1487,11 @@ def _why_report(
     )
     return {
         "identity": identity,
-        "scope": {"name": target_scope or "", "live": bool(scope_live)},
+        "scope": {
+            "name": target_scope or "",
+            "live": bool(scope_live),
+            "deprioritized": target_scope in _deprioritized_scopes(store),
+        },
         "provenance": provenance or {},
         "current_decision": {
             "action": action,
@@ -2439,12 +2460,13 @@ def cmd_status(a):
         result = 0
     memory_view = _memory_snapshot(cfg, store)
     memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
+    deprioritized_scopes = _deprioritized_scopes(store)
     base = cgroup.base()
     if os.path.isdir(base):
         if getattr(a, "json", False) or getattr(a, "jsonl", False):
             scopes = []
             for path in sorted(cgroup.subdirs(base)):
-                _walk(path, 0, scopes, memory_scopes)
+                _walk(path, 0, scopes, memory_scopes, deprioritized_scopes)
             scope_count = len(scopes)
         else:
             scopes = []

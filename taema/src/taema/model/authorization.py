@@ -57,6 +57,7 @@ __all__ = [
     "GC_REMOVE_EMPTY",
     "SESSION_END",
     "MANUAL_STOP",
+    "QOS",
 ]
 
 Mode = Literal["observe", "adopt", "enforce", "auto"]
@@ -75,9 +76,10 @@ Trigger = Literal[
     "gc_remove_empty",
     "session_end",
     "manual_stop",
+    "qos",
 ]
 GovernorAction = Literal[
-    "adopt", "budget", "contain", "freeze", "reclaim", "remove", "stop"
+    "adopt", "budget", "contain", "deprioritize", "freeze", "reclaim", "remove", "stop"
 ]
 SlotFn = Callable[[str, str, "Facts"], tuple[Vote, str]]
 
@@ -113,6 +115,7 @@ GC_REMOVE_EMPTY: Final[Trigger] = (
 )
 SESSION_END: Final[Trigger] = "session_end"  # Daemon.end_session
 MANUAL_STOP: Final[Trigger] = "manual_stop"  # cli.cmd_kill (`taema kill`)
+QOS: Final[Trigger] = "qos"  # Daemon.qos_pass, reversible priority changes
 
 # Every lifecycle trigger declares its governor action. New actions such as reclaim must be
 # classified here so the hold-slot contract test proves that the ladder blocks them.
@@ -127,10 +130,11 @@ TRIGGER_ACTIONS: Final[dict[str, GovernorAction]] = {
     GC_REMOVE_EMPTY: "remove",
     SESSION_END: "stop",
     MANUAL_STOP: "stop",
+    QOS: "deprioritize",
 }
 HOLD_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(("stop", "reclaim"))
 VETO_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(
-    ("budget", "freeze", "reclaim", "stop")
+    ("budget", "deprioritize", "freeze", "reclaim", "stop")
 )
 
 # authority values an `act` carries to its actuation
@@ -348,6 +352,12 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
             AUTHORITY_MANUAL,
             "explicit taema kill: a user request acts in every mode",
         ),
+    },
+    QOS: {
+        "observe": (WOULD_ACT, "", "qos: observe records priority changes only"),
+        "adopt": (ACT, AUTHORITY_MODE, "qos: adopt applies reversible priorities"),
+        "enforce": (ACT, AUTHORITY_MODE, "qos: enforce applies reversible priorities"),
+        "auto": (ACT, AUTHORITY_MODE, "qos: auto applies reversible priorities"),
     },
 }
 

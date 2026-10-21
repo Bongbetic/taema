@@ -44,7 +44,7 @@
     },
     "scope": {
       "type": "object",
-      "required": ["schema", "depth", "name", "processes", "memory_bytes", "psi_avg10", "commands"],
+      "required": ["schema", "depth", "name", "processes", "memory_bytes", "psi_avg10", "commands", "deprioritized"],
       "properties": {
         "schema": { "const": "taema.scope.v1" },
         "depth": { "type": "integer", "minimum": 0 },
@@ -53,13 +53,14 @@
         "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
         "commands": { "type": "array", "items": { "type": "string" } },
+        "deprioritized": { "type": "boolean" },
         "memory": { "anyOf": [{ "$ref": "#/$defs/memory-scope" }, { "type": "null" }] }
       },
       "additionalProperties": false
     },
     "scope-data": {
       "type": "object",
-      "required": ["depth", "name", "processes", "memory_bytes", "psi_avg10", "commands"],
+      "required": ["depth", "name", "processes", "memory_bytes", "psi_avg10", "commands", "deprioritized"],
       "properties": {
         "depth": { "type": "integer", "minimum": 0 },
         "name": { "type": "string", "minLength": 1 },
@@ -67,6 +68,7 @@
         "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
         "commands": { "type": "array", "items": { "type": "string" } },
+        "deprioritized": { "type": "boolean" },
         "memory": { "anyOf": [{ "$ref": "#/$defs/memory-scope" }, { "type": "null" }] }
       },
       "additionalProperties": false
@@ -206,10 +208,11 @@
     },
     "explanation-scope": {
       "type": "object",
-      "required": ["name", "live"],
+      "required": ["name", "live", "deprioritized"],
       "properties": {
         "name": { "type": "string" },
-        "live": { "type": "boolean" }
+        "live": { "type": "boolean" },
+        "deprioritized": { "type": "boolean" }
       },
       "additionalProperties": false
     },

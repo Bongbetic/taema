@@ -60,6 +60,7 @@ class DoctorChecks(unittest.TestCase):
             ("memory.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
             ("cgroup.freeze", "0\n"),
             ("cpu.idle", "0\n"),
+            ("cpu.weight", "100\n"),
             ("io.weight", "default 100\n"),
             ("memory.swap.current", "0\n"),
             ("memory.swap.max", "max\n"),
@@ -135,6 +136,13 @@ class DoctorChecks(unittest.TestCase):
         self.assertIn("eligible apps", self.check(report, "adopt behavior")["message"])
         self.assertIn("[ok] delegation", doctor.render(report))
         self.assertEqual(process.uid_of(4242), self.uid)
+
+    def test_missing_cpu_weight_fallback_is_reported(self):
+        os.unlink(self.base + "/cpu.weight")
+        report = self.report()
+        fallback = self.check(report, "CPU weight fallback")
+        self.assertEqual(fallback["status"], "warn")
+        self.assertIn("cpu.weight", fallback["message"])
 
     def test_unknown_keys_and_parse_errors_are_reported(self):
         self.cfg["paths"]["not_a_setting"] = True

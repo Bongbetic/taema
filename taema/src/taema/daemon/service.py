@@ -27,6 +27,7 @@ from ..model import authorization
 from ..core import (
     cgroup,
     memory,
+    qos,
     process as inspect,
     lineage,
     signature as survivor_signature,
@@ -142,6 +143,10 @@ class Daemon:
         self.iv_memory = 60.0
         self.memory_peaks = {}
         self.last_memory_prune = 0.0
+        self.qos_pending = {}  # scope -> (candidate class, first observed time)
+        self.qos_usage = {}  # app scope -> (aggregate cpu usage_usec, sample time)
+        self.qos_idle_since = {}  # app scopes independently observed idle of GC eligibility
+        self.qos_next_background_sample = 0.0
         saved_samples = self.store.latest_memory_samples() if self.mem_enabled else {}
         self.memory_last_samples = {}
         for key, sample in saved_samples.items():
@@ -2131,6 +2136,8 @@ class Daemon:
             apply_pairs=not (q.get("signature") and choice in ("stop", "keep")),
         ):
             return {"error": "answer could not be applied"}
+        if choice in ("keep", "standalone"):
+            self._restore_qos_for_keys(q["ask_keys"])
         if choice == "standalone":
             members = self._live_standalone_members(q.get("members", []))
             self.adopt_standalone(members, owner)
@@ -2531,6 +2538,514 @@ class Daemon:
         self.last_result["gc"] = res
         return res
 
+    def _qos_state(self):
+        scopes = self.store.data.get("qos_scopes")
+        if not isinstance(scopes, dict):
+            scopes = {}
+            self.store.data["qos_scopes"] = scopes
+            self.store.dirty = True
+        exempt = self.store.data.get("qos_exempt")
+        if not isinstance(exempt, dict):
+            exempt = {}
+            self.store.data["qos_exempt"] = exempt
+            self.store.dirty = True
+        return scopes, exempt
+
+    def _restore_qos_scope(self, scope, exempt=False, classification=None):
+        scopes, exemptions = self._qos_state()
+        record = scopes.get(scope)
+        if not isinstance(record, dict):
+            record = {}
+        resources = record.get("originals", [])
+        if record.get("applied") and resources:
+            result = self._undo_action_effect(
+                {
+                    "id": "qos-restore",
+                    "scope": scope,
+                    "undo": {
+                        "operation": "restore_priorities",
+                        "resources": resources,
+                    },
+                }
+            )
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                self.store.log(
+                    event="qos_restore_failed",
+                    scope=scope,
+                    why=(result or {}).get("error", "priority restore failed"),
+                )
+                return False
+        scopes.pop(scope, None)
+        self.qos_pending.pop(scope, None)
+        if exempt:
+            held_class = classification or record.get("class")
+            if isinstance(held_class, str) and held_class:
+                if not record and exemptions.get(scope) == held_class:
+                    return True
+                exemptions[scope] = held_class
+        else:
+            exemptions.pop(scope, None)
+        self.store.dirty = True
+        return True
+
+    def _restore_qos_for_keys(self, keys):
+        keys = {key for key in keys if isinstance(key, str) and key}
+        if not keys:
+            return 0
+        scopes, _exempt = self._qos_state()
+        restored = 0
+        for scope in tuple(scopes):
+            if not isinstance(scope, str):
+                continue
+            path = cgroup.resolve(scope)
+            if not path:
+                continue
+            members = {
+                policy.app_key(pid, units=self.units) for pid in cgroup.tree_procs(path)
+            }
+            if keys.intersection(members):
+                record = scopes.get(scope)
+                resource_class = (
+                    record.get("class") if isinstance(record, dict) else None
+                )
+                if self._restore_qos_scope(
+                    scope, exempt=True, classification=resource_class
+                ):
+                    restored += 1
+        return restored
+
+    def _qos_scope_kept(self, path):
+        """Honor explicit keep/standalone answers before applying scope priorities."""
+        for pid in cgroup.tree_procs(path):
+            key = policy.app_key(pid, units=self.units)
+            if not key:
+                continue
+            if (
+                self.store.standalone(key)
+                or self.store.peek(key).get("user_keep", 0.0) > 0
+                or self.store.is_persistent(key)
+            ):
+                return True
+            for owner in self.store.owners_of(key):
+                if self.store.pair_decision(owner, key)[0] in ("keep", "standalone"):
+                    return True
+        return False
+
+    def _qos_controller_parents(self, path):
+        base = cgroup.base()
+        parent = os.path.dirname(path)
+        relative = os.path.relpath(parent, base)
+        parents = [base]
+        current = base
+        if relative != ".":
+            for segment in relative.split(os.sep):
+                current = os.path.join(current, segment)
+                parents.append(current)
+        return parents
+
+    def _qos_hard_safety(self, path):
+        for pid in cgroup.tree_procs(path):
+            reason = policy.protected_reason(pid, self.cfg)
+            if reason:
+                return reason
+        return ""
+
+    def _qos_authorization(self, scope, path):
+        return self.authorize(
+            authorization.QOS,
+            authorization.Facts(scope=scope, hard_safety=self._qos_hard_safety(path)),
+        )
+
+    def _qos_tree_cpu_usage(self, path):
+        # cpu.stat is hierarchical and includes descendant usage.
+        return engine._cpu_usage(path)
+
+    def _qos_unit_class(self, path):
+        """Resolve explicit runtime/foreground classes before inferring background from CPU."""
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        if not unit:
+            return None
+        metadata = unit.get("unit", {})
+        resource_class = metadata.get("qos_class", metadata.get("class"))
+        if resource_class in (
+            "interactive",
+            "foreground",
+            "infrastructure",
+            "protected",
+            "container",
+            "vm",
+        ):
+            return "normal"
+        if resource_class == "background":
+            return "background"
+        if unit.get("gc", {}).get("keep_while_children") is True:
+            # Runtime scopes that retain live child workloads stay at normal weight.
+            return "normal"
+        return None
+
+    def _observe_qos_background(self, scope, path, pids, now):
+        """Track low-CPU app scopes independently from the GC candidate set."""
+        if "/" in scope or not scope.startswith("app-") or not pids:
+            self.qos_usage.pop(scope, None)
+            self.qos_idle_since.pop(scope, None)
+            return
+        if self._qos_unit_class(path) == "normal":
+            self.qos_usage.pop(scope, None)
+            self.qos_idle_since.pop(scope, None)
+            return
+        if self._qos_hard_safety(path):
+            self.qos_usage.pop(scope, None)
+            self.qos_idle_since.pop(scope, None)
+            return
+        snapshot = inspect.LazySnapshot().get()
+        if not getattr(snapshot, "ok", True) or inspect.edges(set(pids), snapshot):
+            self.qos_usage.pop(scope, None)
+            self.qos_idle_since.pop(scope, None)
+            return
+        usage = self._qos_tree_cpu_usage(path)
+        previous = self.qos_usage.get(scope)
+        self.qos_usage[scope] = (usage, now) if usage is not None else None
+        if usage is None:
+            self.qos_usage.pop(scope, None)
+            self.qos_idle_since.pop(scope, None)
+            return
+        if previous is None or previous[0] is None or now <= previous[1]:
+            self.qos_idle_since.pop(scope, None)
+            return
+        elapsed = now - previous[1]
+        if elapsed < qos.BACKGROUND_SAMPLE_SECONDS:
+            return
+        cpu_percent = 100.0 * max(0, usage - previous[0]) / (elapsed * 1_000_000)
+        if cpu_percent > qos.BACKGROUND_CPU_PERCENT:
+            self.qos_idle_since.pop(scope, None)
+        else:
+            self.qos_idle_since.setdefault(scope, previous[1])
+
+    def _enable_qos_controllers(self, scope, path):
+        all_enabled = True
+        for parent in self._qos_controller_parents(path):
+            reason = qos.enable_controllers(parent)
+            if reason:
+                all_enabled = False
+                if self.store.changed("qos_controller:" + parent, reason):
+                    self.store.log(
+                        event="qos_controller_unavailable",
+                        scope=scope,
+                        parent=cgroup.rel(parent),
+                        reason=reason,
+                    )
+        return all_enabled
+
+    def _apply_qos_class(
+        self, scope, path, resource_class, now=None, only_controls=None
+    ):
+        now = time.time() if now is None else float(now)
+        scopes, _exemptions = self._qos_state()
+        previous = scopes.get(scope)
+        if not isinstance(previous, dict) or previous.get("class") != resource_class:
+            previous = {}
+        decision = self._qos_authorization(scope, path)
+        if decision.verdict == authorization.KEEP:
+            if self.store.changed("qos_refused:" + scope, decision.reason):
+                self.store.log(
+                    event="qos_refused",
+                    scope=scope,
+                    reason=decision.reason,
+                )
+            return False
+        observing = decision.verdict == authorization.WOULD_ACT
+        if observing:
+            plan = qos.plan(path, resource_class)
+            if plan.available and self.store.changed(
+                "qos_would:" + scope, (resource_class, plan.available)
+            ):
+                self.store.log(
+                    event="qos_would",
+                    scope=scope,
+                    resource_class=resource_class,
+                    controls=list(plan.available),
+                )
+            scopes[scope] = {
+                "class": resource_class,
+                "active": False,
+                "applied": False,
+                "originals": [],
+                "available": list(plan.available),
+                "deprioritized": bool(plan.available),
+            }
+            self.store.dirty = True
+            return True
+
+        # Authorization is checked immediately before changing parent delegation too.
+        decision = self._qos_authorization(scope, path)
+        if decision.verdict != authorization.ACT:
+            if self.store.changed("qos_refused:" + scope, decision.reason):
+                self.store.log(event="qos_refused", scope=scope, reason=decision.reason)
+            return False
+        controllers_ready = self._enable_qos_controllers(scope, path)
+        plan = qos.plan(path, resource_class)
+        if only_controls is not None:
+            previously_available = set(previous.get("available", []))
+            # Controller enablement can expose controls between the preflight plan
+            # and this plan. Treat those as newly available in this same pass.
+            newly_available = set(plan.available) - previously_available
+            plan = qos.QoSPlan(
+                tuple(
+                    item
+                    for item in plan.writes
+                    if item.name in only_controls or item.name in newly_available
+                ),
+                plan.available,
+            )
+        if plan.writes:
+            decision = self._qos_authorization(scope, path)
+            if decision.verdict != authorization.ACT:
+                if self.store.changed("qos_refused:" + scope, decision.reason):
+                    self.store.log(
+                        event="qos_refused", scope=scope, reason=decision.reason
+                    )
+                return False
+            originals_by_file = {
+                item["file"]: item["value"]
+                for item in previous.get("originals", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("file"), str)
+                and isinstance(item.get("value"), str)
+            }
+            rollback = [
+                {"file": item.name, "value": item.original} for item in plan.writes
+            ]
+            for item in plan.writes:
+                originals_by_file.setdefault(item.name, item.original)
+            originals = [
+                {"file": name, "value": value}
+                for name, value in sorted(originals_by_file.items())
+            ]
+            undo = {
+                "operation": "restore_priorities",
+                "resources": originals,
+                "qos": True,
+            }
+            try:
+                with self.store.decision_context(
+                    "qos",
+                    scope=scope,
+                    authority=decision.authority or "mode",
+                    mode=self.mode,
+                    why="deprioritize %s scope" % resource_class,
+                    undo=undo,
+                ):
+                    qos.apply(path, plan)
+                    self.store.log(
+                        event="qos_applied",
+                        scope=scope,
+                        resource_class=resource_class,
+                        controls=list(plan.available),
+                    )
+            except OSError as error:
+                try:
+                    self._undo_action_effect(
+                        {
+                            "id": "qos-rollback",
+                            "scope": scope,
+                            "undo": {
+                                "operation": "restore_priorities",
+                                "resources": rollback,
+                            },
+                        }
+                    )
+                except (OSError, engine.Refused):
+                    pass
+                self.store.log(event="qos_refused", scope=scope, error=str(error))
+                return False
+        else:
+            originals = previous.get("originals", [])
+            if not plan.available and self.store.changed(
+                "qos_unavailable:" + scope, resource_class
+            ):
+                self.store.log(
+                    event="qos_controls_unavailable",
+                    scope=scope,
+                    resource_class=resource_class,
+                )
+        scopes[scope] = {
+            "class": resource_class,
+            "active": True,
+            "applied": bool(originals),
+            "originals": originals,
+            "available": list(plan.available),
+            "controllers_ready": controllers_ready,
+            "controller_retry_at": (
+                0.0 if controllers_ready else now + qos.CONTROLLER_RETRY_SECONDS
+            ),
+            "deprioritized": bool(plan.available),
+        }
+        self.store.dirty = True
+        return True
+
+    def qos_pass(self, now=None):
+        """Reconcile managed scope classes after a stable two-second observation."""
+        now = time.time() if now is None else float(now)
+        scopes, exemptions = self._qos_state()
+        base = cgroup.base()
+        paths = {}
+        pending = list(cgroup.subdirs(base))
+        while pending:
+            path = pending.pop()
+            scope = cgroup.rel(path)
+            paths[scope] = path
+            pending.extend(cgroup.subdirs(path))
+
+        for transient_state in (
+            self.qos_pending,
+            self.qos_usage,
+            self.qos_idle_since,
+        ):
+            for scope in tuple(transient_state):
+                if scope not in paths:
+                    transient_state.pop(scope, None)
+
+        for scope in tuple(scopes):
+            if scope not in paths:
+                scopes.pop(scope, None)
+                exemptions.pop(scope, None)
+                self.qos_pending.pop(scope, None)
+                self.qos_usage.pop(scope, None)
+                self.qos_idle_since.pop(scope, None)
+                self.store.dirty = True
+
+        config = self.cfg.get("qos", policy._DEFAULTS["qos"])
+        enabled = isinstance(config, dict) and config.get("enabled", True) is True
+        background_scopes = [
+            (scope, path, cgroup.tree_procs(path))
+            for scope, path in paths.items()
+            if "/" not in scope
+            and scope.startswith("app-")
+            and self._qos_unit_class(path) != "normal"
+            and cgroup.tree_procs(path)
+            and os.path.isfile(os.path.join(path, "cpu.stat"))
+        ]
+        if enabled and background_scopes:
+            if now >= self.qos_next_background_sample:
+                for scope, path, pids in background_scopes:
+                    self._observe_qos_background(scope, path, pids, now)
+                self.qos_next_background_sample = now + qos.BACKGROUND_SAMPLE_SECONDS
+        else:
+            self.qos_next_background_sample = 0.0
+            if not enabled:
+                self.qos_usage.clear()
+                self.qos_idle_since.clear()
+        idle_times = {**self.idle_since, **self.qos_idle_since}
+        for scope, path in paths.items():
+            record = scopes.get(scope)
+            if not isinstance(record, dict):
+                record = None
+            pids = cgroup.tree_procs(path)
+            if not enabled:
+                if record:
+                    self._restore_qos_scope(scope)
+                else:
+                    self.qos_pending.pop(scope, None)
+                    exemptions.pop(scope, None)
+                continue
+            if not pids:
+                self.qos_usage.pop(scope, None)
+                self.qos_idle_since.pop(scope, None)
+                if record:
+                    self._restore_qos_scope(scope)
+                else:
+                    self.qos_pending.pop(scope, None)
+                    exemptions.pop(scope, None)
+                continue
+
+            unit_class = self._qos_unit_class(path)
+            resource_class = (
+                None
+                if unit_class == "normal"
+                else unit_class or qos.classify(scope, idle_times, now)
+            )
+            if resource_class is not None and self._qos_scope_kept(path):
+                self._restore_qos_scope(
+                    scope, exempt=True, classification=resource_class
+                )
+                continue
+            exempt_class = exemptions.get(scope)
+            if exempt_class is not None and exempt_class == resource_class:
+                self.qos_pending.pop(scope, None)
+                continue
+            if exempt_class is not None:
+                exemptions.pop(scope, None)
+                self.store.dirty = True
+
+            if resource_class is None and not record:
+                self.qos_pending.pop(scope, None)
+                continue
+
+            if self.mode == "observe" and record and record.get("active"):
+                if not self._restore_qos_scope(scope):
+                    continue
+                record = None
+            elif (
+                resource_class is not None
+                and record
+                and record.get("class") == resource_class
+                and record.get("active") is (self.mode != "observe")
+            ):
+                plan = qos.plan(path, resource_class)
+                if self.mode == "observe":
+                    self.qos_pending.pop(scope, None)
+                    if plan.available and self.store.changed(
+                        "qos_would:" + scope, (resource_class, plan.available)
+                    ):
+                        self.store.log(
+                            event="qos_would",
+                            scope=scope,
+                            resource_class=resource_class,
+                            controls=list(plan.available),
+                        )
+                    continue
+                recorded_controls = set(record.get("available", []))
+                newly_available = set(plan.available) - recorded_controls
+                controller_retry_due = not record.get(
+                    "controllers_ready", False
+                ) and now >= record.get("controller_retry_at", 0.0)
+                if not newly_available and not controller_retry_due:
+                    self.qos_pending.pop(scope, None)
+                    continue
+                candidate = self.qos_pending.get(scope)
+                if candidate is None or candidate[0] != resource_class:
+                    self.qos_pending[scope] = (resource_class, now)
+                    continue
+                if now - candidate[1] < qos.DEBOUNCE_SECONDS:
+                    continue
+                self.qos_pending.pop(scope, None)
+                self._apply_qos_class(
+                    scope,
+                    path,
+                    resource_class,
+                    now=now,
+                    only_controls=newly_available,
+                )
+                continue
+
+            candidate = self.qos_pending.get(scope)
+            if candidate is None or candidate[0] != resource_class:
+                self.qos_pending[scope] = (resource_class, now)
+                continue
+            if now - candidate[1] < qos.DEBOUNCE_SECONDS:
+                continue
+            self.qos_pending.pop(scope, None)
+            if resource_class is None:
+                if record:
+                    self._restore_qos_scope(scope)
+                continue
+            if record and record.get("class") != resource_class:
+                if not self._restore_qos_scope(scope):
+                    continue
+            self._apply_qos_class(scope, path, resource_class, now=now)
+
+        self.store.save_if_dirty(min_interval=0.5)
+
     def session_ended(self):
         """True once every login session of this user has gone (after at least one was seen)."""
         st = policy.session_state()
@@ -2693,7 +3208,7 @@ class Daemon:
                 if not isinstance(item, dict) or item.get("file") not in allowed_files:
                     return {"ok": False, "error": "priority resource is invalid"}
                 value = item.get("value")
-                if not isinstance(value, str) or not value or len(value) > 128:
+                if not isinstance(value, str) or not value or len(value) > 8192:
                     return {"ok": False, "error": "priority value is invalid"}
                 name = item["file"]
                 if name == "cpu.idle":
@@ -2704,7 +3219,7 @@ class Daemon:
                     )
                 else:
                     lines = value.strip().splitlines()
-                    valid_value = bool(lines) and len(lines) <= 16
+                    valid_value = bool(lines) and len(lines) <= 128
                     for line in lines:
                         fields = line.split()
                         if len(fields) != 2 or not fields[1].isdecimal():
@@ -2753,10 +3268,13 @@ class Daemon:
                 safe_oom_values.append((pid, start, value))
             try:
                 for item in resources:
-                    with open(
-                        os.path.join(path, item["file"]), "w", encoding="ascii"
-                    ) as target:
-                        target.write(item["value"].rstrip() + "\n")
+                    commands = (
+                        item["value"].strip().splitlines()
+                        if item["file"] == "io.weight"
+                        else [item["value"].rstrip()]
+                    )
+                    for command in commands:
+                        qos.write_control(path, item["file"], command)
                 for pid, start, value in safe_oom_values:
                     engine.helper_oom_restore(self.cfg, pid, start, value)
             except (OSError, engine.Refused) as error:
@@ -2765,6 +3283,14 @@ class Daemon:
                     "error": "could not restore priorities: %s" % error,
                 }
             self.store.log(event="priority_restored", scope=scope)
+            if payload.get("qos") is True:
+                scopes, exemptions = self._qos_state()
+                current = scopes.pop(scope, {})
+                held_class = current.get("class")
+                if isinstance(held_class, str) and held_class:
+                    exemptions[scope] = held_class
+                self.qos_pending.pop(scope, None)
+                self.store.dirty = True
             return {"ok": True, "scope": scope, "resources": len(resources)}
 
         if operation == "adopt_standalone":
@@ -3048,6 +3574,15 @@ class Daemon:
                 if result is None:
                     return {"error": "bad request"}
                 if not result.get("duplicate"):
+                    if msg.get("op") in (
+                        "answer",
+                        "teach",
+                        "review_answer",
+                    ) and result.get("choice") in ("keep", "standalone"):
+                        scope = result.get("scope")
+                        if isinstance(scope, str):
+                            self._restore_qos_scope(scope, exempt=True)
+                        self._restore_qos_for_keys(result.get("leftovers", []))
                     self.store.save()
                 self._adopt_answered_standalones()
                 self.store.save_if_dirty()
@@ -3710,6 +4245,26 @@ class Daemon:
             self.last["gc"] + self.iv_gc,
             now + MAX_SLEEP,
         ] + [d[0] for d in self.deadlines]
+        due_times.extend(
+            since + qos.DEBOUNCE_SECONDS
+            for _candidate, since in self.qos_pending.values()
+        )
+        if self.qos_next_background_sample:
+            due_times.append(self.qos_next_background_sample)
+        for scope, record in self.store.data.get("qos_scopes", {}).items():
+            if (
+                not isinstance(record, dict)
+                or record.get("active") is not True
+                or record.get("controllers_ready", False)
+            ):
+                continue
+            retry_at = record.get("controller_retry_at")
+            if not isinstance(retry_at, (int, float)):
+                continue
+            candidate = self.qos_pending.get(scope)
+            if candidate is not None:
+                retry_at = candidate[1] + qos.DEBOUNCE_SECONDS
+            due_times.append(retry_at)
         if self.mem_enabled:
             due_times.append(self.last.get("memory", now) + self.iv_memory)
         monotonic_now = time.monotonic()
@@ -3754,6 +4309,7 @@ class Daemon:
                 if self.queue_collector_event(MemoryReconcile()):
                     self.last["memory"] = now
             self.drain_collector_events()
+            self.guarded(self.qos_pass)
         finally:
             self._in_tick = False
             self.store.defer_writes = False

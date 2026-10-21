@@ -4805,6 +4805,27 @@ class Daemon:
                     self._thaw_scope(scope, "listener state unknown: " + detail)
                 )
                 continue
+            socket_reason = freezing.socket_safety_reason(
+                members,
+                snapshot,
+                member_socket_inodes,
+                wake_on_connect=True,
+            )
+            if socket_reason:
+                if socket_reason in (
+                    "listener has pending connections",
+                    "established TCP connection",
+                    "Unix socket peer unknown",
+                    "Unix socket peer owner unknown",
+                    "outside Unix socket peer",
+                    "connected to a window compositor",
+                    "connected to an audio or video client socket",
+                ):
+                    reason = "connect"
+                else:
+                    reason = "listener state unknown: " + socket_reason
+                results.append(self._thaw_scope(scope, reason))
+                continue
             listeners = record.get("listeners")
             if not isinstance(listeners, list) or not listeners:
                 results.append(self._thaw_scope(scope, "listener state unknown"))
@@ -5309,6 +5330,12 @@ class Daemon:
             if not self.store.db.write_available():
                 skip_pass = True
                 self.guarded(self.thaw_held_scopes)
+                now = time.time()
+                if (
+                    self._frozen_listener_scopes()
+                    and now - self.last_listener_check >= 2.0
+                ):
+                    self.guarded(lambda: self.listener_wake_pass(now=now))
                 self.store.log(event="store_busy", where="tick", retry=True)
                 return
             self.guarded(self.check_socket)

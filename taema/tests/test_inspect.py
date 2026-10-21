@@ -125,14 +125,14 @@ class Parse(unittest.TestCase):
             (2302403, 2302404, {11549}, "", 0, 0),
         )
 
-    def test_parse_unix_listener_queue_and_extended_inode(self):
+    def test_parse_unix_listener_queue_and_socket_inode(self):
         row = inspect.parse_ss_unix(
             'u_str LISTEN 0 8 /run/user/1000/test.sock 64634660 * 0 '
             'users:(("python3",pid=42,fd=3)) <-> ino:19010946 dev:0/66306 peers:'
         )[0]
         self.assertEqual(
             (row["state"], row["inode"], row["recv_q"], row["send_q"], row["path"]),
-            ("LISTEN", 19010946, 0, 8, "/run/user/1000/test.sock"),
+            ("LISTEN", 64634660, 0, 8, "/run/user/1000/test.sock"),
         )
 
     def test_parse_tcp_no_users(self):

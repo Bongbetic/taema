@@ -264,7 +264,6 @@ def parse_ss_unix(text):
         if not m:
             continue
         _, state, recv_q, send_q, lpath, linode, _ppath, pinode = m.groups()
-        inode = _INODE.search(line)
         rows.append(
             {
                 "state": state,
@@ -272,7 +271,9 @@ def parse_ss_unix(text):
                 "send_q": int(send_q),
                 "path": "" if lpath == "*" else lpath,
                 "peer_path": "" if _ppath == "*" else _ppath,
-                "inode": int(inode.group(1)) if inode else int(linode),
+                # `ino:` in extended ss output is the filesystem node inode for
+                # pathname sockets; the local column is the socket inode used by /proc.
+                "inode": int(linode),
                 "peer_inode": int(pinode),
                 "pids": _pids(line),
             }

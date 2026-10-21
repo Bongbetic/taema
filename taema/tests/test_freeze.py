@@ -296,6 +296,61 @@ class FreezeTests(unittest.TestCase):
     def test_pending_unix_connection_thaws_listener_scope(self):
         self._assert_listener_queue_wakes_scope("unix")
 
+    def test_connection_accepted_during_freeze_race_thaws_listener_scope(self):
+        inode = 9203
+        self.daemon.store.set_frozen_scope(
+            self.scope,
+            1.0,
+            listeners=[{"transport": "tcp", "inode": inode}],
+            source="auto",
+        )
+        write(os.path.join(self.path, "cgroup.freeze"), "1\n")
+        fd_dir = os.path.join(self.proc_root, "4242", "fd")
+        os.symlink("socket:[%d]" % inode, os.path.join(fd_dir, "5"))
+        established = {
+            "state": "ESTAB",
+            "recv_q": 0,
+            "send_q": 0,
+            "local": "127.0.0.1:8000",
+            "peer": "127.0.0.1:42123",
+            "inode": 9204,
+            "pids": {4242},
+        }
+        os.symlink("socket:[9204]", os.path.join(fd_dir, "6"))
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "local": "127.0.0.1:8000",
+            "peer": "0.0.0.0:*",
+            "inode": inode,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(established,),
+            tcp_listen=(listener,),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={inode, 9204},
+        )
+        with (
+            mock.patch.object(service.inspect, "Snapshot", return_value=snapshot),
+            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+        ):
+            result = self.daemon.listener_wake_pass(now=1000.0)
+
+        self.assertTrue(result[0]["thawed"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+        self.assertTrue(
+            any(
+                call.kwargs.get("event") == "thaw"
+                and call.kwargs.get("reason") == "connect"
+                for call in log.call_args_list
+            )
+        )
+
     def test_accept_queue_poll_is_scheduled_only_for_frozen_listeners(self):
         self.daemon.last.update(
             {"adopt": 1000.0, "gc": 1000.0, "freeze": 1000.0}
@@ -317,6 +372,52 @@ class FreezeTests(unittest.TestCase):
             service.inspect, "Snapshot", side_effect=AssertionError("unexpected poll")
         ):
             self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
+
+    def test_listener_wake_still_thaws_when_store_writer_is_busy(self):
+        inode = 9302
+        self.daemon.store.set_frozen_scope(
+            self.scope,
+            1.0,
+            listeners=[{"transport": "tcp", "inode": inode}],
+        )
+        write(os.path.join(self.path, "cgroup.freeze"), "1\n")
+        os.symlink(
+            "socket:[%d]" % inode,
+            os.path.join(self.proc_root, "4242", "fd", "5"),
+        )
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 1,
+            "send_q": 8,
+            "local": "127.0.0.1:8000",
+            "peer": "0.0.0.0:*",
+            "inode": inode,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(),
+            tcp_listen=(listener,),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={inode},
+        )
+
+        with (
+            mock.patch.object(service.inspect, "Snapshot", return_value=snapshot),
+            mock.patch.object(self.daemon.store.db, "write_available", return_value=False),
+        ):
+            self.daemon.tick()
+
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+        self.assertTrue(
+            any(
+                event["event"] == "thaw"
+                and event["data"].get("reason") == "connect"
+                for event in self.daemon.store.events_since(0)["events"]
+            )
+        )
 
     def test_manual_freeze_and_thaw_work_in_observe_mode(self):
         self.daemon.cfg["mode"] = "observe"

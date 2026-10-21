@@ -4598,9 +4598,6 @@ class Daemon:
             snapshot = inspect.Snapshot()
         if not getattr(snapshot, "ok", False):
             return "socket state unknown", []
-        edge_map = inspect.edges(set(pids), snapshot)
-        if edge_map:
-            return "outside dependency edge", []
         fd_reason, member_socket_inodes, pty_host = freezing.member_fd_facts(
             pids, snapshot, inspect.PROC
         )
@@ -4619,6 +4616,9 @@ class Daemon:
         )
         if socket_reason:
             return socket_reason, []
+        edge_map = inspect.edges(set(pids), snapshot)
+        if edge_map:
+            return "outside dependency edge", []
         listeners = ()
         if wake_on_connect:
             listeners, listener_error = freezing.listener_descriptors(

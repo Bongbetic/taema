@@ -486,6 +486,72 @@ class FreezeTests(unittest.TestCase):
             )
         )
 
+    def test_pending_connection_during_freeze_reconciliation_reports_connect(self):
+        inode = 9311
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "local": "127.0.0.1:8000",
+            "inode": inode,
+            "pids": {4242},
+        }
+        quiet_snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(),
+            tcp_listen=(listener,),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={inode},
+        )
+        pending_snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(
+                {
+                    "state": "ESTAB",
+                    "recv_q": 0,
+                    "send_q": 0,
+                    "local": "127.0.0.1:8000",
+                    "peer": "192.0.2.10:42000",
+                    "inode": 9312,
+                    "pids": set(),
+                },
+            ),
+            tcp_listen=({**listener, "recv_q": 1},),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={inode, 9312},
+        )
+        with (
+            mock.patch.object(
+                service.inspect,
+                "Snapshot",
+                side_effect=[quiet_snapshot, pending_snapshot],
+            ),
+            mock.patch.object(
+                service.inspect,
+                "edges",
+                side_effect=[{}, {4242: [{"kind": "tcp_server"}]}],
+            ),
+            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+        ):
+            result = self.daemon.freeze_scope(
+                self.scope, manual=False, cpu_verified=True
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("pending connections", result["error"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+        self.assertTrue(
+            any(
+                call.kwargs.get("event") == "thaw"
+                and call.kwargs.get("reason") == "connect"
+                for call in log.call_args_list
+            )
+        )
+
     def test_listener_wake_still_thaws_when_store_writer_is_busy(self):
         inode = 9302
         self.daemon.store.set_frozen_scope(

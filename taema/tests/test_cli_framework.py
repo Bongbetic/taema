@@ -291,6 +291,7 @@ class CliViews(unittest.TestCase):
             self.assertTrue(matches(status, SCHEMA, SCHEMA))
             self.assertEqual(status["schema"], "taema.view.v1")
             self.assertEqual(status["status"]["daemon"], "unavailable")
+            self.assertEqual(status["memory"]["schema"], "taema.memory.v1")
 
         with FakeCg() as cg:
             cg.leaf("scope-json")
@@ -303,6 +304,7 @@ class CliViews(unittest.TestCase):
             self.assertTrue(matches(scopes, SCHEMA, SCHEMA))
             self.assertEqual(scopes["kind"], "ls")
             self.assertEqual(scopes["scopes"][0]["name"], "scope-json")
+            self.assertEqual(scopes["memory"]["schema"], "taema.memory.v1")
 
     def test_jsonl_uses_one_schema_tagged_record_per_scope(self):
         with FakeCg() as cg:
@@ -313,9 +315,15 @@ class CliViews(unittest.TestCase):
             with redirect_stdout(output):
                 commands.cmd_ls(args)
         records = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(len(records), 2)
+        self.assertEqual(len(records), 3)
         self.assertTrue(all(matches(record, SCHEMA, SCHEMA) for record in records))
-        self.assertEqual({record["schema"] for record in records}, {"taema.scope.v1"})
+        self.assertEqual(
+            {record["schema"] for record in records},
+            {"taema.scope.v1", "taema.memory.v1"},
+        )
+        self.assertEqual(
+            sum(record["schema"] == "taema.scope.v1" for record in records), 2
+        )
 
     def test_no_arguments_prints_compact_status_summary(self):
         with tempfile.TemporaryDirectory() as state_dir:
@@ -325,6 +333,7 @@ class CliViews(unittest.TestCase):
             with (
                 mock.patch.object(commands, "_load_status", return_value=(cfg, store)),
                 mock.patch.object(commands, "ask", return_value=None),
+                mock.patch.dict(os.environ, {"TAEMA_MEM": "0"}),
                 mock.patch.object(
                     commands.cgroup, "base", return_value="/missing/cgroup"
                 ),
@@ -341,7 +350,8 @@ class CliViews(unittest.TestCase):
             "profile: auto (automatic profile selection)\n"
             "scopes: 0\n"
             "reviews: 0\n"
-            "feedback_invalid: 0\n",
+            "feedback_invalid: 0\n"
+            "memory: disabled\n",
         )
 
     def test_color_environment_and_plain_flags_are_respected(self):

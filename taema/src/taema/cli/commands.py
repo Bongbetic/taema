@@ -6,6 +6,7 @@ from datetime import time as _local_time
 from datetime import timedelta as _timedelta
 from itertools import count
 import json
+import math as _math
 import os
 import sys
 import time
@@ -45,6 +46,7 @@ class _LazyModule:
 
 authorization = _LazyModule("authorization", "taema.model.authorization")
 cgroup = _LazyModule("cgroup", "taema.core.cgroup")
+memory = _LazyModule("memory", "taema.core.memory")
 inspect = _LazyModule("inspect", "taema.core.process")
 lineage = _LazyModule("lineage", "taema.core.lineage")
 engine = _LazyModule("engine", "taema.governor.engine")
@@ -1077,25 +1079,212 @@ def _fmt_psi(v):
     return "-" if v is None else "%.2f" % v
 
 
-def _walk(path, depth, out):
+def _memory_snapshot(cfg=None, store=None):
+    if not memory.enabled(cfg):
+        return memory.snapshot(base=cgroup.base(), cfg=cfg)
+    peak_cache = {}
+    if store is not None:
+        for key, sample in store.latest_memory_samples().items():
+            if sample.get("peak") is not None:
+                peak_cache[key] = sample["peak"]
+    return memory.snapshot(base=cgroup.base(), cfg=cfg, peak_cache=peak_cache)
+
+
+def _memory_config(args):
+    cfg = policy.load_config(path=getattr(args, "config", None))
+    store = _status_store(cfg)
+    return cfg, store
+
+
+def _memory_human(report, pressure_only=False):
+    if not report.get("enabled"):
+        return "memory collection is disabled\n"
+    host = report.get("host") or {}
+    lines = ["host memory"]
+    lines.append(
+        "  total %s  available %s  pressure %s%%  swap %s / %s  zswap %s"
+        % (
+            _fmt_mem(host.get("total_bytes")),
+            _fmt_mem(host.get("available_bytes")),
+            _fmt_psi(host.get("pressure_avg10")),
+            _fmt_mem(host.get("swap_used_bytes")),
+            _fmt_mem(host.get("swap_total_bytes")),
+            _fmt_mem(host.get("zswap_bytes")),
+        )
+    )
+    lines.append(
+        "  delegated current %s  zswap source %s"
+        % (
+            _fmt_mem(host.get("delegated_current_bytes")),
+            host.get("zswap_source") or "unsupported",
+        )
+    )
+    if report.get("features", {}).get("accounting") == "unsupported":
+        lines.append("memory accounting: unsupported; no cgroup memory.current")
+    rows = report.get("scopes", [])
+    if pressure_only:
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                row.get("psi_avg10") if row.get("psi_avg10") is not None else -1
+            ),
+            reverse=True,
+        )
+        lines.append("scope pressure (avg10)")
+        for scope in rows:
+            lines.append(
+                "  %-28s %-10s %6s%% (%s)"
+                % (
+                    scope["name"],
+                    scope["class"],
+                    _fmt_psi(scope.get("psi_avg10")),
+                    scope.get("psi_source") or "unsupported",
+                )
+            )
+        return "\n".join(lines) + "\n"
+    lines.append("scope class current peak anon file swap zswap reclaimable PSI10")
+    for scope in rows:
+        lines.append(
+            "%-28s %-9s %8s %8s %8s %8s %8s %8s %8s %6s%%"
+            % (
+                scope["name"],
+                scope["class"],
+                _fmt_mem(scope.get("current_bytes")),
+                _fmt_mem(scope.get("peak_bytes")),
+                _fmt_mem(scope.get("anon_bytes")),
+                _fmt_mem(scope.get("file_bytes")),
+                _fmt_mem(scope.get("swap_bytes")),
+                _fmt_mem(scope.get("zswap_bytes")),
+                _fmt_mem(scope.get("reclaimable_bytes")),
+                _fmt_psi(scope.get("psi_avg10")),
+            )
+        )
+    if not rows:
+        lines.append("no active scopes")
+    return "\n".join(lines) + "\n"
+
+
+def _emit_memory(report, args, human=None):
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    elif getattr(args, "jsonl", False):
+        for record in _memory_jsonl_records(report):
+            print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    else:
+        print(human if human is not None else _memory_human(report), end="")
+
+
+def _memory_jsonl_records(report):
+    if not report.get("enabled"):
+        return [report]
+    return [
+        {
+            "schema": "taema.memory-host.v1",
+            "sampled_at": report["sampled_at"],
+            "host": report["host"],
+            "features": report["features"],
+        }
+    ] + [
+        {"schema": "taema.memory-scope.v1", "scope": scope}
+        for scope in report.get("scopes", [])
+    ]
+
+
+def cmd_memory(a):
+    cfg, store = _memory_config(a)
+    report = _memory_snapshot(cfg, store)
+    _emit_memory(report, a)
+    return 0
+
+
+def cmd_memory_top(a):
+    limit = getattr(a, "limit", 10)
+    if limit <= 0:
+        return die("--limit must be positive")
+    cfg, store = _memory_config(a)
+    report = _memory_snapshot(cfg, store)
+    report["scopes"] = sorted(
+        report.get("scopes", []),
+        key=lambda row: row.get("current_bytes") or 0,
+        reverse=True,
+    )[:limit]
+    _emit_memory(report, a)
+    return 0
+
+
+def cmd_memory_pressure(a):
+    cfg, store = _memory_config(a)
+    report = _memory_snapshot(cfg, store)
+    _emit_memory(report, a, _memory_human(report, pressure_only=True))
+    return 0
+
+
+def cmd_memory_watch(a):
+    interval = getattr(a, "interval", 5.0)
+    count = getattr(a, "count", None)
+    if not _math.isfinite(interval) or interval <= 0:
+        return die("--interval must be a finite positive number")
+    if count is not None and count <= 0:
+        return die("--count must be positive")
+    cfg, store = _memory_config(a)
+    if not memory.enabled(cfg):
+        _emit_memory(_memory_snapshot(cfg, store), a)
+        return 0
+    if getattr(a, "json", False) and count is None:
+        count = 1
+    snapshots = []
+    emitted = 0
+    while count is None or emitted < count:
+        report = _memory_snapshot(cfg, store)
+        emitted += 1
+        if getattr(a, "json", False):
+            snapshots.append(report)
+        elif getattr(a, "jsonl", False):
+            _emit_memory(report, a)
+        else:
+            print(_memory_human(report), end="")
+        if count is None or emitted < count:
+            time.sleep(interval)
+    if getattr(a, "json", False):
+        print(
+            json.dumps(
+                {"schema": "taema.memory-watch.v1", "snapshots": snapshots},
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    return 0
+
+
+def _walk(path, depth, out, memory_scopes=None):
     pids = cgroup.procs(path)
     comms = []
     for p in pids:
         c = inspect.comm(p)
         if c and c not in comms:
             comms.append(c)
+    key = cgroup.rel(path)
+    metrics = memory_scopes.get(key) if memory_scopes is not None else None
+    if memory_scopes is None and memory.enabled():
+        current = cgroup.memory_current(path)
+        pressure = cgroup.memory_psi(path)
+    else:
+        current = metrics.get("current_bytes") if metrics else None
+        pressure = metrics.get("psi_avg10") if metrics else None
     out.append(
         {
             "depth": depth,
             "name": os.path.basename(path) if depth else cgroup.rel(path),
             "processes": len(pids),
-            "memory_bytes": cgroup.memory_current(path),
-            "psi_avg10": cgroup.memory_psi(path),
+            "memory_bytes": current,
+            "psi_avg10": pressure,
+            "memory": metrics,
             "commands": sorted(comms),
         }
     )
     for d in sorted(cgroup.subdirs(path)):
-        _walk(d, depth + 1, out)
+        _walk(d, depth + 1, out, memory_scopes)
 
 
 def _count_scopes(base):
@@ -1111,16 +1300,24 @@ def _count_scopes(base):
 def cmd_ls(a):
     from . import view
 
+    try:
+        cfg = policy.load_config(path=getattr(a, "config", None))
+    except (OSError, ValueError):
+        cfg = None
+    memory_view = _memory_snapshot(cfg)
+    memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
     base = cgroup.base()
     if not os.path.isdir(base):
-        model = view.snapshot("ls", scopes=())
+        model = view.snapshot("ls", scopes=(), memory=memory_view)
         view.emit(model, a, "scope tree unavailable: %s\n" % base)
         return 3
     rows = []
     for d in sorted(cgroup.subdirs(base)):
-        _walk(d, 0, rows)
-    model = view.snapshot("ls", scopes=rows)
+        _walk(d, 0, rows, memory_scopes)
+    model = view.snapshot("ls", scopes=rows, memory=memory_view)
     records = [view.record("scope", row) for row in rows]
+    if getattr(a, "jsonl", False):
+        records.insert(0, memory_view)
     view.emit(model, a, view.render_scopes(rows, a), records)
     return 0
 
@@ -2216,12 +2413,14 @@ def cmd_status(a):
             "details": reply,
         }
         result = 0
+    memory_view = _memory_snapshot(cfg, store)
+    memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
     base = cgroup.base()
     if os.path.isdir(base):
         if getattr(a, "json", False) or getattr(a, "jsonl", False):
             scopes = []
             for path in sorted(cgroup.subdirs(base)):
-                _walk(path, 0, scopes)
+                _walk(path, 0, scopes, memory_scopes)
             scope_count = len(scopes)
         else:
             scopes = []
@@ -2229,8 +2428,12 @@ def cmd_status(a):
     else:
         scopes = []
         scope_count = 0
-    model = view.snapshot("status", status, scopes, scope_count=scope_count)
+    model = view.snapshot(
+        "status", status, scopes, scope_count=scope_count, memory=memory_view
+    )
     records = [view.record("status", {"status": status})]
+    if getattr(a, "jsonl", False):
+        records.extend(_memory_jsonl_records(memory_view))
     records.extend(view.record("scope", row) for row in scopes)
     view.emit(
         model,

@@ -224,6 +224,14 @@ class Store:
     def app_identity(self, key):
         return self.db.app_identity(key)
 
+    def latest_memory_samples(self):
+        return self.db.latest_memory_samples()
+
+    def record_memory_samples(self, samples, now=None):
+        if self.read_only:
+            return 0
+        return self.db.save_memory_samples(samples, now=now)
+
     def latest_app_instance(self, key):
         return self.db.latest_app_instance(key)
 

@@ -24,7 +24,13 @@ import tempfile
 import time
 
 from ..model import authorization
-from ..core import cgroup, process as inspect, lineage, signature as survivor_signature
+from ..core import (
+    cgroup,
+    memory,
+    process as inspect,
+    lineage,
+    signature as survivor_signature,
+)
 from ..governor import engine
 from ..store import knowledge
 from ..config import policy
@@ -124,9 +130,29 @@ class Daemon:
         self.gc_noted = set()  # leaves already logged as kept
         self.srv = None
         self.sock_path = None
-        self.last = {"adopt": 0.0, "gc": 0.0}
+        self.mem_enabled = memory.enabled(cfg)
+        self.last = {"adopt": 0.0, "gc": 0.0, "memory": 0.0}
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.iv_memory = 60.0
+        self.memory_peaks = {}
+        self.last_memory_prune = 0.0
+        saved_samples = self.store.latest_memory_samples() if self.mem_enabled else {}
+        self.memory_last_samples = {}
+        for key, sample in saved_samples.items():
+            if sample.get("peak") is not None:
+                self.memory_peaks[key] = sample["peak"]
+            self.memory_last_samples[key] = {
+                "ts": sample.get("ts", 0),
+                "current_bytes": sample.get("current"),
+                "anon_bytes": sample.get("anon"),
+                "file_bytes": sample.get("file"),
+                "swap_bytes": sample.get("swap"),
+                "zswap_bytes": sample.get("zswap"),
+                "peak": sample.get("peak"),
+                "peak_bytes": sample.get("peak"),
+                "psi_avg10": sample.get("psi10"),
+            }
         self.gate_sig = (
             None  # fork gate: (last pid, session pid sets) of the last adopt pass
         )
@@ -753,8 +779,9 @@ class Daemon:
             tty,
         )
 
-    @staticmethod
-    def _review_memory(scope):
+    def _review_memory(self, scope):
+        if not memory.enabled(self.cfg):
+            return None
         path = cgroup.resolve(scope)
         return cgroup.memory_current(path) if path else None
 
@@ -3675,7 +3702,7 @@ class Daemon:
         )
 
     def next_timeout(self, now=None):
-        """Seconds until the next timer is due (adopt, gc), capped at MAX_SLEEP."""
+        """Seconds until the next timer is due (adopt, gc, memory), capped at MAX_SLEEP."""
         if self.collector_events:
             return 0.0
         now = time.time() if now is None else now
@@ -3684,6 +3711,8 @@ class Daemon:
             self.last["gc"] + self.iv_gc,
             now + MAX_SLEEP,
         ] + [d[0] for d in self.deadlines]
+        if self.mem_enabled:
+            due_times.append(self.last.get("memory", now) + self.iv_memory)
         monotonic_now = time.monotonic()
         due_times.extend(
             now + max(0, item["close_deadline"] - monotonic_now)
@@ -3719,6 +3748,12 @@ class Daemon:
             if now - self.last["gc"] >= self.iv_gc:
                 if self.queue_collector_event(LeafReconcile()):
                     self.last["gc"] = now
+            if (
+                self.mem_enabled
+                and now - self.last.get("memory", 0.0) >= self.iv_memory
+            ):
+                self.guarded(lambda: self.memory_pass(now))
+                self.last["memory"] = now
             self.drain_collector_events()
         finally:
             self._in_tick = False
@@ -3727,6 +3762,49 @@ class Daemon:
                 self.guarded(self.store.save_if_dirty)
                 self.guarded(self.store.export_daily_if_due)
             self._write_summary_if_dirty()
+
+    def memory_pass(self, now=None):
+        """Sample live cgroups and persist only material changes or the 10-minute heartbeat."""
+        if not memory.enabled(self.cfg):
+            return 0
+        now = time.time() if now is None else float(now)
+        snapshot = memory.snapshot(cfg=self.cfg, peak_cache=self.memory_peaks, now=now)
+        live = set()
+        samples = []
+        for scope in snapshot["scopes"]:
+            key = scope["name"]
+            live.add(key)
+            if scope.get("current_bytes") is None:
+                continue
+            previous = self.memory_last_samples.get(key)
+            current = {
+                "current_bytes": scope.get("current_bytes"),
+                "anon_bytes": scope.get("anon_bytes"),
+                "file_bytes": scope.get("file_bytes"),
+                "swap_bytes": scope.get("swap_bytes"),
+                "zswap_bytes": scope.get("zswap_bytes"),
+                "peak_bytes": scope.get("peak_bytes"),
+                "psi_avg10": scope.get("psi_avg10"),
+            }
+            if memory.sample_due(previous, current, now):
+                sample = memory.sample_record(scope, now)
+                samples.append(sample)
+                self.memory_last_samples[key] = {
+                    "ts": now,
+                    **current,
+                    "peak": scope.get("peak_bytes"),
+                }
+        for key in tuple(self.memory_last_samples):
+            if key not in live:
+                self.memory_last_samples.pop(key, None)
+                self.memory_peaks.pop(key, None)
+        prune_due = now - self.last_memory_prune >= memory.SAMPLE_INTERVAL
+        if not samples and not prune_due:
+            return 0
+        saved = self.store.record_memory_samples(samples, now=now)
+        if prune_due:
+            self.last_memory_prune = now
+        return saved
 
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)

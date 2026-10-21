@@ -7,7 +7,7 @@ import subprocess
 from urllib.parse import quote
 
 from .config import policy
-from .core import cgroup, process
+from .core import cgroup, memory, process
 from .store import db
 
 _CONFIG_KEYS = set(policy._DEFAULTS) | {
@@ -457,67 +457,213 @@ def _feature_check(name, path, controllers, required_controller=None):
     return _check(name, "ok", "%s is available" % os.path.basename(path))
 
 
-def _kernel_checks(base, controllers, system_root):
-    checks = [
-        _feature_check(
-            "memory accounting",
-            os.path.join(base, "memory.current"),
-            controllers,
-            "memory",
-        ),
-        _feature_check(
-            "memory reclaim",
-            os.path.join(base, "memory.reclaim"),
-            controllers,
-            "memory",
-        ),
-        _feature_check(
-            "memory PSI", os.path.join(base, "memory.pressure"), controllers, "memory"
-        ),
-        _feature_check(
-            "cgroup freeze", os.path.join(base, "cgroup.freeze"), controllers
-        ),
-        _feature_check("cpu.idle", os.path.join(base, "cpu.idle"), controllers, "cpu"),
-        _feature_check("io.weight", os.path.join(base, "io.weight"), controllers, "io"),
-        _feature_check(
-            "swap accounting",
-            os.path.join(base, "memory.swap.current"),
-            controllers,
-            "memory",
-        ),
-    ]
-    zswap_paths = (
-        "/sys/module/zswap/parameters/enabled",
-        "/sys/kernel/mm/zswap/enabled",
-    )
-    zswap_path = next(
-        (
-            _rooted(system_root, path)
-            for path in zswap_paths
-            if os.path.isfile(_rooted(system_root, path))
-        ),
-        None,
-    )
-    if zswap_path is None:
-        checks.append(
+def _kernel_checks(base, controllers, system_root, cfg=None):
+    memory_features = {
+        "memory accounting": "memory.current and memory.stat",
+        "memory peak usage": "memory.peak",
+        "memory pressure": "memory.pressure or /proc/pressure/memory",
+        "memory reclaim": "memory.reclaim or memory.high fallback",
+        "memory soft cap": "memory.high",
+        "memory hard cap": "memory.max",
+        "swap accounting": "memory.swap.current and memory.swap.max",
+        "zswap accounting": "memory.zswap.current",
+        "memory OOM events": "memory.events or memory.events.local",
+    }
+    if not memory.enabled(cfg):
+        checks = [
             _check(
-                "zswap",
+                name,
                 "warn",
-                "the kernel does not expose zswap state",
-                "Zswap is optional; enable it only if desired in kernel configuration.",
+                "%s is not probed because memory collection is disabled" % feature,
+                "Enable memory collection to inspect this kernel feature.",
             )
-        )
-    elif (_read(zswap_path) or "").strip().lower() in ("y", "1", "yes"):
-        checks.append(_check("zswap", "ok", "zswap is enabled"))
+            for name, feature in memory_features.items()
+        ]
     else:
+        checks = []
+        if "memory" not in controllers:
+            checks.append(
+                _check(
+                    "memory accounting",
+                    "warn",
+                    "the memory controller is unavailable; scope memory is unsupported",
+                    "Enable the delegated memory controller; host memory remains readable.",
+                )
+            )
+        elif all(
+            os.path.isfile(os.path.join(base, name))
+            for name in ("memory.current", "memory.stat")
+        ):
+            checks.append(
+                _check(
+                    "memory accounting",
+                    "ok",
+                    "memory.current and memory.stat are available",
+                )
+            )
+        else:
+            checks.append(
+                _check(
+                    "memory accounting",
+                    "warn",
+                    "memory.current or memory.stat is unavailable",
+                    "Scope accounting is unsupported on this cgroup; host metrics remain available.",
+                )
+            )
+
+        peak_path = os.path.join(base, "memory.peak")
+        checks.append(
+            _check("memory peak usage", "ok", "memory.peak is available")
+            if os.path.isfile(peak_path)
+            else _check(
+                "memory peak usage",
+                "warn",
+                "memory.peak is unsupported; the daemon samples max(memory.current)",
+                "No action required; sampled maxima are used as the fallback.",
+            )
+        )
+
+        pressure_path = os.path.join(base, "memory.pressure")
+        proc_pressure = _rooted(system_root, "/proc/pressure/memory")
+        checks.append(
+            _check("memory pressure", "ok", "cgroup memory.pressure is available")
+            if os.path.isfile(pressure_path)
+            else _check(
+                "memory pressure",
+                "ok" if os.path.isfile(proc_pressure) else "warn",
+                "host PSI fallback /proc/pressure/memory is available"
+                if os.path.isfile(proc_pressure)
+                else "memory.pressure and host PSI are unsupported; scope PSI is unknown",
+                "No action required; host PSI is used when cgroup PSI is unavailable."
+                if os.path.isfile(proc_pressure)
+                else "Enable PSI in the kernel to report pressure.",
+            )
+        )
+
+        reclaim_path = os.path.join(base, "memory.reclaim")
+        high_path = os.path.join(base, "memory.high")
+        checks.append(
+            _feature_check("memory reclaim", reclaim_path, controllers, "memory")
+            if os.path.isfile(reclaim_path) or "memory" not in controllers
+            else _check(
+                "memory reclaim",
+                "warn",
+                "memory.reclaim is unsupported; memory.high pulse is the available fallback"
+                if os.path.isfile(high_path)
+                else "memory.reclaim is unsupported; no targeted reclaim fallback is available",
+                "The daemon will use the memory.high fallback when configured."
+                if os.path.isfile(high_path)
+                else "No targeted reclaim operation is available on this kernel.",
+            )
+        )
+        checks.extend(
+            _feature_check(name, os.path.join(base, filename), controllers, "memory")
+            for name, filename in (
+                ("memory soft cap", "memory.high"),
+                ("memory hard cap", "memory.max"),
+            )
+        )
+        checks.append(
+            _check(
+                "swap accounting",
+                "ok",
+                "memory.swap.current and memory.swap.max are available",
+            )
+            if all(
+                os.path.isfile(os.path.join(base, filename))
+                for filename in ("memory.swap.current", "memory.swap.max")
+            )
+            else _check(
+                "swap accounting",
+                "warn",
+                "cgroup swap accounting is unsupported; host swap remains available",
+                "Enable cgroup swap accounting to report per-scope swap use.",
+            )
+        )
+        zswap_current = os.path.join(base, "memory.zswap.current")
+        checks.append(
+            _feature_check("zswap accounting", zswap_current, controllers, "memory")
+            if os.path.isfile(zswap_current) or "memory" not in controllers
+            else _check(
+                "zswap accounting",
+                "warn",
+                "memory.zswap.current is unsupported; report swap use where available",
+                "Cgroup swap accounting remains the fallback for compressed swap.",
+            )
+        )
+        checks.append(
+            _check(
+                "memory OOM events",
+                "ok",
+                "memory.events or memory.events.local is available",
+            )
+            if any(
+                os.path.isfile(os.path.join(base, filename))
+                for filename in ("memory.events.local", "memory.events")
+            )
+            else _check(
+                "memory OOM events",
+                "warn",
+                "cgroup OOM event files are unsupported; process exits remain observable",
+                "No action required; event counters are optional.",
+            )
+        )
+
+    checks.extend(
+        [
+            _feature_check(
+                "cgroup freeze", os.path.join(base, "cgroup.freeze"), controllers
+            ),
+            _feature_check(
+                "cpu.idle", os.path.join(base, "cpu.idle"), controllers, "cpu"
+            ),
+            _feature_check(
+                "io.weight", os.path.join(base, "io.weight"), controllers, "io"
+            ),
+        ]
+    )
+    if not memory.enabled(cfg):
         checks.append(
             _check(
                 "zswap",
                 "warn",
-                "zswap is available but disabled",
-                "Enable zswap only if desired.",
+                "zswap state is not probed because memory collection is disabled",
+                "Enable memory collection to inspect zswap.",
             )
         )
+    else:
+        zswap_paths = (
+            "/sys/module/zswap/parameters/enabled",
+            "/sys/kernel/mm/zswap/enabled",
+        )
+        zswap_path = next(
+            (
+                _rooted(system_root, path)
+                for path in zswap_paths
+                if os.path.isfile(_rooted(system_root, path))
+            ),
+            None,
+        )
+        if zswap_path is None:
+            checks.append(
+                _check(
+                    "zswap",
+                    "warn",
+                    "the kernel does not expose zswap state",
+                    "Zswap is optional; enable it only if desired in kernel configuration.",
+                )
+            )
+        elif (_read(zswap_path) or "").strip().lower() in ("y", "1", "yes"):
+            checks.append(_check("zswap", "ok", "zswap is enabled"))
+        else:
+            checks.append(
+                _check(
+                    "zswap",
+                    "warn",
+                    "zswap is available but disabled",
+                    "Enable zswap only if desired.",
+                )
+            )
     return checks
 
 
@@ -721,7 +867,7 @@ def diagnose(
     )
     base, _root_controllers, controllers, cgroup_results = _cgroup_checks(uid)
     checks.extend(cgroup_results)
-    checks.extend(_kernel_checks(base, controllers, system_root))
+    checks.extend(_kernel_checks(base, controllers, system_root, cfg))
     checks.append(_socket_check(cfg, uid))
     checks.extend(_store_checks(cfg, store, store_error))
     mode = cfg.get("mode")

@@ -48,7 +48,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 8
+                    connection.execute("PRAGMA user_version").fetchone()[0], 9
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -119,7 +119,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     ("signature-1",),
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 8
+                    connection.execute("PRAGMA user_version").fetchone()[0], 9
                 )
 
             self.assertTrue({"suspended_until", "suspended_at"}.issubset(columns))
@@ -154,7 +154,7 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 8
+                    connection.execute("PRAGMA user_version").fetchone()[0], 9
                 )
                 self.assertTrue(
                     connection.execute(
@@ -194,7 +194,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     "SELECT id, owner, runtime_hash, veto FROM signatures"
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 8
+                    connection.execute("PRAGMA user_version").fetchone()[0], 9
                 )
 
             self.assertEqual(
@@ -236,9 +236,56 @@ class StoreDatabaseTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-            self.assertEqual(version, 8)
+            self.assertEqual(version, 9)
             self.assertTrue({"last_outcome", "last_outcome_at"}.issubset(columns))
             self.assertEqual(tuple(row), ("stop", None, None))
+
+    def test_schema_eight_migration_adds_sampled_peak_without_losing_samples(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            path = store.path
+            with store.db.connection() as connection:
+                connection.execute("DROP INDEX mem_samples_ts")
+                connection.execute("ALTER TABLE mem_samples RENAME TO mem_samples_v9")
+                connection.executescript(
+                    """
+                    CREATE TABLE mem_samples (
+                        scope_key TEXT NOT NULL,
+                        ts REAL NOT NULL,
+                        current INTEGER,
+                        anon INTEGER,
+                        file INTEGER,
+                        swap INTEGER,
+                        zswap INTEGER,
+                        psi10 REAL,
+                        PRIMARY KEY (scope_key, ts)
+                    );
+                    CREATE INDEX mem_samples_ts ON mem_samples(ts);
+                    INSERT INTO mem_samples(scope_key, ts, current, anon, file, swap, zswap, psi10)
+                    VALUES ('app-browser', 123.0, 4096, 2048, 1024, 512, 0, 1.25);
+                    DROP TABLE mem_samples_v9;
+                    PRAGMA user_version = 8;
+                    """
+                )
+
+            StateDB(path)
+
+            with StateDB(path, read_only=True).connection() as connection:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(mem_samples)")
+                }
+                row = connection.execute(
+                    "SELECT scope_key, ts, current, anon, file, swap, zswap, psi10, peak "
+                    "FROM mem_samples"
+                ).fetchone()
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+        self.assertEqual(version, 9)
+        self.assertIn("peak", columns)
+        self.assertEqual(
+            tuple(row), ("app-browser", 123.0, 4096, 2048, 1024, 512, 0, 1.25, None)
+        )
 
     def test_pruning_retains_long_lived_instances_while_they_are_observed(self):
         with tempfile.TemporaryDirectory() as temporary:

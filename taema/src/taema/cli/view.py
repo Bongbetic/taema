@@ -8,10 +8,10 @@ def record(name, values):
     return {"schema": "taema.%s.v1" % name, **values}
 
 
-def snapshot(kind, status=None, scopes=(), scope_count=None):
+def snapshot(kind, status=None, scopes=(), scope_count=None, memory=None):
     """Build the stable snapshot consumed by status, ls, and future live surfaces."""
     scopes = list(scopes)
-    return record(
+    model = record(
         "view",
         {
             "kind": kind,
@@ -20,6 +20,9 @@ def snapshot(kind, status=None, scopes=(), scope_count=None):
             "scope_count": len(scopes) if scope_count is None else scope_count,
         },
     )
+    if memory is not None:
+        model["memory"] = memory
+    return model
 
 
 def emit(model, args, human, jsonl_records=None):
@@ -160,6 +163,31 @@ def render_status(model, args, summary=False):
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),
     ]
+    memory = model.get("memory") or {}
+    host = memory.get("host") or {}
+    if memory.get("enabled") and host:
+        lines.append(
+            "memory: %s available / %s total; pressure %s%%; swap %s; zswap %s"
+            % (
+                _format_memory(host.get("available_bytes"))
+                if host.get("available_bytes") is not None
+                else "unknown",
+                _format_memory(host.get("total_bytes"))
+                if host.get("total_bytes") is not None
+                else "unknown",
+                "-"
+                if host.get("pressure_avg10") is None
+                else "%.2f" % host["pressure_avg10"],
+                _format_memory(host.get("swap_used_bytes"))
+                if host.get("swap_used_bytes") is not None
+                else "unknown",
+                _format_memory(host.get("zswap_bytes"))
+                if host.get("zswap_bytes") is not None
+                else "unknown",
+            )
+        )
+    elif memory and not memory.get("enabled"):
+        lines.append("memory: disabled")
     hold_state = status.get("hold_state") or {}
     hold_parts = []
     if hold_state.get("global"):
@@ -184,7 +212,7 @@ def render_status(model, args, summary=False):
             )
         )
     if summary:
-        return "\n".join(lines[:8]) + "\n"
+        return "\n".join(lines[:9]) + "\n"
     if status.get("config"):
         lines.append(
             "config: %s" % (", ".join(status["config"]) or "built-in defaults")

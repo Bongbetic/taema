@@ -13,7 +13,11 @@
     { "$ref": "#/$defs/explain" },
     { "$ref": "#/$defs/gc" },
     { "$ref": "#/$defs/learn" },
-    { "$ref": "#/$defs/doctor" }
+    { "$ref": "#/$defs/doctor" },
+    { "$ref": "#/$defs/memory-view" },
+    { "$ref": "#/$defs/memory-host-record" },
+    { "$ref": "#/$defs/memory-scope-record" },
+    { "$ref": "#/$defs/memory-watch" }
   ],
   "$defs": {
     "view": {
@@ -24,7 +28,8 @@
         "kind": { "enum": ["status", "ls"] },
         "status": { "anyOf": [{ "$ref": "#/$defs/status-data" }, { "type": "null" }] },
         "scopes": { "type": "array", "items": { "$ref": "#/$defs/scope-data" } },
-        "scope_count": { "type": "integer", "minimum": 0 }
+        "scope_count": { "type": "integer", "minimum": 0 },
+        "memory": { "$ref": "#/$defs/memory-view" }
       },
       "additionalProperties": false
     },
@@ -47,7 +52,8 @@
         "processes": { "type": "integer", "minimum": 0 },
         "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
-        "commands": { "type": "array", "items": { "type": "string" } }
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "memory": { "anyOf": [{ "$ref": "#/$defs/memory-scope" }, { "type": "null" }] }
       },
       "additionalProperties": false
     },
@@ -60,7 +66,8 @@
         "processes": { "type": "integer", "minimum": 0 },
         "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
         "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
-        "commands": { "type": "array", "items": { "type": "string" } }
+        "commands": { "type": "array", "items": { "type": "string" } },
+        "memory": { "anyOf": [{ "$ref": "#/$defs/memory-scope" }, { "type": "null" }] }
       },
       "additionalProperties": false
     },
@@ -426,6 +433,84 @@
         "status": { "enum": ["ok", "warn", "fail"] },
         "message": { "type": "string" },
         "fix": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "memory-view": {
+      "type": "object",
+      "required": ["schema", "enabled", "sampled_at", "host", "scopes", "features"],
+      "properties": {
+        "schema": { "const": "taema.memory.v1" },
+        "enabled": { "type": "boolean" },
+        "sampled_at": { "type": "number", "minimum": 0 },
+        "host": { "anyOf": [{ "$ref": "#/$defs/memory-host" }, { "type": "null" }] },
+        "scopes": { "type": "array", "items": { "$ref": "#/$defs/memory-scope" } },
+        "features": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "memory-host": {
+      "type": "object",
+      "required": ["total_bytes", "available_bytes", "used_bytes", "pressure_avg10", "swap_total_bytes", "swap_used_bytes", "zswap_bytes", "zswap_source", "delegated_current_bytes"],
+      "properties": {
+        "total_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "available_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "used_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "pressure_avg10": { "type": ["number", "null"], "minimum": 0 },
+        "swap_total_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "swap_used_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "zswap_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "zswap_source": { "type": ["string", "null"] },
+        "delegated_current_bytes": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "memory-scope": {
+      "type": "object",
+      "required": ["name", "class", "current_bytes", "peak_bytes", "peak_source", "anon_bytes", "file_bytes", "swap_bytes", "zswap_bytes", "reclaimable_bytes", "psi_avg10", "psi_source", "features"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "class": { "type": "string" },
+        "current_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "peak_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "peak_source": { "type": "string" },
+        "anon_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "file_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "swap_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "zswap_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "reclaimable_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
+        "psi_source": { "type": ["string", "null"] },
+        "features": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "memory-host-record": {
+      "type": "object",
+      "required": ["schema", "sampled_at", "host", "features"],
+      "properties": {
+        "schema": { "const": "taema.memory-host.v1" },
+        "sampled_at": { "type": "number", "minimum": 0 },
+        "host": { "$ref": "#/$defs/memory-host" },
+        "features": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "memory-scope-record": {
+      "type": "object",
+      "required": ["schema", "scope"],
+      "properties": {
+        "schema": { "const": "taema.memory-scope.v1" },
+        "scope": { "$ref": "#/$defs/memory-scope" }
+      },
+      "additionalProperties": false
+    },
+    "memory-watch": {
+      "type": "object",
+      "required": ["schema", "snapshots"],
+      "properties": {
+        "schema": { "const": "taema.memory-watch.v1" },
+        "snapshots": { "type": "array", "items": { "$ref": "#/$defs/memory-view" } }
       },
       "additionalProperties": false
     }

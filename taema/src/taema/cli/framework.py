@@ -98,7 +98,7 @@ def _parser(selected=None, include_all=True):
         children = spec.get("children", ())
         if children:
             child_parsers = command_parser.add_subparsers(
-                dest="child_command", required=True
+                dest="child_command", required=not spec.get("optional_children", False)
             )
             for child in children:
                 child_parser = child_parsers.add_parser(
@@ -223,7 +223,7 @@ def _invoke(args):
     handler = getattr(commands, args._handler)
     args._color = view.color_enabled(args, sys.stdout)
     args._width = view.terminal_width(args)
-    streaming = args._command == "watch" or (
+    streaming = args._command in ("watch", "memory watch") or (
         args._command == "events" and bool(getattr(args, "follow", False))
     )
     capture = (

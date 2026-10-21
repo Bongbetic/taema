@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -276,6 +276,7 @@ _MIGRATIONS = {
         ALTER TABLE signatures ADD COLUMN last_outcome TEXT;
         ALTER TABLE signatures ADD COLUMN last_outcome_at REAL;
     """,
+    9: "ALTER TABLE mem_samples ADD COLUMN peak INTEGER;",
 }
 
 
@@ -1290,6 +1291,96 @@ class StateDB:
                 return False
             raise
 
+    def latest_memory_samples(self):
+        """Return the newest retained sample for each scope, without creating a store."""
+        if not self.available:
+            return {}
+        with self.connection() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(mem_samples)")
+            }
+            peak = "sample.peak" if "peak" in columns else "NULL AS peak"
+            rows = connection.execute(
+                """SELECT sample.scope_key, sample.ts, sample.current, sample.anon,
+                          sample.file, sample.swap, sample.zswap, sample.psi10, %s
+                   FROM mem_samples AS sample
+                   JOIN (SELECT scope_key, max(ts) AS ts FROM mem_samples
+                         GROUP BY scope_key) AS latest
+                     ON latest.scope_key = sample.scope_key AND latest.ts = sample.ts"""
+                % peak
+            ).fetchall()
+        return {row["scope_key"]: dict(row) for row in rows}
+
+    def save_memory_samples(self, samples, now=None):
+        """Persist changed scope samples and update daily p50/peak rollups atomically."""
+        if self.read_only or not self.available:
+            return 0
+        now = time.time() if now is None else float(now)
+        day = int(now // DAY)
+        day_start = day * DAY
+        rollup_scopes = set()
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if samples:
+                connection.executemany(
+                    """INSERT OR REPLACE INTO mem_samples
+                       (scope_key, ts, current, anon, file, swap, zswap, psi10, peak)
+                       VALUES (:scope_key, :ts, :current, :anon, :file, :swap,
+                               :zswap, :psi10, :peak)""",
+                    samples,
+                )
+            rollup_scopes = {sample["scope_key"] for sample in samples}
+            values_by_scope = {key: [] for key in rollup_scopes}
+            scope_list = sorted(rollup_scopes)
+            for offset in range(0, len(scope_list), 500):
+                chunk = scope_list[offset : offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    """SELECT scope_key, current FROM mem_samples
+                       WHERE scope_key IN (%s) AND ts >= ? AND ts < ?
+                         AND current IS NOT NULL
+                       ORDER BY scope_key, current"""
+                    % placeholders,
+                    (*chunk, day_start, day_start + DAY),
+                )
+                for row in rows:
+                    values_by_scope[row["scope_key"]].append(row["current"])
+
+            peaks_by_scope = {}
+            for sample in samples:
+                key = sample["scope_key"]
+                peak = sample.get("peak") or sample.get("current") or 0
+                peaks_by_scope[key] = max(peaks_by_scope.get(key, 0), peak)
+            rollups = []
+            for key, values in values_by_scope.items():
+                if not values:
+                    continue
+                middle = len(values) // 2
+                current_p50 = (
+                    values[middle]
+                    if len(values) % 2
+                    else (values[middle - 1] + values[middle]) // 2
+                )
+                rollups.append((key, day, current_p50, peaks_by_scope[key]))
+            connection.executemany(
+                """INSERT INTO mem_rollup(app, day, current_p50, peak)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(app, day) DO UPDATE SET
+                     current_p50=excluded.current_p50,
+                     peak=max(coalesce(mem_rollup.peak, 0), excluded.peak)""",
+                rollups,
+            )
+            connection.execute(
+                "DELETE FROM mem_samples WHERE ts < ?", (now - MEM_SAMPLE_RETENTION,)
+            )
+            connection.execute(
+                "DELETE FROM mem_rollup WHERE day < ?",
+                (day - MEM_ROLLUP_RETENTION // DAY,),
+            )
+            connection.commit()
+        return len(samples)
+
     def _secure_dir(self):
         directory = os.path.dirname(self.path)
         os.makedirs(directory, mode=0o700, exist_ok=True)
@@ -1683,6 +1774,12 @@ class StateDB:
                         );
                         CREATE INDEX signatures_owner ON signatures(owner);
                     """
+            if next_version == 9:
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mem_samples'"
+                ).fetchone()
+                if not table:
+                    migration = ""
             script = (
                 "BEGIN IMMEDIATE;\n"
                 + migration

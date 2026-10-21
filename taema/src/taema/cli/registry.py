@@ -298,6 +298,42 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "read": True,
     },
     {
+        "name": "memory",
+        "aliases": (),
+        "help": "show host and per-scope memory accounting",
+        "handler": "cmd_memory",
+        "read": True,
+        "optional_children": True,
+        "children": (
+            {
+                "name": "top",
+                "help": "show scopes ranked by current memory use",
+                "handler": "cmd_memory_top",
+                "read": True,
+                "arguments": ((("--limit",), {"type": int, "default": 10}),),
+            },
+            {
+                "name": "watch",
+                "help": "watch memory snapshots",
+                "handler": "cmd_memory_watch",
+                "read": True,
+                "arguments": (
+                    (("--interval",), {"type": float, "default": 5.0}),
+                    (
+                        ("--count",),
+                        {"type": int, "help": "stop after this many snapshots"},
+                    ),
+                ),
+            },
+            {
+                "name": "pressure",
+                "help": "show host and per-scope memory pressure",
+                "handler": "cmd_memory_pressure",
+                "read": True,
+            },
+        ),
+    },
+    {
         "name": "watch",
         "aliases": (),
         "help": "print live changes as plain lines",

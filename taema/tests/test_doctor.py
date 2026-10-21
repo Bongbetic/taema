@@ -50,13 +50,20 @@ class DoctorChecks(unittest.TestCase):
         self.write(self.base + "/cgroup.subtree_control", "+cpu +io +memory +pids\n")
         for name, value in (
             ("memory.current", "0\n"),
+            ("memory.stat", "anon 0\nfile 0\ninactive_file 0\nshmem 0\n"),
+            ("memory.peak", "0\n"),
             ("memory.reclaim", ""),
+            ("memory.high", "max\n"),
+            ("memory.max", "max\n"),
+            ("memory.events", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"),
+            ("memory.events.local", "oom 0\noom_kill 0\n"),
             ("memory.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
             ("cgroup.freeze", "0\n"),
             ("cpu.idle", "0\n"),
             ("io.weight", "default 100\n"),
             ("memory.swap.current", "0\n"),
             ("memory.swap.max", "max\n"),
+            ("memory.zswap.current", "0\n"),
         ):
             self.write(self.base + "/" + name, value)
 
@@ -208,6 +215,57 @@ class DoctorChecks(unittest.TestCase):
         os.unlink(cgroup.CG + "/cgroup.controllers")
         report = self.report()
         self.assertEqual(self.check(report, "cgroup v2")["status"], "fail")
+
+    def test_doctor_reports_memory_features_and_named_fallbacks(self):
+        report = self.report()
+        names = {item["name"] for item in report["checks"]}
+        self.assertTrue(
+            {
+                "memory accounting",
+                "memory peak usage",
+                "memory pressure",
+                "memory reclaim",
+                "memory soft cap",
+                "memory hard cap",
+                "swap accounting",
+                "zswap accounting",
+                "memory OOM events",
+            }
+            <= names
+        )
+        self.assertEqual(self.check(report, "memory peak usage")["status"], "ok")
+
+        os.unlink(self.base + "/memory.peak")
+        os.unlink(self.base + "/memory.pressure")
+        os.unlink(self.base + "/memory.reclaim")
+        self.write(
+            self.system_root + "/proc/pressure/memory",
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        report = self.report()
+        self.assertIn("samples max", self.check(report, "memory peak usage")["message"])
+        self.assertIn(
+            "host PSI fallback", self.check(report, "memory pressure")["message"]
+        )
+        self.assertIn(
+            "memory.high pulse", self.check(report, "memory reclaim")["message"]
+        )
+
+        os.unlink(self.base + "/memory.zswap.current")
+        report = self.report()
+        self.assertIn("swap use", self.check(report, "zswap accounting")["message"])
+
+    def test_doctor_does_not_probe_memory_when_disabled(self):
+        self.cfg["mem"] = {"enabled": False}
+        with mock.patch.object(doctor.memory, "_read", side_effect=AssertionError):
+            report = self.report()
+        for name in (
+            "memory accounting",
+            "memory peak usage",
+            "memory pressure",
+            "zswap",
+        ):
+            self.assertIn("disabled", self.check(report, name)["message"])
 
     def test_foreign_process_and_insecure_socket_fail_safely(self):
         with mock.patch.object(doctor.process, "uid_of", return_value=self.uid + 1):

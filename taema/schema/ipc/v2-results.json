@@ -44,6 +44,25 @@
       },
       "additionalProperties": true
     },
+    "memory_budget": {
+      "type": "object",
+      "required": ["schema", "enabled", "manage", "budget_bytes", "floor_bytes", "allocatable_bytes", "delegated_max_bytes", "scopes"],
+      "properties": {
+        "schema": {"const": "taema.memory-budget.v1"},
+        "enabled": {"type": "boolean"},
+        "manage": {"enum": ["soft", "hard"]},
+        "budget_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "floor_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "allocatable_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "delegated_max_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "fraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "infrastructure_bytes": {"type": "integer", "minimum": 0},
+        "reserved_bytes": {"type": "integer", "minimum": 0},
+        "background_bytes": {"type": "integer", "minimum": 0},
+        "scopes": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": false
+    },
     "reload": {
       "oneOf": [
         {

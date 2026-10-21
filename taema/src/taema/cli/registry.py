@@ -306,6 +306,12 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "optional_children": True,
         "children": (
             {
+                "name": "budget",
+                "help": "show the memory budget and live scope shares",
+                "handler": "cmd_memory_budget",
+                "read": True,
+            },
+            {
                 "name": "top",
                 "help": "show scopes ranked by current memory use",
                 "handler": "cmd_memory_top",

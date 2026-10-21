@@ -33,7 +33,7 @@ from ..core import (
     lineage,
     signature as survivor_signature,
 )
-from ..governor import engine
+from ..governor import engine, memory_budget
 from ..store import knowledge
 from ..config import policy
 from .. import events as event_views, protocol
@@ -155,6 +155,8 @@ class Daemon:
             1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
         )
         self.memory_peaks = {}
+        self.memory_scope_seen = set()
+        self.memory_scope_allocations = {}
         self.last_memory_prune = 0.0
         self.reclaim_usage = {}  # scope -> aggregate cpu usage_usec and sample time
         self.reclaim_idle_since = {}
@@ -2676,8 +2678,8 @@ class Daemon:
                 parents.append(current)
         return parents
 
-    def _qos_hard_safety(self, path):
-        for pid in cgroup.tree_procs(path):
+    def _qos_hard_safety(self, path, pids=None):
+        for pid in cgroup.tree_procs(path) if pids is None else pids:
             reason = policy.protected_reason(pid, self.cfg)
             if reason:
                 return reason
@@ -3897,6 +3899,8 @@ class Daemon:
                 return {"error": "bad request"}
             result = self.reload_config(reason)
             return result
+        if c == "memory_budget":
+            return self._memory_budget_report()
         if c == "status":
             self.store.expire_reviews()
             self._save_if_idle()
@@ -4642,6 +4646,10 @@ class Daemon:
             mode=self.mode,
             sources=list(cfg.get("_sources", [])),
         )
+        try:
+            self.memory_governor_pass(now=time.time())
+        except Exception as error:
+            self.store.log(event="memory_budget_failed", reason=str(error))
         self._save_if_idle()
         return {"reloaded": True, "sources": list(cfg.get("_sources", []))}
 
@@ -4766,12 +4774,674 @@ class Daemon:
                 self.guarded(self.store.export_daily_if_due)
             self._write_summary_if_dirty()
 
+    def _memory_paths(self):
+        """Return every real directory below this user's delegated cgroup boundary."""
+        base = cgroup.base()
+        paths = {}
+        pending = list(cgroup.subdirs(base))
+        while pending:
+            path = pending.pop()
+            scope = cgroup.rel(path)
+            if scope == path or not cgroup.valid_rel(scope):
+                continue
+            paths[scope] = path
+            pending.extend(cgroup.subdirs(path))
+        return paths
+
+    def _memory_scope_owned(self, scope, path):
+        """Constrain control writes to directories owned by this uid under cgroup.base()."""
+        base = cgroup.base()
+        try:
+            if os.path.commonpath((base, path)) != base:
+                return False
+            if cgroup.rel(path) != scope or not cgroup.valid_rel(scope):
+                return False
+            return os.stat(path, follow_symlinks=False).st_uid == os.getuid()
+        except (OSError, ValueError):
+            return False
+
+    def _memory_targets(self, snapshot, now):
+        """Resolve aggregate user scopes and their conservative resource classes."""
+        paths = self._memory_paths()
+        parents = set()
+        for name in paths:
+            parts = name.split("/")
+            parents.update("/".join(parts[:index]) for index in range(1, len(parts)))
+        rows = []
+        idle_times = {**self.idle_since, **self.qos_idle_since}
+        for observed in snapshot.get("scopes", []):
+            scope = observed.get("name")
+            path = paths.get(scope)
+            if not isinstance(scope, str) or path is None:
+                continue
+            first = scope.split("/", 1)[0]
+            descendants = scope in parents
+            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            known_unit = "/" not in scope and unit is not None
+            if known_unit:
+                pass  # Named unit scopes may use any valid cgroup leaf name.
+            elif "/" not in scope and scope.startswith(("app-", "scope-")):
+                pass  # Aggregate application scopes are the primary accounting boundary.
+            elif first in ("leftover", "shared") and not descendants:
+                pass  # Treat each contained leaf as one independent budget target.
+            elif scope == "manager" and not descendants:
+                pass  # Account for the daemon without applying workload limits to it.
+            else:
+                continue
+
+            metadata = unit.get("unit", {}) if isinstance(unit, dict) else {}
+            unit_mem = unit.get("mem", {}) if isinstance(unit, dict) else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if not isinstance(unit_mem, dict):
+                unit_mem = {}
+            raw_class = unit_mem.get(
+                "class",
+                metadata.get(
+                    "mem_class",
+                    metadata.get(
+                        "qos_class", metadata.get("class", metadata.get("kind"))
+                    ),
+                ),
+            )
+            if raw_class in ("vm", "container", "app"):
+                class_name = raw_class
+            elif raw_class in ("interactive", "foreground"):
+                class_name = "app"
+            elif scope.startswith("app-") or scope.startswith("scope-"):
+                class_name = "app"
+            else:
+                class_name = None
+            resource_class = qos.classify(scope, idle_times, now)
+            background = (
+                raw_class == "background"
+                or unit_mem.get("background") is True
+                or resource_class in ("background", "leftover")
+            )
+            infrastructure = first in ("shared", "manager") or raw_class in (
+                "infrastructure",
+                "protected",
+            )
+            try:
+                pids = cgroup.tree_procs(path)
+                safety = self._qos_hard_safety(path, pids) if pids else ""
+            except OSError:
+                pids, safety = None, "scope process facts are unavailable"
+            if safety:
+                infrastructure = True
+                background = False
+            current = observed.get("current_bytes")
+            rows.append(
+                {
+                    "name": scope,
+                    "path": path,
+                    "unit": unit,
+                    "unit_mem": unit_mem,
+                    "class": "infrastructure" if infrastructure else class_name,
+                    "background": bool(background and not infrastructure),
+                    "infrastructure": infrastructure,
+                    "current_bytes": current,
+                    "pids": pids,
+                    "safety": safety,
+                    "owned": self._memory_scope_owned(scope, path),
+                }
+            )
+        return paths, rows
+
+    @staticmethod
+    def _memory_control(path, name):
+        value = memory._read(os.path.join(path, name))
+        return value.strip() if value is not None else None
+
+    @staticmethod
+    def _memory_numeric_limit(value):
+        if value is None or value == "max":
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
+    def _memory_budget_report(self, snapshot=None, now=None, _details=False):
+        """Build the same live plan the periodic governor applies, without writing controls."""
+        now = time.time() if now is None else float(now)
+        if snapshot is None:
+            snapshot = memory.snapshot(
+                cfg=self.cfg, peak_cache=self.memory_peaks, now=now
+            )
+        if not snapshot.get("enabled"):
+            result = {
+                "schema": "taema.memory-budget.v1",
+                "enabled": False,
+                "manage": self.cfg.get("mem", {}).get("manage", "soft"),
+                "budget_bytes": None,
+                "floor_bytes": None,
+                "allocatable_bytes": None,
+                "delegated_max_bytes": None,
+                "scopes": [],
+            }
+            return (result, {}, []) if _details else result
+
+        config = self.cfg.get("mem", {})
+        if not isinstance(config, dict):
+            config = {}
+        paths, rows = self._memory_targets(snapshot, now)
+        host = snapshot.get("host") or {}
+        total = host.get("total_bytes")
+        delegated_value = self._memory_control(cgroup.base(), "memory.max")
+        delegated = self._memory_numeric_limit(delegated_value)
+        budget_known = (
+            isinstance(total, int)
+            and not isinstance(total, bool)
+            and total > 0
+            and (delegated_value == "max" or delegated is not None)
+        )
+        explicit = config.get("budget", "auto")
+        if explicit == "auto":
+            explicit_bytes = None
+        else:
+            try:
+                explicit_bytes = memory.size_bytes(explicit)
+            except ValueError:
+                explicit_bytes = None
+        try:
+            floor = memory.size_bytes(config.get("floor", "512M"))
+            minimum_headroom = memory.size_bytes(config.get("min_headroom", "128M"))
+        except ValueError:
+            floor = memory_budget.DEFAULT_AVAILABILITY_FLOOR
+            minimum_headroom = memory_budget.DEFAULT_MIN_HEADROOM
+        fraction = config.get("fraction", 0.80)
+        budget = (
+            memory_budget.budget_bytes(total, delegated, fraction, explicit_bytes)
+            if budget_known
+            else None
+        )
+        infrastructure = sum(
+            row["current_bytes"] or 0
+            for row in rows
+            if row["infrastructure"] and isinstance(row["current_bytes"], int)
+        )
+        plan_rows = [
+            memory_budget.BudgetScope(
+                name=row["name"],
+                class_name=row["class"],
+                background=row["background"],
+            )
+            for row in rows
+            if row["pids"]
+        ]
+        allocation = memory_budget.plan(
+            budget if budget is not None else 0, floor, infrastructure, plan_rows
+        )
+        rendered = []
+        for row in rows:
+            current = row["current_bytes"]
+            headroom = (
+                memory_budget.headroom_bytes(
+                    current, minimum_headroom, config.get("headroom_percent", 10)
+                )
+                if isinstance(current, int) and not isinstance(current, bool)
+                else None
+            )
+            share = allocation.shares.get(row["name"]) if budget_known else None
+            reservation = (
+                allocation.reservations.get(row["name"]) if budget_known else None
+            )
+            desired_high = (
+                max(current + headroom, share)
+                if row["background"]
+                and isinstance(current, int)
+                and headroom is not None
+                and share is not None
+                else None
+            )
+            hard_cap = None
+            if config.get("manage", "soft") == "hard":
+                raw_cap = row["unit_mem"].get("max")
+                if raw_cap is not None:
+                    try:
+                        hard_cap = memory.size_bytes(raw_cap)
+                    except ValueError:
+                        hard_cap = None
+            managed_state = self.store.data.get("memory_scopes", {})
+            managed_scope = (
+                managed_state.get(row["name"], {})
+                if isinstance(managed_state, dict)
+                else {}
+            )
+            if not isinstance(managed_scope, dict):
+                managed_scope = {}
+            rendered.append(
+                {
+                    "name": row["name"],
+                    "class": row["class"] or "unknown",
+                    "background": row["background"],
+                    "current_bytes": current,
+                    "headroom_bytes": headroom,
+                    "share_bytes": share,
+                    "reservation_bytes": reservation,
+                    "desired_high_bytes": desired_high,
+                    "desired_low_bytes": reservation,
+                    "desired_max_bytes": hard_cap,
+                    "high": self._memory_control(row["path"], "memory.high"),
+                    "low": self._memory_control(row["path"], "memory.low"),
+                    "max": self._memory_control(row["path"], "memory.max"),
+                    "owned": row["owned"],
+                    "managed": sorted(
+                        key
+                        for key in managed_scope
+                        if key in ("memory.high", "memory.low", "memory.max")
+                    ),
+                }
+            )
+        result = {
+            "schema": "taema.memory-budget.v1",
+            "enabled": True,
+            "manage": config.get("manage", "soft"),
+            "budget_bytes": budget,
+            "floor_bytes": floor,
+            "allocatable_bytes": (
+                allocation.allocatable_bytes if budget_known else None
+            ),
+            "delegated_max_bytes": delegated,
+            "fraction": fraction,
+            "infrastructure_bytes": allocation.infrastructure_bytes,
+            "reserved_bytes": allocation.reserved_bytes,
+            "background_bytes": allocation.background_bytes,
+            "scopes": rendered,
+        }
+        return (result, paths, rows) if _details else result
+
+    def _memory_control_state(self):
+        state = self.store.data.get("memory_scopes")
+        if not isinstance(state, dict):
+            state = {}
+            self.store.data["memory_scopes"] = state
+            self.store.dirty = True
+        return state
+
+    def _memory_apply_control(
+        self, scope, path, name, target, *, soft_threshold=False, minimum_target=None
+    ):
+        if not self._memory_scope_owned(scope, path):
+            return False
+        states = self._memory_control_state()
+        scope_state = states.get(scope)
+        if not isinstance(scope_state, dict):
+            scope_state = {}
+        record = scope_state.get(name)
+        current = self._memory_control(path, name)
+        if current is None:
+            return False
+        desired = str(target)
+        current_limit = self._memory_numeric_limit(current)
+        below_minimum = minimum_target is not None and (
+            current_limit is None or current_limit < minimum_target
+        )
+        within_soft_threshold = (
+            soft_threshold
+            and not memory_budget.materially_changed(current, target)
+            and not below_minimum
+        )
+        if isinstance(record, dict):
+            if record.get("blocked") is True:
+                return False
+            if current != record.get("applied"):
+                if record.get("blocked") is not True:
+                    record["blocked"] = True
+                    self.store.dirty = True
+                    self.store.log(
+                        event="memory_control_external_change",
+                        scope=scope,
+                        control=name,
+                        current=current,
+                    )
+                return False
+            if (
+                current == desired
+                or record.get("requested") == desired
+                or within_soft_threshold
+            ):
+                return True
+            original = record.get("original", current)
+        else:
+            if current == desired or within_soft_threshold:
+                return True
+            original = current
+        try:
+            memory._write_control(path, name, desired)
+        except OSError as error:
+            reason = str(error)
+            if self.store.changed(f"memory_budget_failed:{scope}:{name}:apply", reason):
+                self.store.log(
+                    event="memory_budget_failed",
+                    scope=scope,
+                    control=name,
+                    reason=reason,
+                )
+            return False
+        applied = self._memory_control(path, name)
+        if applied is None:
+            applied = desired
+        states[scope] = scope_state
+        scope_state[name] = {
+            "original": original,
+            "requested": desired,
+            "applied": applied,
+        }
+        self.store.dirty = True
+        self.store.log(
+            event="memory_budget_applied",
+            scope=scope,
+            control=name,
+            old=current,
+            new=applied,
+        )
+        return True
+
+    def _memory_restore_control(self, scope, path, name):
+        states = self._memory_control_state()
+        scope_state = states.get(scope)
+        record = scope_state.get(name) if isinstance(scope_state, dict) else None
+        if not isinstance(record, dict):
+            return True
+        if not self._memory_scope_owned(scope, path):
+            states.pop(scope, None)
+            self.store.dirty = True
+            return False
+        if record.get("blocked") is True:
+            return False
+        current = self._memory_control(path, name)
+        if current is None:
+            return False
+        if current != record.get("applied"):
+            record["blocked"] = True
+            self.store.dirty = True
+            self.store.log(
+                event="memory_control_external_change",
+                scope=scope,
+                control=name,
+                current=current,
+            )
+            return False
+        try:
+            memory._write_control(path, name, record.get("original", "max"))
+        except OSError as error:
+            reason = str(error)
+            if self.store.changed(
+                f"memory_budget_failed:{scope}:{name}:restore", reason
+            ):
+                self.store.log(
+                    event="memory_budget_failed",
+                    scope=scope,
+                    control=name,
+                    reason=reason,
+                )
+            return False
+        scope_state.pop(name, None)
+        if not scope_state:
+            states.pop(scope, None)
+        self.store.dirty = True
+        self.store.log(
+            event="memory_control_restored",
+            scope=scope,
+            control=name,
+            value=record.get("original", "max"),
+        )
+        return True
+
+    def _memory_restore_scope(self, scope, path):
+        for name in ("memory.high", "memory.low", "memory.max"):
+            self._memory_restore_control(scope, path, name)
+
+    def _enable_memory_controllers(self, scope, path):
+        ready = True
+        for parent in self._qos_controller_parents(path):
+            reason = qos.enable_controllers(parent, required=("memory",))
+            if reason:
+                ready = False
+                if self.store.changed("memory_controller:" + parent, reason):
+                    self.store.log(
+                        event="memory_controller_unavailable",
+                        scope=scope,
+                        parent=cgroup.rel(parent),
+                        reason=reason,
+                    )
+        return ready
+
+    def memory_governor_pass(self, now=None, snapshot=None, force_restore=False):
+        """Reconcile reversible scope limits from one bounded accounting snapshot."""
+        now = time.time() if now is None else float(now)
+        states = self._memory_control_state()
+        if force_restore or not memory.enabled(self.cfg):
+            paths = self._memory_paths()
+            for scope, state in list(states.items()):
+                path = paths.get(scope)
+                if path is not None and self._memory_scope_owned(scope, path):
+                    self._memory_restore_scope(scope, path)
+                else:
+                    states.pop(scope, None)
+                    self.store.dirty = True
+            self.memory_scope_seen.clear()
+            self.memory_scope_allocations.clear()
+            return {"restored": True, "scopes": []}
+
+        if not states and not any(
+            os.path.isfile(os.path.join(cgroup.base(), name))
+            for name in ("memory.high", "memory.low", "memory.max")
+        ):
+            self.memory_scope_seen.clear()
+            self.memory_scope_allocations.clear()
+            return {"enabled": True, "scopes": []}
+
+        report, observed_paths, rows = self._memory_budget_report(
+            snapshot=snapshot, now=now, _details=True
+        )
+        row_data = {row["name"]: row for row in report["scopes"]}
+        active = {row["name"] for row in rows if row["pids"]}
+        exited = self.memory_scope_seen - active
+        stale = {scope for scope in states if scope not in observed_paths}
+        released = exited | stale
+        for scope in sorted(released):
+            released_bytes = self.memory_scope_allocations.get(scope, 0)
+            scope_state = states.get(scope, {})
+            if not released_bytes and isinstance(scope_state, dict):
+                released_bytes = max(
+                    (
+                        self._memory_numeric_limit(record.get("applied")) or 0
+                        for record in scope_state.values()
+                        if isinstance(record, dict)
+                    ),
+                    default=0,
+                )
+            self.store.log(
+                event="rebalance",
+                scope=scope,
+                released_bytes=released_bytes,
+                remaining_scopes=len(active),
+            )
+        # A restarted daemon has no in-memory active set. Persisted ownership records
+        # still tell us that an empty scope needs its reservation released and logged.
+        for row in rows:
+            scope = row["name"]
+            if (
+                row["pids"] == []
+                and scope in states
+                and scope not in released
+                and self.store.changed("memory_rebalance_empty:" + scope, True)
+            ):
+                scope_state = states.get(scope, {})
+                released_bytes = (
+                    max(
+                        (
+                            self._memory_numeric_limit(record.get("applied")) or 0
+                            for record in scope_state.values()
+                            if isinstance(record, dict)
+                        ),
+                        default=0,
+                    )
+                    if isinstance(scope_state, dict)
+                    else 0
+                )
+                self.store.log(
+                    event="rebalance",
+                    scope=scope,
+                    released_bytes=released_bytes,
+                    remaining_scopes=len(active),
+                )
+        self.memory_scope_allocations = {
+            row["name"]: row_data.get(row["name"], {}).get("reservation_bytes")
+            or row_data.get(row["name"], {}).get("share_bytes")
+            or 0
+            for row in rows
+            if row["pids"]
+        }
+        for scope in sorted(exited):
+            path = observed_paths.get(scope)
+            if path is not None and self._memory_scope_owned(scope, path):
+                self._memory_restore_scope(scope, path)
+        self.memory_scope_seen = active
+
+        for scope in tuple(states):
+            if scope not in observed_paths:
+                states.pop(scope, None)
+                self.store.dirty = True
+
+        config = self.cfg.get("mem", {})
+        if not isinstance(config, dict):
+            config = {}
+        manage = config.get("manage", "soft")
+        for row in rows:
+            scope, path = row["name"], row["path"]
+            plan_row = row_data.get(scope, {})
+            if not row["owned"]:
+                if self.store.changed("memory_unowned:" + scope, True):
+                    self.store.log(
+                        event="memory_scope_refused",
+                        scope=scope,
+                        reason="scope is outside user-owned cgroup controls",
+                    )
+                if states.pop(scope, None) is not None:
+                    self.store.dirty = True
+                continue
+            if not row["pids"]:
+                self._memory_restore_scope(scope, path)
+                continue
+            if row["pids"] is None or row["safety"] or row["current_bytes"] is None:
+                self._memory_restore_scope(scope, path)
+                continue
+
+            decision = self.authorize(
+                authorization.RECLAIM,
+                authorization.Facts(scope=scope, hard_safety=row["safety"]),
+            )
+            if decision.verdict != authorization.ACT:
+                if decision.verdict == authorization.WOULD_ACT and self.store.changed(
+                    "memory_budget_would:" + scope,
+                    (
+                        plan_row.get("desired_high_bytes"),
+                        plan_row.get("desired_low_bytes"),
+                        plan_row.get("desired_max_bytes"),
+                    ),
+                ):
+                    self.store.log(
+                        event="memory_budget_would",
+                        scope=scope,
+                        high=plan_row.get("desired_high_bytes"),
+                        low=plan_row.get("desired_low_bytes"),
+                        max=plan_row.get("desired_max_bytes"),
+                        reason=decision.reason,
+                    )
+                self._memory_restore_scope(scope, path)
+                continue
+
+            wants_controls = any(
+                plan_row.get(key) is not None
+                for key in (
+                    "desired_high_bytes",
+                    "desired_low_bytes",
+                    "desired_max_bytes",
+                )
+            )
+            if wants_controls and not any(
+                os.path.isfile(os.path.join(path, name))
+                for name in ("memory.high", "memory.low", "memory.max")
+            ):
+                self._enable_memory_controllers(scope, path)
+
+            desired_max = None
+            if manage == "hard" and row["unit_mem"].get("max") is not None:
+                desired_max = plan_row.get("desired_max_bytes")
+                headroom = plan_row.get("headroom_bytes")
+                if desired_max is None:
+                    if self.store.changed(
+                        "memory_cap_invalid:" + scope, repr(row["unit_mem"].get("max"))
+                    ):
+                        self.store.log(
+                            event="memory_cap_refused",
+                            scope=scope,
+                            reason="unit mem.max must be a valid binary size",
+                        )
+                elif headroom is None or desired_max < row["current_bytes"] + headroom:
+                    if self.store.changed(
+                        "memory_cap_refused:" + scope,
+                        (desired_max, row["current_bytes"], headroom),
+                    ):
+                        self.store.log(
+                            event="memory_cap_refused",
+                            scope=scope,
+                            cap=desired_max,
+                            current=row["current_bytes"],
+                            headroom=headroom,
+                            reason="cap is below current usage plus required headroom",
+                        )
+                    desired_max = None
+            if desired_max is not None:
+                self._memory_apply_control(scope, path, "memory.max", desired_max)
+            else:
+                self._memory_restore_control(scope, path, "memory.max")
+
+            desired_low = plan_row.get("desired_low_bytes")
+            if desired_low is not None and not row["background"]:
+                try:
+                    desired_low = memory_budget.align_up(
+                        desired_low, int(os.sysconf("SC_PAGE_SIZE"))
+                    )
+                except (OSError, ValueError):
+                    pass
+                self._memory_apply_control(scope, path, "memory.low", desired_low)
+            else:
+                self._memory_restore_control(scope, path, "memory.low")
+
+            desired_high = plan_row.get("desired_high_bytes")
+            if desired_high is not None and row["background"]:
+                try:
+                    page_size = int(os.sysconf("SC_PAGE_SIZE"))
+                    desired_high = memory_budget.align_up(desired_high, page_size)
+                except (OSError, ValueError):
+                    pass
+                self._memory_apply_control(
+                    scope,
+                    path,
+                    "memory.high",
+                    desired_high,
+                    soft_threshold=True,
+                    minimum_target=row["current_bytes"] + plan_row["headroom_bytes"],
+                )
+            else:
+                self._memory_restore_control(scope, path, "memory.high")
+
+        return report
+
     def memory_pass(self, now=None):
         """Sample live cgroups and persist only material changes or the 10-minute heartbeat."""
         if not memory.enabled(self.cfg):
+            self.memory_governor_pass(now=now, force_restore=True)
             return 0
         now = time.time() if now is None else float(now)
         snapshot = memory.snapshot(cfg=self.cfg, peak_cache=self.memory_peaks, now=now)
+        self.memory_governor_pass(now=now, snapshot=snapshot)
         live = set()
         samples = []
         for scope in snapshot["scopes"]:
@@ -5311,6 +5981,7 @@ class Daemon:
             self._drop_subscriber(conn)
         for qid in list(self.pending):
             self.drop_question(qid)
+        self.guarded(lambda: self.memory_governor_pass(force_restore=True))
         self.store.log(event="daemon_stop")
         self.store.save()
         self._write_summary_if_dirty()

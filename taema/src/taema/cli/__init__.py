@@ -41,6 +41,7 @@ __all__ = (
     "cmd_memory_watch",
     "cmd_memory_pressure",
     "cmd_memory_reclaim",
+    "cmd_memory_budget",
     "cmd_explain",
     "cmd_keep",
     "cmd_do_not_kill",

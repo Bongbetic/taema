@@ -2333,6 +2333,7 @@ class StateDB:
             "muted_apps": [],
             "qos_scopes": {},
             "qos_exempt": {},
+            "memory_scopes": {},
         }
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2352,6 +2353,7 @@ class StateDB:
                     "muted_apps",
                     "qos_scopes",
                     "qos_exempt",
+                    "memory_scopes",
                 ):
                     value = data.get(key, optional_meta_defaults.get(key))
                     if key not in optional_meta_defaults:

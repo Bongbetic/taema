@@ -18,7 +18,8 @@
     { "$ref": "#/$defs/memory-host-record" },
     { "$ref": "#/$defs/memory-scope-record" },
     { "$ref": "#/$defs/memory-watch" },
-    { "$ref": "#/$defs/memory-reclaim" }
+    { "$ref": "#/$defs/memory-reclaim" },
+    { "$ref": "#/$defs/memory-budget" }
   ],
   "$defs": {
     "view": {
@@ -536,6 +537,49 @@
         "reclaimable_after": { "type": ["integer", "null"], "minimum": 0 },
         "resource_class": { "type": "string" },
         "elapsed_ms": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "memory-budget": {
+      "type": "object",
+      "required": ["schema", "enabled", "manage", "budget_bytes", "floor_bytes", "allocatable_bytes", "delegated_max_bytes", "scopes"],
+      "properties": {
+        "schema": { "const": "taema.memory-budget.v1" },
+        "enabled": { "type": "boolean" },
+        "manage": { "enum": ["soft", "hard"] },
+        "budget_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "floor_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "allocatable_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "delegated_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "infrastructure_bytes": { "type": "integer", "minimum": 0 },
+        "reserved_bytes": { "type": "integer", "minimum": 0 },
+        "background_bytes": { "type": "integer", "minimum": 0 },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "class", "background", "current_bytes", "headroom_bytes", "share_bytes", "reservation_bytes", "desired_high_bytes", "desired_low_bytes", "desired_max_bytes", "high", "low", "max", "owned", "managed"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "class": { "type": "string" },
+              "background": { "type": "boolean" },
+              "current_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "headroom_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "share_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "reservation_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "desired_high_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "desired_low_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "desired_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
+              "high": { "type": ["string", "null"] },
+              "low": { "type": ["string", "null"] },
+              "max": { "type": ["string", "null"] },
+              "owned": { "type": "boolean" },
+              "managed": { "type": "array", "items": { "enum": ["memory.high", "memory.low", "memory.max"] } }
+            },
+            "additionalProperties": false
+          }
+        }
       },
       "additionalProperties": false
     }

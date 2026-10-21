@@ -139,6 +139,34 @@ class ConfigLayering(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, expected):
                         policy._load_files([bad])
 
+    def test_memory_budget_settings_validate_mode_fraction_and_sizes(self):
+        with tempfile.TemporaryDirectory() as root:
+            valid = self.write(
+                Path(root) / "valid-budget.toml",
+                '[mem]\nmanage = "hard"\nfraction = 0.75\n'
+                'budget = "4G"\nfloor = "512M"\n',
+            )
+            cfg = policy._load_files([valid])
+            self.assertEqual(cfg["mem"]["manage"], "hard")
+            self.assertEqual(cfg["mem"]["budget"], "4G")
+            invalid_values = (
+                ('manage = "auto"', "mem.manage must be soft or hard"),
+                ("fraction = 1.1", "mem.fraction must be between 0 and 1"),
+                ('budget = "huge"', "mem.budget must be auto or a valid binary size"),
+                (
+                    'floor = "free"',
+                    "mem.floor must be a valid non-negative binary size",
+                ),
+            )
+            for index, (value, expected) in enumerate(invalid_values):
+                bad = self.write(
+                    Path(root) / ("bad-budget-%d.toml" % index),
+                    "[mem]\n" + value + "\n",
+                )
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        policy._load_files([bad])
+
     def test_taema_config_replaces_all_file_layers(self):
         with tempfile.TemporaryDirectory() as root:
             system = self.write(

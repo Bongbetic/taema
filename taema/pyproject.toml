@@ -43,9 +43,10 @@ module = [
   "taema.authorization.*",
   "taema.model",
   "taema.model.*",
+  "taema.governor.memory_budget",
 ]
-# Pure authorization/model modules use strict checking. The moved store and governor
-# implementations retain their existing gradual typing baseline.
+# Pure authorization/model and budget arithmetic modules use strict checking. The moved
+# store and legacy governor implementations retain their existing gradual typing baseline.
 disallow_any_generics = true
 disallow_subclassing_any = true
 disallow_untyped_calls = true

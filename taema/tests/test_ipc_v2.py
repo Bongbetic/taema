@@ -180,6 +180,7 @@ class IpcV2Tests(unittest.TestCase):
         pid = os.getpid()
         requests = [
             ("status", {}),
+            ("memory_budget", {}),
             ("reload", {}),
             ("review", {}),
             ("register", {"scope": "scope-ipc", "owner": pid}),

@@ -194,6 +194,7 @@ class Store:
             "muted_apps": [],
             "qos_scopes": {},
             "qos_exempt": {},
+            "memory_scopes": {},
             "leftover_expiries": {},
         }
 
@@ -265,6 +266,7 @@ class Store:
             "muted_apps",
             "qos_scopes",
             "qos_exempt",
+            "memory_scopes",
             "leftover_expiries",
         )
         return json.loads(json.dumps({field: self.data.get(field) for field in fields}))

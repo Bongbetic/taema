@@ -188,6 +188,15 @@ controls are reported by `doctor`; leftover PID limits remain disabled.
 
 ## Resource budget
 
+Memory shares are computed from the lower of the configured RAM fraction and a finite delegated
+`memory.max`, with the availability floor and infrastructure use reserved before distributing
+class shares. Active VM, container, and app scopes receive bounded `memory.low` reservations;
+idle background scopes receive `memory.high` at no less than current use plus headroom. The
+daemon records original controls, restores only values it still owns, and recalculates shares when
+a scope exits. `memory.max` remains opt-in through hard management and a unit's explicit `mem.max`.
+The `taema memory budget` view reports the ceiling, reservations, shares, live controls, and
+ownership state.
+
 Targets for an idle daemon (no app starting or stopping): RSS at most 25 MB, CPU at most
 0.1 % of one core. How the loops stay inside them:
 

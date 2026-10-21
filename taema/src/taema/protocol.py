@@ -7,6 +7,7 @@ MAX_REQUEST_ID = (1 << 53) - 1
 _COMMANDS = {
     "status": ({}, ()),
     "doctor": ({}, ()),
+    "memory_budget": ({}, ()),
     "reload": ({"reason": "string"}, ()),
     "review": ({}, ()),
     "subscribe": ({"topics": "array", "since_seq": "integer"}, ("topics", "since_seq")),

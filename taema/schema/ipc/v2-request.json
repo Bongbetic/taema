@@ -3,6 +3,7 @@
   "$id": "taema-ipc-v2-request",
   "oneOf": [
     {"$ref": "#/$defs/status"},
+    {"$ref": "#/$defs/memory_budget"},
     {"$ref": "#/$defs/reload"},
     {"$ref": "#/$defs/review"},
     {"$ref": "#/$defs/subscribe"},
@@ -227,6 +228,11 @@
     "status": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
       "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "status"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "memory_budget": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "memory_budget"}, "args": {"$ref": "#/$defs/empty"}},
       "additionalProperties": false
     },
     "reload": {

@@ -320,6 +320,36 @@ shared                          0         -      -
   adb-1                         1    768.0K   0.00  adb
 ```
 
+### Memory budget
+
+```sh
+taema memory budget
+taema memory budget --json
+```
+
+The daemon bounds the budget ceiling by 80% of host RAM and any finite memory maximum on the
+delegated user cgroup. It keeps the configured availability floor (512 MiB by default) outside
+the allocatable shares, accounts for infrastructure use, and reserves class-wide shares for
+active VMs (25%), containers (10%), and apps (5%). Active scopes receive `memory.low` from their
+class reservation. Idle background scopes share the remainder through `memory.high`, with each
+limit kept at or above current use plus the larger of 128 MiB or the configured percentage.
+Soft limits are protection and pressure signals; they do not transfer or pre-allocate physical
+memory. High controls change only when the requested value differs materially, and tæma restores
+the original value when a scope becomes active or leaves the managed set.
+
+The default `[mem] manage = "soft"` does not apply unit `memory.max` caps. Hard caps require
+`[mem] manage = "hard"` in the user config and an explicit `[mem] max` in that unit's file,
+for example:
+
+```toml
+[mem]
+max = "12G"
+```
+
+That unit cap is refused when it is below current use plus required headroom. OOM event growth
+does not cause the daemon to lower a cap. Holds, vetoes, protected processes, and unowned scopes
+prevent changes; `observe` reports planned limits without writing controls.
+
 ### Reclaim idle page cache
 
 The daemon can reclaim file cache from eligible idle background, leftover, and container scopes.

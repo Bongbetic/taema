@@ -332,6 +332,30 @@ def _validate_config(cfg, sources):
                 "%s:1:1: mem.%s must be a finite number of at least %s seconds"
                 % (source, name, minimum)
             )
+    fraction = mem.get("fraction", _DEFAULTS["mem"]["fraction"])
+    fraction_source = sources.get("mem.fraction", mem_source)
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not math.isfinite(fraction)
+        or not 0 <= fraction <= 1
+    ):
+        raise ValueError(
+            "%s:1:1: mem.fraction must be between 0 and 1" % fraction_source
+        )
+    manage = mem.get("manage", _DEFAULTS["mem"]["manage"])
+    manage_source = sources.get("mem.manage", mem_source)
+    if manage not in ("soft", "hard"):
+        raise ValueError("%s:1:1: mem.manage must be soft or hard" % manage_source)
+    budget = mem.get("budget", _DEFAULTS["mem"]["budget"])
+    budget_source = sources.get("mem.budget", mem_source)
+    if budget != "auto":
+        try:
+            memory.size_bytes(budget)
+        except ValueError as error:
+            raise ValueError(
+                "%s:1:1: mem.budget must be auto or a valid binary size" % budget_source
+            ) from error
     for name in ("pressure_gate", "pressure_ceiling", "headroom_percent"):
         value = mem.get(name, _DEFAULTS["mem"][name])
         source = sources.get("mem." + name, mem_source)
@@ -344,7 +368,7 @@ def _validate_config(cfg, sources):
             raise ValueError(
                 "%s:1:1: mem.%s must be between 0 and 100" % (source, name)
             )
-    for name in ("reclaim_max", "reclaim_minimum", "min_headroom"):
+    for name in ("reclaim_max", "reclaim_minimum", "min_headroom", "floor"):
         value = mem.get(name, _DEFAULTS["mem"].get(name))
         if value is None:
             continue

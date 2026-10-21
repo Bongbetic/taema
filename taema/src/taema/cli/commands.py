@@ -1306,6 +1306,61 @@ def cmd_memory_reclaim(a):
     return 0
 
 
+def cmd_memory_budget(a):
+    """Show the daemon's current budget, classifications, and owned memory controls."""
+    cfg, _store = _memory_config(a)
+    reply = ask(cfg, {"cmd": "memory_budget"})
+    if reply is None:
+        return die(
+            "daemon is not running; live memory budget state requires the daemon", 3
+        )
+    if not isinstance(reply, dict) or reply.get("schema") != "taema.memory-budget.v1":
+        return die("daemon returned an invalid memory budget", 3)
+    if getattr(a, "json", False) or getattr(a, "jsonl", False):
+        print(
+            json.dumps(
+                reply,
+                ensure_ascii=False,
+                indent=not getattr(a, "jsonl", False),
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not reply.get("enabled"):
+        print("memory management is disabled")
+        return 0
+    lines = [
+        "memory budget (%s management)" % reply["manage"],
+        "  ceiling %s  availability floor %s  allocatable %s  delegated max %s"
+        % (
+            _fmt_mem(reply.get("budget_bytes")),
+            _fmt_mem(reply.get("floor_bytes")),
+            _fmt_mem(reply.get("allocatable_bytes")),
+            _fmt_mem(reply.get("delegated_max_bytes")),
+        ),
+        "scope class current share reservation high low max ownership",
+    ]
+    for scope in reply.get("scopes", []):
+        lines.append(
+            "%-28s %-14s %8s %8s %8s %8s %8s %8s %s"
+            % (
+                scope["name"],
+                scope["class"],
+                _fmt_mem(scope.get("current_bytes")),
+                _fmt_mem(scope.get("share_bytes")),
+                _fmt_mem(scope.get("reservation_bytes")),
+                scope.get("high") or "-",
+                scope.get("low") or "-",
+                scope.get("max") or "-",
+                "user-owned" if scope.get("owned") else "unavailable",
+            )
+        )
+    if not reply.get("scopes"):
+        lines.append("no managed scopes")
+    print("\n".join(lines))
+    return 0
+
+
 def cmd_memory_watch(a):
     interval = getattr(a, "interval", 5.0)
     count = getattr(a, "count", None)

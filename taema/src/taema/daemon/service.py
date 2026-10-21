@@ -99,6 +99,11 @@ class LeafReconcile:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryReconcile:
+    pass
+
+
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -140,19 +145,10 @@ class Daemon:
         saved_samples = self.store.latest_memory_samples() if self.mem_enabled else {}
         self.memory_last_samples = {}
         for key, sample in saved_samples.items():
-            if sample.get("peak") is not None:
-                self.memory_peaks[key] = sample["peak"]
-            self.memory_last_samples[key] = {
-                "ts": sample.get("ts", 0),
-                "current_bytes": sample.get("current"),
-                "anon_bytes": sample.get("anon"),
-                "file_bytes": sample.get("file"),
-                "swap_bytes": sample.get("swap"),
-                "zswap_bytes": sample.get("zswap"),
-                "peak": sample.get("peak"),
-                "peak_bytes": sample.get("peak"),
-                "psi_avg10": sample.get("psi10"),
-            }
+            record = memory.MemorySample.from_db_row(sample)
+            if record.peak is not None:
+                self.memory_peaks[key] = record.peak
+            self.memory_last_samples[key] = record
         self.gate_sig = (
             None  # fork gate: (last pid, session pid sets) of the last adopt pass
         )
@@ -402,6 +398,7 @@ class Daemon:
                 LeafFrozen,
                 ProcessReconcile,
                 LeafReconcile,
+                MemoryReconcile,
             ),
         ):
             raise TypeError("unsupported collector event: %s" % type(event).__name__)
@@ -436,6 +433,8 @@ class Daemon:
                 self.guarded(self.end_session)
         elif isinstance(event, LeafReconcile):
             self.guarded(self.gc_pass)
+        elif isinstance(event, MemoryReconcile):
+            self.guarded(self.memory_pass)
 
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
@@ -3752,8 +3751,8 @@ class Daemon:
                 self.mem_enabled
                 and now - self.last.get("memory", 0.0) >= self.iv_memory
             ):
-                self.guarded(lambda: self.memory_pass(now))
-                self.last["memory"] = now
+                if self.queue_collector_event(MemoryReconcile()):
+                    self.last["memory"] = now
             self.drain_collector_events()
         finally:
             self._in_tick = False
@@ -3777,23 +3776,10 @@ class Daemon:
             if scope.get("current_bytes") is None:
                 continue
             previous = self.memory_last_samples.get(key)
-            current = {
-                "current_bytes": scope.get("current_bytes"),
-                "anon_bytes": scope.get("anon_bytes"),
-                "file_bytes": scope.get("file_bytes"),
-                "swap_bytes": scope.get("swap_bytes"),
-                "zswap_bytes": scope.get("zswap_bytes"),
-                "peak_bytes": scope.get("peak_bytes"),
-                "psi_avg10": scope.get("psi_avg10"),
-            }
-            if memory.sample_due(previous, current, now):
-                sample = memory.sample_record(scope, now)
+            sample = memory.sample_record(scope, now)
+            if memory.sample_due(previous, sample, now):
                 samples.append(sample)
-                self.memory_last_samples[key] = {
-                    "ts": now,
-                    **current,
-                    "peak": scope.get("peak_bytes"),
-                }
+                self.memory_last_samples[key] = sample
         for key in tuple(self.memory_last_samples):
             if key not in live:
                 self.memory_last_samples.pop(key, None)
@@ -3801,7 +3787,9 @@ class Daemon:
         prune_due = now - self.last_memory_prune >= memory.SAMPLE_INTERVAL
         if not samples and not prune_due:
             return 0
-        saved = self.store.record_memory_samples(samples, now=now)
+        saved = self.store.record_memory_samples(
+            [sample.as_db_row() for sample in samples], now=now
+        )
         if prune_due:
             self.last_memory_prune = now
         return saved

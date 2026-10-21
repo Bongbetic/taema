@@ -1,6 +1,6 @@
 # SQLite state schema
 
-The current `state.db` schema version is **8**, recorded in `PRAGMA user_version`.
+The current `state.db` schema version is **9**, recorded in `PRAGMA user_version`.
 `taema/store/db.py` applies each numbered migration in its own write transaction and
 advances `user_version` only after that migration succeeds. Migrations are forward-only
 and additive; this document records the storage contract needed by read-only clients.
@@ -46,3 +46,12 @@ automatic counters cannot be ordered against explicit answers because their even
 were not stored. Pair payloads created before `last_auto_outcome` use their retained answer,
 pending-stop timestamp, and `last_keep` / `last_auto_stop` timestamps for a best-effort result;
 the original event order cannot be recovered when those timestamps are absent or ambiguous.
+
+## Memory samples
+
+Schema 9 adds the nullable `peak INTEGER` column to `mem_samples`. It stores each scope's
+observed peak alongside the current, anonymous, file, swap, zswap, and PSI sample values.
+Migration 9 appends the column with `ALTER TABLE`; existing rows retain `NULL` peak values
+and are not rewritten. Older schema-8 databases are upgraded on the next writable startup.
+Read-only consumers that encounter a schema-8 database can continue reading the existing
+columns and treat peak as unavailable.

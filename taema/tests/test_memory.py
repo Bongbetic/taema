@@ -85,11 +85,13 @@ class MemoryAccounting(unittest.TestCase):
         self.assertEqual(row["features"]["peak"], "sampled")
 
     def test_missing_files_are_unsupported_and_peak_uses_sampled_maximum(self):
-        with FakeCg() as cg:
+        with FakeCg() as cg, tempfile.TemporaryDirectory() as temporary:
             scope = cg.leaf("scope-legacy")
             write(scope + "/memory.current", "1200\n")
             cache = {"scope-legacy": 2000}
-            report = memory.snapshot(base=cg.base, peak_cache=cache)
+            report = memory.snapshot(
+                base=cg.base, peak_cache=cache, proc_root=temporary + "/proc"
+            )
 
         row = report["scopes"][0]
         self.assertEqual(row["peak_bytes"], 2000)
@@ -98,6 +100,39 @@ class MemoryAccounting(unittest.TestCase):
         self.assertIsNone(row["swap_bytes"])
         self.assertEqual(row["features"]["memory_stat"], "unsupported")
         self.assertEqual(row["features"]["pressure"], "unsupported")
+
+    def test_scope_pressure_uses_labeled_host_fallback(self):
+        with FakeCg() as cg, tempfile.TemporaryDirectory() as temporary:
+            proc = os.path.join(temporary, "proc")
+            scope = cg.leaf("app-no-scope-psi")
+            write_scope(scope)
+            os.remove(scope + "/memory.pressure")
+            write(
+                proc + "/pressure/memory",
+                "some avg10=3.75 avg60=1.00 avg300=0.50 total=9\n",
+            )
+
+            report = memory.snapshot(base=cg.base, proc_root=proc)
+
+        row = report["scopes"][0]
+        self.assertEqual(row["psi_avg10"], 3.75)
+        self.assertEqual(row["psi_source"], "host")
+        self.assertEqual(row["features"]["pressure"], "host")
+
+    def test_host_zswap_uses_meminfo_when_sysfs_is_unavailable(self):
+        with FakeCg() as cg, tempfile.TemporaryDirectory() as temporary:
+            proc = os.path.join(temporary, "proc")
+            system = os.path.join(temporary, "system")
+            write(proc + "/meminfo", "Zswap: 128 kB\n")
+
+            report = memory.snapshot(
+                base=cg.base,
+                proc_root=proc,
+                system_root=system,
+            )
+
+        self.assertEqual(report["host"]["zswap_bytes"], 128 * 1024)
+        self.assertEqual(report["host"]["zswap_source"], "host")
 
     def test_disabled_mode_does_not_read_host_or_scope_memory(self):
         with mock.patch.dict(os.environ, {"TAEMA_MEM": "0"}):
@@ -137,23 +172,67 @@ class MemoryAccounting(unittest.TestCase):
             self.assertEqual(daemon.store.latest_memory_samples(), {})
 
     def test_change_sampling_uses_strict_five_percent_and_ten_minute_heartbeat(self):
-        previous = {
-            "ts": 100.0,
-            "current_bytes": 1000,
-            "peak_bytes": 1000,
-            "anon_bytes": 600,
-            "file_bytes": 300,
-            "swap_bytes": 50,
-            "zswap_bytes": 10,
-            "psi_avg10": 2.0,
-        }
-        current = dict(previous)
-        current["current_bytes"] = 1050
+        previous = memory.MemorySample(
+            scope_key="app-test",
+            ts=100.0,
+            current=1000,
+            peak=1000,
+            anon=600,
+            file=300,
+            swap=50,
+            zswap=10,
+            psi10=2.0,
+        )
+        current = memory.MemorySample(
+            scope_key="app-test",
+            ts=101.0,
+            current=1050,
+            peak=1000,
+            anon=600,
+            file=300,
+            swap=50,
+            zswap=10,
+            psi10=2.0,
+        )
         self.assertFalse(memory.sample_due(previous, current, 101.0))
-        current["current_bytes"] = 1051
-        self.assertTrue(memory.sample_due(previous, current, 101.0))
-        current = dict(previous)
+        changed = memory.MemorySample(
+            scope_key="app-test",
+            ts=101.0,
+            current=1051,
+            peak=1000,
+            anon=600,
+            file=300,
+            swap=50,
+            zswap=10,
+            psi10=2.0,
+        )
+        self.assertTrue(memory.sample_due(previous, changed, 101.0))
         self.assertTrue(memory.sample_due(previous, current, 700.0))
+
+    def test_memory_records_are_immutable_and_serialize_at_boundaries(self):
+        sample = memory.MemorySample(
+            scope_key="app-test",
+            ts=123.0,
+            current=100,
+            peak=150,
+            anon=70,
+            file=20,
+            swap=5,
+            zswap=1,
+            psi10=0.5,
+        )
+        with self.assertRaises(AttributeError):
+            sample.current = 200
+        self.assertEqual(sample.as_db_row()["peak"], 150)
+        self.assertEqual(memory.MemorySample.from_db_row(sample.as_db_row()), sample)
+
+    def test_memory_reconcile_is_dispatched_through_collector_queue(self):
+        with FakeCg(), tempfile.TemporaryDirectory() as state:
+            daemon = service.Daemon(make_cfg(state))
+            self.assertTrue(daemon.queue_collector_event(service.MemoryReconcile()))
+            with mock.patch.object(daemon, "memory_pass") as memory_pass:
+                daemon.drain_collector_events()
+        memory_pass.assert_called_once_with()
 
     def test_retention_prunes_samples_and_rollups_even_when_no_scope_changed(self):
         with FakeCg(), tempfile.TemporaryDirectory() as state:
@@ -238,6 +317,62 @@ class MemoryAccounting(unittest.TestCase):
                 self.assertTrue(matches(value, SCHEMA, SCHEMA))
                 if output_schema == "taema.memory.v1":
                     self.assertEqual(value["scopes"][0]["current_bytes"], 2048)
+
+    def test_memory_watch_keeps_sampled_peak_between_snapshots(self):
+        with FakeCg() as cg, tempfile.TemporaryDirectory() as state:
+            path = cg.leaf("app-watch")
+            write_scope(path, current=1000)
+            cfg = make_cfg(state)
+            output = io.StringIO()
+            with (
+                mock.patch.object(commands, "_memory_config", return_value=(cfg, None)),
+                mock.patch.object(
+                    commands.time,
+                    "sleep",
+                    side_effect=lambda _interval: write(
+                        path + "/memory.current", "100\n"
+                    ),
+                ),
+                redirect_stdout(output),
+            ):
+                result = commands.main(
+                    ["memory", "watch", "--count", "2", "--interval", "0.01", "--json"]
+                )
+
+        report = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(report["snapshots"][0]["scopes"][0]["peak_bytes"], 1000)
+        self.assertEqual(report["snapshots"][1]["scopes"][0]["peak_bytes"], 1000)
+
+    def test_human_memory_views_label_fallbacks_and_unsupported_features(self):
+        with FakeCg() as cg, tempfile.TemporaryDirectory() as state:
+            path = cg.leaf("app-no-features")
+            write_scope(path)
+            for name in (
+                "memory.stat",
+                "memory.swap.current",
+                "memory.zswap.current",
+            ):
+                os.unlink(path + "/" + name)
+            cfg = make_cfg(state)
+            for argv in (
+                ["memory"],
+                ["memory", "top"],
+                ["memory", "watch", "--count", "1"],
+            ):
+                output = io.StringIO()
+                with (
+                    mock.patch.object(
+                        commands, "_memory_config", return_value=(cfg, None)
+                    ),
+                    redirect_stdout(output),
+                ):
+                    result = commands.main(argv)
+                self.assertEqual(result, 0)
+                rendered = output.getvalue()
+                self.assertIn("peak=sampled", rendered)
+                self.assertIn("memory_stat=unsupported", rendered)
+                self.assertIn("swap=unsupported", rendered)
 
     def test_two_hundred_scope_memory_pass_is_under_one_hundred_ms(self):
         with FakeCg() as cg, tempfile.TemporaryDirectory() as state:

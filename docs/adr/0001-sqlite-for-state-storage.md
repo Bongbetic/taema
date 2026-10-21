@@ -29,7 +29,7 @@ which a single JSON blob models well.
 
 - The store is `state.db` in the state directory (default `~/.local/state/taema/`), opened
   in WAL mode with `synchronous=NORMAL`, `busy_timeout=2000`, and `foreign_keys=ON`; the
-  schema version lives in `PRAGMA user_version` (currently schema 8). The versioned
+  schema version lives in `PRAGMA user_version` (currently schema 9). The versioned
   storage contract and migration notes are in `docs/state-schema.md`.
 - There is exactly one writer, the daemon, committing one transaction per pass and
   immediately after answers, vetoes, and undo. Readers (CLI, dashboard, agent, bar) open

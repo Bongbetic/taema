@@ -1079,14 +1079,34 @@ def _fmt_psi(v):
     return "-" if v is None else "%.2f" % v
 
 
-def _memory_snapshot(cfg=None, store=None):
-    if not memory.enabled(cfg):
-        return memory.snapshot(base=cgroup.base(), cfg=cfg)
+def _memory_scope_sources(scope):
+    """Summarize fallbacks and unavailable scope features for human reports."""
+    features = scope.get("features", {})
+    sources = []
+    for feature in ("peak", "pressure"):
+        source = features.get(feature, "unsupported")
+        if source not in ("kernel", "cgroup"):
+            sources.append("%s=%s" % (feature, source))
+    for feature in ("accounting", "memory_stat", "swap", "zswap"):
+        if features.get(feature) == "unsupported":
+            sources.append("%s=unsupported" % feature)
+    return ",".join(sources) or "-"
+
+
+def _memory_peak_cache(store=None):
     peak_cache = {}
     if store is not None:
         for key, sample in store.latest_memory_samples().items():
             if sample.get("peak") is not None:
                 peak_cache[key] = sample["peak"]
+    return peak_cache
+
+
+def _memory_snapshot(cfg=None, store=None, peak_cache=None):
+    if not memory.enabled(cfg):
+        return memory.snapshot(base=cgroup.base(), cfg=cfg)
+    if peak_cache is None:
+        peak_cache = _memory_peak_cache(store)
     return memory.snapshot(base=cgroup.base(), cfg=cfg, peak_cache=peak_cache)
 
 
@@ -1142,10 +1162,12 @@ def _memory_human(report, pressure_only=False):
                 )
             )
         return "\n".join(lines) + "\n"
-    lines.append("scope class current peak anon file swap zswap reclaimable PSI10")
+    lines.append(
+        "scope class current peak anon file swap zswap reclaimable PSI10 capabilities"
+    )
     for scope in rows:
         lines.append(
-            "%-28s %-9s %8s %8s %8s %8s %8s %8s %8s %6s%%"
+            "%-28s %-9s %8s %8s %8s %8s %8s %8s %8s %6s%% %s"
             % (
                 scope["name"],
                 scope["class"],
@@ -1157,6 +1179,7 @@ def _memory_human(report, pressure_only=False):
                 _fmt_mem(scope.get("zswap_bytes")),
                 _fmt_mem(scope.get("reclaimable_bytes")),
                 _fmt_psi(scope.get("psi_avg10")),
+                _memory_scope_sources(scope),
             )
         )
     if not rows:
@@ -1230,12 +1253,13 @@ def cmd_memory_watch(a):
     if not memory.enabled(cfg):
         _emit_memory(_memory_snapshot(cfg, store), a)
         return 0
+    peak_cache = _memory_peak_cache(store)
     if getattr(a, "json", False) and count is None:
         count = 1
     snapshots = []
     emitted = 0
     while count is None or emitted < count:
-        report = _memory_snapshot(cfg, store)
+        report = _memory_snapshot(cfg, store, peak_cache=peak_cache)
         emitted += 1
         if getattr(a, "json", False):
             snapshots.append(report)

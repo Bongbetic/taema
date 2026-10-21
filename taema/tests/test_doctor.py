@@ -248,6 +248,10 @@ class DoctorChecks(unittest.TestCase):
             "host PSI fallback", self.check(report, "memory pressure")["message"]
         )
         self.assertIn(
+            "host-wide PSI",
+            self.check(report, "memory pressure")["fix"],
+        )
+        self.assertIn(
             "memory.high pulse", self.check(report, "memory reclaim")["message"]
         )
 

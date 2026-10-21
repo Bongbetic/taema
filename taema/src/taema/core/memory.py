@@ -2,11 +2,120 @@
 
 import os
 import time
+from dataclasses import dataclass
 
 from . import cgroup
 
 SAMPLE_CHANGE = 0.05
 SAMPLE_INTERVAL = 10 * 60
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeMemory:
+    """Immutable kernel observations for one cgroup scope."""
+
+    name: str
+    class_name: str
+    current_bytes: int | None
+    peak_bytes: int | None
+    peak_source: str
+    anon_bytes: int | None
+    file_bytes: int | None
+    swap_bytes: int | None
+    zswap_bytes: int | None
+    reclaimable_bytes: int | None
+    psi_avg10: float | None
+    psi_source: str | None
+    feature_sources: tuple[tuple[str, str], ...]
+
+    def as_dict(self):
+        """Serialize at the JSON and view boundary."""
+        return {
+            "name": self.name,
+            "class": self.class_name,
+            "current_bytes": self.current_bytes,
+            "peak_bytes": self.peak_bytes,
+            "peak_source": self.peak_source,
+            "anon_bytes": self.anon_bytes,
+            "file_bytes": self.file_bytes,
+            "swap_bytes": self.swap_bytes,
+            "zswap_bytes": self.zswap_bytes,
+            "reclaimable_bytes": self.reclaimable_bytes,
+            "psi_avg10": self.psi_avg10,
+            "psi_source": self.psi_source,
+            "features": dict(self.feature_sources),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySample:
+    """Immutable sample record shared by daemon sampling and SQLite serialization."""
+
+    scope_key: str
+    ts: float
+    current: int | None
+    peak: int | None
+    anon: int | None
+    file: int | None
+    swap: int | None
+    zswap: int | None
+    psi10: float | None
+
+    @classmethod
+    def from_scope(cls, scope, now):
+        """Build one persisted sample from a serialized scope observation."""
+        return cls(
+            scope_key=scope["name"],
+            ts=float(now),
+            current=scope.get("current_bytes"),
+            peak=scope.get("peak_bytes"),
+            anon=scope.get("anon_bytes"),
+            file=scope.get("file_bytes"),
+            swap=scope.get("swap_bytes"),
+            zswap=scope.get("zswap_bytes"),
+            psi10=scope.get("psi_avg10"),
+        )
+
+    @classmethod
+    def from_db_row(cls, row):
+        """Build the immutable record returned by the SQLite read boundary."""
+        return cls(
+            scope_key=row["scope_key"],
+            ts=float(row.get("ts", 0)),
+            current=row.get("current"),
+            peak=row.get("peak"),
+            anon=row.get("anon"),
+            file=row.get("file"),
+            swap=row.get("swap"),
+            zswap=row.get("zswap"),
+            psi10=row.get("psi10"),
+        )
+
+    def as_db_row(self):
+        """Serialize into SQLite's column names at the storage boundary."""
+        return {
+            "scope_key": self.scope_key,
+            "ts": self.ts,
+            "current": self.current,
+            "peak": self.peak,
+            "anon": self.anon,
+            "file": self.file,
+            "swap": self.swap,
+            "zswap": self.zswap,
+            "psi10": self.psi10,
+        }
+
+    def change_metrics(self):
+        """Return the one canonical metric bundle used by change detection."""
+        return (
+            self.current,
+            self.peak,
+            self.anon,
+            self.file,
+            self.swap,
+            self.zswap,
+            self.psi10,
+        )
 
 
 def enabled(cfg=None):
@@ -98,6 +207,9 @@ def _host(proc_root, system_root, base):
         if zswap is not None:
             zswap_source = "host"
             break
+    if zswap is None and values.get("Zswap") is not None:
+        zswap = values["Zswap"]
+        zswap_source = "host"
     if zswap is None:
         zswap = _integer(os.path.join(base, "memory.zswap.current"))
         if zswap is not None:
@@ -129,7 +241,7 @@ def _host(proc_root, system_root, base):
     }
 
 
-def _scope(path, key, peak_cache):
+def _scope(path, key, peak_cache, host_pressure=None):
     if not os.path.isdir(path):
         return None
     current = _integer(os.path.join(path, "memory.current"))
@@ -149,6 +261,9 @@ def _scope(path, key, peak_cache):
     zswap = _integer(os.path.join(path, "memory.zswap.current"))
     psi = _psi(os.path.join(path, "memory.pressure"))
     psi_source = "cgroup" if psi is not None else None
+    if psi is None and host_pressure is not None:
+        psi = host_pressure
+        psi_source = "host"
     if not os.path.isdir(path):
         return None
 
@@ -163,28 +278,28 @@ def _scope(path, key, peak_cache):
         else None
     )
 
-    return {
-        "name": key,
-        "class": scope_class(key),
-        "current_bytes": current,
-        "peak_bytes": peak,
-        "peak_source": peak_source,
-        "anon_bytes": stat.get("anon") if stat is not None else None,
-        "file_bytes": file_bytes,
-        "swap_bytes": swap,
-        "zswap_bytes": zswap,
-        "reclaimable_bytes": reclaimable,
-        "psi_avg10": psi,
-        "psi_source": psi_source,
-        "features": {
-            "accounting": "supported" if current is not None else "unsupported",
-            "memory_stat": "supported" if stat is not None else "unsupported",
-            "peak": peak_source,
-            "pressure": "cgroup" if psi_source == "cgroup" else "unsupported",
-            "swap": "supported" if swap is not None else "unsupported",
-            "zswap": "supported" if zswap is not None else "unsupported",
-        },
-    }
+    return ScopeMemory(
+        name=key,
+        class_name=scope_class(key),
+        current_bytes=current,
+        peak_bytes=peak,
+        peak_source=peak_source,
+        anon_bytes=stat.get("anon") if stat is not None else None,
+        file_bytes=file_bytes,
+        swap_bytes=swap,
+        zswap_bytes=zswap,
+        reclaimable_bytes=reclaimable,
+        psi_avg10=psi,
+        psi_source=psi_source,
+        feature_sources=(
+            ("accounting", "supported" if current is not None else "unsupported"),
+            ("memory_stat", "supported" if stat is not None else "unsupported"),
+            ("peak", peak_source),
+            ("pressure", psi_source or "unsupported"),
+            ("swap", "supported" if swap is not None else "unsupported"),
+            ("zswap", "supported" if zswap is not None else "unsupported"),
+        ),
+    )
 
 
 def scope_class(key):
@@ -227,12 +342,12 @@ def snapshot(
             continue
         key = cgroup.rel(path)
         try:
-            row = _scope(path, key, peak_cache)
+            row = _scope(path, key, peak_cache, host.get("pressure_avg10"))
         except OSError:
             row = None
         if row is not None:
             alive.add(key)
-            scopes.append(row)
+            scopes.append(row.as_dict())
         try:
             pending.extend(reversed(cgroup.subdirs(path)))
         except OSError:
@@ -268,19 +383,9 @@ def snapshot(
 
 def sample_due(previous, current, now):
     """Store the first sample, a >5% metric change, or the ten-minute heartbeat."""
-    if previous is None or now - float(previous.get("ts", 0)) >= SAMPLE_INTERVAL:
+    if previous is None or now - previous.ts >= SAMPLE_INTERVAL:
         return True
-    for field in (
-        "current_bytes",
-        "peak_bytes",
-        "anon_bytes",
-        "file_bytes",
-        "swap_bytes",
-        "zswap_bytes",
-        "psi_avg10",
-    ):
-        new = current.get(field)
-        old = previous.get(field)
+    for old, new in zip(previous.change_metrics(), current.change_metrics()):
         if new is None or old is None:
             continue
         difference = abs(new - old)
@@ -292,14 +397,4 @@ def sample_due(previous, current, now):
 
 
 def sample_record(scope, now):
-    return {
-        "scope_key": scope["name"],
-        "ts": now,
-        "current": scope.get("current_bytes"),
-        "peak": scope.get("peak_bytes"),
-        "anon": scope.get("anon_bytes"),
-        "file": scope.get("file_bytes"),
-        "swap": scope.get("swap_bytes"),
-        "zswap": scope.get("zswap_bytes"),
-        "psi10": scope.get("psi_avg10"),
-    }
+    return MemorySample.from_scope(scope, now)

@@ -534,7 +534,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "host PSI fallback /proc/pressure/memory is available"
                 if os.path.isfile(proc_pressure)
                 else "memory.pressure and host PSI are unsupported; scope PSI is unknown",
-                "No action required; host PSI is used when cgroup PSI is unavailable."
+                "No action required; host-wide PSI is labeled as a fallback."
                 if os.path.isfile(proc_pressure)
                 else "Enable PSI in the kernel to report pressure.",
             )

@@ -43,6 +43,7 @@ module = [
   "taema.authorization.*",
   "taema.model",
   "taema.model.*",
+  "taema.governor.guard",
   "taema.governor.memory_budget",
 ]
 # Pure authorization/model and budget arithmetic modules use strict checking. The moved

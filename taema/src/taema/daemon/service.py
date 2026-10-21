@@ -212,17 +212,7 @@ class Daemon:
         self.collector_event_drops = 0
         self.last_guard_check = 0.0
         self.guard_last_steps = {}
-        self.guard_state = {
-            "active": False,
-            "trigger": None,
-            "triggers": [],
-            "started_at": None,
-            "steps": [],
-            "bytes_freed": 0,
-            "last_trigger": None,
-            "last_bytes_freed": 0,
-            "last_duration_ms": None,
-        }
+        self.guard_state = pressure_guard.empty_status()
         self.guard_trigger_until = 0.0
         self.guard_started_monotonic = 0.0
         self.oom_handlers_cache = None
@@ -4596,6 +4586,24 @@ class Daemon:
             self.mode == "adopt" and freeze.get("adopt", False) is True
         )
 
+    def _guard_freeze_authorized(self):
+        """Whether the pressure guard may create automatic freeze records."""
+        guard = self.cfg.get("guard", {})
+        freeze = self.cfg.get("freeze", {})
+        if (
+            not self._guard_enabled()
+            or not isinstance(freeze, dict)
+            or freeze.get("enabled", True) is not True
+        ):
+            return False
+        if self.mode in ("auto", "enforce"):
+            return True
+        return (
+            self.mode == "adopt"
+            and isinstance(guard, dict)
+            and guard.get("freeze_in_adopt", False) is True
+        )
+
     @staticmethod
     def _freeze_value(path):
         try:
@@ -4989,9 +4997,12 @@ class Daemon:
         manual=False,
         reason="eligible idle leftover",
         cpu_verified=False,
+        guard=False,
     ):
         """Freeze one known-safe leftover, using the authorization ladder first."""
-        if not self._freeze_config_enabled():
+        if not self._freeze_config_enabled() and not (
+            guard and self._guard_freeze_authorized()
+        ):
             return {"ok": False, "error": "freezing is disabled by configuration"}
         trigger = authorization.MANUAL_FREEZE if manual else authorization.FREEZE
         decision = self.authorize(
@@ -5105,39 +5116,14 @@ class Daemon:
         """Sample leftover CPU and freeze only scopes idle for the configured grace."""
         now = time.time() if now is None else now
         managed = self.store.data.get("frozen_scopes", {})
-        freeze_config = self.cfg.get("freeze", {})
-        freeze_allowed = (
-            isinstance(freeze_config, dict)
-            and freeze_config.get("enabled", True) is True
-        )
-        guard_config = self.cfg.get("guard", {})
-        guard_freeze = (
-            guard
-            and self._guard_enabled()
-            and freeze_allowed
-            and (
-                self.mode in ("auto", "enforce")
-                or (
-                    self.mode == "adopt"
-                    and isinstance(guard_config, dict)
-                    and guard_config.get("freeze_in_adopt", False) is True
-                )
-            )
-        )
+        guard_freeze = guard and self._guard_freeze_authorized()
         if not self._freeze_config_enabled() and not guard_freeze:
             self.freeze_usage.clear()
             self.manual_freeze_usage.clear()
             self.freeze_idle_since.clear()
             self.thaw_all_managed_scopes("freezing disabled by profile or flag")
             return []
-        guard_adopt = (
-            guard
-            and self.mode == "adopt"
-            and isinstance(guard_config, dict)
-            and guard_config.get("freeze_in_adopt", False) is True
-        )
-        guard_auto = guard and self.mode in ("auto", "enforce") and guard_freeze
-        if not self._freeze_auto_enabled() and not guard_adopt and not guard_auto:
+        if not self._freeze_auto_enabled() and not guard_freeze:
             self.freeze_usage.clear()
             self.freeze_idle_since.clear()
             self.thaw_all_managed_scopes(
@@ -5219,14 +5205,19 @@ class Daemon:
                 self.freeze_usage.pop(scope, None)
                 self.freeze_idle_since.pop(scope, None)
                 continue
-            self.freeze_usage[scope] = (usage, now, pids)
-            if prior is None or prior[2] != pids or now - prior[1] < 60.0:
-                self.freeze_idle_since.pop(scope, None)
-                continue
-            if usage < prior[0]:
+            if prior is None or prior[2] != pids:
+                self.freeze_usage[scope] = (usage, now, pids)
                 self.freeze_idle_since.pop(scope, None)
                 continue
             elapsed = now - prior[1]
+            if elapsed < 60.0:
+                # Pressure guard retries may arrive every ten seconds. Keep the
+                # baseline until a complete idle sample has elapsed.
+                continue
+            self.freeze_usage[scope] = (usage, now, pids)
+            if usage < prior[0]:
+                self.freeze_idle_since.pop(scope, None)
+                continue
             cpu = 100.0 * max(0, usage - prior[0]) / (elapsed * 1_000_000)
             cpu_limit = self.cfg.get("freeze", {}).get("cpu_idle_max", 0.5)
             if cpu > cpu_limit:
@@ -5241,6 +5232,7 @@ class Daemon:
                 manual=False,
                 reason="CPU %.3f%% idle for %.0fs" % (cpu, now - idle_since),
                 cpu_verified=True,
+                guard=guard,
             )
             results.append(result)
             if result.get("ok"):
@@ -5543,6 +5535,12 @@ class Daemon:
             return False
         if time.monotonic() < self.guard_trigger_until:
             return True
+        return self._guard_pressure_now_high()
+
+    def _guard_pressure_now_high(self):
+        """Check current floor and PSI readings without transient trigger grace."""
+        if not self._guard_enabled():
+            return False
         available, floor = self._guard_floor()
         if available is not None and floor is not None and available < floor:
             return True
@@ -5614,8 +5612,13 @@ class Daemon:
         candidates.sort(key=lambda item: (-item[0], item[1]))
         results = []
         measured = 0
-        for _size, scope, path, resource_class in candidates:
-            if not self._guard_pressure_high():
+        for index, (_size, scope, path, resource_class) in enumerate(candidates):
+            pressure_high = (
+                self._guard_pressure_high()
+                if index == 0
+                else self._guard_pressure_now_high()
+            )
+            if not pressure_high:
                 break
             result = self._reclaim_one(
                 scope,
@@ -5656,24 +5659,7 @@ class Daemon:
                 "scopes": [],
                 "reason": "observe mode",
             }
-        guard = self.cfg.get("guard", {})
-        freeze = self.cfg.get("freeze", {})
-        freeze_allowed = (
-            isinstance(freeze, dict) and freeze.get("enabled", True) is True
-        )
-        guard_auto = (
-            self.mode in ("auto", "enforce")
-            and freeze_allowed
-            and self._guard_enabled()
-        )
-        allowed_in_adopt = (
-            self.mode == "adopt"
-            and isinstance(guard, dict)
-            and guard.get("freeze_in_adopt", False) is True
-            and freeze_allowed
-            and self._guard_enabled()
-        )
-        if not self._freeze_auto_enabled() and not guard_auto and not allowed_in_adopt:
+        if not self._freeze_auto_enabled() and not self._guard_freeze_authorized():
             return {
                 "performed": 0,
                 "bytes_freed": 0,
@@ -5738,7 +5724,7 @@ class Daemon:
 
         attempted = []
         for current, scope, path, why, unit, pair_authorized in ranked:
-            if not self._guard_pressure_high():
+            if not self._guard_pressure_now_high():
                 break
             facts = (
                 self._pair_scope_facts(path)
@@ -5870,6 +5856,10 @@ class Daemon:
             if self.guard_state.get("active"):
                 return self._finish_guard()
             return None
+        trigger_only = (
+            time.monotonic() < self.guard_trigger_until
+            and not self._guard_pressure_now_high()
+        )
         state = self.guard_state
         if not state.get("active"):
             state.update(
@@ -5901,7 +5891,8 @@ class Daemon:
             ("stop", self._guard_stop_step),
         )
         for name, action in stages:
-            if not self._guard_pressure_high():
+            pressure_high = self._guard_pressure_now_high()
+            if not pressure_high and not (trigger_only and name == "page_cache"):
                 break
             last = self.guard_last_steps.get(name)
             if isinstance(last, (int, float)) and monotonic_now - last < cooldown:
@@ -5910,6 +5901,7 @@ class Daemon:
             before_available, _floor = self._guard_floor()
             started = time.monotonic()
             result = action()
+            trigger_only = False
             elapsed_ms = round((time.monotonic() - started) * 1000, 2)
             after_available, _floor = self._guard_floor()
             freed = result.get("bytes_freed", 0)
@@ -5943,10 +5935,10 @@ class Daemon:
                 duration_ms=elapsed_ms,
                 reason=step["reason"],
             )
-            if not self._guard_pressure_high():
+            if not self._guard_pressure_now_high():
                 break
 
-        if self._guard_pressure_high():
+        if self._guard_pressure_now_high():
             due = [
                 value + cooldown
                 for value in self.guard_last_steps.values()

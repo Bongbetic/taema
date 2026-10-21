@@ -110,11 +110,12 @@ class FreezeTests(unittest.TestCase):
         self.daemon.cfg["mem"] = {"enabled": True}
         self.daemon.mem_enabled = True
         self.daemon.cfg["experimental"]["guard"] = True
+        self.daemon.cfg["experimental"]["freeze"] = False
         self.daemon.cfg["guard"] = {"enabled": True, "freeze_in_adopt": False}
         self.cg.set_cpu(self.scope, 0)
 
-        self.assertEqual(self.daemon.freeze_pass(now=0, guard=True), [])
-        self.assertEqual(self.daemon.freeze_pass(now=60, guard=True), [])
+        for now in range(0, 120, 10):
+            self.assertEqual(self.daemon.freeze_pass(now=now, guard=True), [])
         results = self.daemon.freeze_pass(now=120, guard=True)
 
         self.assertTrue(results[0]["ok"])

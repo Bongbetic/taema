@@ -7,7 +7,7 @@ import os
 import re
 import select
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Protocol
 
 _PSI_SETTING = re.compile(
     r"^\s*(\d+(?:\.\d+)?)\s*(us|ms|s)?\s*/\s*"
@@ -255,10 +255,37 @@ def display_earlyoom(handler: OomHandler) -> str:
     return " ".join(parts)
 
 
+def empty_status() -> dict[str, object]:
+    """Build the stable guard status returned when the daemon is unavailable."""
+    return {
+        "active": False,
+        "trigger": None,
+        "triggers": [],
+        "started_at": None,
+        "steps": [],
+        "bytes_freed": 0,
+        "last_trigger": None,
+        "last_bytes_freed": 0,
+        "last_duration_ms": None,
+    }
+
+
+class _Epoll(Protocol):
+    def fileno(self) -> int: ...
+
+    def register(self, fd: int, eventmask: int) -> None: ...
+
+    def unregister(self, fd: int) -> None: ...
+
+    def poll(self, timeout: float | None = None) -> list[tuple[int, int]]: ...
+
+    def close(self) -> None: ...
+
+
 class PsiTriggerMonitor:
     """Own PSI trigger fds and surface ready metric names through an epoll fd."""
 
-    def __init__(self, epoll=None):
+    def __init__(self, epoll: _Epoll | None = None) -> None:
         self._epoll = select.epoll() if epoll is None else epoll
         self._fds: dict[int, str] = {}
 

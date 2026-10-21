@@ -233,6 +233,11 @@ class GuardDaemonTests(unittest.TestCase):
                 "_guard_pressure_high",
                 side_effect=lambda: pressure["high"],
             ),
+            mock.patch.object(
+                self.daemon,
+                "_guard_pressure_now_high",
+                side_effect=lambda: pressure["high"],
+            ),
             mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 50)),
             mock.patch.object(
                 self.daemon,
@@ -279,6 +284,32 @@ class GuardDaemonTests(unittest.TestCase):
         self.assertEqual(result["last_trigger"], "full")
         self.assertEqual(result["last_bytes_freed"], 3)
 
+    def test_psi_trigger_does_not_continue_to_stop_after_pressure_clears(self):
+        self.daemon.cfg["guard"]["cooldown"] = 0
+        reclaimed = {
+            "performed": 1,
+            "bytes_freed": 128,
+            "scopes": ["leftover/cache"],
+        }
+        with (
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=False
+            ),
+            mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 50)),
+            mock.patch.object(
+                self.daemon, "_guard_reclaim_step", return_value=reclaimed
+            ) as reclaim,
+            mock.patch.object(self.daemon, "_guard_freeze_step") as freeze,
+            mock.patch.object(self.daemon, "_guard_stop_step") as stop,
+        ):
+            result = self.daemon.guard_pass("some")
+
+        reclaim.assert_called_once_with("page_cache")
+        freeze.assert_not_called()
+        stop.assert_not_called()
+        self.assertFalse(result["active"])
+        self.assertEqual(result["last_bytes_freed"], 128)
+
     def test_disabling_guard_closes_an_active_episode(self):
         self.daemon.guard_state.update(
             active=True,
@@ -305,6 +336,11 @@ class GuardDaemonTests(unittest.TestCase):
             mock.patch.object(
                 self.daemon,
                 "_guard_pressure_high",
+                side_effect=lambda: pressure["high"],
+            ),
+            mock.patch.object(
+                self.daemon,
+                "_guard_pressure_now_high",
                 side_effect=lambda: pressure["high"],
             ),
             mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 50)),
@@ -474,6 +510,7 @@ class GuardDaemonTests(unittest.TestCase):
         with mock.patch.object(self.daemon, "_guard_enabled", return_value=True):
             self.daemon.guard_trigger_until = time.monotonic() + 1
             self.assertTrue(self.daemon._guard_pressure_high())
+            self.assertFalse(self.daemon._guard_pressure_now_high())
             self.daemon.guard_trigger_until = 0
             with (
                 mock.patch.object(self.daemon, "_guard_floor", return_value=(10, 20)),
@@ -531,6 +568,9 @@ class GuardDaemonTests(unittest.TestCase):
         }
         with (
             mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
             mock.patch.object(
                 self.daemon,
                 "_guard_floor",
@@ -656,6 +696,9 @@ class GuardDaemonTests(unittest.TestCase):
             mock.patch.object(service.memory, "pressure", return_value={}),
             mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
             mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
+            mock.patch.object(
                 self.daemon, "_reclaim_one", side_effect=reclaim
             ) as reclaim_one,
         ):
@@ -693,6 +736,9 @@ class GuardDaemonTests(unittest.TestCase):
             ),
             mock.patch.object(service.memory, "pressure", return_value={}),
             mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
             mock.patch.object(
                 self.daemon,
                 "_reclaim_one",
@@ -857,7 +903,9 @@ class GuardDaemonTests(unittest.TestCase):
                 service.memory, "scope_counters", return_value={"current_bytes": 100}
             ),
             mock.patch.object(service.engine, "stop") as stop,
-            mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
         ):
             result = self.daemon._guard_stop_step()
         self.assertEqual(result["performed"], 0)
@@ -886,7 +934,9 @@ class GuardDaemonTests(unittest.TestCase):
                     "current_bytes": 100 if path == small else 300
                 },
             ),
-            mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
             mock.patch.object(self.daemon, "_pair_scope_facts", return_value=facts),
             mock.patch.object(self.daemon, "authorize", return_value=decision),
             mock.patch.object(self.daemon, "auto_stop_path", return_value=True) as stop,
@@ -945,7 +995,9 @@ class GuardDaemonTests(unittest.TestCase):
                     else None
                 ),
             ),
-            mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
             mock.patch.object(self.daemon, "authorize", side_effect=decisions),
             mock.patch.object(self.daemon, "log_would_stop") as would_stop,
             mock.patch.object(self.daemon, "auto_stop_path", return_value=True) as stop,
@@ -984,7 +1036,9 @@ class GuardDaemonTests(unittest.TestCase):
             mock.patch.object(
                 service.memory, "scope_counters", return_value={"current_bytes": 256}
             ),
-            mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon, "_guard_pressure_now_high", return_value=True
+            ),
             mock.patch.object(self.daemon, "authorize", return_value=decision),
             mock.patch.object(
                 self.daemon.store, "decision_context", return_value=nullcontext(audit)

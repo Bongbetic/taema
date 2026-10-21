@@ -52,6 +52,7 @@ lineage = _LazyModule("lineage", "taema.core.lineage")
 engine = _LazyModule("engine", "taema.governor.engine")
 knowledge = _LazyModule("knowledge", "taema.store.knowledge")
 policy = _LazyModule("policy", "taema.config.policy")
+_pressure_guard = _LazyModule("_pressure_guard", "taema.governor.guard")
 
 _REQUEST_IDS = count(1)
 
@@ -2539,17 +2540,7 @@ def cmd_status(a):
         "snooze_remaining_s": 0,
         "reason": "",
     }
-    empty_guard_state = {
-        "active": False,
-        "trigger": None,
-        "triggers": [],
-        "started_at": None,
-        "steps": [],
-        "bytes_freed": 0,
-        "last_trigger": None,
-        "last_bytes_freed": 0,
-        "last_duration_ms": None,
-    }
+    empty_guard_state = _pressure_guard.empty_status()
     if store is None:
         store = _status_store(cfg, pending_only=reply is not None)
     if reply is None:

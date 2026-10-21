@@ -621,6 +621,8 @@ def stop(
     leftover=None,
 ):
     """Trace a stop attempt unless its caller already established the decision context."""
+    if not dry_run:
+        thaw_managed_scope_before_stop(path, store)
     context = getattr(store, "decision_context", None)
     if not callable(context) or getattr(store, "_audit_context", None) is not None:
         return _stop_impl(
@@ -668,6 +670,50 @@ def stop(
             signature,
             leftover,
         )
+
+
+def thaw_managed_scope_before_stop(path, store):
+    """Thaw a Taema-managed freeze before any stop path can signal its members."""
+    target_scope = cgroup.rel(path)
+    managed = getattr(store, "data", {}).get("frozen_scopes", {})
+    if not isinstance(managed, dict):
+        return False
+    targets = sorted(
+        (
+            scope
+            for scope in managed
+            if target_scope == scope or target_scope.startswith(scope + "/")
+        ),
+        key=lambda scope: scope.count("/"),
+        reverse=True,
+    )
+    thawed_any = False
+    for scope in targets:
+        freeze_path = os.path.join(cgroup.base(), scope, "cgroup.freeze")
+        try:
+            with open(freeze_path, encoding="ascii") as source:
+                frozen = source.read().strip() == "1"
+            if frozen:
+                with open(freeze_path, "w", encoding="ascii") as target:
+                    target.write("0\n")
+        except FileNotFoundError:
+            frozen = False
+        except OSError as error:
+            raise Refused(
+                "could not thaw managed scope %s before stop: %s" % (scope, error)
+            ) from error
+        clear = getattr(store, "clear_frozen_scope", None)
+        if callable(clear):
+            clear(scope)
+        store.log(
+            event="thaw",
+            scope=scope,
+            reason="before stop",
+            source="stop",
+            thawed=frozen,
+        )
+        thawed_any = thawed_any or frozen
+    return thawed_any
 
 
 def _slug(s):
@@ -1388,7 +1434,7 @@ def auto_adopt_plan(cfg, units, table, lin, store, cap=AUTO_CAP):
     return ops
 
 
-def signal_survivors(cfg, items, grace, allow_sigkill):
+def signal_survivors(cfg, items, grace, allow_sigkill, store=None):
     """Stop job survivors that cannot be carved (they live outside user/<uid>): SIGTERM through a
     pidfd-pinned _signal_all, wait, SIGKILL only when allowed. items: [{"pid","start"}]. Returns the
     pids that left the scope after a signal was sent."""
@@ -1403,6 +1449,8 @@ def signal_survivors(cfg, items, grace, allow_sigkill):
     for path, pids in groups.items():
         try:
             self_guard(path)
+            if store is not None:
+                thaw_managed_scope_before_stop(path, store)
         except Refused:
             continue
         term_sent = _signal_all(path, pids, signal.SIGTERM, cfg)

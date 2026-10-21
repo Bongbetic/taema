@@ -215,6 +215,8 @@ class HoldCli(unittest.TestCase):
             authorization.GC_STOP,
             authorization.SESSION_END,
             authorization.MANUAL_STOP,
+            authorization.FREEZE,
+            authorization.MANUAL_FREEZE,
         )
         for trigger in triggers:
             with self.subTest(trigger=trigger):
@@ -229,7 +231,8 @@ class HoldCli(unittest.TestCase):
 
     def test_hold_ladder_contract_covers_each_registered_governor_action(self):
         self.assertEqual(
-            authorization.HOLD_BLOCKED_ACTIONS, frozenset(("stop", "reclaim"))
+            authorization.HOLD_BLOCKED_ACTIONS,
+            frozenset(("freeze", "stop", "reclaim")),
         )
         self.assertEqual(
             set(authorization.TRIGGER_ACTIONS), set(authorization._CAPABILITY)
@@ -396,6 +399,9 @@ class HoldCli(unittest.TestCase):
             cfg = make_cfg(state_dir, mode="enforce")
             with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime_dir}):
                 daemon = service.Daemon(cfg)
+                daemon.store.set_frozen_scope(
+                    "scope-browser", time.time(), source="manual"
+                )
                 daemon.store.apply_feedback_command(
                     {
                         "v": 2,

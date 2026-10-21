@@ -70,6 +70,8 @@ __all__ = (
     "cmd_learn",
     "cmd_learn_export",
     "cmd_gc",
+    "cmd_freeze",
+    "cmd_thaw",
     "cmd_adopt",
     "cmd_daemon",
     "cmd_complete",

@@ -158,7 +158,7 @@ class ForkGate(unittest.TestCase):
 
 
 class LazySs(unittest.TestCase):
-    def test_snapshot_runs_two_ss_calls(self):
+    def test_snapshot_runs_socket_inventory_ss_calls(self):
         calls = []
         tcp = (
             'LISTEN 0 4096 127.0.0.1:80 0.0.0.0:* users:(("a",pid=5,fd=3))\n'
@@ -167,10 +167,11 @@ class LazySs(unittest.TestCase):
         with mock.patch.object(
             inspect,
             "_ss",
-            side_effect=lambda *a: calls.append(a) or (tcp if "-tanp" in a else ""),
+            side_effect=lambda *a: calls.append(a)
+            or (tcp if "-tanpe" in a else ""),
         ):
             s = inspect.Snapshot()
-        self.assertEqual(calls, [("-xapn",), ("-tanp",)])
+        self.assertEqual(calls, [("-xapne",), ("-tanpe",), ("-uanpe",)])
         self.assertEqual([r["state"] for r in s.tcp_listen], ["LISTEN"])
         self.assertEqual([r["state"] for r in s.tcp], ["ESTAB"])
         self.assertTrue(s.ok)

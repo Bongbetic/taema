@@ -818,11 +818,12 @@ class DaemonStopPaths(unittest.TestCase):
 
     def test_veto_thaws_a_managed_freeze_for_online_and_replayed_vetoes(self):
         for replayed in (False, True):
-            scope = "scope-frozen-%s" % replayed
+            scope = "scope-frozen-%s" % str(replayed).lower()
             path = self.cg.leaf(scope)
             freeze_path = os.path.join(path, "cgroup.freeze")
             with open(freeze_path, "w") as target:
                 target.write("1\n")
+            self.d.store.set_frozen_scope(scope, time.time(), source="manual")
             operation = {
                 "v": 2,
                 "id": "freeze-veto-%s" % replayed,

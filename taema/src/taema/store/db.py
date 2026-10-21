@@ -17,7 +17,7 @@ from urllib.parse import quote
 from ..config import policy
 
 BUSY_TIMEOUT_MS = 2000
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DAY = 86400
 MAX_INSTANCES = 50_000
 MAX_EVENTS = 200_000
@@ -277,6 +277,7 @@ _MIGRATIONS = {
         ALTER TABLE signatures ADD COLUMN last_outcome_at REAL;
     """,
     9: "ALTER TABLE mem_samples ADD COLUMN peak INTEGER;",
+    10: "ALTER TABLE frozen ADD COLUMN source TEXT NOT NULL DEFAULT 'auto';",
 }
 
 
@@ -999,6 +1000,7 @@ def _prune(connection, now):
     )
     decision_refs = (
         "id NOT IN (SELECT decision_id FROM vetoes WHERE decision_id IS NOT NULL) "
+        "AND id NOT IN (SELECT decision_id FROM frozen WHERE decision_id IS NOT NULL) "
         "AND CASE WHEN json_valid(undo) AND "
         "json_type(undo, '$._taema_audit') = 'object' THEN "
         "CASE WHEN coalesce(json_extract(undo, '$._taema_audit.undoable'), 0) = 1 "
@@ -1780,6 +1782,22 @@ class StateDB:
                 ).fetchone()
                 if not table:
                     migration = ""
+            if next_version == 10:
+                table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'frozen'"
+                ).fetchone()
+                if table:
+                    columns = {
+                        row["name"]
+                        for row in connection.execute("PRAGMA table_info(frozen)")
+                    }
+                    migration = (
+                        ""
+                        if "source" in columns
+                        else "ALTER TABLE frozen ADD COLUMN source TEXT NOT NULL DEFAULT 'auto';"
+                    )
+                else:
+                    migration = ""
             script = (
                 "BEGIN IMMEDIATE;\n"
                 + migration
@@ -2138,6 +2156,27 @@ class StateDB:
                     "SELECT scope, payload FROM leftover_expiries"
                 )
             }
+            frozen = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'frozen'"
+            ).fetchone()
+            if frozen:
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(frozen)")
+                }
+                source = "source" if "source" in columns else "'auto' AS source"
+                data["frozen_scopes"] = {
+                    row["scope"]: {
+                        "since": _number(row["since"], 0.0),
+                        "listeners": _load(row["listeners"], []),
+                        "decision_id": row["decision_id"],
+                        "source": row["source"],
+                    }
+                    for row in connection.execute(
+                        "SELECT scope, since, listeners, decision_id, %s FROM frozen"
+                        % source
+                    )
+                }
         return data
 
     def audit_sequences(self):
@@ -2334,6 +2373,7 @@ class StateDB:
             "qos_scopes": {},
             "qos_exempt": {},
             "memory_scopes": {},
+            "frozen_scopes": {},
         }
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2593,6 +2633,21 @@ class StateDB:
                     [
                         (scope, _dump(value))
                         for scope, value in data["leftover_expiries"].items()
+                    ],
+                )
+                connection.execute("DELETE FROM frozen")
+                connection.executemany(
+                    "INSERT INTO frozen(scope, since, listeners, decision_id, source) VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (
+                            scope,
+                            record.get("since"),
+                            _dump(record.get("listeners", [])),
+                            record.get("decision_id"),
+                            record.get("source", "auto"),
+                        )
+                        for scope, record in data.get("frozen_scopes", {}).items()
+                        if isinstance(scope, str) and isinstance(record, dict)
                     ],
                 )
                 _prune(connection, now)

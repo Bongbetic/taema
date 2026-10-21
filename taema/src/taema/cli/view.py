@@ -97,7 +97,11 @@ def render_scopes(scopes, args):
     for scope in scopes:
         depth = scope["depth"]
         indent = "  " * depth
-        row_name = scope["name"] + (" ↓" if scope.get("deprioritized") else "")
+        row_name = (
+            scope["name"]
+            + (" ↓" if scope.get("deprioritized") else "")
+            + (" ❄" if scope.get("frozen") else "")
+        )
         row_name = _clip(row_name, max(1, name_width - len(indent)), wide)
         commands = ",".join(scope["commands"])
         commands = _clip(commands, command_width, wide)
@@ -395,7 +399,8 @@ def render_explanation(target, explanation):
         "scope: %s (%s)"
         % (
             (scope.get("name") or "unknown")
-            + (" ↓" if scope.get("deprioritized") else ""),
+            + (" ↓" if scope.get("deprioritized") else "")
+            + (" ❄" if scope.get("frozen") else ""),
             "live" if scope.get("live") else "not verified live",
         )
     )

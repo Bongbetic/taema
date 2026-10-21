@@ -33,6 +33,8 @@ _COMMANDS = {
         {"scope": "string", "force_veto": "boolean", "dry_run": "boolean"},
         ("scope",),
     ),
+    "freeze": ({"scope": "string"}, ("scope",)),
+    "thaw": ({"scope": "string", "all": "boolean"}, ()),
     "feedback": ({}, ()),
 }
 
@@ -379,6 +381,15 @@ def _validate_args(command, args):
             _fail("job status or command word is out of range")
     if command == "reclaim" and (not args["scope"] or len(args["scope"]) > 96):
         _fail("reclaim scope is empty or too long")
+    if command == "freeze" and (not args["scope"] or len(args["scope"]) > 96):
+        _fail("freeze scope is empty or too long")
+    if command == "thaw":
+        scope = args.get("scope")
+        all_scopes = args.get("all") is True
+        if all_scopes == (scope is not None):
+            _fail("thaw requires exactly one of scope or all=true")
+        if scope is not None and (not scope or len(scope) > 96):
+            _fail("thaw scope is empty or too long")
     if command == "kill_done" and args["word"] not in (
         "kill",
         "pkill",

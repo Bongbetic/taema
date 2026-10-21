@@ -60,6 +60,8 @@ __all__ = [
     "RECLAIM",
     "MANUAL_RECLAIM",
     "QOS",
+    "FREEZE",
+    "MANUAL_FREEZE",
 ]
 
 Mode = Literal["observe", "adopt", "enforce", "auto"]
@@ -81,6 +83,8 @@ Trigger = Literal[
     "reclaim",
     "manual_reclaim",
     "qos",
+    "freeze",
+    "manual_freeze",
 ]
 GovernorAction = Literal[
     "adopt", "budget", "contain", "deprioritize", "freeze", "reclaim", "remove", "stop"
@@ -122,6 +126,8 @@ MANUAL_STOP: Final[Trigger] = "manual_stop"  # cli.cmd_kill (`taema kill`)
 RECLAIM: Final[Trigger] = "reclaim"  # daemon memory governor
 MANUAL_RECLAIM: Final[Trigger] = "manual_reclaim"  # explicit memory CLI action
 QOS: Final[Trigger] = "qos"  # Daemon.qos_pass, reversible priority changes
+FREEZE: Final[Trigger] = "freeze"  # idle leftover quarantine
+MANUAL_FREEZE: Final[Trigger] = "manual_freeze"  # explicit CLI freeze
 
 # Every lifecycle trigger declares its governor action. New actions such as reclaim must be
 # classified here so the hold-slot contract test proves that the ladder blocks them.
@@ -139,8 +145,12 @@ TRIGGER_ACTIONS: Final[dict[str, GovernorAction]] = {
     RECLAIM: "reclaim",
     MANUAL_RECLAIM: "reclaim",
     QOS: "deprioritize",
+    FREEZE: "freeze",
+    MANUAL_FREEZE: "freeze",
 }
-HOLD_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(("stop", "reclaim"))
+HOLD_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(
+    ("freeze", "stop", "reclaim")
+)
 VETO_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(
     ("budget", "deprioritize", "freeze", "reclaim", "stop")
 )
@@ -379,6 +389,18 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
         "adopt": (ACT, AUTHORITY_MODE, "qos: adopt applies reversible priorities"),
         "enforce": (ACT, AUTHORITY_MODE, "qos: enforce applies reversible priorities"),
         "auto": (ACT, AUTHORITY_MODE, "qos: auto applies reversible priorities"),
+    },
+    FREEZE: {
+        "observe": (KEEP, "", "freeze: observe never freezes scopes"),
+        "adopt": (ACT, AUTHORITY_MODE, "freeze: adopt requires freeze.adopt"),
+        "enforce": (ACT, AUTHORITY_MODE, "freeze: enforce freezes eligible leftovers"),
+        "auto": (ACT, AUTHORITY_MODE, "freeze: auto freezes eligible leftovers"),
+    },
+    MANUAL_FREEZE: {
+        "observe": (ACT, AUTHORITY_MANUAL, "manual freeze: explicit user request"),
+        "adopt": (ACT, AUTHORITY_MANUAL, "manual freeze: explicit user request"),
+        "enforce": (ACT, AUTHORITY_MANUAL, "manual freeze: explicit user request"),
+        "auto": (ACT, AUTHORITY_MANUAL, "manual freeze: explicit user request"),
     },
 }
 

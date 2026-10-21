@@ -140,7 +140,7 @@ _DEFAULTS = {
         "daily_export": True,
     },
     "experimental": {
-        "freeze": True,
+        "freeze": False,
         "guard": True,
         "window_close": True,
         "launch_wrap": True,
@@ -300,6 +300,56 @@ def _validate_config(cfg, sources):
     if cfg.get("mode") not in MODES:
         source = sources.get("mode", "built-in defaults")
         raise ValueError("%s:1:1: mode must be one of %s" % (source, MODES))
+    freeze = cfg.get("freeze")
+    freeze_source = sources.get("freeze", "built-in defaults")
+    if not isinstance(freeze, dict):
+        raise ValueError("%s:1:1: freeze must be a table" % freeze_source)
+    for name in ("enabled", "adopt", "wake_on_connect"):
+        value = freeze.get(name, _DEFAULTS["freeze"][name])
+        source = sources.get("freeze." + name, freeze_source)
+        if type(value) is not bool:
+            raise ValueError("%s:1:1: freeze.%s must be a boolean" % (source, name))
+    after = freeze.get("after", _DEFAULTS["freeze"]["after"])
+    after_source = sources.get("freeze.after", freeze_source)
+    if (
+        isinstance(after, bool)
+        or not isinstance(after, (int, float))
+        or not math.isfinite(after)
+        or after < 0
+    ):
+        raise ValueError(
+            "%s:1:1: freeze.after must be a non-negative number of seconds"
+            % after_source
+        )
+    maximum = freeze.get("max_frozen", _DEFAULTS["freeze"]["max_frozen"])
+    maximum_source = sources.get("freeze.max_frozen", freeze_source)
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError(
+            "%s:1:1: freeze.max_frozen must be a non-negative integer"
+            % maximum_source
+        )
+    cpu_limit = freeze.get("cpu_idle_max", _DEFAULTS["freeze"]["cpu_idle_max"])
+    cpu_source = sources.get("freeze.cpu_idle_max", freeze_source)
+    if (
+        isinstance(cpu_limit, bool)
+        or not isinstance(cpu_limit, (int, float))
+        or not math.isfinite(cpu_limit)
+        or not 0 <= cpu_limit <= 100
+    ):
+        raise ValueError(
+            "%s:1:1: freeze.cpu_idle_max must be between 0 and 100" % cpu_source
+        )
+    experimental = cfg.get("experimental")
+    experimental_source = sources.get("experimental", "built-in defaults")
+    if not isinstance(experimental, dict):
+        raise ValueError("%s:1:1: experimental must be a table" % experimental_source)
+    experimental_freeze = experimental.get(
+        "freeze", _DEFAULTS["experimental"]["freeze"]
+    )
+    if type(experimental_freeze) is not bool:
+        raise ValueError(
+            "%s:1:1: experimental.freeze must be a boolean" % experimental_source
+        )
     guard = cfg.get("guard")
     guard_source = sources.get("guard", "built-in defaults")
     if not isinstance(guard, dict):

@@ -176,6 +176,23 @@ class IpcV2Tests(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.decode_v2(invalid)
 
+    def test_freeze_and_thaw_requests_are_typed_and_exclusive(self):
+        freeze = self.request(1, "freeze", {"scope": "leftover/browser"})
+        thaw = self.request(2, "thaw", {"scope": "leftover/browser"})
+        thaw_all = self.request(3, "thaw", {"all": True})
+        for envelope in (freeze, thaw, thaw_all):
+            self.assertTrue(matches(envelope, self.request_schema, self.request_schema))
+        self.assertEqual(
+            protocol.decode_v2(freeze),
+            {"cmd": "freeze", "scope": "leftover/browser"},
+        )
+        self.assertEqual(
+            protocol.decode_v2(thaw_all), {"cmd": "thaw", "all": True}
+        )
+        for args in ({}, {"all": True, "scope": "leftover/browser"}, {"all": False}):
+            with self.subTest(args=args), self.assertRaises(protocol.ProtocolError):
+                protocol.decode_v2(self.request(4, "thaw", args))
+
     def test_every_current_command_reply_matches_its_schema(self):
         pid = os.getpid()
         requests = [
@@ -196,6 +213,9 @@ class IpcV2Tests(unittest.TestCase):
                 "reclaim",
                 {"scope": "leftover/reclaim-test", "force_veto": True, "dry_run": True},
             ),
+            ("freeze", {"scope": "leftover/browser"}),
+            ("thaw", {"scope": "leftover/browser"}),
+            ("thaw", {"all": True}),
             ("feedback", {"op": "keep", "key": "ipc-schema"}),
             (
                 "feedback",
@@ -252,6 +272,22 @@ class IpcV2Tests(unittest.TestCase):
                         return_value={"scope": args["scope"], "status": "would"},
                     )
                     memory_operation = nullcontext()
+                elif command == "freeze":
+                    operation = mock.patch.object(
+                        self.daemon,
+                        "freeze_scope",
+                        return_value={"ok": True, "scope": args["scope"], "frozen": True},
+                    )
+                elif command == "thaw" and "scope" in args:
+                    operation = mock.patch.object(
+                        self.daemon,
+                        "_thaw_scope",
+                        return_value={"ok": True, "scope": args["scope"], "thawed": True},
+                    )
+                elif command == "thaw":
+                    operation = mock.patch.object(
+                        self.daemon, "thaw_all_managed_scopes", return_value=[]
+                    )
                 else:
                     operation = nullcontext()
                     memory_operation = nullcontext()

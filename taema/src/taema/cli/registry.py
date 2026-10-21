@@ -465,6 +465,23 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "freeze",
+        "aliases": (),
+        "help": "manually freeze a safe leftover scope",
+        "handler": "cmd_freeze",
+        "arguments": ((("name",), {}),),
+    },
+    {
+        "name": "thaw",
+        "aliases": (),
+        "help": "thaw a scope managed by taema, or all managed freezes",
+        "handler": "cmd_thaw",
+        "arguments": (
+            (("--all",), {"action": "store_true"}),
+            (("name",), {"nargs": "?"}),
+        ),
+    },
+    {
         "name": "gc",
         "aliases": (),
         "help": "show or collect idle scopes",

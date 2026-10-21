@@ -15,6 +15,8 @@
     {"$ref": "#/$defs/answer"},
     {"$ref": "#/$defs/gc"},
     {"$ref": "#/$defs/reclaim"},
+    {"$ref": "#/$defs/freeze"},
+    {"$ref": "#/$defs/thaw"},
     {"$ref": "#/$defs/feedback"}
   ],
   "$defs": {
@@ -288,6 +290,16 @@
     "reclaim": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
       "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "reclaim"}, "args": {"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}, "force_veto": {"type": "boolean"}, "dry_run": {"type": "boolean"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "freeze": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "freeze"}, "args": {"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "thaw": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "thaw"}, "args": {"oneOf": [{"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}, "all": {"const": false}}, "additionalProperties": false}, {"type": "object", "required": ["all"], "properties": {"all": {"const": true}}, "additionalProperties": false}]}},
       "additionalProperties": false
     },
     "feedback": {

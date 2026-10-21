@@ -379,6 +379,33 @@ The `[mem]` settings `reclaim`, `reclaim_interval`, `idle_reclaim_grace`, `recla
 `headroom_percent` tune this pass. Defaults are conservative; disabling `reclaim` leaves accounting
 and the rest of lifecycle management available.
 
+### Freeze idle leftovers
+
+Freezing is experimental and off until `[experimental] freeze = true`. In `auto` and `enforce`,
+Taema freezes only leaf scopes under `leftover/` after 120 seconds of measured CPU at or below
+0.5% over a 60-second sample, with a default limit of 32 automatically frozen scopes. Unknown
+process, socket, or dependency facts keep the scope running. Listeners remain ineligible until
+connect-triggered thaw is available. `adopt` requires the additional `freeze.adopt = true` opt-in;
+`observe` never freezes automatically.
+
+```toml
+[experimental]
+freeze = true
+
+[freeze]
+enabled = true
+after = 120
+max_frozen = 32
+cpu_idle_max = 0.5
+adopt = false
+```
+
+`taema freeze NAME` still applies the same safety checks, including a measured 60-second CPU idle
+window; the first request waits for that sample. `taema thaw NAME` or `taema thaw --all` reverses
+managed freezes. `taema ls` and `taema explain` mark frozen scopes with `❄`. Taema thaws
+managed scopes before stopping, when a hold or veto applies, when the feature is disabled, during
+shutdown, and when a new daemon recovers the prior daemon's freeze records.
+
 `taema kill` prints one line per process: `kill`, `share` (moved to `shared/` because
 something outside still uses it) or `skip` (protected).
 

@@ -68,6 +68,7 @@ _SCOPE = {
     "owner_watch_full",
     "stop_error",
     "stopped",
+    "freeze",
     "thaw",
     "thaw_failed",
     "would_attribute",

@@ -13,9 +13,10 @@ PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
 MAX_RESTORE_ARGV_BYTES = 16 << 10
 _USERS = re.compile(r'\("([^"]*)",pid=(\d+)')
 _UNIX = re.compile(
-    r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)\s*(users:\(.*\))?\s*$"
+    r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)"
 )
-_TCP = re.compile(r"^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s*(users:\(.*\))?\s*$")
+_TCP = re.compile(r"^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)")
+_INODE = re.compile(r"\bino:(\d+)\b")
 
 
 # ---- /proc ----------------------------------------------------------------------------
@@ -256,20 +257,21 @@ def _pids(users):
 
 
 def parse_ss_unix(text):
-    """Rows of `ss -H -xpn` / `ss -H -xlpn`: dicts with state, path, inode, peer_inode, pids."""
+    """Rows of `ss -H -xpn` / `ss -H -xlpn` with local and peer socket facts."""
     rows = []
     for line in text.splitlines():
         m = _UNIX.match(line.strip())
         if not m:
             continue
-        _, state, lpath, linode, _ppath, pinode, users = m.groups()
+        _, state, lpath, linode, _ppath, pinode = m.groups()
         rows.append(
             {
                 "state": state,
                 "path": "" if lpath == "*" else lpath,
+                "peer_path": "" if _ppath == "*" else _ppath,
                 "inode": int(linode),
                 "peer_inode": int(pinode),
-                "pids": _pids(users),
+                "pids": _pids(line),
             }
         )
     return rows
@@ -282,10 +284,12 @@ def parse_ss_tcp(text):
         m = _TCP.match(line.strip())
         if not m:
             continue
-        state, local, peer, users = m.groups()
-        rows.append(
-            {"state": state, "local": local, "peer": peer, "pids": _pids(users)}
-        )
+        state, local, peer = m.groups()
+        row = {"state": state, "local": local, "peer": peer, "pids": _pids(line)}
+        inode = _INODE.search(line)
+        if inode:
+            row["inode"] = int(inode.group(1))
+        rows.append(row)
     return rows
 
 
@@ -309,10 +313,10 @@ def _ss(*args):
 
 
 class Snapshot:
-    """One consistent view of sockets, taken once per decision pass: two ss runs
-    (`-xapn`, `-tanp`); listening tcp rows are split out by state."""
+    """One consistent view of sockets, taken once per decision pass: three ss runs
+    (`-xapne`, `-tanpe`, `-uanpe`); listening tcp rows are split out by state."""
 
-    def __init__(self, unix_text=None, tcp_text=None, tcp_listen_text=None):
+    def __init__(self, unix_text=None, tcp_text=None, tcp_listen_text=None, udp_text=None):
         self.ok = True  # False when any ss call failed: edges are unknown, not absent
 
         def get(given, args):
@@ -322,15 +326,22 @@ class Snapshot:
                 return ""
             return t
 
-        self.unix = parse_ss_unix(get(unix_text, ("-xapn",)))
+        self.unix = parse_ss_unix(get(unix_text, ("-xapne",)))
         if tcp_text is None and tcp_listen_text is None:
-            rows = parse_ss_tcp(get(None, ("-tanp",)))
+            rows = parse_ss_tcp(get(None, ("-tanpe",)))
             self.tcp = [r for r in rows if r["state"] != "LISTEN"]
             self.tcp_listen = [r for r in rows if r["state"] == "LISTEN"]
+            self.udp = parse_ss_tcp(get(udp_text, ("-uanpe",)))
         else:
             self.tcp = parse_ss_tcp(get(tcp_text, ("-tnp",)))
             self.tcp_listen = parse_ss_tcp(get(tcp_listen_text, ("-tlnp",)))
+            self.udp = parse_ss_tcp(udp_text or "")
         self.by_inode = {r["inode"]: r for r in self.unix}
+        self.socket_inodes = {
+            row["inode"]
+            for row in (*self.unix, *self.tcp, *self.tcp_listen, *self.udp)
+            if isinstance(row.get("inode"), int)
+        }
 
 
 class LazySnapshot:

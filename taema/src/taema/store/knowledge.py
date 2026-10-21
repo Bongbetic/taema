@@ -196,6 +196,7 @@ class Store:
             "qos_exempt": {},
             "memory_scopes": {},
             "leftover_expiries": {},
+            "frozen_scopes": {},
         }
 
     def _load(self):
@@ -234,6 +235,25 @@ class Store:
         if self.read_only:
             return 0
         return self.db.save_memory_samples(samples, now=now)
+
+    def set_frozen_scope(
+        self, scope, since, decision_id=None, listeners=(), source="auto"
+    ):
+        """Record a cgroup freeze owned by Taema for crash recovery and explicit thaw."""
+        self.data.setdefault("frozen_scopes", {})[scope] = {
+            "since": float(since),
+            "decision_id": decision_id,
+            "listeners": list(listeners),
+            "source": source,
+        }
+        self.dirty = True
+
+    def clear_frozen_scope(self, scope):
+        """Forget one managed freeze after a successful thaw or confirmed removal."""
+        record = self.data.setdefault("frozen_scopes", {}).pop(scope, None)
+        if record is not None:
+            self.dirty = True
+        return record is not None
 
     def latest_app_instance(self, key):
         return self.db.latest_app_instance(key)

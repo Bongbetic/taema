@@ -1415,7 +1415,14 @@ def _deprioritized_scopes(store):
     }
 
 
-def _walk(path, depth, out, memory_scopes=None, deprioritized_scopes=None):
+def _walk(
+    path,
+    depth,
+    out,
+    memory_scopes=None,
+    deprioritized_scopes=None,
+    frozen_scopes=None,
+):
     pids = cgroup.procs(path)
     comms = []
     for p in pids:
@@ -1440,10 +1447,11 @@ def _walk(path, depth, out, memory_scopes=None, deprioritized_scopes=None):
             "memory": metrics,
             "commands": sorted(comms),
             "deprioritized": cgroup.rel(path) in (deprioritized_scopes or set()),
+            "frozen": cgroup.rel(path) in (frozen_scopes or set()),
         }
     )
     for d in sorted(cgroup.subdirs(path)):
-        _walk(d, depth + 1, out, memory_scopes, deprioritized_scopes)
+        _walk(d, depth + 1, out, memory_scopes, deprioritized_scopes, frozen_scopes)
 
 
 def _count_scopes(base):
@@ -1466,6 +1474,7 @@ def cmd_ls(a):
     memory_view = _memory_snapshot(cfg, store)
     memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
     deprioritized_scopes = _deprioritized_scopes(store)
+    frozen_scopes = set((store.data.get("frozen_scopes", {}) if store else {}).keys())
     base = cgroup.base()
     if not os.path.isdir(base):
         model = view.snapshot("ls", scopes=(), memory=memory_view)
@@ -1473,7 +1482,7 @@ def cmd_ls(a):
         return 3
     rows = []
     for d in sorted(cgroup.subdirs(base)):
-        _walk(d, 0, rows, memory_scopes, deprioritized_scopes)
+        _walk(d, 0, rows, memory_scopes, deprioritized_scopes, frozen_scopes)
     model = view.snapshot("ls", scopes=rows, memory=memory_view)
     records = [view.record("scope", row) for row in rows]
     if getattr(a, "jsonl", False):
@@ -1610,6 +1619,8 @@ def _why_report(
             "name": target_scope or "",
             "live": bool(scope_live),
             "deprioritized": target_scope in _deprioritized_scopes(store),
+            "frozen": target_scope
+            in (store.data.get("frozen_scopes", {}) if store else {}),
         },
         "provenance": provenance or {},
         "current_decision": {
@@ -2580,12 +2591,19 @@ def cmd_status(a):
     memory_view = _memory_snapshot(cfg, store)
     memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
     deprioritized_scopes = _deprioritized_scopes(store)
+    frozen_scopes = set((store.data.get("frozen_scopes", {}) if store else {}).keys())
+    if reply is not None:
+        frozen_scopes.update(
+            item.get("scope")
+            for item in reply.get("frozen_scopes", [])
+            if isinstance(item, dict) and isinstance(item.get("scope"), str)
+        )
     base = cgroup.base()
     if os.path.isdir(base):
         if getattr(a, "json", False) or getattr(a, "jsonl", False):
             scopes = []
             for path in sorted(cgroup.subdirs(base)):
-                _walk(path, 0, scopes, memory_scopes, deprioritized_scopes)
+                _walk(path, 0, scopes, memory_scopes, deprioritized_scopes, frozen_scopes)
             scope_count = len(scopes)
         else:
             scopes = []
@@ -3413,6 +3431,56 @@ def cmd_gc(a):
     model = view.record("gc", {"result": reply})
     view.emit(model, a, json.dumps(reply, indent=1, ensure_ascii=False) + "\n")
     return 0 if available else 3
+
+
+def cmd_freeze(a):
+    """Request a manually authorized, safety-checked freeze from the daemon."""
+    cfg, _store, _units = _load(a)
+    name = getattr(a, "name", None)
+    path = cgroup.resolve(name) if isinstance(name, str) else None
+    if path is None:
+        return die("scope %s not found" % (name or ""), 2)
+    scope = cgroup.rel(path)
+    reply = ask(cfg, {"cmd": "freeze", "scope": scope})
+    if reply is None:
+        return die("daemon is not running; freeze requires live safety checks", 3)
+    if not isinstance(reply, dict):
+        return die("daemon returned an invalid freeze reply", 3)
+    if reply.get("error"):
+        return die(str(reply["error"]), 4)
+    print("frozen %s" % scope)
+    return 0
+
+
+def cmd_thaw(a):
+    """Thaw one cgroup or every scope Taema recorded as frozen."""
+    cfg, _store, _units = _load(a)
+    name = getattr(a, "name", None)
+    all_scopes = getattr(a, "all", False) is True
+    if all_scopes == (name is not None):
+        return die("choose exactly one scope or --all", 2)
+    if all_scopes:
+        request = {"cmd": "thaw", "all": True}
+    else:
+        path = cgroup.resolve(name) if isinstance(name, str) else None
+        if path is None:
+            return die("scope %s not found" % (name or ""), 2)
+        request = {"cmd": "thaw", "scope": cgroup.rel(path)}
+    reply = ask(cfg, request)
+    if reply is None:
+        return die("daemon is not running; thaw requires live cgroup ownership", 3)
+    if not isinstance(reply, dict):
+        return die("daemon returned an invalid thaw reply", 3)
+    if reply.get("error"):
+        return die(str(reply["error"]), 4)
+    if all_scopes:
+        thawed = reply.get("thawed", [])
+        print("thawed %s" % (", ".join(thawed) if thawed else "no managed scopes"))
+    elif reply.get("thawed"):
+        print("thawed %s" % request["scope"])
+    else:
+        print("%s is already thawed" % request["scope"])
+    return 0
 
 
 def cmd_complete(a):

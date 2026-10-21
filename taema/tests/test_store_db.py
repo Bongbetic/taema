@@ -23,12 +23,58 @@ from tests.test_phase0 import make_cfg
 
 
 class StoreDatabaseTests(unittest.TestCase):
+    def test_schema_nine_migration_adds_freeze_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.db"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE frozen (
+                        scope TEXT PRIMARY KEY,
+                        since REAL,
+                        listeners TEXT,
+                        decision_id INTEGER
+                    );
+                    INSERT INTO frozen(scope, since, listeners, decision_id)
+                    VALUES ('leftover/browser', 123.0, '[]', NULL);
+                    PRAGMA user_version = 9;
+                    """
+                )
+
+            StateDB(path)
+
+            with StateDB(path, read_only=True).connection() as connection:
+                row = connection.execute(
+                    "SELECT source FROM frozen WHERE scope = ?",
+                    ("leftover/browser",),
+                ).fetchone()
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+        self.assertEqual(version, 10)
+        self.assertEqual(row["source"], "auto")
+
+    def test_read_only_schema_nine_state_defaults_freeze_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            store.set_frozen_scope("leftover/browser", 123.0)
+            store.save()
+            with store.db.connection() as connection:
+                connection.execute("ALTER TABLE frozen DROP COLUMN source")
+                connection.execute("PRAGMA user_version = 9")
+
+            reopened = Store(temporary, {}, read_only=True)
+
+        self.assertEqual(
+            reopened.data["frozen_scopes"]["leftover/browser"]["source"], "auto"
+        )
+
     def test_fresh_store_uses_private_versioned_wal_database(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(temporary, {})
             store.bump("firefox", "seen", 2)
             store.answer("npm", "vite", "stop")
             store.add_veto("app", "firefox")
+            store.set_frozen_scope("leftover/browser", 123.0, source="manual")
             store.save()
 
             self.assertEqual(Path(store.path).name, "state.db")
@@ -48,7 +94,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
                 )
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 9
+                    connection.execute("PRAGMA user_version").fetchone()[0], 10
                 )
                 self.assertEqual(
                     connection.execute("PRAGMA journal_mode").fetchone()[0], "wal"
@@ -88,6 +134,10 @@ class StoreDatabaseTests(unittest.TestCase):
             self.assertEqual(
                 reopened.match_veto(members=[{"apps": ["firefox"]}])["value"], "firefox"
             )
+            self.assertEqual(
+                reopened.data["frozen_scopes"]["leftover/browser"]["source"],
+                "manual",
+            )
 
     def test_schema_six_migration_adds_signature_regret_suspension(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -119,7 +169,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     ("signature-1",),
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 9
+                    connection.execute("PRAGMA user_version").fetchone()[0], 10
                 )
 
             self.assertTrue({"suspended_until", "suspended_at"}.issubset(columns))
@@ -154,7 +204,7 @@ class StoreDatabaseTests(unittest.TestCase):
             database = StateDB(path, read_only=True)
             with database.connection() as connection:
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 9
+                    connection.execute("PRAGMA user_version").fetchone()[0], 10
                 )
                 self.assertTrue(
                     connection.execute(
@@ -194,7 +244,7 @@ class StoreDatabaseTests(unittest.TestCase):
                     "SELECT id, owner, runtime_hash, veto FROM signatures"
                 ).fetchone()
                 self.assertEqual(
-                    connection.execute("PRAGMA user_version").fetchone()[0], 9
+                    connection.execute("PRAGMA user_version").fetchone()[0], 10
                 )
 
             self.assertEqual(
@@ -236,7 +286,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-            self.assertEqual(version, 9)
+            self.assertEqual(version, 10)
             self.assertTrue({"last_outcome", "last_outcome_at"}.issubset(columns))
             self.assertEqual(tuple(row), ("stop", None, None))
 
@@ -281,7 +331,7 @@ class StoreDatabaseTests(unittest.TestCase):
                 ).fetchone()
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-        self.assertEqual(version, 9)
+        self.assertEqual(version, 10)
         self.assertIn("peak", columns)
         self.assertEqual(
             tuple(row), ("app-browser", 123.0, 4096, 2048, 1024, 512, 0, 1.25, None)

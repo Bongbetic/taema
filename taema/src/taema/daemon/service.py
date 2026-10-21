@@ -33,7 +33,7 @@ from ..core import (
     lineage,
     signature as survivor_signature,
 )
-from ..governor import engine, memory_budget
+from ..governor import engine, freezing, memory_budget
 from ..store import knowledge
 from ..config import policy
 from .. import events as event_views, protocol
@@ -132,7 +132,6 @@ class Daemon:
         self.store.expire_reviews()
         self.store.save_if_dirty()
         self.units = policy.load_units(cfg)
-        self.thaw_held_scopes()
         self.config_error = None
         self.profile_reason = cfg.get("_profile_reason", "automatic profile selection")
         self.reload_requested = False
@@ -142,12 +141,21 @@ class Daemon:
         self.owners = {}  # pidfd -> (scope leaf name, owner pid, owner starttime)
         self.idle_since = {}
         self.gc_usage = {}  # rel -> cpu usage_usec when the idle window started
+        self.freeze_usage = {}  # rel -> (usage_usec, sample_time, member pids)
+        self.manual_freeze_usage = {}  # rel -> manual request CPU sample
+        self.freeze_idle_since = {}
         self.gc_skip = set()  # leaves with a protected member: not retried
         self.gc_noted = set()  # leaves already logged as kept
         self.srv = None
         self.sock_path = None
         self.mem_enabled = memory.enabled(cfg)
-        self.last = {"adopt": 0.0, "gc": 0.0, "memory": 0.0, "reclaim": 0.0}
+        self.last = {
+            "adopt": 0.0,
+            "gc": 0.0,
+            "memory": 0.0,
+            "reclaim": 0.0,
+            "freeze": 0.0,
+        }
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
         self.iv_memory = 60.0
@@ -214,6 +222,8 @@ class Daemon:
         self._summary_dirty = True
         self._last_event = "ready"
         self.store.add_event_listener(self._publish_event)
+        self.thaw_all_managed_scopes("daemon restart recovery")
+        self.thaw_held_scopes()
 
     def restore_runtime_hold(self):
         """Import an offline runtime marker and honor the cautious service boot setting."""
@@ -1144,6 +1154,7 @@ class Daemon:
                 good_items,
                 engine.auto_grace(self.store, {item["key"] for item in good_items}),
                 allow_sigkill,
+                self.store,
             )
             sent_items = [item for item in good_items if item["pid"] in sent]
             if sent_items:
@@ -1632,7 +1643,9 @@ class Daemon:
                     )
             if loose:
                 stopped.update(
-                    engine.signal_survivors(self.cfg, loose, grace, allow_sigkill)
+                    engine.signal_survivors(
+                        self.cfg, loose, grace, allow_sigkill, self.store
+                    )
                 )
             stopped_items = [item for item in good if item["pid"] in stopped]
             if stopped_items:
@@ -3901,6 +3914,44 @@ class Daemon:
             return result
         if c == "memory_budget":
             return self._memory_budget_report()
+        if c == "freeze":
+            scope = msg.get("scope")
+            if (
+                not isinstance(scope, str)
+                or not cgroup.valid_rel(scope)
+                or scope == "manager"
+                or scope.startswith("manager/")
+            ):
+                return {"error": "invalid freeze scope", "code": "invalid_request"}
+            result = self.freeze_scope(scope, manual=True, reason="manual freeze")
+            if not result.get("ok"):
+                return {"error": result.get("error", "freeze refused")}
+            return result
+        if c == "thaw":
+            scope, all_scopes = msg.get("scope"), msg.get("all") is True
+            if all_scopes == (scope is not None):
+                return {"error": "choose one scope or --all", "code": "invalid_request"}
+            if all_scopes:
+                results = self.thaw_all_managed_scopes("manual thaw all")
+                failed = [item for item in results if not item.get("ok")]
+                if failed:
+                    return {"error": failed[0].get("error", "thaw failed")}
+                return {
+                    "thawed": [item["scope"] for item in results if item.get("thawed")]
+                }
+            if (
+                not isinstance(scope, str)
+                or not cgroup.valid_rel(scope)
+                or scope == "manager"
+                or scope.startswith("manager/")
+            ):
+                return {"error": "invalid thaw scope", "code": "invalid_request"}
+            result = self._thaw_scope(
+                scope, "manual thaw", authority="manual", managed_only=False
+            )
+            if not result.get("ok"):
+                return {"error": result.get("error", "thaw refused")}
+            return result
         if c == "status":
             self.store.expire_reviews()
             self._save_if_idle()
@@ -3934,6 +3985,13 @@ class Daemon:
                 "feedback_invalid": self.store.data.get("feedback_invalid", 0),
                 "hold": self.store.hold_reason(),
                 "hold_state": self.store.hold_status(),
+                "frozen_scopes": [
+                    {"scope": scope, **record}
+                    for scope, record in sorted(
+                        self.store.data.get("frozen_scopes", {}).items()
+                    )
+                    if isinstance(record, dict)
+                ],
                 "config_error": self.config_error,
                 "config": list(self.cfg.get("_sources", [])),
                 "unit_errors": list(self.cfg.get("_unit_errors", [])),
@@ -4470,72 +4528,460 @@ class Daemon:
             self.bind(want)
             self.store.log(event="socket_bound", path=want)
 
-    def thaw_held_scopes(self):
-        """Thaw frozen managed scopes covered by a hold or any active veto."""
-        state = self.store.hold_status()
-        global_hold = state["global"] or state["snooze_until"] is not None
-        held_scopes = state["scopes"]
-        active_vetoes = self.store._active_vetoes()
-        if not global_hold and not held_scopes and not active_vetoes:
-            return
-        stack = list(cgroup.subdirs(cgroup.base()))
-        while stack:
-            path = stack.pop()
-            if os.path.basename(path) == "manager":
-                continue
-            scope = cgroup.rel(path)
-            stack.extend(cgroup.subdirs(path))
-            held = global_hold or any(
-                scope == held_scope or scope.startswith(held_scope + "/")
-                for held_scope in held_scopes
-            )
-            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
-            veto = engine.veto_for_scope(
-                self.store,
-                path,
-                unit=unit,
-            )
-            if not held and not veto:
-                continue
-            freeze = os.path.join(path, "cgroup.freeze")
-            try:
-                with open(freeze, encoding="ascii") as source:
-                    frozen = source.read().strip() == "1"
-                if not frozen:
-                    continue
-                reason = (
-                    self.store.describe_veto(veto)
-                    if veto
-                    else self.store.hold_reason(scope) or "runtime hold"
-                )
-                authority = "veto" if veto else "hold"
-                why = (
-                    "veto thawed a managed freeze: %s"
-                    if veto
-                    else "hold thawed a managed freeze: %s"
-                ) % reason
+    def _freeze_config_enabled(self):
+        freeze = self.cfg.get("freeze", {})
+        experimental = self.cfg.get("experimental", {})
+        return (
+            isinstance(freeze, dict)
+            and freeze.get("enabled", True) is True
+            and isinstance(experimental, dict)
+            and experimental.get("freeze", False) is True
+        )
+
+    def _freeze_auto_enabled(self):
+        if not self._freeze_config_enabled():
+            return False
+        freeze = self.cfg.get("freeze", {})
+        return self.mode in ("auto", "enforce") or (
+            self.mode == "adopt" and freeze.get("adopt", False) is True
+        )
+
+    @staticmethod
+    def _freeze_value(path):
+        try:
+            with open(os.path.join(path, "cgroup.freeze"), encoding="ascii") as source:
+                value = source.read().strip()
+        except OSError:
+            return None
+        return value if value in ("0", "1") else None
+
+    def _freeze_safety_reason(self, scope, path, snapshot=None):
+        """Return a fail-closed reason when a leftover cannot safely be frozen."""
+        if (
+            not cgroup.valid_rel(scope)
+            or scope == "manager"
+            or scope.startswith("manager/")
+            or scope.count("/") != 1
+            or not scope.startswith("leftover/")
+        ):
+            return "not a top-level leftover scope"
+        if not os.path.isdir(path):
+            return "scope is unavailable"
+        if cgroup.subdirs(path):
+            return "scope is not a leaf"
+        pids = cgroup.tree_procs(path)
+        if not pids:
+            return "scope is empty"
+        if snapshot is None:
+            snapshot = inspect.Snapshot()
+        if not getattr(snapshot, "ok", False):
+            return "socket state unknown"
+        edge_map = inspect.edges(set(pids), snapshot)
+        if edge_map:
+            return "outside dependency edge"
+        fd_reason, member_socket_inodes, pty_host = freezing.member_fd_facts(
+            pids, snapshot, inspect.PROC
+        )
+        if fd_reason:
+            return fd_reason
+        if pty_host:
+            return "pty host"
+        socket_reason = freezing.socket_safety_reason(
+            pids, snapshot, member_socket_inodes
+        )
+        if socket_reason:
+            return socket_reason
+        for pid in pids:
+            entry = self.lineage.entry(pid)
+            if (
+                not entry
+                or not isinstance(entry.get("start"), int)
+                or entry["start"] <= 0
+            ):
+                return "process identity unknown"
+            member_cgroup = cgroup.proc_cgroup(pid)
+            if not member_cgroup:
+                return "process cgroup unknown"
+            if not cgroup.is_prefix(path, member_cgroup):
+                return "process moved during inspection"
+            env_rules = self.cfg.get("protected", {}).get("env_prefix", {})
+            if env_rules:
+                try:
+                    with open(
+                        os.path.join(inspect.PROC, str(pid), "environ"), "rb"
+                    ) as source:
+                        source.read()
+                except OSError:
+                    return "protected environment state unknown"
+            protected = policy.protected_reason(pid, self.cfg)
+            if protected:
+                return "protected member: %s" % protected
+            key = entry.get("key")
+            if not isinstance(key, str) or not key:
+                return "member identity unknown"
+            facts = self.store.peek(key)
+            if (
+                self.store.is_persistent(key)
+                or self.store.standalone(key)
+                or facts.get("user_keep", 0.0) > 0
+            ):
+                return "member has a keep or standalone decision"
+            if self.store.default_action(key)[0] == "share":
+                return "member is configured to be kept"
+            for owner in self.store.owners_of(
+                key, limit=max(1, len(self.store.data.get("pairs", {})))
+            ):
+                if self.store.pair_decision(owner, key)[0] in ("keep", "standalone"):
+                    return "member has a keep or standalone decision"
+        return ""
+
+    def _clear_freeze_samples(self, scope):
+        self.freeze_usage.pop(scope, None)
+        self.manual_freeze_usage.pop(scope, None)
+        self.freeze_idle_since.pop(scope, None)
+
+    def _thaw_scope(self, scope, reason, *, authority="mode", managed_only=True):
+        """Thaw one safe, validated scope and clear its recovery record after success."""
+        if (
+            not isinstance(scope, str)
+            or not cgroup.valid_rel(scope)
+            or scope == "manager"
+            or scope.startswith("manager/")
+        ):
+            return {"ok": False, "error": "invalid or managed scope"}
+        record = self.store.data.get("frozen_scopes", {}).get(scope)
+        if managed_only and record is None:
+            return {"ok": False, "error": "scope is not frozen by taema"}
+        path = os.path.join(cgroup.base(), scope)
+        value = self._freeze_value(path)
+        if value is None:
+            if not os.path.exists(path):
                 with self.store.decision_context(
                     "thaw",
                     scope=scope,
                     authority=authority,
                     mode=self.mode,
-                    why=why,
+                    why=reason,
                 ):
-                    with open(freeze, "w", encoding="ascii") as target:
-                        target.write("0\n")
+                    self.store.clear_frozen_scope(scope)
                     self.store.log(
                         event="thaw",
                         scope=scope,
                         reason=reason,
-                        target=self.store._target(veto) if veto else None,
-                        source=veto.get("source") if veto else "hold",
+                        source=(record or {}).get("source", "external"),
+                        thawed=False,
+                        stale=True,
                     )
-            except OSError as error:
+                self._clear_freeze_samples(scope)
+                self._save_if_idle()
+                return {"ok": True, "scope": scope, "thawed": False, "stale": True}
+            self.store.log(
+                event="thaw_failed",
+                scope=scope,
+                reason="%s: freeze state is unavailable" % reason,
+            )
+            return {"ok": False, "error": "freeze state is unavailable"}
+        try:
+            with self.store.decision_context(
+                "thaw",
+                scope=scope,
+                authority=authority,
+                mode=self.mode,
+                why=reason,
+            ):
+                if value == "1":
+                    with open(
+                        os.path.join(path, "cgroup.freeze"), "w", encoding="ascii"
+                    ) as target:
+                        target.write("0\n")
+                self.store.clear_frozen_scope(scope)
                 self.store.log(
-                    event="thaw_failed",
+                    event="thaw",
                     scope=scope,
-                    reason="%s: %s" % (self.store.hold_reason(scope) or "hold", error),
+                    reason=reason,
+                    source=(record or {}).get("source", "external"),
+                    thawed=value == "1",
                 )
+        except OSError as error:
+            self.store.log(
+                event="thaw_failed", scope=scope, reason="%s: %s" % (reason, error)
+            )
+            return {"ok": False, "error": "could not thaw %s: %s" % (scope, error)}
+        self._clear_freeze_samples(scope)
+        self._save_if_idle()
+        return {"ok": True, "scope": scope, "thawed": value == "1"}
+
+    def thaw_all_managed_scopes(self, reason, *, sources=None):
+        """Thaw recorded Taema freezes, optionally restricted to their origin."""
+        managed = self.store.data.get("frozen_scopes", {})
+        if not isinstance(managed, dict):
+            return []
+        results = []
+        for scope, record in list(managed.items()):
+            if sources is not None and (record or {}).get("source", "auto") not in sources:
+                continue
+            result = self._thaw_scope(scope, reason, managed_only=True)
+            results.append(result)
+        if results:
+            self._save_if_idle()
+        return results
+
+    def _manual_freeze_cpu_reason(self, scope, path, members):
+        """Require a stable, measured 60-second idle window for a manual freeze."""
+        now = time.time()
+        usage = engine._cpu_usage(path)
+        if usage is None:
+            self.manual_freeze_usage.pop(scope, None)
+            return "CPU state unknown"
+        prior = self.manual_freeze_usage.get(scope)
+        self.manual_freeze_usage[scope] = (usage, now, members)
+        if prior is None or prior[2] != members or now - prior[1] < 60.0:
+            return "CPU idle window unavailable; need a stable 60-second sample"
+        if usage < prior[0]:
+            self.freeze_idle_since.pop(scope, None)
+            return "CPU counter changed during idle sample"
+        cpu = 100.0 * (usage - prior[0]) / ((now - prior[1]) * 1_000_000)
+        limit = self.cfg.get("freeze", {}).get("cpu_idle_max", 0.5)
+        if cpu > limit:
+            self.freeze_idle_since.pop(scope, None)
+            return "CPU %.3f%% is above the %.3f%% idle limit" % (cpu, limit)
+        return ""
+
+    def freeze_scope(
+        self,
+        scope,
+        *,
+        manual=False,
+        reason="eligible idle leftover",
+        cpu_verified=False,
+    ):
+        """Freeze one known-safe leftover, using the authorization ladder first."""
+        if not self._freeze_config_enabled():
+            return {"ok": False, "error": "freezing is disabled by configuration"}
+        trigger = authorization.MANUAL_FREEZE if manual else authorization.FREEZE
+        decision = self.authorize(
+            trigger, authorization.Facts(scope=scope, leftover=True)
+        )
+        if decision.verdict != authorization.ACT:
+            return {"ok": False, "error": decision.reason}
+        path = os.path.join(cgroup.base(), scope)
+        members = tuple(sorted(cgroup.tree_procs(path)))
+        self.lineage.observe(inspect.ProcTable.scan())
+        snapshot = inspect.Snapshot()
+        safety = self._freeze_safety_reason(scope, path, snapshot)
+        if safety:
+            return {"ok": False, "error": safety}
+        value = self._freeze_value(path)
+        if value is None:
+            return {"ok": False, "error": "freeze control is unavailable"}
+        record = self.store.data.get("frozen_scopes", {}).get(scope)
+        if value == "1":
+            if record is not None:
+                self._clear_freeze_samples(scope)
+                return {"ok": True, "scope": scope, "frozen": True, "already": True}
+            return {"ok": False, "error": "scope is already frozen outside taema"}
+        if manual and not cpu_verified:
+            cpu_reason = self._manual_freeze_cpu_reason(scope, path, members)
+            if cpu_reason:
+                return {"ok": False, "error": cpu_reason}
+        if tuple(sorted(cgroup.tree_procs(path))) != members:
+            return {"ok": False, "error": "scope membership changed during inspection"}
+        # Re-read after CPU sampling so an external or concurrent freeze cannot race
+        # the inspection above into a duplicate or unauthorized managed record.
+        value = self._freeze_value(path)
+        if value is None:
+            return {"ok": False, "error": "freeze control is unavailable"}
+        record = self.store.data.get("frozen_scopes", {}).get(scope)
+        if value == "1":
+            if record is not None:
+                self._clear_freeze_samples(scope)
+                return {"ok": True, "scope": scope, "frozen": True, "already": True}
+            return {"ok": False, "error": "scope is already frozen outside taema"}
+        maximum = self.cfg.get("freeze", {}).get("max_frozen", 32)
+        if scope not in self.store.data.get("frozen_scopes", {}) and len(
+            self.store.data.get("frozen_scopes", {})
+        ) >= maximum:
+            return {"ok": False, "error": "managed freeze limit reached"}
+        source = "manual" if manual else "auto"
+        why = reason or "eligible idle leftover"
+        try:
+            with self.store.decision_context(
+                "freeze",
+                scope=scope,
+                authority=decision.authority or ("manual" if manual else "mode"),
+                mode=self.mode,
+                why=why,
+            ) as audit:
+                self.store.set_frozen_scope(
+                    scope,
+                    time.time(),
+                    decision_id=audit["id"],
+                    source=source,
+                )
+                # Persist the recovery intent before changing kernel state. A crash from here
+                # onward is recoverable on startup, including one between the write and log.
+                self.store.save()
+                with open(
+                    os.path.join(path, "cgroup.freeze"), "w", encoding="ascii"
+                ) as target:
+                    target.write("1\n")
+                self.store.log(
+                    event="freeze", scope=scope, reason=why, source=source
+                )
+        except OSError as error:
+            if self._freeze_value(path) == "0":
+                self.store.clear_frozen_scope(scope)
+                self.store.save()
+            self.store.log(
+                event="freeze_refused", scope=scope, reason="%s: %s" % (why, error)
+            )
+            return {"ok": False, "error": "could not freeze %s: %s" % (scope, error)}
+        # A frozen interval is not an idle CPU sample. Drop both trackers so any later
+        # thaw path, including one initiated by the stop engine, must begin afresh.
+        self._clear_freeze_samples(scope)
+        self._save_if_idle()
+        return {"ok": True, "scope": scope, "frozen": True}
+
+    def freeze_pass(self, now=None):
+        """Sample leftover CPU and freeze only scopes idle for the configured grace."""
+        now = time.time() if now is None else now
+        managed = self.store.data.get("frozen_scopes", {})
+        if not self._freeze_config_enabled():
+            self.freeze_usage.clear()
+            self.manual_freeze_usage.clear()
+            self.freeze_idle_since.clear()
+            self.thaw_all_managed_scopes("freezing disabled by profile or flag")
+            return []
+        if not self._freeze_auto_enabled():
+            self.freeze_usage.clear()
+            self.freeze_idle_since.clear()
+            self.thaw_all_managed_scopes(
+                "automatic freezing disabled by mode", sources={"auto"}
+            )
+            return []
+
+        base = os.path.join(cgroup.base(), "leftover")
+        if not os.path.isdir(base):
+            self.freeze_usage.clear()
+            self.freeze_idle_since.clear()
+            return []
+        leaves = {
+            "leftover/" + os.path.basename(path): path
+            for path in cgroup.subdirs(base)
+            if not cgroup.subdirs(path)
+        }
+        snapshot = None
+        for scope in list(managed):
+            record = managed.get(scope) or {}
+            if record.get("source", "auto") != "auto":
+                continue
+            path = os.path.join(cgroup.base(), scope)
+            if scope not in leaves:
+                self._thaw_scope(
+                    scope,
+                    "freeze eligibility changed: scope is no longer a leaf",
+                )
+                continue
+            if not os.path.isdir(path):
+                self._thaw_scope(scope, "frozen scope was removed")
+                continue
+            if self._freeze_value(path) == "0":
+                self.store.clear_frozen_scope(scope)
+                self.freeze_usage.pop(scope, None)
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            if snapshot is None:
+                snapshot = inspect.Snapshot()
+            safety = self._freeze_safety_reason(scope, path, snapshot)
+            if safety:
+                self._thaw_scope(scope, "freeze eligibility changed: " + safety)
+
+        managed = self.store.data.get("frozen_scopes", {})
+        automatic = [
+            (scope, record)
+            for scope, record in managed.items()
+            if isinstance(record, dict) and record.get("source", "auto") == "auto"
+        ]
+        maximum = self.cfg.get("freeze", {}).get("max_frozen", 32)
+        for scope, _record in sorted(automatic, key=lambda item: item[1].get("since", 0))[
+            : max(0, len(managed) - maximum)
+        ]:
+            self._thaw_scope(scope, "automatic freeze limit reduced")
+        managed = self.store.data.get("frozen_scopes", {})
+        automatic_count = len(managed)
+        results = []
+        seen = set()
+        for scope, path in sorted(leaves.items()):
+            seen.add(scope)
+            record = managed.get(scope)
+            if record is not None:
+                continue
+            if automatic_count >= maximum:
+                self.freeze_usage.pop(scope, None)
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            if snapshot is None:
+                snapshot = inspect.Snapshot()
+            safety = self._freeze_safety_reason(scope, path, snapshot)
+            if safety:
+                self.freeze_usage.pop(scope, None)
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            pids = tuple(sorted(cgroup.tree_procs(path)))
+            usage = engine._cpu_usage(path)
+            prior = self.freeze_usage.get(scope)
+            if usage is None or not pids:
+                self.freeze_usage.pop(scope, None)
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            self.freeze_usage[scope] = (usage, now, pids)
+            if prior is None or prior[2] != pids or now - prior[1] < 60.0:
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            if usage < prior[0]:
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            elapsed = now - prior[1]
+            cpu = 100.0 * max(0, usage - prior[0]) / (elapsed * 1_000_000)
+            cpu_limit = self.cfg.get("freeze", {}).get("cpu_idle_max", 0.5)
+            if cpu > cpu_limit:
+                self.freeze_idle_since.pop(scope, None)
+                continue
+            idle_since = self.freeze_idle_since.setdefault(scope, prior[1])
+            after = float(self.cfg.get("freeze", {}).get("after", 120))
+            if now - idle_since < after:
+                continue
+            result = self.freeze_scope(
+                scope,
+                manual=False,
+                reason="CPU %.3f%% idle for %.0fs" % (cpu, now - idle_since),
+                cpu_verified=True,
+            )
+            results.append(result)
+            if result.get("ok"):
+                automatic_count += 1
+        for scope in set(self.freeze_usage) - seen:
+            self.freeze_usage.pop(scope, None)
+            self.freeze_idle_since.pop(scope, None)
+        return results
+
+    def thaw_held_scopes(self):
+        """Thaw managed freezes as soon as a matching hold or veto becomes active."""
+        managed = self.store.data.get("frozen_scopes", {})
+        if not isinstance(managed, dict):
+            return
+        for scope in list(managed):
+            if not isinstance(scope, str) or not cgroup.valid_rel(scope):
+                continue
+            path = os.path.join(cgroup.base(), scope)
+            held = self.store.hold_reason(scope)
+            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            veto = engine.veto_for_scope(self.store, path, unit=unit)
+            if veto:
+                reason = self.store.describe_veto(veto)
+                self._thaw_scope(scope, "veto: " + reason, authority="veto")
+            elif held:
+                self._thaw_scope(scope, "hold: " + held, authority="hold")
 
     def _on_signal(self, signum, _frame):
         if signum == getattr(signal, "SIGUSR1", None):
@@ -4554,6 +5000,7 @@ class Daemon:
             old_state_dir = old_cfg.get("paths", {}).get("state_dir")
             new_state_dir = cfg.get("paths", {}).get("state_dir")
             if policy.expand(old_state_dir) != policy.expand(new_state_dir):
+                self.thaw_all_managed_scopes("state directory changed")
                 old_holds = old_store.hold_status(
                     include_pending=True, include_runtime=False
                 )
@@ -4619,6 +5066,8 @@ class Daemon:
             1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
         )
         self.config_error = None
+        self.freeze_usage.clear()
+        self.freeze_idle_since.clear()
         active_profile = cfg.get("_profile_name", "auto")
         if active_profile != previous_profile:
             self.profile_reason = reason or cfg.get(
@@ -4646,6 +5095,12 @@ class Daemon:
             mode=self.mode,
             sources=list(cfg.get("_sources", [])),
         )
+        if not self._freeze_config_enabled():
+            self.thaw_all_managed_scopes("freezing disabled by profile or flag")
+        elif not self._freeze_auto_enabled():
+            self.thaw_all_managed_scopes(
+                "automatic freezing disabled by mode", sources={"auto"}
+            )
         try:
             self.memory_governor_pass(now=time.time())
         except Exception as error:
@@ -4684,7 +5139,7 @@ class Daemon:
         )
 
     def next_timeout(self, now=None):
-        """Seconds until the next adopt, gc, memory, or reclaim pass is due."""
+        """Seconds until the next scheduled lifecycle or resource pass is due."""
         if self.collector_events:
             return 0.0
         now = time.time() if now is None else now
@@ -4693,6 +5148,8 @@ class Daemon:
             self.last["gc"] + self.iv_gc,
             now + MAX_SLEEP,
         ] + [d[0] for d in self.deadlines]
+        if self.last.get("freeze", 0.0):
+            due_times.append(self.last["freeze"] + 60.0)
         due_times.extend(
             since + qos.DEBOUNCE_SECONDS
             for _candidate, since in self.qos_pending.values()
@@ -4764,6 +5221,9 @@ class Daemon:
             ):
                 if self.queue_collector_event(ReclaimReconcile()):
                     self.last["reclaim"] = now
+            if now - self.last.get("freeze", 0.0) >= 60.0:
+                self.last["freeze"] = now
+                self.guarded(self.freeze_pass)
             self.drain_collector_events()
             self.guarded(self.qos_pass)
         finally:
@@ -5981,6 +6441,7 @@ class Daemon:
             self._drop_subscriber(conn)
         for qid in list(self.pending):
             self.drop_question(qid)
+        self.guarded(lambda: self.thaw_all_managed_scopes("daemon shutdown"))
         self.guarded(lambda: self.memory_governor_pass(force_restore=True))
         self.store.log(event="daemon_stop")
         self.store.save()

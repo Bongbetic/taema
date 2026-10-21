@@ -362,10 +362,11 @@ class UndoDaemonTests(unittest.TestCase):
                 {"file": "cpu.weight", "value": "100"},
                 {"file": "io.weight", "value": "default 100"},
             ],
-            "oom_score_adj": [{"pid": 42, "start": 99, "value": 0}],
+            "oom_score_adj": [{"pid": 42, "start": 99, "value": 0, "applied": 500}],
         }
         with (
             mock.patch.object(service.inspect, "starttime", return_value=99),
+            mock.patch.object(service.inspect, "uid_of", return_value=os.getuid()),
             mock.patch.object(service.engine, "helper_oom_restore") as restore_oom,
         ):
             result = self.daemon._undo_action_effect(
@@ -378,7 +379,42 @@ class UndoDaemonTests(unittest.TestCase):
         self.assertEqual(
             Path(os.path.join(qos_path, "io.weight")).read_text(), "default 100\n"
         )
-        restore_oom.assert_called_once_with(self.daemon.cfg, 42, 99, 0)
+        restore_oom.assert_called_once_with(self.daemon.cfg, 42, 99, 0, 500)
+
+    def test_restore_filters_stale_oom_history_before_applying_record_limit(self):
+        scope = "leftover/qos-history"
+        self.cg.leaf(scope)
+        stale = [
+            {"pid": pid, "start": 1, "value": -100, "applied": 500}
+            for pid in range(10000, 10000 + service.MAX_QOS_OOM_RECORDS + 1)
+        ]
+        oom_values = stale + [{"pid": 42, "start": 99, "value": 0, "applied": 500}]
+
+        def starttime(pid):
+            if pid == 42:
+                return 99
+            raise ProcessLookupError(pid)
+
+        with (
+            mock.patch.object(service.inspect, "starttime", side_effect=starttime),
+            mock.patch.object(service.inspect, "uid_of", return_value=os.getuid()),
+            mock.patch.object(service.engine, "helper_oom_restore") as restore_oom,
+        ):
+            result = self.daemon._undo_action_effect(
+                {
+                    "id": 3,
+                    "scope": scope,
+                    "undo": {
+                        "operation": "restore_priorities",
+                        "resources": [],
+                        "oom_score_adj": oom_values,
+                    },
+                }
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["oom_score_adj"], 1)
+        restore_oom.assert_called_once_with(self.daemon.cfg, 42, 99, 0, 500)
 
     def test_undo_containment_adopts_live_members_as_standalone(self):
         decision = self.daemon.store.record_decision(

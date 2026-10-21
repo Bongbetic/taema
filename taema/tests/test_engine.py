@@ -85,5 +85,58 @@ class PlanStop(unittest.TestCase):
         )
 
 
+class OOMHelperCommands(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"paths": {"helper": "/usr/libexec/taema-attach"}}
+
+    def test_restore_uses_the_helper_recorded_pair(self):
+        with (
+            mock.patch.object(engine, "helper_path", return_value="/helper"),
+            mock.patch.object(
+                engine.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0, stderr=""),
+            ) as run,
+        ):
+            engine.helper_oom_restore(self.cfg, 42, 900, -100, 500)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "-n", "/helper", "oom-restore", "42", "900", "-100", "500"],
+        )
+
+    def test_record_registers_original_and_applied_values(self):
+        with (
+            mock.patch.object(engine, "helper_path", return_value="/helper"),
+            mock.patch.object(
+                engine.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0, stderr=""),
+            ) as run,
+        ):
+            engine.helper_oom_record(self.cfg, 42, 900, -100, 500)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "-n", "/helper", "oom-record", "42", "900", "-100", "500"],
+        )
+
+    def test_invalid_restore_and_record_pairs_are_refused_before_sudo(self):
+        with mock.patch.object(engine.subprocess, "run") as run:
+            for args in (
+                (42, 900, 501, 500),
+                (42, 900, -100, -101),
+                (True, 900, -100, 500),
+            ):
+                with self.subTest(args=args), self.assertRaises(engine.Refused):
+                    engine.helper_oom_restore(self.cfg, *args)
+            for args in (
+                (42, 900, 500, 200),
+                (42, 900, -100, -100),
+                (True, 900, -100, 500),
+            ):
+                with self.subTest(args=args), self.assertRaises(engine.Refused):
+                    engine.helper_oom_record(self.cfg, *args)
+        run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

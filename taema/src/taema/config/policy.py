@@ -299,6 +299,26 @@ def _validate_config(cfg, sources):
     if cfg.get("mode") not in MODES:
         source = sources.get("mode", "built-in defaults")
         raise ValueError("%s:1:1: mode must be one of %s" % (source, MODES))
+    guard = cfg.get("guard")
+    guard_source = sources.get("guard", "built-in defaults")
+    if not isinstance(guard, dict):
+        raise ValueError("%s:1:1: guard must be a table" % guard_source)
+    for name in ("oom_adj_leftover", "oom_adj_shared"):
+        value = guard.get(name, _DEFAULTS["guard"][name])
+        source = sources.get("guard." + name, guard_source)
+        if type(value) is not int or not -1000 <= value <= 1000:
+            raise ValueError(
+                "%s:1:1: guard.%s must be an integer from -1000 to 1000"
+                % (source, name)
+            )
+    group_oom = guard.get(
+        "oom_group_leftover", _DEFAULTS["guard"]["oom_group_leftover"]
+    )
+    group_source = sources.get("guard.oom_group_leftover", guard_source)
+    if type(group_oom) is not bool:
+        raise ValueError(
+            "%s:1:1: guard.oom_group_leftover must be a boolean" % group_source
+        )
     learn = cfg.get("learn")
     learn_source = sources.get("learn", "built-in defaults")
     if not isinstance(learn, dict):

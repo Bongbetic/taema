@@ -27,6 +27,7 @@ from ..model import authorization
 from ..core import (
     cgroup,
     memory,
+    oom,
     qos,
     process as inspect,
     lineage,
@@ -64,6 +65,8 @@ RESTORE_START_TIMEOUT = 15.0
 MAX_EVENT_REPLAY = 1000
 SUBSCRIBER_CLOSE_TTL = 1.0
 MAX_COLLECTOR_EVENTS = 4096
+MAX_QOS_OOM_RECORDS = 4096
+MAX_QOS_OOM_UNDO_INPUT = 16384
 
 
 @dataclass(frozen=True, slots=True)
@@ -2557,7 +2560,8 @@ class Daemon:
         if not isinstance(record, dict):
             record = {}
         resources = record.get("originals", [])
-        if record.get("applied") and resources:
+        oom_values = record.get("oom_score_adj", [])
+        if record.get("applied") and (resources or oom_values):
             result = self._undo_action_effect(
                 {
                     "id": "qos-restore",
@@ -2565,6 +2569,7 @@ class Daemon:
                     "undo": {
                         "operation": "restore_priorities",
                         "resources": resources,
+                        "oom_score_adj": oom_values,
                     },
                 }
             )
@@ -2655,6 +2660,229 @@ class Daemon:
             authorization.QOS,
             authorization.Facts(scope=scope, hard_safety=self._qos_hard_safety(path)),
         )
+
+    def _qos_oom_target(self, resource_class):
+        key = {
+            "leftover": "oom_adj_leftover",
+            "shared": "oom_adj_shared",
+        }.get(resource_class)
+        if key is None:
+            return None
+        guard = self.cfg.get("guard", {})
+        if not isinstance(guard, dict):
+            return None
+        target = guard.get(key, policy._DEFAULTS["guard"][key])
+        if type(target) is not int or not oom.MIN_SCORE <= target <= oom.MAX_SCORE:
+            if self.store.changed("qos_oom_config:" + key, repr(target)):
+                self.store.log(
+                    event="qos_refused",
+                    why="guard.%s must be an integer from -1000 to 1000" % key,
+                )
+            return None
+        return target
+
+    def _qos_oom_group_write(self, path, resource_class):
+        guard = self.cfg.get("guard", {})
+        if (
+            resource_class != "leftover"
+            or not isinstance(guard, dict)
+            or guard.get("oom_group_leftover", True) is not True
+        ):
+            return None
+        control = os.path.join(path, "memory.oom.group")
+        try:
+            with open(control, encoding="ascii") as source:
+                current = source.read().strip()
+        except OSError:
+            if self.store.changed("qos_oom_group:" + path, "missing"):
+                self.store.log(
+                    event="qos_controls_unavailable",
+                    scope=cgroup.rel(path),
+                    control="memory.oom.group",
+                )
+            return None
+        if current == "1":
+            return None
+        if current != "0":
+            if self.store.changed("qos_oom_group:" + path, current):
+                self.store.log(
+                    event="qos_refused",
+                    scope=cgroup.rel(path),
+                    why="memory.oom.group has an invalid value",
+                )
+            return None
+        return qos.ResourceWrite("memory.oom.group", "1", current)
+
+    def _qos_restore_disabled_oom_group(self, scope, path, record):
+        """Restore a taema-owned group flag after live config turns it off."""
+        guard = self.cfg.get("guard", {})
+        if (
+            record.get("class") != "leftover"
+            or not isinstance(guard, dict)
+            or guard.get("oom_group_leftover", True) is True
+        ):
+            return True
+        originals = record.get("originals", [])
+        group = next(
+            (
+                item
+                for item in originals
+                if isinstance(item, dict) and item.get("file") == "memory.oom.group"
+            ),
+            None,
+        )
+        if group is None:
+            return True
+        original = group.get("value")
+        if not isinstance(original, str) or original.strip() not in ("0", "1"):
+            self.store.log(
+                event="qos_restore_failed",
+                scope=scope,
+                why="memory.oom.group original value is invalid",
+            )
+            return False
+        try:
+            control = os.path.join(path, "memory.oom.group")
+            with open(control, encoding="ascii") as source:
+                current = source.read().strip()
+            if current == "1":
+                qos.write_control(path, "memory.oom.group", original.strip())
+        except OSError as error:
+            self.store.log(
+                event="qos_restore_failed",
+                scope=scope,
+                why="could not restore memory.oom.group: %s" % error,
+            )
+            return False
+        record["originals"] = [
+            item
+            for item in originals
+            if not (isinstance(item, dict) and item.get("file") == "memory.oom.group")
+        ]
+        self.store.dirty = True
+        return True
+
+    @staticmethod
+    def _qos_live_oom_records(values):
+        """Keep only valid OOM originals that still identify this user's process."""
+        if not isinstance(values, list):
+            return []
+        live = []
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            pid, start, original, applied = (
+                item.get("pid"),
+                item.get("start"),
+                item.get("value"),
+                item.get("applied"),
+            )
+            if (
+                not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 1
+                or not isinstance(start, int)
+                or isinstance(start, bool)
+                or start <= 0
+                or not isinstance(original, int)
+                or isinstance(original, bool)
+                or not -1000 <= original <= 1000
+                or not isinstance(applied, int)
+                or isinstance(applied, bool)
+                or not original < applied <= 1000
+            ):
+                continue
+            try:
+                if (
+                    inspect.starttime(pid) != start
+                    or inspect.uid_of(pid) != os.getuid()
+                ):
+                    continue
+            except (OSError, ProcessLookupError, ValueError):
+                continue
+            live.append(item)
+        return live
+
+    def _qos_oom_candidates(self, path, resource_class, existing=()):
+        target = self._qos_oom_target(resource_class)
+        if target is None:
+            return []
+        known = {
+            (item.get("pid"), item.get("start"))
+            for item in existing
+            if isinstance(item, dict)
+        }
+        candidates = []
+        for pid in cgroup.tree_procs(path):
+            if policy.protected_reason(pid, self.cfg):
+                continue
+            try:
+                start = inspect.starttime(pid)
+                if (pid, start) in known:
+                    continue
+                if inspect.uid_of(pid) != os.getuid():
+                    continue
+                original = oom.read_score(pid)
+            except (OSError, ValueError, ProcessLookupError):
+                continue
+            applied = max(original, target)
+            if applied > original:
+                candidates.append(
+                    {
+                        "pid": pid,
+                        "start": start,
+                        "value": original,
+                        "applied": applied,
+                    }
+                )
+        return candidates
+
+    def _register_qos_oom(self, scope, path, candidates):
+        registered = []
+        for item in candidates:
+            decision = self._qos_authorization(scope, path)
+            if decision.verdict != authorization.ACT:
+                for prior in registered:
+                    try:
+                        engine.helper_oom_restore(
+                            self.cfg,
+                            prior["pid"],
+                            prior["start"],
+                            prior["value"],
+                            prior["applied"],
+                        )
+                    except engine.Refused as error:
+                        self.store.log(
+                            event="qos_restore_failed",
+                            scope=scope,
+                            pid=prior["pid"],
+                            why="could not clear unused OOM record: %s" % error,
+                        )
+                raise engine.Refused(decision.reason or "OOM shaping is not authorized")
+            pid, start, original, applied = (
+                item["pid"],
+                item["start"],
+                item["value"],
+                item["applied"],
+            )
+            try:
+                if (
+                    inspect.starttime(pid) != start
+                    or inspect.uid_of(pid) != os.getuid()
+                    or oom.read_score(pid) != original
+                ):
+                    continue
+                engine.helper_oom_record(self.cfg, pid, start, original, applied)
+            except (OSError, ValueError, engine.Refused) as error:
+                self.store.log(
+                    event="qos_refused",
+                    scope=scope,
+                    pid=pid,
+                    why="OOM priority record refused: %s" % error,
+                )
+                continue
+            registered.append(item)
+        return registered
 
     def _qos_tree_cpu_usage(self, path):
         # cpu.stat is hierarchical and includes descendant usage.
@@ -2756,22 +2984,39 @@ class Daemon:
         observing = decision.verdict == authorization.WOULD_ACT
         if observing:
             plan = qos.plan(path, resource_class)
-            if plan.available and self.store.changed(
-                "qos_would:" + scope, (resource_class, plan.available)
+            oom_candidates = self._qos_oom_candidates(
+                path, resource_class, previous.get("oom_score_adj", [])
+            )
+            group_write = self._qos_oom_group_write(path, resource_class)
+            controls = list(plan.available)
+            if group_write is not None:
+                controls.append(group_write.name)
+            would_signature = (
+                resource_class,
+                tuple(controls),
+                tuple(
+                    (item["pid"], item["start"], item["value"], item["applied"])
+                    for item in oom_candidates
+                ),
+            )
+            if (controls or oom_candidates) and self.store.changed(
+                "qos_would:" + scope, would_signature
             ):
                 self.store.log(
                     event="qos_would",
                     scope=scope,
                     resource_class=resource_class,
-                    controls=list(plan.available),
+                    controls=controls,
+                    oom_pids=[item["pid"] for item in oom_candidates],
                 )
             scopes[scope] = {
                 "class": resource_class,
                 "active": False,
                 "applied": False,
                 "originals": [],
+                "oom_score_adj": [],
                 "available": list(plan.available),
-                "deprioritized": bool(plan.available),
+                "deprioritized": bool(plan.available or oom_candidates or group_write),
             }
             self.store.dirty = True
             return True
@@ -2797,14 +3042,51 @@ class Daemon:
                 ),
                 plan.available,
             )
-        if plan.writes:
-            decision = self._qos_authorization(scope, path)
-            if decision.verdict != authorization.ACT:
-                if self.store.changed("qos_refused:" + scope, decision.reason):
-                    self.store.log(
-                        event="qos_refused", scope=scope, reason=decision.reason
-                    )
-                return False
+        previous_oom_values = self._qos_live_oom_records(
+            previous.get("oom_score_adj", [])
+        )
+        if previous_oom_values != previous.get("oom_score_adj", []):
+            previous["oom_score_adj"] = previous_oom_values
+            self.store.dirty = True
+        previous_resources = previous.get("originals", [])
+        previous_resource_names = {
+            item.get("file") for item in previous_resources if isinstance(item, dict)
+        }
+        group_write = self._qos_oom_group_write(path, resource_class)
+        if group_write is not None and group_write.name not in previous_resource_names:
+            plan = qos.QoSPlan(plan.writes + (group_write,), plan.available)
+        new_oom_values = []
+        decision = self._qos_authorization(scope, path)
+        if decision.verdict != authorization.ACT:
+            if self.store.changed("qos_refused:" + scope, decision.reason):
+                self.store.log(event="qos_refused", scope=scope, reason=decision.reason)
+            return False
+        try:
+            candidates = self._qos_oom_candidates(
+                path, resource_class, previous_oom_values
+            )
+            remaining_records = max(0, MAX_QOS_OOM_RECORDS - len(previous_oom_values))
+            if len(candidates) > remaining_records:
+                self.store.log(
+                    event="qos_controls_unavailable",
+                    scope=scope,
+                    control="oom_score_adj",
+                    reason="the bounded restore record is full",
+                )
+                candidates = candidates[:remaining_records]
+            new_oom_values = self._register_qos_oom(scope, path, candidates)
+        except engine.Refused as error:
+            self.store.log(event="qos_refused", scope=scope, why=str(error))
+            return False
+        oom_values_by_pid = {
+            (item.get("pid"), item.get("start")): item
+            for item in previous_oom_values
+            if isinstance(item, dict)
+        }
+        for item in new_oom_values:
+            oom_values_by_pid[(item["pid"], item["start"])] = item
+        oom_values = [oom_values_by_pid[key] for key in sorted(oom_values_by_pid)]
+        if plan.writes or new_oom_values:
             originals_by_file = {
                 item["file"]: item["value"]
                 for item in previous.get("originals", [])
@@ -2824,7 +3106,15 @@ class Daemon:
             undo = {
                 "operation": "restore_priorities",
                 "resources": originals,
+                "oom_score_adj": oom_values,
                 "qos": True,
+            }
+            rollback = {
+                "operation": "restore_priorities",
+                "resources": [
+                    {"file": item.name, "value": item.original} for item in plan.writes
+                ],
+                "oom_score_adj": new_oom_values,
             }
             try:
                 with self.store.decision_context(
@@ -2836,24 +3126,47 @@ class Daemon:
                     undo=undo,
                 ):
                     qos.apply(path, plan)
+                    for item in new_oom_values:
+                        decision = self._qos_authorization(scope, path)
+                        if decision.verdict != authorization.ACT:
+                            raise engine.Refused(
+                                decision.reason or "OOM shaping is not authorized"
+                            )
+                        pid = item["pid"]
+                        if (
+                            policy.protected_reason(pid, self.cfg)
+                            or inspect.starttime(pid) != item["start"]
+                            or inspect.uid_of(pid) != os.getuid()
+                            or oom.read_score(pid) != item["value"]
+                        ):
+                            raise engine.Refused(
+                                "OOM priority target changed before shaping"
+                            )
+                        oom.write_score(
+                            pid, item["applied"], item["start"], item["value"]
+                        )
                     self.store.log(
                         event="qos_applied",
                         scope=scope,
                         resource_class=resource_class,
                         controls=list(plan.available),
+                        oom_pids=[item["pid"] for item in new_oom_values],
                     )
-            except OSError as error:
+            except (OSError, ValueError, engine.Refused) as error:
                 try:
-                    self._undo_action_effect(
-                        {
-                            "id": "qos-rollback",
-                            "scope": scope,
-                            "undo": {
-                                "operation": "restore_priorities",
-                                "resources": rollback,
-                            },
-                        }
+                    rollback_result = self._undo_action_effect(
+                        {"id": "qos-rollback", "scope": scope, "undo": rollback}
                     )
+                    if not isinstance(rollback_result, dict) or not rollback_result.get(
+                        "ok"
+                    ):
+                        self.store.log(
+                            event="qos_restore_failed",
+                            scope=scope,
+                            why=(rollback_result or {}).get(
+                                "error", "priority rollback failed"
+                            ),
+                        )
                 except (OSError, engine.Refused):
                     pass
                 self.store.log(event="qos_refused", scope=scope, error=str(error))
@@ -2871,14 +3184,15 @@ class Daemon:
         scopes[scope] = {
             "class": resource_class,
             "active": True,
-            "applied": bool(originals),
+            "applied": bool(originals or oom_values),
             "originals": originals,
+            "oom_score_adj": oom_values,
             "available": list(plan.available),
             "controllers_ready": controllers_ready,
             "controller_retry_at": (
                 0.0 if controllers_ready else now + qos.CONTROLLER_RETRY_SECONDS
             ),
-            "deprioritized": bool(plan.available),
+            "deprioritized": bool(plan.available or oom_values or originals),
         }
         self.store.dirty = True
         return True
@@ -2964,6 +3278,11 @@ class Daemon:
                 if unit_class == "normal"
                 else unit_class or qos.classify(scope, idle_times, now)
             )
+            if record and record.get("active"):
+                decision = self._qos_authorization(scope, path)
+                if decision.verdict == authorization.KEEP:
+                    self._restore_qos_scope(scope)
+                    continue
             if resource_class is not None and self._qos_scope_kept(path):
                 self._restore_qos_scope(
                     scope, exempt=True, classification=resource_class
@@ -2994,22 +3313,62 @@ class Daemon:
                 plan = qos.plan(path, resource_class)
                 if self.mode == "observe":
                     self.qos_pending.pop(scope, None)
-                    if plan.available and self.store.changed(
-                        "qos_would:" + scope, (resource_class, plan.available)
+                    oom_candidates = self._qos_oom_candidates(
+                        path, resource_class, record.get("oom_score_adj", [])
+                    )
+                    group_write = self._qos_oom_group_write(path, resource_class)
+                    controls = list(plan.available)
+                    if group_write is not None and group_write.name not in {
+                        item.get("file")
+                        for item in record.get("originals", [])
+                        if isinstance(item, dict)
+                    }:
+                        controls.append(group_write.name)
+                    signature = (
+                        resource_class,
+                        tuple(controls),
+                        tuple(
+                            (item["pid"], item["start"], item["value"], item["applied"])
+                            for item in oom_candidates
+                        ),
+                    )
+                    if (controls or oom_candidates) and self.store.changed(
+                        "qos_would:" + scope, signature
                     ):
                         self.store.log(
                             event="qos_would",
                             scope=scope,
                             resource_class=resource_class,
-                            controls=list(plan.available),
+                            controls=controls,
+                            oom_pids=[item["pid"] for item in oom_candidates],
                         )
                     continue
                 recorded_controls = set(record.get("available", []))
+                if not self._qos_restore_disabled_oom_group(scope, path, record):
+                    continue
                 newly_available = set(plan.available) - recorded_controls
+                recorded_resources = {
+                    item.get("file")
+                    for item in record.get("originals", [])
+                    if isinstance(item, dict)
+                }
+                group_write = self._qos_oom_group_write(path, resource_class)
+                group_available = (
+                    group_write is not None
+                    and group_write.name not in recorded_resources
+                )
+                new_oom_candidates = self._qos_oom_candidates(
+                    path, resource_class, record.get("oom_score_adj", [])
+                )
                 controller_retry_due = not record.get(
                     "controllers_ready", False
                 ) and now >= record.get("controller_retry_at", 0.0)
-                if not newly_available and not controller_retry_due:
+                if (
+                    not newly_available
+                    and not group_available
+                    and not new_oom_candidates
+                    and not controller_retry_due
+                ):
                     self.qos_pending.pop(scope, None)
                     continue
                 candidate = self.qos_pending.get(scope)
@@ -3198,12 +3557,18 @@ class Daemon:
                 not isinstance(resources, list)
                 or len(resources) > 16
                 or not isinstance(oom_values, list)
-                or len(oom_values) > 64
+                or len(oom_values) > MAX_QOS_OOM_UNDO_INPUT
                 or not resources
                 and not oom_values
             ):
                 return {"ok": False, "error": "priority undo payload is invalid"}
-            allowed_files = {"cpu.idle", "cpu.weight", "io.weight", "io.bfq.weight"}
+            allowed_files = {
+                "cpu.idle",
+                "cpu.weight",
+                "io.weight",
+                "io.bfq.weight",
+                "memory.oom.group",
+            }
             for item in resources:
                 if not isinstance(item, dict) or item.get("file") not in allowed_files:
                     return {"ok": False, "error": "priority resource is invalid"}
@@ -3211,7 +3576,7 @@ class Daemon:
                 if not isinstance(value, str) or not value or len(value) > 8192:
                     return {"ok": False, "error": "priority value is invalid"}
                 name = item["file"]
-                if name == "cpu.idle":
+                if name in ("cpu.idle", "memory.oom.group"):
                     valid_value = value.strip() in ("0", "1")
                 elif name == "cpu.weight":
                     valid_value = (
@@ -3247,10 +3612,11 @@ class Daemon:
             for item in oom_values:
                 if not isinstance(item, dict):
                     return {"ok": False, "error": "oom priority value is invalid"}
-                pid, start, value = (
+                pid, start, value, applied = (
                     item.get("pid"),
                     item.get("start"),
                     item.get("value"),
+                    item.get("applied"),
                 )
                 if (
                     not isinstance(pid, int)
@@ -3262,10 +3628,22 @@ class Daemon:
                     or not isinstance(value, int)
                     or isinstance(value, bool)
                     or not -1000 <= value <= 1000
-                    or inspect.starttime(pid) != start
+                    or not isinstance(applied, int)
+                    or isinstance(applied, bool)
+                    or not value < applied <= 1000
                 ):
-                    return {"ok": False, "error": "oom priority target is stale"}
-                safe_oom_values.append((pid, start, value))
+                    return {"ok": False, "error": "oom priority value is invalid"}
+                try:
+                    if (
+                        inspect.starttime(pid) != start
+                        or inspect.uid_of(pid) != os.getuid()
+                    ):
+                        continue
+                except (OSError, ProcessLookupError, ValueError):
+                    continue
+                safe_oom_values.append((pid, start, value, applied))
+            if len(safe_oom_values) > MAX_QOS_OOM_RECORDS:
+                return {"ok": False, "error": "priority undo payload is invalid"}
             try:
                 for item in resources:
                     commands = (
@@ -3275,8 +3653,8 @@ class Daemon:
                     )
                     for command in commands:
                         qos.write_control(path, item["file"], command)
-                for pid, start, value in safe_oom_values:
-                    engine.helper_oom_restore(self.cfg, pid, start, value)
+                for pid, start, value, applied in safe_oom_values:
+                    engine.helper_oom_restore(self.cfg, pid, start, value, applied)
             except (OSError, engine.Refused) as error:
                 return {
                     "ok": False,
@@ -3291,7 +3669,12 @@ class Daemon:
                     exemptions[scope] = held_class
                 self.qos_pending.pop(scope, None)
                 self.store.dirty = True
-            return {"ok": True, "scope": scope, "resources": len(resources)}
+            return {
+                "ok": True,
+                "scope": scope,
+                "resources": len(resources),
+                "oom_score_adj": len(safe_oom_values),
+            }
 
         if operation == "adopt_standalone":
             members = payload.get("members")

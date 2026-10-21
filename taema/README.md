@@ -246,10 +246,21 @@ for 7 days and asks you again. You never need a command to undo it.
 After a scope stays in one resource class for two seconds, active modes lower the priority of
 contained leftovers (`cpu.idle=1`, or CPU weight 10 as a fallback, and IO weight 10 where
 available). Shared helpers and idle background app scopes use CPU and IO weight 50. tæma records
-the original controls and restores them on undo, keep, or standalone answers. `observe` logs the
-planned changes without writing controls. `taema ls` and `taema explain scope:NAME` mark
-deprioritized scopes with `↓`; `taema doctor` reports missing controls. Leftover pid limits stay
-off by default.
+the original controls and restores them on undo, keep, or standalone answers. It also raises
+`oom_score_adj` to 500 for leftover members and 200 for shared helpers when their current value is
+lower; higher values are preserved. Leftover scopes set `memory.oom.group=1` when that control is
+available. These settings can be changed in `[guard]`:
+
+```toml
+[guard]
+oom_adj_leftover = 500
+oom_adj_shared = 200
+oom_group_leftover = true
+```
+
+`observe` logs the planned changes without writing controls or process scores. `taema ls` and
+`taema explain scope:NAME` mark deprioritized scopes with `↓`; `taema doctor` reports missing
+controls. Leftover pid limits stay off by default.
 
 Pair-stop authority is separate from mode. `adopt` defaults to `answered`, so it stops
 survivors only when you explicitly answered "stop" for their pair or survivor signature;

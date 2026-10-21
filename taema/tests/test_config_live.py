@@ -85,6 +85,27 @@ class ConfigLayering(unittest.TestCase):
             str(Path(root) / "home/.config/taema/taema.d/50-cli.toml"),
         )
 
+    def test_oom_guard_values_load_and_validate(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self.write(
+                Path(root) / "taema.toml",
+                "[guard]\noom_adj_leftover = 700\n"
+                "oom_adj_shared = 250\noom_group_leftover = false\n",
+            )
+            cfg = policy._load_files([path])
+            self.assertEqual(cfg["guard"]["oom_adj_leftover"], 700)
+            self.assertEqual(cfg["guard"]["oom_adj_shared"], 250)
+            self.assertFalse(cfg["guard"]["oom_group_leftover"])
+
+            for invalid, expected in (
+                ("oom_adj_leftover = 1001", "integer from -1000 to 1000"),
+                ("oom_adj_shared = true", "integer from -1000 to 1000"),
+                ('oom_group_leftover = "yes"', "must be a boolean"),
+            ):
+                bad = self.write(Path(root) / "bad.toml", "[guard]\n" + invalid + "\n")
+                with self.assertRaisesRegex(ValueError, expected):
+                    policy._load_files([bad])
+
     def test_taema_config_replaces_all_file_layers(self):
         with tempfile.TemporaryDirectory() as root:
             system = self.write(

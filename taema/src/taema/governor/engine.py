@@ -48,7 +48,7 @@ def helper_attach(cfg, pid, name):
         raise Refused(r.stderr.strip() or "attach failed")
 
 
-def helper_oom_restore(cfg, pid, start, value):
+def helper_oom_restore(cfg, pid, start, value, applied):
     """Restore a recorded oom_score_adj value through the root helper."""
     if (
         not isinstance(pid, int)
@@ -60,6 +60,9 @@ def helper_oom_restore(cfg, pid, start, value):
         or not isinstance(value, int)
         or isinstance(value, bool)
         or not -1000 <= value <= 1000
+        or not isinstance(applied, int)
+        or isinstance(applied, bool)
+        or not value <= applied <= 1000
     ):
         raise Refused("invalid OOM priority restore target")
     result = subprocess.run(
@@ -71,12 +74,38 @@ def helper_oom_restore(cfg, pid, start, value):
             str(pid),
             str(start),
             str(value),
+            str(applied),
         ],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         raise Refused(result.stderr.strip() or "OOM priority restore failed")
+
+
+def helper_oom_record(cfg, pid, start, original, applied):
+    """Register the original/applied score pair before the daemon raises a process score."""
+    values = (pid, start, original, applied)
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        raise Refused("invalid OOM priority record")
+    if pid <= 1 or start <= 0 or not -1000 <= original < applied <= 1000:
+        raise Refused("invalid OOM priority record")
+    result = subprocess.run(
+        [
+            "sudo",
+            "-n",
+            helper_path(cfg),
+            "oom-record",
+            str(pid),
+            str(start),
+            str(original),
+            str(applied),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise Refused(result.stderr.strip() or "OOM priority record failed")
 
 
 def helper_move(cfg, relpath, pids):

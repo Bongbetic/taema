@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -14,6 +15,7 @@ import taema.cli.commands as cli
 from taema.core import cgroup, qos
 from taema.daemon import service
 from taema.cli import view
+from taema.model import authorization
 from tests.test_phase0 import FakeCg, make_cfg
 
 
@@ -47,6 +49,39 @@ def emulate_io_weight_commands():
         yield writes
 
 
+@contextmanager
+def fake_oom_process(scores, protected=()):
+    with ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(
+                service.inspect, "starttime", side_effect=lambda pid: 1000 + pid
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(service.inspect, "uid_of", return_value=os.getuid())
+        )
+        stack.enter_context(
+            mock.patch.object(
+                service.policy,
+                "protected_reason",
+                side_effect=lambda pid, _cfg: "protected" if pid in protected else None,
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                service.oom, "read_score", side_effect=lambda pid: scores[pid]
+            )
+        )
+        write_score = stack.enter_context(mock.patch.object(service.oom, "write_score"))
+        record = stack.enter_context(
+            mock.patch.object(service.engine, "helper_oom_record")
+        )
+        restore = stack.enter_context(
+            mock.patch.object(service.engine, "helper_oom_restore")
+        )
+        yield SimpleNamespace(write=write_score, record=record, restore=restore)
+
+
 class QoSIntegration(unittest.TestCase):
     def setUp(self):
         self.cg = FakeCg().__enter__()
@@ -60,8 +95,8 @@ class QoSIntegration(unittest.TestCase):
         protection.start()
         self.addCleanup(protection.stop)
 
-    def add_scope_controls(self, scope, controls):
-        path = self.cg.leaf(scope, [42])
+    def add_scope_controls(self, scope, controls, pids=(42,)):
+        path = self.cg.leaf(scope, pids)
         parents = [self.cg.base]
         parent = os.path.dirname(path)
         if parent != self.cg.base:
@@ -76,7 +111,7 @@ class QoSIntegration(unittest.TestCase):
 
     def apply_after_debounce(self, scope="leftover/browser", now=100.0):
         self.daemon.qos_pass(now=now)
-        self.daemon.qos_pass(now=now + qos.DEBOUNCE_SECONDS - 0.01)
+        self.daemon.qos_pass(now=now + qos.DEBOUNCE_SECONDS)
         path = cgroup.resolve(scope)
         return path
 
@@ -87,42 +122,240 @@ class QoSIntegration(unittest.TestCase):
                 "cpu.idle": "0\n",
                 "cpu.weight": "100\n",
                 "io.weight": "default 100\n",
+                "memory.oom.group": "0\n",
                 "pids.max": "max\n",
             },
         )
 
-        self.daemon.qos_pass(now=100.0)
-        self.daemon.qos_pass(now=101.99)
-        self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
-        self.assertEqual(Path(path, "io.weight").read_text(), "default 100\n")
+        with fake_oom_process({42: -100}) as oom_process:
+            self.daemon.qos_pass(now=100.0)
+            self.daemon.qos_pass(now=101.99)
+            self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
+            self.assertEqual(Path(path, "io.weight").read_text(), "default 100\n")
 
-        self.daemon.qos_pass(now=102.0)
-        self.assertEqual(Path(path, "cpu.idle").read_text(), "1\n")
-        self.assertEqual(Path(path, "io.weight").read_text(), "default 10\n")
-        self.assertEqual(Path(path, "pids.max").read_text(), "max\n")
+            self.daemon.qos_pass(now=102.0)
+            self.assertEqual(Path(path, "cpu.idle").read_text(), "1\n")
+            self.assertEqual(Path(path, "io.weight").read_text(), "default 10\n")
+            self.assertEqual(Path(path, "memory.oom.group").read_text(), "1\n")
+            self.assertEqual(Path(path, "pids.max").read_text(), "max\n")
+            self.assertEqual(
+                self.daemon.store.data["qos_scopes"]["leftover/browser"]["class"],
+                "leftover",
+            )
+            oom_process.record.assert_called_once_with(
+                self.daemon.cfg, 42, 1042, -100, 500
+            )
+            oom_process.write.assert_called_once_with(42, 500, 1042, -100)
+
+            decision = self.daemon.store.latest_undoable_decision(kinds=("qos",))
+            self.assertIsNotNone(decision)
+            result = self.daemon.handle(
+                {
+                    "cmd": "feedback",
+                    "v": 2,
+                    "id": "qos-undo-1",
+                    "op": "undo",
+                    "action_id": str(decision["id"]),
+                }
+            )
+            self.assertEqual(result["target_decision_id"], decision["id"])
+            self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
+            self.assertEqual(Path(path, "io.weight").read_text(), "default 100\n")
+            self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+            self.assertIn("leftover/browser", self.daemon.store.data["qos_exempt"])
+            oom_process.restore.assert_called_once_with(
+                self.daemon.cfg, 42, 1042, -100, 500
+            )
+
+            self.daemon.qos_pass(now=110.0)
+            self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
+
+    def test_shared_oom_target_preserves_higher_existing_scores(self):
+        path = self.add_scope_controls(
+            "shared/adb",
+            {"cpu.weight": "100\n", "memory.oom.group": "0\n"},
+            pids=(43, 44),
+        )
+        with fake_oom_process({43: -50, 44: 300}) as oom_process:
+            self.apply_after_debounce("shared/adb")
+
+        self.assertEqual(Path(path, "cpu.weight").read_text(), "50\n")
+        self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+        oom_process.record.assert_called_once_with(self.daemon.cfg, 43, 1043, -50, 200)
+        oom_process.write.assert_called_once_with(43, 200, 1043, -50)
+
+    def test_new_members_in_an_active_scope_get_their_own_original_record(self):
+        scope = "leftover/browser"
+        self.add_scope_controls(scope, {"cpu.idle": "0\n", "memory.oom.group": "0\n"})
+        with fake_oom_process({42: -100, 43: -50}) as oom_process:
+            self.daemon.qos_pass(now=100.0)
+            self.daemon.qos_pass(now=102.0)
+            self.cg.set_procs(scope, (42, 43))
+            self.daemon.qos_pass(now=103.0)
+            self.daemon.qos_pass(now=105.0)
+
         self.assertEqual(
-            self.daemon.store.data["qos_scopes"]["leftover/browser"]["class"],
-            "leftover",
+            self.daemon.store.data["qos_scopes"][scope]["oom_score_adj"],
+            [
+                {"pid": 42, "start": 1042, "value": -100, "applied": 500},
+                {"pid": 43, "start": 1043, "value": -50, "applied": 500},
+            ],
         )
+        self.assertEqual(oom_process.record.call_count, 2)
+        self.assertEqual(oom_process.write.call_count, 2)
 
-        decision = self.daemon.store.latest_undoable_decision(kinds=("qos",))
-        self.assertIsNotNone(decision)
-        result = self.daemon.handle(
-            {
-                "cmd": "feedback",
-                "v": 2,
-                "id": "qos-undo-1",
-                "op": "undo",
-                "action_id": str(decision["id"]),
+    def test_oom_group_flag_can_be_disabled_independently(self):
+        path = self.add_scope_controls(
+            "leftover/no-group",
+            {"cpu.idle": "0\n", "memory.oom.group": "0\n"},
+        )
+        self.cfg["guard"] = {"oom_group_leftover": False}
+        with fake_oom_process({42: -100}) as oom_process:
+            self.apply_after_debounce("leftover/no-group")
+
+        self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+        oom_process.record.assert_called_once_with(self.daemon.cfg, 42, 1042, -100, 500)
+        oom_process.write.assert_called_once_with(42, 500, 1042, -100)
+
+    def test_live_config_disabling_oom_group_restores_only_the_group_flag(self):
+        scope = "leftover/live-group"
+        path = self.add_scope_controls(
+            scope,
+            {"cpu.idle": "0\n", "memory.oom.group": "0\n"},
+        )
+        with fake_oom_process({42: -100}) as oom_process:
+            self.apply_after_debounce(scope)
+            self.assertEqual(Path(path, "memory.oom.group").read_text(), "1\n")
+
+            self.cfg["guard"] = {"oom_group_leftover": False}
+            self.daemon.qos_pass(now=104.0)
+
+        self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+        self.assertEqual(Path(path, "cpu.idle").read_text(), "1\n")
+        record = self.daemon.store.data["qos_scopes"][scope]
+        self.assertEqual(record["oom_score_adj"][0]["applied"], 500)
+        self.assertNotIn(
+            "memory.oom.group", [item["file"] for item in record["originals"]]
+        )
+        oom_process.restore.assert_not_called()
+
+    def test_active_scope_prunes_stale_oom_history_before_adding_member(self):
+        scope = "leftover/prune-history"
+        path = self.add_scope_controls(
+            scope,
+            {"cpu.idle": "1\n", "memory.oom.group": "0\n"},
+        )
+        stale = [
+            {"pid": pid, "start": 1, "value": -100, "applied": 500}
+            for pid in range(10000, 10000 + service.MAX_QOS_OOM_RECORDS)
+        ]
+        self.daemon.store.data["qos_scopes"] = {
+            scope: {
+                "class": "leftover",
+                "active": True,
+                "applied": True,
+                "originals": [],
+                "oom_score_adj": stale,
+                "available": ["cpu.idle"],
             }
-        )
-        self.assertEqual(result["target_decision_id"], decision["id"])
-        self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
-        self.assertEqual(Path(path, "io.weight").read_text(), "default 100\n")
-        self.assertIn("leftover/browser", self.daemon.store.data["qos_exempt"])
+        }
+        with (
+            mock.patch.object(
+                service.inspect,
+                "starttime",
+                side_effect=lambda pid: 1042 if pid == 42 else 2,
+            ),
+            mock.patch.object(
+                service.inspect,
+                "uid_of",
+                side_effect=lambda pid: os.getuid() if pid == 42 else os.getuid() + 1,
+            ),
+            mock.patch.object(service.oom, "read_score", return_value=-100),
+            mock.patch.object(service.engine, "helper_oom_record") as register,
+            mock.patch.object(service.oom, "write_score") as write_score,
+        ):
+            self.assertTrue(self.daemon._apply_qos_class(scope, path, "leftover"))
 
-        self.daemon.qos_pass(now=110.0)
+        record = self.daemon.store.data["qos_scopes"][scope]
+        self.assertEqual(
+            record["oom_score_adj"],
+            [{"pid": 42, "start": 1042, "value": -100, "applied": 500}],
+        )
+        register.assert_called_once_with(self.daemon.cfg, 42, 1042, -100, 500)
+        write_score.assert_called_once_with(42, 500, 1042, -100)
+
+    def test_observe_logs_oom_plan_without_shaping_scores_or_group(self):
+        path = self.add_scope_controls(
+            "leftover/preview",
+            {"cpu.idle": "0\n", "memory.oom.group": "0\n"},
+        )
+        self.daemon.cfg["mode"] = "observe"
+        with fake_oom_process({42: -100}) as oom_process:
+            self.daemon.qos_pass(now=100.0)
+            self.daemon.qos_pass(now=102.0)
+
         self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
+        self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+        oom_process.record.assert_not_called()
+        oom_process.write.assert_not_called()
+        self.assertTrue(
+            any(
+                event["event"] == "qos_would"
+                and event.get("data", {}).get("oom_pids") == [42]
+                for event in self.daemon.store.events_since(0)["events"]
+            )
+        )
+
+    def test_vetoed_or_protected_scope_never_shapes_oom_scores(self):
+        veto_path = self.add_scope_controls(
+            "leftover/vetoed", {"cpu.idle": "0\n", "memory.oom.group": "0\n"}
+        )
+        with fake_oom_process({42: -100}) as oom_process:
+            with mock.patch.object(
+                self.daemon,
+                "authorize",
+                return_value=SimpleNamespace(
+                    verdict=authorization.KEEP, reason="vetoed by user"
+                ),
+            ):
+                self.daemon.qos_pass(now=100.0)
+                self.daemon.qos_pass(now=102.0)
+        self.assertEqual(Path(veto_path, "memory.oom.group").read_text(), "0\n")
+        oom_process.record.assert_not_called()
+        oom_process.write.assert_not_called()
+
+        protected_path = self.add_scope_controls(
+            "leftover/protected",
+            {"cpu.idle": "0\n", "memory.oom.group": "0\n"},
+            pids=(42, 43),
+        )
+        with fake_oom_process({42: -100, 43: -100}, protected={42}) as oom_process:
+            self.daemon.qos_pass(now=110.0)
+            self.daemon.qos_pass(now=112.0)
+        self.assertEqual(Path(protected_path, "memory.oom.group").read_text(), "0\n")
+        oom_process.record.assert_not_called()
+        oom_process.write.assert_not_called()
+        shutil.rmtree(veto_path)
+        shutil.rmtree(protected_path)
+
+        changed_path = self.add_scope_controls(
+            "leftover/veto-after", {"cpu.idle": "0\n", "memory.oom.group": "0\n"}
+        )
+        with fake_oom_process({42: -100}) as oom_process:
+            self.daemon.qos_pass(now=120.0)
+            self.daemon.qos_pass(now=122.0)
+            with mock.patch.object(
+                self.daemon,
+                "authorize",
+                return_value=SimpleNamespace(
+                    verdict=authorization.KEEP, reason="vetoed after shaping"
+                ),
+            ):
+                self.daemon.qos_pass(now=123.0)
+        self.assertEqual(Path(changed_path, "memory.oom.group").read_text(), "0\n")
+        oom_process.restore.assert_called_once_with(
+            self.daemon.cfg, 42, 1042, -100, 500
+        )
 
     def test_cpu_weight_is_fallback_and_io_default_preserves_device_weights(self):
         path = self.add_scope_controls(
@@ -340,11 +573,19 @@ class QoSIntegration(unittest.TestCase):
 
     def test_keep_answer_restores_controls_and_prevents_reapplication(self):
         path = self.add_scope_controls(
-            "leftover/vite", {"cpu.idle": "0\n", "io.weight": "default 100\n"}
+            "leftover/vite",
+            {
+                "cpu.idle": "0\n",
+                "io.weight": "default 100\n",
+                "memory.oom.group": "0\n",
+            },
         )
-        self.daemon.qos_pass(now=100.0)
-        self.daemon.qos_pass(now=102.0)
-        with mock.patch.object(service.policy, "app_key", return_value="vite"):
+        with (
+            mock.patch.object(service.policy, "app_key", return_value="vite"),
+            fake_oom_process({42: -100}) as oom_process,
+        ):
+            self.daemon.qos_pass(now=100.0)
+            self.daemon.qos_pass(now=102.0)
             result = self.daemon.handle(
                 {
                     "cmd": "feedback",
@@ -358,17 +599,29 @@ class QoSIntegration(unittest.TestCase):
             )
             self.assertTrue(result["ok"])
             self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
+            self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+            oom_process.restore.assert_called_once_with(
+                self.daemon.cfg, 42, 1042, -100, 500
+            )
             self.daemon.qos_pass(now=110.0)
         self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
         self.assertIn("leftover/vite", self.daemon.store.data["qos_exempt"])
 
     def test_standalone_answer_restores_controls(self):
         path = self.add_scope_controls(
-            "leftover/vite", {"cpu.idle": "0\n", "io.weight": "default 100\n"}
+            "leftover/vite",
+            {
+                "cpu.idle": "0\n",
+                "io.weight": "default 100\n",
+                "memory.oom.group": "0\n",
+            },
         )
-        self.daemon.qos_pass(now=100.0)
-        self.daemon.qos_pass(now=102.0)
-        with mock.patch.object(service.policy, "app_key", return_value="vite"):
+        with (
+            mock.patch.object(service.policy, "app_key", return_value="vite"),
+            fake_oom_process({42: -100}) as oom_process,
+        ):
+            self.daemon.qos_pass(now=100.0)
+            self.daemon.qos_pass(now=102.0)
             result = self.daemon.handle(
                 {
                     "cmd": "feedback",
@@ -383,6 +636,10 @@ class QoSIntegration(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(Path(path, "cpu.idle").read_text(), "0\n")
         self.assertEqual(Path(path, "io.weight").read_text(), "default 100\n")
+        self.assertEqual(Path(path, "memory.oom.group").read_text(), "0\n")
+        oom_process.restore.assert_called_once_with(
+            self.daemon.cfg, 42, 1042, -100, 500
+        )
 
     def test_idle_app_scope_gets_background_weights_then_restores_when_active(self):
         path = self.add_scope_controls(

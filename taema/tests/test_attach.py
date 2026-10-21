@@ -1,8 +1,10 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -74,8 +76,10 @@ class AttachTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"SUDO_UID": "1000"}),
             mock.patch.object(self.h, "restore_oom") as restore_oom,
         ):
-            self.assertEqual(self.h.main(["oom-restore", "42", "987", "-200"]), 0)
-        restore_oom.assert_called_once_with(42, 1000, 987, -200)
+            self.assertEqual(
+                self.h.main(["oom-restore", "42", "987", "-200", "500"]), 0
+            )
+        restore_oom.assert_called_once_with(42, 1000, 987, -200, 500)
 
     def test_main_rejects_invalid_oom_restore_arguments(self):
         with (
@@ -84,38 +88,221 @@ class AttachTests(unittest.TestCase):
             mock.patch.object(self.h, "restore_oom") as restore_oom,
         ):
             with self.assertRaises(self.h.Refused):
-                self.h.main(["oom-restore", "42", "987", "1001"])
+                self.h.main(["oom-restore", "42", "987", "1001", "1000"])
         restore_oom.assert_not_called()
 
-    def test_restore_oom_checks_identity_and_writes_requested_value(self):
-        target = os.path.join(self.tmp.name, "oom_score_adj")
-        with open(target, "w", encoding="ascii"):
-            pass
-        target_fd = os.open(target, os.O_WRONLY)
-        pidfd = os.open("/dev/null", os.O_RDONLY)
+    def test_main_dispatches_oom_record(self):
         with (
-            mock.patch.object(self.h.os, "pidfd_open", return_value=pidfd),
-            mock.patch.object(self.h.os, "open", return_value=target_fd),
+            mock.patch.object(self.h.os, "geteuid", return_value=0),
+            mock.patch.dict(os.environ, {"SUDO_UID": "1000"}),
+            mock.patch.object(self.h, "record_oom") as record_oom,
+        ):
+            self.assertEqual(self.h.main(["oom-record", "42", "987", "-200", "500"]), 0)
+        record_oom.assert_called_once_with(42, 1000, 987, -200, 500)
+
+    def test_helper_refuses_untrusted_record_files_and_directories(self):
+        path = os.path.join(self.tmp.name, "untrusted.json")
+        with open(path, "w", encoding="ascii") as target:
+            target.write("{}")
+        os.chmod(path, 0o644)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            with self.assertRaises(self.h.Refused):
+                self.h._validate_oom_record_fd(fd)
+        finally:
+            os.close(fd)
+
+        state_dir = os.path.join(self.tmp.name, "state")
+        os.mkdir(state_dir, 0o755)
+        with mock.patch.object(self.h, "OOM_STATE_DIR", state_dir):
+            with self.assertRaises(self.h.Refused):
+                self.h.oom_state_dir()
+
+    def _write_oom_record(self, directory, **overrides):
+        record = {
+            "uid": 1000,
+            "pid": 42,
+            "start": 987,
+            "original": -200,
+            "applied": 500,
+            "state": 0,
+        }
+        record.update(overrides)
+        path = os.path.join(directory, "1000-42-987.json")
+        with open(path, "w", encoding="ascii") as target:
+            json.dump(record, target, separators=(",", ":"))
+        os.chmod(path, 0o600)
+        return path
+
+    def _patch_oom_process(self, target, score_values):
+        real_open = os.open
+
+        def open_path(path, flags, *args, **kwargs):
+            if path == "/proc/42/oom_score_adj":
+                path = target
+            return real_open(path, flags, *args, **kwargs)
+
+        return (
+            mock.patch.object(
+                self.h.os,
+                "pidfd_open",
+                side_effect=lambda _pid: real_open("/dev/null", os.O_RDONLY),
+            ),
+            mock.patch.object(self.h.os, "open", side_effect=open_path),
+            mock.patch.object(self.h, "oom_state_dir", return_value=self.tmp.name),
+            mock.patch.object(self.h, "_validate_oom_record_fd"),
             mock.patch.object(self.h, "pid_uid", return_value=1000),
             mock.patch.object(self.h, "starttime", return_value=987),
             mock.patch.object(self.h, "pidfd_gone", return_value=False),
+            mock.patch.object(self.h, "read_oom_score", side_effect=score_values),
             mock.patch.object(self.h, "log"),
-        ):
-            self.h.restore_oom(42, 1000, 987, -200)
+        )
+
+    @contextmanager
+    def _patched_oom_process(self, target, score_values):
+        with ExitStack() as stack:
+            for patcher in self._patch_oom_process(target, score_values):
+                stack.enter_context(patcher)
+            yield
+
+    def test_restore_oom_checks_record_identity_and_restores_idempotently(self):
+        target = os.path.join(self.tmp.name, "oom_score_adj")
+        with open(target, "w", encoding="ascii"):
+            pass
+        record_path = self._write_oom_record(self.tmp.name)
+        with self._patched_oom_process(target, [500, -200]):
+            self.h.restore_oom(42, 1000, 987, -200, 500)
+            self.h.restore_oom(42, 1000, 987, -200, 500)
         with open(target, encoding="ascii") as source:
             self.assertEqual(source.read(), "-200\n")
+        with open(record_path, encoding="ascii") as source:
+            self.assertEqual(json.load(source)["state"], 1)
 
-    def test_restore_oom_refuses_reused_pid_before_opening_target(self):
-        pidfd = os.open("/dev/null", os.O_RDONLY)
+    def test_restore_oom_refuses_wrong_uid_and_reused_pid(self):
+        self._write_oom_record(self.tmp.name)
+        real_open = os.open
         with (
-            mock.patch.object(self.h.os, "pidfd_open", return_value=pidfd),
-            mock.patch.object(self.h.os, "open") as open_target,
+            mock.patch.object(
+                self.h.os,
+                "pidfd_open",
+                side_effect=lambda _pid: real_open("/dev/null", os.O_RDONLY),
+            ),
+            mock.patch.object(self.h, "oom_state_dir", return_value=self.tmp.name),
+            mock.patch.object(self.h, "_validate_oom_record_fd"),
             mock.patch.object(self.h, "pid_uid", return_value=1000),
             mock.patch.object(self.h, "starttime", return_value=988),
         ):
             with self.assertRaises(self.h.Refused):
-                self.h.restore_oom(42, 1000, 987, -200)
-        open_target.assert_not_called()
+                self.h.restore_oom(42, 1000, 987, -200, 500)
+        with (
+            mock.patch.object(
+                self.h.os,
+                "pidfd_open",
+                side_effect=lambda _pid: real_open("/dev/null", os.O_RDONLY),
+            ),
+            mock.patch.object(self.h, "pid_uid", return_value=1001),
+            mock.patch.object(self.h, "starttime", return_value=987),
+        ):
+            with self.assertRaises(self.h.Refused):
+                self.h.restore_oom(42, 1000, 987, -200, 500)
+
+    def test_restore_oom_refuses_invalid_targets_and_exited_pidfds(self):
+        with mock.patch.object(self.h.os, "pidfd_open") as open_pid:
+            for args in (
+                (1, 1000, 987, -200, 500),
+                (42, 0, 987, -200, 500),
+                (42, 1000, 0, -200, 500),
+                (42, 1000, 987, True, 500),
+                (42, 1000, 987, -200, 1001),
+            ):
+                with self.subTest(args=args), self.assertRaises(self.h.Refused):
+                    self.h.restore_oom(*args)
+        open_pid.assert_not_called()
+
+        target = os.path.join(self.tmp.name, "oom_score_adj")
+        with open(target, "w", encoding="ascii"):
+            pass
+        self._write_oom_record(self.tmp.name)
+        with (
+            self._patched_oom_process(target, [500]),
+            mock.patch.object(self.h, "pidfd_gone", return_value=True),
+        ):
+            with self.assertRaisesRegex(self.h.Refused, "changed identity"):
+                self.h.restore_oom(42, 1000, 987, -200, 500)
+
+    def test_restore_oom_refuses_unrecorded_values_and_unexpected_current_score(self):
+        target = os.path.join(self.tmp.name, "oom_score_adj")
+        self._write_oom_record(self.tmp.name)
+        for value, applied in ((-300, 500), (-200, 400)):
+            with self._patched_oom_process(target, [500]):
+                with self.assertRaises(self.h.Refused):
+                    self.h.restore_oom(42, 1000, 987, value, applied)
+        with self._patched_oom_process(target, [300]):
+            with self.assertRaises(self.h.Refused):
+                self.h.restore_oom(42, 1000, 987, -200, 500)
+
+    def test_restore_oom_refuses_missing_or_corrupt_records(self):
+        target = os.path.join(self.tmp.name, "oom_score_adj")
+        with self._patched_oom_process(target, [500]):
+            with self.assertRaises(self.h.Refused):
+                self.h.restore_oom(42, 1000, 987, -200, 500)
+        path = os.path.join(self.tmp.name, "1000-42-987.json")
+        with open(path, "w", encoding="ascii") as target_file:
+            target_file.write("{")
+        with self._patched_oom_process(target, [500]):
+            with self.assertRaises(self.h.Refused):
+                self.h.restore_oom(42, 1000, 987, -200, 500)
+
+    def test_record_oom_seals_only_a_live_original_value(self):
+        target = os.path.join(self.tmp.name, "oom_score_adj")
+        with open(target, "w", encoding="ascii"):
+            pass
+        real_open = os.open
+        with (
+            mock.patch.object(
+                self.h.os,
+                "pidfd_open",
+                side_effect=lambda _pid: real_open("/dev/null", os.O_RDONLY),
+            ),
+            mock.patch.object(self.h, "oom_state_dir", return_value=self.tmp.name),
+            mock.patch.object(self.h, "_validate_oom_record_fd"),
+            mock.patch.object(self.h, "_prune_oom_records", return_value=0),
+            mock.patch.object(self.h, "pid_uid", return_value=1000),
+            mock.patch.object(self.h, "starttime", return_value=987),
+            mock.patch.object(self.h, "pidfd_gone", return_value=False),
+            mock.patch.object(self.h, "read_oom_score", return_value=-200),
+            mock.patch.object(self.h, "log"),
+        ):
+            self.h.record_oom(42, 1000, 987, -200, 500)
+            self.h.record_oom(42, 1000, 987, -200, 500)
+        with open(
+            os.path.join(self.tmp.name, "1000-42-987.json"), encoding="ascii"
+        ) as source:
+            self.assertEqual(
+                json.load(source),
+                {
+                    "uid": 1000,
+                    "pid": 42,
+                    "start": 987,
+                    "original": -200,
+                    "applied": 500,
+                    "state": 0,
+                },
+            )
+        with (
+            mock.patch.object(
+                self.h.os,
+                "pidfd_open",
+                side_effect=lambda _pid: real_open("/dev/null", os.O_RDONLY),
+            ),
+            mock.patch.object(self.h, "oom_state_dir", return_value=self.tmp.name),
+            mock.patch.object(self.h, "_validate_oom_record_fd"),
+            mock.patch.object(self.h, "pid_uid", return_value=1000),
+            mock.patch.object(self.h, "starttime", return_value=987),
+            mock.patch.object(self.h, "read_oom_score", return_value=-100),
+        ):
+            with self.assertRaises(self.h.Refused):
+                self.h.record_oom(42, 1000, 987, -200, 500)
 
     def test_starttime_parser(self):
         stat = b"123 (we ) ird (name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 99 20\n"

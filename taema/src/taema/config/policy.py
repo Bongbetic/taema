@@ -73,6 +73,7 @@ _DEFAULTS = {
         "reclaim_interval": 60,
         "reclaim_cooldown": 300,
         "reclaim_max": "2G",
+        "reclaim_minimum": "16M",
         "idle_reclaim_grace": 300,
         "pressure_gate": 10,
         "pressure_ceiling": 60,
@@ -303,6 +304,58 @@ def _validate_config(cfg, sources):
     guard_source = sources.get("guard", "built-in defaults")
     if not isinstance(guard, dict):
         raise ValueError("%s:1:1: guard must be a table" % guard_source)
+    mem = cfg.get("mem")
+    mem_source = sources.get("mem", "built-in defaults")
+    if not isinstance(mem, dict):
+        raise ValueError("%s:1:1: mem must be a table" % mem_source)
+    from ..core import memory
+
+    for name in ("enabled", "reclaim"):
+        value = mem.get(name, _DEFAULTS["mem"][name])
+        source = sources.get("mem." + name, mem_source)
+        if type(value) is not bool:
+            raise ValueError("%s:1:1: mem.%s must be a boolean" % (source, name))
+    for name, minimum in (
+        ("reclaim_interval", 1),
+        ("reclaim_cooldown", 0),
+        ("idle_reclaim_grace", 0),
+    ):
+        value = mem.get(name, _DEFAULTS["mem"][name])
+        source = sources.get("mem." + name, mem_source)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+        ):
+            raise ValueError(
+                "%s:1:1: mem.%s must be a finite number of at least %s seconds"
+                % (source, name, minimum)
+            )
+    for name in ("pressure_gate", "pressure_ceiling", "headroom_percent"):
+        value = mem.get(name, _DEFAULTS["mem"][name])
+        source = sources.get("mem." + name, mem_source)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 <= value <= 100
+        ):
+            raise ValueError(
+                "%s:1:1: mem.%s must be between 0 and 100" % (source, name)
+            )
+    for name in ("reclaim_max", "reclaim_minimum", "min_headroom"):
+        value = mem.get(name, _DEFAULTS["mem"].get(name))
+        if value is None:
+            continue
+        source = sources.get("mem." + name, mem_source)
+        try:
+            memory.size_bytes(value)
+        except ValueError as error:
+            raise ValueError(
+                "%s:1:1: mem.%s must be a valid non-negative binary size"
+                % (source, name)
+            ) from error
     for name in ("oom_adj_leftover", "oom_adj_shared"):
         value = guard.get(name, _DEFAULTS["guard"][name])
         source = sources.get("guard." + name, guard_source)

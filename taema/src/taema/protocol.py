@@ -27,7 +27,11 @@ _COMMANDS = {
         {"nonce": "string", "choice": "string", "owner": "string"},
         ("nonce", "choice"),
     ),
-    "gc": ({"dry_run": "boolean"}, ()),
+    "gc": ({"dry_run": "boolean", "memory": "boolean"}, ()),
+    "reclaim": (
+        {"scope": "string", "force_veto": "boolean", "dry_run": "boolean"},
+        ("scope",),
+    ),
     "feedback": ({}, ()),
 }
 
@@ -372,6 +376,8 @@ def _validate_args(command, args):
             or len(args["word"]) > 32
         ):
             _fail("job status or command word is out of range")
+    if command == "reclaim" and (not args["scope"] or len(args["scope"]) > 96):
+        _fail("reclaim scope is empty or too long")
     if command == "kill_done" and args["word"] not in (
         "kill",
         "pkill",

@@ -57,6 +57,8 @@ __all__ = [
     "GC_REMOVE_EMPTY",
     "SESSION_END",
     "MANUAL_STOP",
+    "RECLAIM",
+    "MANUAL_RECLAIM",
     "QOS",
 ]
 
@@ -76,6 +78,8 @@ Trigger = Literal[
     "gc_remove_empty",
     "session_end",
     "manual_stop",
+    "reclaim",
+    "manual_reclaim",
     "qos",
 ]
 GovernorAction = Literal[
@@ -115,6 +119,8 @@ GC_REMOVE_EMPTY: Final[Trigger] = (
 )
 SESSION_END: Final[Trigger] = "session_end"  # Daemon.end_session
 MANUAL_STOP: Final[Trigger] = "manual_stop"  # cli.cmd_kill (`taema kill`)
+RECLAIM: Final[Trigger] = "reclaim"  # daemon memory governor
+MANUAL_RECLAIM: Final[Trigger] = "manual_reclaim"  # explicit memory CLI action
 QOS: Final[Trigger] = "qos"  # Daemon.qos_pass, reversible priority changes
 
 # Every lifecycle trigger declares its governor action. New actions such as reclaim must be
@@ -130,6 +136,8 @@ TRIGGER_ACTIONS: Final[dict[str, GovernorAction]] = {
     GC_REMOVE_EMPTY: "remove",
     SESSION_END: "stop",
     MANUAL_STOP: "stop",
+    RECLAIM: "reclaim",
+    MANUAL_RECLAIM: "reclaim",
     QOS: "deprioritize",
 }
 HOLD_BLOCKED_ACTIONS: Final[frozenset[GovernorAction]] = frozenset(("stop", "reclaim"))
@@ -170,6 +178,7 @@ class Facts:
     held: str = ""
     suppress_stops: bool = False
     hard_safety: str = ""
+    force_veto: bool = False
     pair_action: str = ""
     pair_reason: str = ""
     pair_explicit: bool = False
@@ -353,6 +362,18 @@ _CAPABILITY: Final[dict[str, dict[str, _Cell]]] = {
             "explicit taema kill: a user request acts in every mode",
         ),
     },
+    RECLAIM: {
+        "observe": (WOULD_ACT, "", "reclaim: observe records planned actions only"),
+        "adopt": (ACT, AUTHORITY_MODE, "reclaim: adopt reclaims page cache only"),
+        "enforce": (ACT, AUTHORITY_MODE, "reclaim: enforce reclaims eligible cache"),
+        "auto": (ACT, AUTHORITY_MODE, "reclaim: auto reclaims eligible cache"),
+    },
+    MANUAL_RECLAIM: {
+        "observe": (ACT, AUTHORITY_MANUAL, "manual reclaim: explicit user request"),
+        "adopt": (ACT, AUTHORITY_MANUAL, "manual reclaim: explicit user request"),
+        "enforce": (ACT, AUTHORITY_MANUAL, "manual reclaim: explicit user request"),
+        "auto": (ACT, AUTHORITY_MANUAL, "manual reclaim: explicit user request"),
+    },
     QOS: {
         "observe": (WOULD_ACT, "", "qos: observe records priority changes only"),
         "adopt": (ACT, AUTHORITY_MODE, "qos: adopt applies reversible priorities"),
@@ -434,7 +455,11 @@ def _veto(trigger: str, _mode: str, facts: Facts) -> tuple[Vote, str]:
     """Slot 2: a veto blocks any stop, freeze, reclaim, or budget action."""
     if TRIGGER_ACTIONS.get(trigger) in VETO_BLOCKED_ACTIONS and facts.unit_veto:
         return "deny", "unit veto: " + facts.unit_veto
-    if TRIGGER_ACTIONS.get(trigger) in VETO_BLOCKED_ACTIONS and facts.vetoed:
+    if (
+        TRIGGER_ACTIONS.get(trigger) in VETO_BLOCKED_ACTIONS
+        and facts.vetoed
+        and not (trigger == MANUAL_RECLAIM and facts.force_veto)
+    ):
         return "deny", "vetoed: " + facts.vetoed
     return "pass", ""
 

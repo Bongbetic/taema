@@ -1,6 +1,9 @@
 """Read-only memory accounting for the host and delegated cgroup tree."""
 
+import errno
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -8,6 +11,25 @@ from . import cgroup
 
 SAMPLE_CHANGE = 0.05
 SAMPLE_INTERVAL = 10 * 60
+MIB = 1024**2
+MIN_USEFUL_RECLAIM = 16 * MIB
+_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt](?:i?b)?|b)?\s*$", re.I)
+_SIZE_UNITS = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "kib": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+    "tib": 1024**4,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,13 +186,13 @@ def _stat(path):
     return result
 
 
-def _psi(path):
+def _psi(path, kind="some"):
     value = _read(path)
     if value is None:
         return None
     for line in value.splitlines():
         fields = line.split()
-        if not fields or fields[0] != "some":
+        if not fields or fields[0] != kind:
             continue
         for field in fields[1:]:
             if field.startswith("avg10="):
@@ -180,6 +202,208 @@ def _psi(path):
                     return None
                 return result if result >= 0 else None
     return None
+
+
+def pressure(path=None):
+    """Read the PSI some/full avg10 values from host or cgroup memory pressure."""
+    path = path or os.path.join(
+        os.environ.get("TAEMA_PROCROOT", "/proc"), "pressure", "memory"
+    )
+    return {"some_avg10": _psi(path, "some"), "full_avg10": _psi(path, "full")}
+
+
+def size_bytes(value):
+    """Parse an integer or binary size string used by memory governor settings."""
+    if isinstance(value, bool):
+        raise ValueError("size must be a non-negative number")
+    if isinstance(value, (int, float)):
+        amount, unit = float(value), ""
+    elif isinstance(value, str):
+        match = _SIZE.fullmatch(value)
+        if match is None:
+            raise ValueError("size must look like 512M or 1.5G")
+        amount, unit = float(match.group(1)), (match.group(2) or "").lower()
+    else:
+        raise ValueError("size must be a number or binary size string")
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("size must be finite and non-negative")
+    return math.ceil(amount * _SIZE_UNITS[unit])
+
+
+def page_cache_budget(
+    current_bytes,
+    anon_bytes,
+    reclaimable_bytes,
+    maximum_bytes,
+    minimum_headroom_bytes,
+    headroom_percent,
+    minimum_bytes=MIN_USEFUL_RECLAIM,
+):
+    """Bound file-cache reclaim while retaining anonymous usage plus configured headroom."""
+    values = (
+        current_bytes,
+        anon_bytes,
+        reclaimable_bytes,
+        maximum_bytes,
+        minimum_headroom_bytes,
+        minimum_bytes,
+    )
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in values
+    ):
+        return 0
+    if (
+        not isinstance(headroom_percent, (int, float))
+        or isinstance(headroom_percent, bool)
+        or not math.isfinite(headroom_percent)
+        or not 0 <= headroom_percent <= 100
+        or anon_bytes > current_bytes
+    ):
+        return 0
+    percent_headroom = math.ceil(current_bytes * headroom_percent / 100)
+    headroom = max(minimum_headroom_bytes, percent_headroom)
+    above_floor = max(0, current_bytes - anon_bytes - headroom)
+    amount = min(reclaimable_bytes, maximum_bytes, above_floor)
+    return amount if amount >= minimum_bytes else 0
+
+
+def scope_counters(path):
+    """Return current memory and stat counters needed for bounded cache reclaim."""
+    current = _integer(os.path.join(path, "memory.current"))
+    stats = _stat(path)
+    if current is None or stats is None:
+        return None
+    file_bytes = stats.get("file")
+    inactive_file = stats.get("inactive_file")
+    if file_bytes is None or inactive_file is None:
+        reclaimable = None
+    else:
+        # shmem is counted in file but is swap-backed. Subtract it conservatively.
+        shmem = stats.get("shmem", 0)
+        reclaimable = max(0, min(inactive_file, file_bytes - shmem))
+    high_events = None
+    events = _read(os.path.join(path, "memory.events"))
+    if events is not None:
+        for line in events.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] == "high":
+                try:
+                    high_events = max(0, int(fields[1]))
+                except ValueError:
+                    pass
+                break
+    return {
+        "current_bytes": current,
+        "anon_bytes": stats.get("anon"),
+        "file_bytes": file_bytes,
+        "reclaimable_bytes": reclaimable,
+        "workingset_refault_file": stats.get("workingset_refault_file"),
+        "pgmajfault": stats.get("pgmajfault"),
+        "high_events": high_events,
+    }
+
+
+def _write_control(path, name, value):
+    with open(os.path.join(path, name), "w", encoding="ascii") as target:
+        target.write(str(value).rstrip() + "\n")
+
+
+def reclaim_page_cache(path, amount, high_target, pulse_seconds=0.05):
+    """Request file-only reclaim, falling back to a short, restored memory.high pulse."""
+    if (
+        not isinstance(amount, int)
+        or isinstance(amount, bool)
+        or amount <= 0
+        or not isinstance(high_target, int)
+        or isinstance(high_target, bool)
+        or high_target < 0
+    ):
+        raise ValueError("page-cache reclaim request is invalid")
+    try:
+        _write_control(path, "memory.reclaim", "%d swappiness=0" % amount)
+        return "memory.reclaim"
+    except OSError as error:
+        if error.errno == errno.EAGAIN:
+            # The kernel may have reclaimed some pages before reporting a shortfall.
+            return "memory.reclaim"
+        unsupported = {
+            errno.ENOENT,
+            errno.EINVAL,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            errno.ENOTSUP,
+            getattr(errno, "ENOSYS", errno.EINVAL),
+        }
+        if error.errno not in unsupported:
+            raise
+
+    high_path = os.path.join(path, "memory.high")
+    with open(high_path, encoding="ascii") as source:
+        original = source.read().strip()
+    if original == "max":
+        target = high_target
+    else:
+        try:
+            original_bytes = int(original)
+        except ValueError as error:
+            raise ValueError("memory.high has an invalid value") from error
+        if original_bytes < 0 or original_bytes <= high_target:
+            raise OSError(errno.EALREADY, "memory.high already has a tighter limit")
+        target = min(original_bytes, high_target)
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    if not isinstance(page_size, int) or page_size <= 0:
+        raise OSError(errno.EINVAL, "system page size is unavailable")
+    # memory.high is rounded down by the kernel, so send an aligned value.
+    # Rounding upward keeps the pulse at or above the budget floor from the caller.
+    target = ((target + page_size - 1) // page_size) * page_size
+    if original != "max" and target >= original_bytes:
+        raise OSError(errno.EALREADY, "memory.high pulse would not lower the limit")
+
+    # memory.high reclaim may swap anonymous pages. Suppress swap for the pulse,
+    # and only when the scope has no existing swap usage and both controls exist.
+    try:
+        with open(
+            os.path.join(path, "memory.swap.current"), encoding="ascii"
+        ) as source:
+            swap_current = int(source.read().strip())
+        with open(os.path.join(path, "memory.swap.max"), encoding="ascii") as source:
+            original_swap_max = source.read().strip()
+    except (OSError, ValueError) as error:
+        raise OSError(
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            "cannot verify that fallback reclaim will not swap anonymous pages",
+        ) from error
+    if swap_current != 0:
+        raise OSError(errno.EBUSY, "fallback reclaim is unsafe while swap is in use")
+
+    limit_swap = original_swap_max != "0"
+    if limit_swap:
+        _write_control(path, "memory.swap.max", 0)
+    try:
+        if limit_swap:
+            with open(
+                os.path.join(path, "memory.swap.max"), encoding="ascii"
+            ) as source:
+                if source.read().strip() != "0":
+                    raise OSError(
+                        errno.EIO, "could not disable swap for fallback reclaim"
+                    )
+        _write_control(path, "memory.high", target)
+        try:
+            time.sleep(max(0.0, min(float(pulse_seconds), 0.25)))
+        finally:
+            with open(high_path, encoding="ascii") as source:
+                current = source.read().strip()
+            if current == str(target):
+                _write_control(path, "memory.high", original)
+    finally:
+        if limit_swap:
+            swap_path = os.path.join(path, "memory.swap.max")
+            with open(swap_path, encoding="ascii") as source:
+                current_swap_max = source.read().strip()
+            if current_swap_max == "0":
+                _write_control(path, "memory.swap.max", original_swap_max)
+    return "memory.high"
 
 
 def _host(proc_root, system_root, base):

@@ -1242,6 +1242,70 @@ def cmd_memory_pressure(a):
     return 0
 
 
+def cmd_memory_reclaim(a):
+    """Ask the daemon to reclaim bounded page cache from one managed scope."""
+    cfg, store, units = _load(a)
+    name = getattr(a, "name", None)
+    path = cgroup.resolve(name) if isinstance(name, str) else None
+    if path is None:
+        return die("scope %s not found" % (name or ""), 2)
+    force_veto = getattr(a, "force_veto", False) is True
+    unit = engine.unit_for_leaf(units, os.path.basename(path))
+    vetoes = engine.vetoes_for_scope(store, path, unit=unit) if force_veto else []
+    if vetoes and not _confirm_bulk(
+        "override veto", [store.describe_veto(veto) for veto in vetoes], a
+    ):
+        return 1
+    reply = ask(
+        cfg,
+        {
+            "cmd": "reclaim",
+            "scope": cgroup.rel(path),
+            "force_veto": force_veto,
+            "dry_run": getattr(a, "dry_run", False) is True,
+        },
+        timeout=60,
+    )
+    if reply is None:
+        return die("daemon is not running; reclaim requires live safety checks", 3)
+    if not isinstance(reply, dict):
+        return die("daemon returned an invalid reclaim reply", 3)
+    status = reply.get("status")
+    if status in ("failed", "skipped"):
+        reason = str(reply.get("reason", reply.get("error", "reclaim was refused")))
+        code = (
+            4
+            if any(
+                word in reason.lower()
+                for word in ("veto", "held", "protected", "daemon", "dependency")
+            )
+            else 1
+        )
+        if getattr(a, "json", False):
+            print(json.dumps({"schema": "taema.memory-reclaim.v1", **reply}, indent=2))
+            return code
+        return die(str(reason), code)
+    if getattr(a, "json", False):
+        print(json.dumps({"schema": "taema.memory-reclaim.v1", **reply}, indent=2))
+        return 0
+    if status == "would":
+        print(
+            "would reclaim %s from %s"
+            % (_fmt_mem(reply.get("requested_bytes")), reply.get("scope", name))
+        )
+        return 0
+    print(
+        "reclaim requested %s from %s (%s; observed %s)"
+        % (
+            _fmt_mem(reply.get("requested_bytes")),
+            reply.get("scope", name),
+            reply.get("method", "unknown method"),
+            _fmt_mem(reply.get("reclaimed_bytes")),
+        )
+    )
+    return 0
+
+
 def cmd_memory_watch(a):
     interval = getattr(a, "interval", 5.0)
     count = getattr(a, "count", None)
@@ -3271,13 +3335,25 @@ def cmd_gc(a):
     from . import view
 
     cfg, store, units = _load(a)
-    reply = ask(cfg, {"cmd": "gc", "dry_run": a.dry_run}, timeout=60)
+    reply = ask(
+        cfg,
+        {
+            "cmd": "gc",
+            "dry_run": a.dry_run,
+            "memory": getattr(a, "memory", False) is True,
+        },
+        timeout=60,
+    )
     available = reply is not None
     if reply is None:
         cands = engine.gc_candidates(cfg, units, store, {})
         reply = {
             "candidates": [[cgroup.rel(p), why] for p, why in cands],
-            "note": "daemon not running; immediate candidates only",
+            "note": (
+                "daemon not running; immediate candidates only; memory reclaim requires the daemon"
+                if getattr(a, "memory", False)
+                else "daemon not running; immediate candidates only"
+            ),
         }
     model = view.record("gc", {"result": reply})
     view.emit(model, a, json.dumps(reply, indent=1, ensure_ascii=False) + "\n")

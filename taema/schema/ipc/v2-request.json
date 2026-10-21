@@ -13,6 +13,7 @@
     {"$ref": "#/$defs/ask"},
     {"$ref": "#/$defs/answer"},
     {"$ref": "#/$defs/gc"},
+    {"$ref": "#/$defs/reclaim"},
     {"$ref": "#/$defs/feedback"}
   ],
   "$defs": {
@@ -275,7 +276,12 @@
     },
     "gc": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
-      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "gc"}, "args": {"type": "object", "properties": {"dry_run": {"type": "boolean"}}, "additionalProperties": false}},
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "gc"}, "args": {"type": "object", "properties": {"dry_run": {"type": "boolean"}, "memory": {"type": "boolean"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "reclaim": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "reclaim"}, "args": {"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}, "force_veto": {"type": "boolean"}, "dry_run": {"type": "boolean"}}, "additionalProperties": false}},
       "additionalProperties": false
     },
     "feedback": {

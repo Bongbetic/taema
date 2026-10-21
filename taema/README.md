@@ -320,6 +320,35 @@ shared                          0         -      -
   adb-1                         1    768.0K   0.00  adb
 ```
 
+### Reclaim idle page cache
+
+The daemon can reclaim file cache from eligible idle background, leftover, and container scopes.
+It waits for the configured idle grace, checks dependency and protection facts, and only runs when
+host memory pressure reaches its gate while full pressure stays below its ceiling. Each request is
+capped at 2 GiB by default and leaves at least the anonymous memory plus the larger of 128 MiB or
+10% of current usage. A refault during the cooldown marks a scope warm, doubles its idle grace,
+and suppresses further reclaim for twice the configured cooldown after the refault is detected.
+
+```sh
+taema memory reclaim browser       # ask the daemon to reclaim one managed scope
+taema memory reclaim browser --dry-run
+taema memory reclaim browser --force-veto  # confirms before overriding a user veto
+taema gc --memory                  # collect idle scopes and run the memory pass
+```
+
+Automatic reclaim is available in `adopt`, `enforce`, and `auto`; `observe` records would-actions.
+An explicit `memory reclaim` request is allowed in every mode. Vetoes and holds block it, and
+`--force-veto` overrides only a user veto: protected processes, dependency edges, the daemon scope,
+pressure ceilings, and holds still block reclaim. If the kernel lacks `memory.reclaim`, tæma briefly
+lowers that scope's `memory.high` and restores its previous value. This fallback runs only when swap
+usage is zero and the daemon can temporarily disable and restore swap for that scope, so the pulse
+cannot reclaim anonymous pages.
+
+The `[mem]` settings `reclaim`, `reclaim_interval`, `idle_reclaim_grace`, `reclaim_cooldown`,
+`reclaim_max`, `reclaim_minimum`, `pressure_gate`, `pressure_ceiling`, `min_headroom`, and
+`headroom_percent` tune this pass. Defaults are conservative; disabling `reclaim` leaves accounting
+and the rest of lifecycle management available.
+
 `taema kill` prints one line per process: `kill`, `share` (moved to `shared/` because
 something outside still uses it) or `skip` (protected).
 

@@ -106,6 +106,39 @@ class ConfigLayering(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, expected):
                     policy._load_files([bad])
 
+    def test_memory_reclaim_settings_validate_time_pressure_and_size_bounds(self):
+        with tempfile.TemporaryDirectory() as root:
+            valid = self.write(
+                Path(root) / "valid.toml",
+                "[mem]\nreclaim = true\nreclaim_interval = 5\n"
+                "reclaim_cooldown = 0\nidle_reclaim_grace = 1\n"
+                "pressure_gate = 10\npressure_ceiling = 60\n"
+                'reclaim_max = "1.5G"\nreclaim_minimum = "16M"\n',
+            )
+            cfg = policy._load_files([valid])
+            self.assertEqual(cfg["mem"]["reclaim_interval"], 5)
+            self.assertEqual(cfg["mem"]["reclaim_max"], "1.5G")
+
+            invalid_values = (
+                ('reclaim = "yes"', "mem.reclaim must be a boolean"),
+                ("reclaim_interval = 0", "reclaim_interval must be a finite number"),
+                (
+                    "pressure_ceiling = 101",
+                    "pressure_ceiling must be between 0 and 100",
+                ),
+                (
+                    'reclaim_max = "many"',
+                    "reclaim_max must be a valid non-negative binary size",
+                ),
+            )
+            for index, (value, expected) in enumerate(invalid_values):
+                bad = self.write(
+                    Path(root) / ("bad-%d.toml" % index), "[mem]\n" + value + "\n"
+                )
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        policy._load_files([bad])
+
     def test_taema_config_replaces_all_file_layers(self):
         with tempfile.TemporaryDirectory() as root:
             system = self.write(

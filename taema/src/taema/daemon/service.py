@@ -65,6 +65,8 @@ RESTORE_START_TIMEOUT = 15.0
 MAX_EVENT_REPLAY = 1000
 SUBSCRIBER_CLOSE_TTL = 1.0
 MAX_COLLECTOR_EVENTS = 4096
+MAX_RECLAIM_SCOPES = 32
+RECLAIM_CPU_PERCENT = 1.0
 MAX_QOS_OOM_RECORDS = 4096
 MAX_QOS_OOM_UNDO_INPUT = 16384
 
@@ -108,6 +110,11 @@ class MemoryReconcile:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class ReclaimReconcile:
+    pass
+
+
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -140,12 +147,19 @@ class Daemon:
         self.srv = None
         self.sock_path = None
         self.mem_enabled = memory.enabled(cfg)
-        self.last = {"adopt": 0.0, "gc": 0.0, "memory": 0.0}
+        self.last = {"adopt": 0.0, "gc": 0.0, "memory": 0.0, "reclaim": 0.0}
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
         self.iv_memory = 60.0
+        self.iv_reclaim = max(
+            1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
+        )
         self.memory_peaks = {}
         self.last_memory_prune = 0.0
+        self.reclaim_usage = {}  # scope -> aggregate cpu usage_usec and sample time
+        self.reclaim_idle_since = {}
+        self.reclaim_state = {}  # scope -> cooldown/refault state
+        self.reclaim_cursor = 0
         self.qos_pending = {}  # scope -> (candidate class, first observed time)
         self.qos_usage = {}  # app scope -> (aggregate cpu usage_usec, sample time)
         self.qos_idle_since = {}  # app scopes independently observed idle of GC eligibility
@@ -255,6 +269,14 @@ class Daemon:
     def auto(self):
         return self.mode == "auto"
 
+    def memory_reclaim_enabled(self):
+        config = self.cfg.get("mem", {})
+        return (
+            self.mem_enabled
+            and isinstance(config, dict)
+            and config.get("reclaim", True) is True
+        )
+
     def may_move(self):
         return self.mode in ("adopt", "enforce", "auto")
 
@@ -307,14 +329,17 @@ class Daemon:
                 else os.path.join(cgroup.base(), f.scope)
             )
             unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            force_veto = trigger == authorization.MANUAL_RECLAIM and f.force_veto
             veto = (
                 engine.veto_for_scope(self.store, path, unit=unit)
-                if not f.vetoed
+                if not f.vetoed and not force_veto
                 else None
             )
             unit_veto = (
                 "kill.never_stop"
-                if unit and unit.get("kill", {}).get("never_stop")
+                if trigger not in (authorization.RECLAIM, authorization.MANUAL_RECLAIM)
+                and unit
+                and unit.get("kill", {}).get("never_stop")
                 else ""
             )
             held = self.store.hold_reason(f.scope) if not f.held else ""
@@ -407,6 +432,7 @@ class Daemon:
                 ProcessReconcile,
                 LeafReconcile,
                 MemoryReconcile,
+                ReclaimReconcile,
             ),
         ):
             raise TypeError("unsupported collector event: %s" % type(event).__name__)
@@ -443,6 +469,8 @@ class Daemon:
             self.guarded(self.gc_pass)
         elif isinstance(event, MemoryReconcile):
             self.guarded(self.memory_pass)
+        elif isinstance(event, ReclaimReconcile):
+            self.guarded(self.reclaim_pass)
 
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
@@ -3940,12 +3968,37 @@ class Daemon:
             self.store.defer_writes = True
             try:
                 candidates = self.gc_pass(dry_run=msg.get("dry_run") is True)
+                memory_results = (
+                    self.reclaim_pass(dry_run=msg.get("dry_run") is True)
+                    if msg.get("memory") is True
+                    else None
+                )
             finally:
                 self._in_tick = was_in_tick
                 self.store.defer_writes = was_deferred
             if not was_deferred:
                 self.store.save_if_dirty()
-            return {"candidates": candidates}
+            reply = {"candidates": candidates}
+            if memory_results is not None:
+                reply["memory"] = memory_results
+            return reply
+        if c == "reclaim":
+            was_in_tick = self._in_tick
+            was_deferred = self.store.defer_writes
+            self._in_tick = True
+            self.store.defer_writes = True
+            try:
+                result = self.reclaim_scope(
+                    msg.get("scope"),
+                    force_veto=msg.get("force_veto") is True,
+                    dry_run=msg.get("dry_run") is True,
+                )
+            finally:
+                self._in_tick = was_in_tick
+                self.store.defer_writes = was_deferred
+            if not was_deferred:
+                self.store.save_if_dirty()
+            return result
         if c == "feedback":
             if msg.get("v") in (1, 2):
                 result = self.store.apply_feedback_command(
@@ -4557,6 +4610,10 @@ class Daemon:
         self.lineage.identity_sink = self.store.record_identities
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.mem_enabled = memory.enabled(cfg)
+        self.iv_reclaim = max(
+            1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
+        )
         self.config_error = None
         active_profile = cfg.get("_profile_name", "auto")
         if active_profile != previous_profile:
@@ -4619,7 +4676,7 @@ class Daemon:
         )
 
     def next_timeout(self, now=None):
-        """Seconds until the next timer is due (adopt, gc, memory), capped at MAX_SLEEP."""
+        """Seconds until the next adopt, gc, memory, or reclaim pass is due."""
         if self.collector_events:
             return 0.0
         now = time.time() if now is None else now
@@ -4650,6 +4707,8 @@ class Daemon:
             due_times.append(retry_at)
         if self.mem_enabled:
             due_times.append(self.last.get("memory", now) + self.iv_memory)
+        if self.memory_reclaim_enabled():
+            due_times.append(self.last.get("reclaim", now) + self.iv_reclaim)
         monotonic_now = time.monotonic()
         due_times.extend(
             now + max(0, item["close_deadline"] - monotonic_now)
@@ -4691,6 +4750,12 @@ class Daemon:
             ):
                 if self.queue_collector_event(MemoryReconcile()):
                     self.last["memory"] = now
+            if (
+                self.memory_reclaim_enabled()
+                and now - self.last.get("reclaim", 0.0) >= self.iv_reclaim
+            ):
+                if self.queue_collector_event(ReclaimReconcile()):
+                    self.last["reclaim"] = now
             self.drain_collector_events()
             self.guarded(self.qos_pass)
         finally:
@@ -4732,6 +4797,473 @@ class Daemon:
         if prune_due:
             self.last_memory_prune = now
         return saved
+
+    def _reclaim_class(self, scope, path):
+        """Resolve the deliberately small set of scope classes eligible for idle reclaim."""
+        if scope == "manager" or scope.startswith("manager/"):
+            return None
+        if scope.startswith("leftover/"):
+            return "leftover"
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        metadata = (unit or {}).get("unit", {})
+        unit_gc = (unit or {}).get("gc", {})
+        resource_class = metadata.get("qos_class", metadata.get("class"))
+        bundled_podman = (
+            metadata.get("name") == "app-podman"
+            and metadata.get("kind") == "app"
+            and metadata.get("group_by_env") == "XDG_RUNTIME_DIR"
+            and unit_gc.get("keep_while_children") is True
+            and scope.startswith("app-podman-")
+        )
+        if (
+            resource_class == "container"
+            or metadata.get("kind") == "container"
+            or bundled_podman
+            or scope == "container"
+            or scope.startswith(("container/", "container-", "app-container-"))
+        ):
+            return "container"
+        if resource_class == "background" or scope in self.qos_idle_since:
+            return "background"
+        return None
+
+    def _reclaim_safety_reason(self, scope, path, pids):
+        if scope == "manager" or scope.startswith("manager/"):
+            return "manager scope is never reclaimed"
+        if os.getpid() in pids or cgroup.is_prefix(path, cgroup.own_cgroup()):
+            return "scope contains the daemon"
+        if not pids:
+            return "scope is empty"
+        infos = self._infos(pids)
+        if {info.get("pid") for info in infos} != set(pids):
+            return "member safety facts are unavailable"
+        for info in infos:
+            pid = info["pid"]
+            if info.get("protected"):
+                return "protected member: %s" % info["protected"]
+            if info.get("ptmx"):
+                return "pty host"
+            if info.get("edges") is None:
+                return "dependency edges are unknown"
+            if info["edges"]:
+                return "scope has external dependency edges"
+            if inspect.uid_of(pid) != os.getuid():
+                return "scope contains a process owned by another uid"
+        return ""
+
+    def _reclaim_warm(self, scope, path, now, cooldown):
+        state = self.reclaim_state.get(scope)
+        if not isinstance(state, dict):
+            return False
+        warm_until = state.get("warm_until")
+        if (
+            state.get("warm") is True
+            and isinstance(warm_until, (int, float))
+            and now >= warm_until
+        ):
+            state["warm"] = False
+            state["warm_until"] = None
+        last = state.get("last_at")
+        if not isinstance(last, (int, float)) or now - last > cooldown:
+            return state.get("warm") is True
+        counters = memory.scope_counters(path)
+        if counters is None:
+            return state.get("warm") is True
+        refaulted = False
+        for name, stored in (
+            ("workingset_refault_file", "refault_file"),
+            ("pgmajfault", "major_faults"),
+            ("high_events", "high_events"),
+        ):
+            current = counters.get(name)
+            previous = state.get(stored)
+            if isinstance(current, int) and isinstance(previous, int):
+                if current > previous:
+                    refaulted = True
+                if current != previous:
+                    state[stored] = current
+        if refaulted:
+            was_warm = state.get("warm") is True
+            state["warm"] = True
+            warm_until = state.get("warm_until")
+            state["warm_until"] = max(
+                now + (2 * cooldown),
+                warm_until if isinstance(warm_until, (int, float)) else 0,
+            )
+            if self.store.changed("reclaim_warm:" + scope, state["warm_until"]):
+                self.store.log(
+                    event="memory_scope_warm",
+                    scope=scope,
+                    reason="file refault or major fault followed reclaim",
+                    warm_grace_multiplier=2,
+                    suppress_until=state["warm_until"],
+                    repeated=was_warm,
+                )
+        return state.get("warm") is True
+
+    def _reclaim_idle(self, scope, path, now, warm, grace):
+        usage = engine._cpu_usage(path)
+        previous = self.reclaim_usage.get(scope)
+        if usage is None:
+            self.reclaim_usage.pop(scope, None)
+            self.reclaim_idle_since.pop(scope, None)
+            return False, "CPU usage is unavailable"
+        self.reclaim_usage[scope] = (usage, now)
+        if previous is None or now <= previous[1]:
+            self.reclaim_idle_since[scope] = now
+            return False, "waiting for a second idle sample"
+        elapsed = now - previous[1]
+        if usage < previous[0]:
+            self.reclaim_idle_since[scope] = now
+            return False, "CPU counter changed"
+        if elapsed < qos.BACKGROUND_SAMPLE_SECONDS:
+            return False, "waiting for a stable CPU sample"
+        cpu_percent = 100.0 * (usage - previous[0]) / (elapsed * 1_000_000)
+        if cpu_percent > RECLAIM_CPU_PERCENT:
+            self.reclaim_idle_since[scope] = now
+            return False, "scope is active (%.2f%% CPU)" % cpu_percent
+        idle_since = self.reclaim_idle_since.setdefault(scope, previous[1])
+        effective_grace = grace * (2 if warm else 1)
+        if now - idle_since < effective_grace:
+            return (
+                False,
+                "idle for %ds; needs %ds%s"
+                % (
+                    int(now - idle_since),
+                    int(effective_grace),
+                    " (warm scope)" if warm else "",
+                ),
+            )
+        return True, "idle for %ds" % int(now - idle_since)
+
+    def _reclaim_one(
+        self,
+        scope,
+        path,
+        now,
+        host_pressure,
+        *,
+        manual=False,
+        force_veto=False,
+        dry_run=False,
+        resource_class=None,
+    ):
+        config = self.cfg.get("mem", {})
+        if (
+            not memory.enabled(self.cfg)
+            or not isinstance(config, dict)
+            or config.get("reclaim", True) is not True
+        ):
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "reclaim is disabled",
+            }
+        pids = cgroup.tree_procs(path)
+        safety = self._reclaim_safety_reason(scope, path, pids)
+        if safety:
+            return {"scope": scope, "status": "skipped", "reason": safety}
+
+        cooldown = float(config.get("reclaim_cooldown", 300))
+        warm = self._reclaim_warm(scope, path, now, cooldown)
+        state = self.reclaim_state.get(scope, {})
+        warm_until = state.get("warm_until") if isinstance(state, dict) else None
+        if isinstance(warm_until, (int, float)) and now < warm_until:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "scope is warm; reclaim suppressed for %ds"
+                % int(warm_until - now),
+            }
+        if not manual:
+            idle, reason = self._reclaim_idle(
+                scope,
+                path,
+                now,
+                warm,
+                float(config.get("idle_reclaim_grace", 300)),
+            )
+            if not idle:
+                return {"scope": scope, "status": "skipped", "reason": reason}
+
+        state = self.reclaim_state.get(scope, {})
+        last = state.get("last_at") if isinstance(state, dict) else None
+        if isinstance(last, (int, float)) and now - last < cooldown:
+            remaining = int(cooldown - (now - last))
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "reclaim cooldown has %ds remaining" % remaining,
+            }
+
+        pressure = host_pressure or memory.pressure()
+        full = pressure.get("full_avg10")
+        ceiling = config.get("pressure_ceiling", 60)
+        if full is None:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "full memory pressure is unavailable",
+            }
+        if full > ceiling:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "full memory pressure %.2f%% exceeds %.2f%%"
+                % (full, ceiling),
+            }
+        local_full = memory.pressure(os.path.join(path, "memory.pressure"))[
+            "full_avg10"
+        ]
+        if local_full is not None and local_full > ceiling:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "scope full memory pressure %.2f%% exceeds %.2f%%"
+                % (local_full, ceiling),
+            }
+        if not manual:
+            some = pressure.get("some_avg10")
+            gate = config.get("pressure_gate", 10)
+            if some is None or some < gate:
+                return {
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": "global some pressure is below the reclaim gate",
+                }
+
+        facts = authorization.Facts(
+            scope=scope,
+            hard_safety="",
+            force_veto=bool(force_veto),
+        )
+        trigger = authorization.MANUAL_RECLAIM if manual else authorization.RECLAIM
+        decision = self.authorize(trigger, facts)
+        if decision.verdict == authorization.WOULD_ACT:
+            result = {
+                "scope": scope,
+                "status": "would",
+                "reason": decision.reason,
+            }
+            if not dry_run and self.store.changed(
+                "reclaim_would:" + scope, decision.reason
+            ):
+                self.store.log(
+                    event="memory_reclaim_would",
+                    scope=scope,
+                    reason=decision.reason,
+                    resource_class=resource_class,
+                )
+            return result
+        if decision.verdict != authorization.ACT:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": decision.reason,
+            }
+
+        counters = memory.scope_counters(path)
+        if not isinstance(counters, dict):
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "memory usage statistics are unavailable",
+            }
+        if not manual and counters.get("workingset_refault_file") is None:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "file refault counters are unavailable",
+            }
+        try:
+            maximum = memory.size_bytes(config.get("reclaim_max", "2G"))
+            minimum = memory.size_bytes(config.get("reclaim_minimum", "16M"))
+            headroom = memory.size_bytes(config.get("min_headroom", "128M"))
+            percent = config.get("headroom_percent", 10)
+        except ValueError as error:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "invalid memory reclaim configuration: %s" % error,
+            }
+        amount = memory.page_cache_budget(
+            counters.get("current_bytes"),
+            counters.get("anon_bytes"),
+            counters.get("reclaimable_bytes"),
+            maximum,
+            headroom,
+            percent,
+            minimum,
+        )
+        if amount <= 0:
+            return {
+                "scope": scope,
+                "status": "skipped",
+                "reason": "no useful page cache remains above headroom",
+            }
+
+        result = {
+            "scope": scope,
+            "status": "would" if dry_run else "reclaimed",
+            "requested_bytes": amount,
+            "current_before": counters["current_bytes"],
+            "reclaimable_before": counters["reclaimable_bytes"],
+            "resource_class": resource_class,
+        }
+        if dry_run:
+            return result
+
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        matched_veto = (
+            engine.veto_for_scope(self.store, path, unit=unit) if force_veto else None
+        )
+        started = time.monotonic()
+        try:
+            with self.store.decision_context(
+                "reclaim",
+                scope=scope,
+                authority=decision.authority or ("manual" if manual else "mode"),
+                mode=self.mode,
+                why=decision.reason,
+            ):
+                if matched_veto:
+                    self.store.log(
+                        event="veto_override",
+                        trigger=authorization.MANUAL_RECLAIM,
+                        scope=scope,
+                        target=self.store.describe_veto(matched_veto),
+                        source=matched_veto.get("source", "user"),
+                    )
+                method = memory.reclaim_page_cache(
+                    path,
+                    amount,
+                    counters["current_bytes"] - amount,
+                )
+        except (OSError, ValueError) as error:
+            after = memory.scope_counters(path) or {}
+            result.update(
+                status="failed",
+                error=str(error),
+                current_after=after.get("current_bytes"),
+                reclaimable_after=after.get("reclaimable_bytes"),
+            )
+            self.store.log(
+                event="memory_reclaim_failed",
+                scope=scope,
+                resource_class=resource_class,
+                method="memory.reclaim or memory.high",
+                current_before=counters["current_bytes"],
+                current_after=after.get("current_bytes"),
+                reclaimable_before=counters["reclaimable_bytes"],
+                reclaimable_after=after.get("reclaimable_bytes"),
+                reason=str(error),
+            )
+            return result
+
+        after = memory.scope_counters(path) or {}
+        measured = None
+        if isinstance(after.get("reclaimable_bytes"), int):
+            measured = max(
+                0, counters["reclaimable_bytes"] - after["reclaimable_bytes"]
+            )
+        result.update(
+            method=method,
+            current_after=after.get("current_bytes"),
+            reclaimable_after=after.get("reclaimable_bytes"),
+            reclaimed_bytes=measured,
+            elapsed_ms=round((time.monotonic() - started) * 1000, 2),
+        )
+        self.reclaim_state[scope] = {
+            "last_at": now,
+            "warm": warm,
+            "warm_until": state.get("warm_until") if isinstance(state, dict) else None,
+            "refault_file": after.get("workingset_refault_file"),
+            "major_faults": after.get("pgmajfault"),
+            "high_events": after.get("high_events"),
+        }
+        self.store.log(
+            event="memory_reclaimed",
+            scope=scope,
+            resource_class=resource_class,
+            method=method,
+            requested_bytes=amount,
+            reclaimed_bytes=measured,
+            current_before=counters["current_bytes"],
+            current_after=after.get("current_bytes"),
+            reclaimable_before=counters["reclaimable_bytes"],
+            reclaimable_after=after.get("reclaimable_bytes"),
+            elapsed_ms=result["elapsed_ms"],
+        )
+        return result
+
+    def reclaim_scope(self, scope, force_veto=False, dry_run=False, now=None):
+        """Run one explicit, daemon-authorized page-cache reclaim request."""
+        if not isinstance(scope, str) or not cgroup.valid_rel(scope):
+            return {"scope": scope, "status": "failed", "reason": "scope is invalid"}
+        path = os.path.join(cgroup.base(), scope)
+        if not os.path.isdir(path):
+            return {"scope": scope, "status": "failed", "reason": "scope not found"}
+        return self._reclaim_one(
+            scope,
+            path,
+            time.time() if now is None else float(now),
+            memory.pressure(),
+            manual=True,
+            force_veto=force_veto,
+            dry_run=dry_run,
+            resource_class=self._reclaim_class(scope, path) or "manual",
+        )
+
+    def reclaim_pass(self, now=None, dry_run=False):
+        """Reclaim bounded page cache from safe idle scopes when pressure warrants it."""
+        config = self.cfg.get("mem", {})
+        if not memory.enabled(self.cfg) or not isinstance(config, dict):
+            return []
+        if config.get("reclaim", True) is not True:
+            return []
+        now = time.time() if now is None else float(now)
+        snapshot = memory.snapshot(cfg=self.cfg, peak_cache=self.memory_peaks, now=now)
+        host_pressure = memory.pressure()
+        scope_names = {item["name"] for item in snapshot.get("scopes", [])}
+        tracked_scopes = (
+            set(self.reclaim_state)
+            | set(self.reclaim_usage)
+            | set(self.reclaim_idle_since)
+        )
+        for scope in tracked_scopes - scope_names:
+            self.reclaim_state.pop(scope, None)
+            self.reclaim_usage.pop(scope, None)
+            self.reclaim_idle_since.pop(scope, None)
+
+        candidates = []
+        for row in snapshot.get("scopes", []):
+            scope = row.get("name")
+            if not isinstance(scope, str) or not cgroup.valid_rel(scope):
+                continue
+            path = os.path.join(cgroup.base(), scope)
+            resource_class = self._reclaim_class(scope, path)
+            if resource_class is not None:
+                candidates.append((scope, path, resource_class))
+        results = []
+        if candidates:
+            start = self.reclaim_cursor % len(candidates)
+            count = min(len(candidates), MAX_RECLAIM_SCOPES)
+            selected = (candidates + candidates)[start : start + count]
+            self.reclaim_cursor = (start + count) % len(candidates)
+        else:
+            selected = []
+            self.reclaim_cursor = 0
+        for scope, path, resource_class in selected:
+            result = self._reclaim_one(
+                scope,
+                path,
+                now,
+                host_pressure,
+                dry_run=dry_run,
+                resource_class=resource_class,
+            )
+            results.append(result)
+        return results
 
     def run(self):
         signal.signal(signal.SIGTERM, self._on_signal)

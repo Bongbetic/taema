@@ -87,7 +87,7 @@ class QoSIntegration(unittest.TestCase):
         self.cg = FakeCg().__enter__()
         self.addCleanup(self.cg.__exit__)
         self.cfg = make_cfg(os.path.join(self.cg.root, "state"), mode="enforce")
-        self.cfg["memory"] = {"enabled": False}
+        self.cfg["mem"] = {"enabled": False}
         self.daemon = service.Daemon(self.cfg)
         protection = mock.patch.object(
             service.policy, "protected_reason", return_value=None
@@ -720,7 +720,7 @@ class QoSViews(unittest.TestCase):
         with FakeCg() as cg, tempfile.TemporaryDirectory() as state_dir:
             cg.leaf("leftover/browser")
             cfg = make_cfg(state_dir, mode="observe")
-            cfg["memory"] = {"enabled": False}
+            cfg["mem"] = {"enabled": False}
             store = service.knowledge.Store(state_dir, {})
             store.data["qos_scopes"] = {
                 "leftover/browser": {"class": "leftover", "deprioritized": True}

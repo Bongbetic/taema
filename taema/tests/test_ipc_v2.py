@@ -190,7 +190,11 @@ class IpcV2Tests(unittest.TestCase):
             ),
             ("kill_done", {"shell_pid": pid, "word": "kill"}),
             ("ask", {"shell_pid": pid}),
-            ("gc", {"dry_run": True}),
+            ("gc", {"dry_run": True, "memory": True}),
+            (
+                "reclaim",
+                {"scope": "leftover/reclaim-test", "force_veto": True, "dry_run": True},
+            ),
             ("feedback", {"op": "keep", "key": "ipc-schema"}),
             (
                 "feedback",
@@ -219,6 +223,7 @@ class IpcV2Tests(unittest.TestCase):
             )
             payload = json.dumps(envelope).encode() + b"\n"
             uid = mock.patch.object(inspect, "uid_of", return_value=os.getuid())
+            memory_operation = nullcontext()
             with uid:
                 if command == "register":
                     operation = mock.patch.object(
@@ -236,9 +241,20 @@ class IpcV2Tests(unittest.TestCase):
                     operation = mock.patch.object(
                         self.daemon, "gc_pass", return_value=[]
                     )
+                    memory_operation = mock.patch.object(
+                        self.daemon, "reclaim_pass", return_value=[]
+                    )
+                elif command == "reclaim":
+                    operation = mock.patch.object(
+                        self.daemon,
+                        "reclaim_scope",
+                        return_value={"scope": args["scope"], "status": "would"},
+                    )
+                    memory_operation = nullcontext()
                 else:
                     operation = nullcontext()
-                with operation:
+                    memory_operation = nullcontext()
+                with operation, memory_operation:
                     reply, _ = self.converse(payload)
             self.assertTrue(
                 matches(reply, self.reply_schema, self.reply_schema), command

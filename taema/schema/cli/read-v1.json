@@ -17,7 +17,8 @@
     { "$ref": "#/$defs/memory-view" },
     { "$ref": "#/$defs/memory-host-record" },
     { "$ref": "#/$defs/memory-scope-record" },
-    { "$ref": "#/$defs/memory-watch" }
+    { "$ref": "#/$defs/memory-watch" },
+    { "$ref": "#/$defs/memory-reclaim" }
   ],
   "$defs": {
     "view": {
@@ -514,6 +515,27 @@
       "properties": {
         "schema": { "const": "taema.memory-watch.v1" },
         "snapshots": { "type": "array", "items": { "$ref": "#/$defs/memory-view" } }
+      },
+      "additionalProperties": false
+    },
+    "memory-reclaim": {
+      "type": "object",
+      "required": ["schema", "scope", "status"],
+      "properties": {
+        "schema": { "const": "taema.memory-reclaim.v1" },
+        "scope": { "type": ["string", "null"] },
+        "status": { "enum": ["would", "reclaimed", "skipped", "failed"] },
+        "reason": { "type": "string" },
+        "error": { "type": "string" },
+        "method": { "enum": ["memory.reclaim", "memory.high"] },
+        "requested_bytes": { "type": "integer", "minimum": 0 },
+        "reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "current_before": { "type": ["integer", "null"], "minimum": 0 },
+        "current_after": { "type": ["integer", "null"], "minimum": 0 },
+        "reclaimable_before": { "type": ["integer", "null"], "minimum": 0 },
+        "reclaimable_after": { "type": ["integer", "null"], "minimum": 0 },
+        "resource_class": { "type": "string" },
+        "elapsed_ms": { "type": "number", "minimum": 0 }
       },
       "additionalProperties": false
     }

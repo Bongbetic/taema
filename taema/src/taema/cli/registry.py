@@ -331,6 +331,17 @@ COMMANDS: tuple[dict[str, Any], ...] = (
                 "handler": "cmd_memory_pressure",
                 "read": True,
             },
+            {
+                "name": "reclaim",
+                "help": "reclaim bounded page cache from an eligible scope",
+                "handler": "cmd_memory_reclaim",
+                "read": True,
+                "arguments": (
+                    (("--force-veto",), {"action": "store_true"}),
+                    (("--dry-run",), {"action": "store_true"}),
+                    (("name",), {"metavar": "NAME"}),
+                ),
+            },
         ),
     },
     {
@@ -453,7 +464,10 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "help": "show or collect idle scopes",
         "handler": "cmd_gc",
         "read": True,
-        "arguments": ((("--dry-run",), {"action": "store_true"}),),
+        "arguments": (
+            (("--dry-run",), {"action": "store_true"}),
+            (("--memory",), {"action": "store_true"}),
+        ),
     },
     {
         "name": "adopt",

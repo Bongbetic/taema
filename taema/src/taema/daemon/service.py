@@ -144,6 +144,7 @@ class Daemon:
         self.freeze_usage = {}  # rel -> (usage_usec, sample_time, member pids)
         self.manual_freeze_usage = {}  # rel -> manual request CPU sample
         self.freeze_idle_since = {}
+        self.last_listener_check = 0.0
         self.gc_skip = set()  # leaves with a protected member: not retried
         self.gc_noted = set()  # leaves already logged as kept
         self.srv = None
@@ -4557,6 +4558,10 @@ class Daemon:
 
     def _freeze_safety_reason(self, scope, path, snapshot=None):
         """Return a fail-closed reason when a leftover cannot safely be frozen."""
+        return self._freeze_safety_facts(scope, path, snapshot)[0]
+
+    def _freeze_safety_facts(self, scope, path, snapshot=None):
+        """Return the safety reason and monitored listeners for one freeze inspection."""
         if (
             not cgroup.valid_rel(scope)
             or scope == "manager"
@@ -4564,33 +4569,46 @@ class Daemon:
             or scope.count("/") != 1
             or not scope.startswith("leftover/")
         ):
-            return "not a top-level leftover scope"
+            return "not a top-level leftover scope", []
         if not os.path.isdir(path):
-            return "scope is unavailable"
+            return "scope is unavailable", []
         if cgroup.subdirs(path):
-            return "scope is not a leaf"
+            return "scope is not a leaf", []
         pids = cgroup.tree_procs(path)
         if not pids:
-            return "scope is empty"
+            return "scope is empty", []
         if snapshot is None:
             snapshot = inspect.Snapshot()
         if not getattr(snapshot, "ok", False):
-            return "socket state unknown"
+            return "socket state unknown", []
         edge_map = inspect.edges(set(pids), snapshot)
         if edge_map:
-            return "outside dependency edge"
+            return "outside dependency edge", []
         fd_reason, member_socket_inodes, pty_host = freezing.member_fd_facts(
             pids, snapshot, inspect.PROC
         )
         if fd_reason:
-            return fd_reason
+            return fd_reason, []
         if pty_host:
-            return "pty host"
+            return "pty host", []
+        wake_on_connect = (
+            self.cfg.get("freeze", {}).get("wake_on_connect", False) is True
+        )
         socket_reason = freezing.socket_safety_reason(
-            pids, snapshot, member_socket_inodes
+            pids,
+            snapshot,
+            member_socket_inodes,
+            wake_on_connect=wake_on_connect,
         )
         if socket_reason:
-            return socket_reason
+            return socket_reason, []
+        listeners = []
+        if wake_on_connect:
+            listeners, listener_error = freezing.listener_descriptors(
+                pids, snapshot, member_socket_inodes
+            )
+            if listener_error:
+                return listener_error, []
         for pid in pids:
             entry = self.lineage.entry(pid)
             if (
@@ -4598,12 +4616,12 @@ class Daemon:
                 or not isinstance(entry.get("start"), int)
                 or entry["start"] <= 0
             ):
-                return "process identity unknown"
+                return "process identity unknown", []
             member_cgroup = cgroup.proc_cgroup(pid)
             if not member_cgroup:
-                return "process cgroup unknown"
+                return "process cgroup unknown", []
             if not cgroup.is_prefix(path, member_cgroup):
-                return "process moved during inspection"
+                return "process moved during inspection", []
             env_rules = self.cfg.get("protected", {}).get("env_prefix", {})
             if env_rules:
                 try:
@@ -4612,28 +4630,28 @@ class Daemon:
                     ) as source:
                         source.read()
                 except OSError:
-                    return "protected environment state unknown"
+                    return "protected environment state unknown", []
             protected = policy.protected_reason(pid, self.cfg)
             if protected:
-                return "protected member: %s" % protected
+                return "protected member: %s" % protected, []
             key = entry.get("key")
             if not isinstance(key, str) or not key:
-                return "member identity unknown"
+                return "member identity unknown", []
             facts = self.store.peek(key)
             if (
                 self.store.is_persistent(key)
                 or self.store.standalone(key)
                 or facts.get("user_keep", 0.0) > 0
             ):
-                return "member has a keep or standalone decision"
+                return "member has a keep or standalone decision", []
             if self.store.default_action(key)[0] == "share":
-                return "member is configured to be kept"
+                return "member is configured to be kept", []
             for owner in self.store.owners_of(
                 key, limit=max(1, len(self.store.data.get("pairs", {})))
             ):
                 if self.store.pair_decision(owner, key)[0] in ("keep", "standalone"):
-                    return "member has a keep or standalone decision"
-        return ""
+                    return "member has a keep or standalone decision", []
+        return "", listeners
 
     def _clear_freeze_samples(self, scope):
         self.freeze_usage.pop(scope, None)
@@ -4726,6 +4744,100 @@ class Daemon:
             self._save_if_idle()
         return results
 
+    def _frozen_listener_scopes(self):
+        """Return managed, still-frozen scopes that need accept-queue monitoring."""
+        managed = self.store.data.get("frozen_scopes", {})
+        if not isinstance(managed, dict):
+            return []
+        out = []
+        for scope, record in managed.items():
+            if (
+                not isinstance(scope, str)
+                or not cgroup.valid_rel(scope)
+                or not isinstance(record, dict)
+                or not record.get("listeners")
+            ):
+                continue
+            path = os.path.join(cgroup.base(), scope)
+            if self._freeze_value(path) == "1":
+                out.append((scope, path, record))
+        return out
+
+    def listener_wake_pass(self, now=None):
+        """Thaw frozen listeners with queued clients; unknown queue state thaws too."""
+        now = time.time() if now is None else now
+        frozen = self._frozen_listener_scopes()
+        if not frozen:
+            self.last_listener_check = 0.0
+            return []
+        if now - self.last_listener_check < 2.0:
+            return []
+        self.last_listener_check = now
+        snapshot = inspect.Snapshot()
+        if not getattr(snapshot, "ok", False):
+            return [
+                self._thaw_scope(scope, "listener state unknown")
+                for scope, _path, _record in frozen
+            ]
+
+        current = {}
+        for row in snapshot.tcp_listen:
+            current[("tcp", row.get("inode"))] = row
+        for row in snapshot.unix:
+            if row.get("state") == "LISTEN":
+                current[("unix", row.get("inode"))] = row
+
+        results = []
+        for scope, path, record in frozen:
+            if cgroup.subdirs(path):
+                results.append(self._thaw_scope(scope, "frozen scope is no longer a leaf"))
+                continue
+            members = cgroup.tree_procs(path)
+            if not members:
+                results.append(self._thaw_scope(scope, "frozen scope is empty"))
+                continue
+            fd_reason, member_socket_inodes, pty_host = freezing.member_fd_facts(
+                members, snapshot, inspect.PROC
+            )
+            if fd_reason or pty_host:
+                detail = fd_reason or "pty host"
+                results.append(
+                    self._thaw_scope(scope, "listener state unknown: " + detail)
+                )
+                continue
+            listeners = record.get("listeners")
+            if not isinstance(listeners, list) or not listeners:
+                results.append(self._thaw_scope(scope, "listener state unknown"))
+                continue
+            reason = ""
+            for listener in listeners:
+                if not isinstance(listener, dict):
+                    reason = "listener state unknown"
+                    break
+                transport, inode = listener.get("transport"), listener.get("inode")
+                if (
+                    transport not in ("tcp", "unix")
+                    or not isinstance(inode, int)
+                    or isinstance(inode, bool)
+                    or inode <= 0
+                ):
+                    reason = "listener state unknown"
+                    break
+                row = current.get((transport, inode))
+                if row is None or inode not in member_socket_inodes:
+                    reason = "listener disappeared"
+                    break
+                recv_q = row.get("recv_q")
+                if not isinstance(recv_q, int) or isinstance(recv_q, bool) or recv_q < 0:
+                    reason = "listener state unknown"
+                    break
+                if recv_q > 0:
+                    reason = "connect"
+                    break
+            if reason:
+                results.append(self._thaw_scope(scope, reason))
+        return results
+
     def _manual_freeze_cpu_reason(self, scope, path, members):
         """Require a stable, measured 60-second idle window for a manual freeze."""
         now = time.time()
@@ -4768,7 +4880,7 @@ class Daemon:
         members = tuple(sorted(cgroup.tree_procs(path)))
         self.lineage.observe(inspect.ProcTable.scan())
         snapshot = inspect.Snapshot()
-        safety = self._freeze_safety_reason(scope, path, snapshot)
+        safety, listeners = self._freeze_safety_facts(scope, path, snapshot)
         if safety:
             return {"ok": False, "error": safety}
         value = self._freeze_value(path)
@@ -4816,6 +4928,7 @@ class Daemon:
                     scope,
                     time.time(),
                     decision_id=audit["id"],
+                    listeners=listeners,
                     source=source,
                 )
                 # Persist the recovery intent before changing kernel state. A crash from here
@@ -5150,6 +5263,8 @@ class Daemon:
         ] + [d[0] for d in self.deadlines]
         if self.last.get("freeze", 0.0):
             due_times.append(self.last["freeze"] + 60.0)
+        if self._frozen_listener_scopes():
+            due_times.append(self.last_listener_check + 2.0)
         due_times.extend(
             since + qos.DEBOUNCE_SECONDS
             for _candidate, since in self.qos_pending.values()
@@ -5202,6 +5317,11 @@ class Daemon:
             self.guarded(self.thaw_held_scopes)
             self.run_deadlines()
             now = time.time()
+            if (
+                self._frozen_listener_scopes()
+                and now - self.last_listener_check >= 2.0
+            ):
+                self.guarded(lambda: self.listener_wake_pass(now=now))
             if now - self.last["adopt"] >= self.iv_adopt:
                 self.guarded(self.poll_owner_watches)
                 if self.queue_collector_event(ProcessReconcile()):
@@ -5224,6 +5344,11 @@ class Daemon:
             if now - self.last.get("freeze", 0.0) >= 60.0:
                 self.last["freeze"] = now
                 self.guarded(self.freeze_pass)
+            if (
+                self._frozen_listener_scopes()
+                and now - self.last_listener_check >= 2.0
+            ):
+                self.guarded(lambda: self.listener_wake_pass(now=now))
             self.drain_collector_events()
             self.guarded(self.qos_pass)
         finally:

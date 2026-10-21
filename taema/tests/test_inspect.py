@@ -114,15 +114,35 @@ class Parse(unittest.TestCase):
         txt = 'u_str ESTAB 0      0                                                         * 2302403             * 2302404  users:(("herdr",pid=11549,fd=11),("herdr",pid=11549,fd=9))'
         r = inspect.parse_ss_unix(txt)[0]
         self.assertEqual(
-            (r["inode"], r["peer_inode"], r["pids"], r["path"]),
-            (2302403, 2302404, {11549}, ""),
+            (
+                r["inode"],
+                r["peer_inode"],
+                r["pids"],
+                r["path"],
+                r["recv_q"],
+                r["send_q"],
+            ),
+            (2302403, 2302404, {11549}, "", 0, 0),
+        )
+
+    def test_parse_unix_listener_queue_and_extended_inode(self):
+        row = inspect.parse_ss_unix(
+            'u_str LISTEN 0 8 /run/user/1000/test.sock 64634660 * 0 '
+            'users:(("python3",pid=42,fd=3)) <-> ino:19010946 dev:0/66306 peers:'
+        )[0]
+        self.assertEqual(
+            (row["state"], row["inode"], row["recv_q"], row["send_q"], row["path"]),
+            ("LISTEN", 19010946, 0, 8, "/run/user/1000/test.sock"),
         )
 
     def test_parse_tcp_no_users(self):
         r = inspect.parse_ss_tcp(
             "LISTEN 0      128          0.0.0.0:22         0.0.0.0:*"
         )[0]
-        self.assertEqual((r["local"], r["pids"]), ("0.0.0.0:22", set()))
+        self.assertEqual(
+            (r["local"], r["pids"], r["recv_q"], r["send_q"]),
+            ("0.0.0.0:22", set(), 0, 128),
+        )
 
     def test_parse_tcp_extended_inode(self):
         row = inspect.parse_ss_tcp(

@@ -68,6 +68,21 @@ class StoreDatabaseTests(unittest.TestCase):
             reopened.data["frozen_scopes"]["leftover/browser"]["source"], "auto"
         )
 
+    def test_managed_freeze_listener_metadata_roundtrips(self):
+        listeners = [{"transport": "tcp", "inode": 12345}]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            store.set_frozen_scope(
+                "leftover/browser", 123.0, listeners=listeners, source="auto"
+            )
+            store.save()
+            reopened = Store(temporary, {}, read_only=True)
+
+        self.assertEqual(
+            reopened.data["frozen_scopes"]["leftover/browser"]["listeners"],
+            listeners,
+        )
+
     def test_fresh_store_uses_private_versioned_wal_database(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(temporary, {})

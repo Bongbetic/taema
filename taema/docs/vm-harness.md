@@ -171,6 +171,19 @@ is unavailable).  Job artifacts upload `taema/build/vm/runs/`.
 
 ## Unit tests
 
+The listener wake path also has an opt-in live sandbox test. Run it only where
+the current user has a writable delegated cgroup-v2 tree with `cgroup.freeze`:
+
+```sh
+cd taema
+TAEMA_LIVE_FREEZE_TEST=1 PYTHONPATH=src python -m unittest tests.test_freeze_live
+```
+
+It creates one uniquely named leaf under `user/<uid>/leftover`, runs
+`python3 -m http.server` on loopback, measures ten freeze/request/thaw cycles,
+and removes the leaf and server during cleanup. The ordinary `make test` suite
+skips this test unless the opt-in variable is set.
+
 The locally testable parts are covered by `tests/test_vmharness.py` in the
 ordinary suite (`make test`): config validation, image/cache layout, QEMU and
 overlay argv (KVM vs TCG, loopback-only forwarding), recursive/private

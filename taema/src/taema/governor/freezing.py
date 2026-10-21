@@ -70,13 +70,10 @@ def member_fd_facts(members, snapshot, proc_root):
     return "", sockets, False
 
 
-def socket_safety_reason(members, snapshot, member_socket_inodes=()):
-    """Return why socket state is unsafe or unknown, otherwise ``None``.
-
-    Any member listener is withheld until wake-on-connect is implemented. All established TCP
-    connections are live dependencies. Unix peer facts must resolve; named compositor and
-    media-service connections are treated as live clients even without a window/session agent.
-    """
+def socket_safety_reason(
+    members, snapshot, member_socket_inodes=(), *, wake_on_connect=False
+):
+    """Return why socket state is unsafe or unknown, otherwise ``None``."""
     members = set(members)
     member_socket_inodes = set(member_socket_inodes)
     if not getattr(snapshot, "ok", False):
@@ -84,7 +81,9 @@ def socket_safety_reason(members, snapshot, member_socket_inodes=()):
 
     for row in snapshot.tcp_listen:
         if row["pids"] & members or row.get("inode") in member_socket_inodes:
-            return "listening socket"
+            reason = _listener_queue_reason(row, wake_on_connect)
+            if reason:
+                return reason
     for row in snapshot.tcp:
         if row["state"] == "ESTAB" and (
             row["pids"] & members or row.get("inode") in member_socket_inodes
@@ -99,7 +98,10 @@ def socket_safety_reason(members, snapshot, member_socket_inodes=()):
         if not owned:
             continue
         if row["state"] == "LISTEN":
-            return "listening socket"
+            reason = _listener_queue_reason(row, wake_on_connect)
+            if reason:
+                return reason
+            continue
         peer_inode = row["peer_inode"]
         peer = snapshot.by_inode.get(peer_inode) if peer_inode else None
         if peer is None:
@@ -121,3 +123,40 @@ def socket_safety_reason(members, snapshot, member_socket_inodes=()):
         if peer_pids - members:
             return "outside Unix socket peer"
     return None
+
+
+def _listener_queue_reason(row, wake_on_connect):
+    if not wake_on_connect:
+        return "listening socket"
+    recv_q = row.get("recv_q")
+    if not isinstance(recv_q, int) or isinstance(recv_q, bool) or recv_q < 0:
+        return "listener queue unknown"
+    if recv_q:
+        return "listener has pending connections"
+    return None
+
+
+def listener_descriptors(members, snapshot, member_socket_inodes=()):
+    """Identify every member-owned listener for post-freeze accept-queue monitoring."""
+    members = set(members)
+    member_socket_inodes = set(member_socket_inodes)
+    descriptors = {}
+    for transport, rows in (
+        ("tcp", snapshot.tcp_listen),
+        ("unix", snapshot.unix),
+    ):
+        for row in rows:
+            if row.get("state") != "LISTEN":
+                continue
+            if not (row.get("pids", set()) & members) and row.get(
+                "inode"
+            ) not in member_socket_inodes:
+                continue
+            inode = row.get("inode")
+            if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:
+                return [], "listener identity unknown"
+            descriptors[(transport, inode)] = {
+                "transport": transport,
+                "inode": inode,
+            }
+    return [descriptors[key] for key in sorted(descriptors)], ""

@@ -13,9 +13,9 @@ PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
 MAX_RESTORE_ARGV_BYTES = 16 << 10
 _USERS = re.compile(r'\("([^"]*)",pid=(\d+)')
 _UNIX = re.compile(
-    r"^(\S+)\s+(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)"
+    r"^(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)"
 )
-_TCP = re.compile(r"^(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)")
+_TCP = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)")
 _INODE = re.compile(r"\bino:(\d+)\b")
 
 
@@ -263,13 +263,16 @@ def parse_ss_unix(text):
         m = _UNIX.match(line.strip())
         if not m:
             continue
-        _, state, lpath, linode, _ppath, pinode = m.groups()
+        _, state, recv_q, send_q, lpath, linode, _ppath, pinode = m.groups()
+        inode = _INODE.search(line)
         rows.append(
             {
                 "state": state,
+                "recv_q": int(recv_q),
+                "send_q": int(send_q),
                 "path": "" if lpath == "*" else lpath,
                 "peer_path": "" if _ppath == "*" else _ppath,
-                "inode": int(linode),
+                "inode": int(inode.group(1)) if inode else int(linode),
                 "peer_inode": int(pinode),
                 "pids": _pids(line),
             }
@@ -284,8 +287,15 @@ def parse_ss_tcp(text):
         m = _TCP.match(line.strip())
         if not m:
             continue
-        state, local, peer = m.groups()
-        row = {"state": state, "local": local, "peer": peer, "pids": _pids(line)}
+        state, recv_q, send_q, local, peer = m.groups()
+        row = {
+            "state": state,
+            "recv_q": int(recv_q),
+            "send_q": int(send_q),
+            "local": local,
+            "peer": peer,
+            "pids": _pids(line),
+        }
         inode = _INODE.search(line)
         if inode:
             row["inode"] = int(inode.group(1))

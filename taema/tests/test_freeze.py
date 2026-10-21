@@ -141,6 +141,183 @@ class FreezeTests(unittest.TestCase):
             "connected to a window compositor",
         )
 
+    def test_wake_on_connect_freeze_records_tcp_listener(self):
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "local": "127.0.0.1:8000",
+            "inode": 9101,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(),
+            tcp_listen=(listener,),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={9101},
+        )
+        with mock.patch.object(service.inspect, "Snapshot", return_value=snapshot):
+            reason = self.daemon._freeze_safety_reason(self.scope, self.path)
+            frozen = self.daemon.freeze_scope(
+                self.scope, manual=False, cpu_verified=True
+            )
+
+        self.assertEqual(reason, "")
+        self.assertTrue(frozen["ok"])
+        self.assertEqual(
+            self.daemon.store.data["frozen_scopes"][self.scope]["listeners"],
+            [{"transport": "tcp", "inode": 9101}],
+        )
+
+    def test_wake_on_connect_freeze_records_unix_listener(self):
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "path": "/run/user/1000/test.sock",
+            "peer_path": "",
+            "inode": 9103,
+            "peer_inode": 0,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(),
+            tcp_listen=(),
+            unix=(listener,),
+            udp=(),
+            by_inode={9103: listener},
+            socket_inodes={9103},
+        )
+        with mock.patch.object(service.inspect, "Snapshot", return_value=snapshot):
+            reason = self.daemon._freeze_safety_reason(self.scope, self.path)
+            frozen = self.daemon.freeze_scope(
+                self.scope, manual=False, cpu_verified=True
+            )
+
+        self.assertEqual(reason, "")
+        self.assertTrue(frozen["ok"])
+        self.assertEqual(
+            self.daemon.store.data["frozen_scopes"][self.scope]["listeners"],
+            [{"transport": "unix", "inode": 9103}],
+        )
+
+    def test_listener_freeze_stays_disabled_without_wake_on_connect(self):
+        self.daemon.cfg["freeze"]["wake_on_connect"] = False
+        listener = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "local": "127.0.0.1:8000",
+            "inode": 9102,
+            "pids": {4242},
+        }
+        snapshot = SimpleNamespace(
+            ok=True,
+            tcp=(),
+            tcp_listen=(listener,),
+            unix=(),
+            udp=(),
+            by_inode={},
+            socket_inodes={9102},
+        )
+        self.assertEqual(
+            self.daemon._freeze_safety_reason(self.scope, self.path, snapshot),
+            "listening socket",
+        )
+
+    def _assert_listener_queue_wakes_scope(self, transport):
+        inode = 9201 if transport == "tcp" else 9202
+        descriptor = {"transport": transport, "inode": inode}
+        self.daemon.store.set_frozen_scope(
+            self.scope, 1.0, listeners=[descriptor], source="auto"
+        )
+        write(os.path.join(self.path, "cgroup.freeze"), "1\n")
+        fd_dir = os.path.join(self.proc_root, "4242", "fd")
+        os.symlink("socket:[%d]" % inode, os.path.join(fd_dir, "5"))
+        row = {
+            "state": "LISTEN",
+            "recv_q": 0,
+            "send_q": 8,
+            "inode": inode,
+            "pids": {4242},
+        }
+        if transport == "tcp":
+            row["local"] = "127.0.0.1:8000"
+            snapshot = SimpleNamespace(
+                ok=True,
+                tcp=(),
+                tcp_listen=(row,),
+                unix=(),
+                udp=(),
+                by_inode={},
+                socket_inodes={inode},
+            )
+        else:
+            row.update({"path": "/run/test.sock", "peer_path": "", "peer_inode": 0})
+            snapshot = SimpleNamespace(
+                ok=True,
+                tcp=(),
+                tcp_listen=(),
+                unix=(row,),
+                udp=(),
+                by_inode={inode: row},
+                socket_inodes={inode},
+            )
+
+        with (
+            mock.patch.object(service.inspect, "Snapshot", return_value=snapshot) as take,
+            mock.patch.object(self.daemon.store, "log", wraps=self.daemon.store.log) as log,
+        ):
+            self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
+            self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
+            self.assertEqual(self.daemon.listener_wake_pass(now=1001.9), [])
+            self.assertEqual(take.call_count, 1)
+            row["recv_q"] = 1
+            result = self.daemon.listener_wake_pass(now=1002.0)
+
+        self.assertTrue(result[0]["thawed"])
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "0\n")
+        self.assertNotIn(self.scope, self.daemon.store.data["frozen_scopes"])
+        self.assertTrue(
+            any(
+                call.kwargs.get("event") == "thaw"
+                and call.kwargs.get("reason") == "connect"
+                for call in log.call_args_list
+            )
+        )
+
+    def test_pending_tcp_connection_thaws_listener_scope(self):
+        self._assert_listener_queue_wakes_scope("tcp")
+
+    def test_pending_unix_connection_thaws_listener_scope(self):
+        self._assert_listener_queue_wakes_scope("unix")
+
+    def test_accept_queue_poll_is_scheduled_only_for_frozen_listeners(self):
+        self.daemon.last.update(
+            {"adopt": 1000.0, "gc": 1000.0, "freeze": 1000.0}
+        )
+        self.daemon.last_listener_check = 1000.0
+        without_listener = self.daemon.next_timeout(now=1000.0)
+        self.daemon.store.set_frozen_scope(
+            self.scope,
+            1000.0,
+            listeners=[{"transport": "tcp", "inode": 9301}],
+        )
+        write(os.path.join(self.path, "cgroup.freeze"), "1\n")
+        with_listener = self.daemon.next_timeout(now=1000.0)
+        self.assertGreater(without_listener, 2.0)
+        self.assertEqual(with_listener, 2.0)
+
+    def test_no_accept_queue_snapshot_without_frozen_listener(self):
+        with mock.patch.object(
+            service.inspect, "Snapshot", side_effect=AssertionError("unexpected poll")
+        ):
+            self.assertEqual(self.daemon.listener_wake_pass(now=1000.0), [])
+
     def test_manual_freeze_and_thaw_work_in_observe_mode(self):
         self.daemon.cfg["mode"] = "observe"
         self.daemon.manual_freeze_usage[self.scope] = (

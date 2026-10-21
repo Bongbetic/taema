@@ -5116,14 +5116,17 @@ class Daemon:
         """Sample leftover CPU and freeze only scopes idle for the configured grace."""
         now = time.time() if now is None else now
         managed = self.store.data.get("frozen_scopes", {})
-        guard_freeze = guard and self._guard_freeze_authorized()
-        if not self._freeze_config_enabled() and not guard_freeze:
+        guard_freeze_authorized = self._guard_freeze_authorized()
+        guard_maintenance = (
+            not guard and guard_freeze_authorized and not self._freeze_config_enabled()
+        )
+        if not self._freeze_config_enabled() and not guard_freeze_authorized:
             self.freeze_usage.clear()
             self.manual_freeze_usage.clear()
             self.freeze_idle_since.clear()
             self.thaw_all_managed_scopes("freezing disabled by profile or flag")
             return []
-        if not self._freeze_auto_enabled() and not guard_freeze:
+        if not self._freeze_auto_enabled() and not guard_freeze_authorized:
             self.freeze_usage.clear()
             self.freeze_idle_since.clear()
             self.thaw_all_managed_scopes(
@@ -5178,6 +5181,8 @@ class Daemon:
             automatic, key=lambda item: item[1].get("since", 0)
         )[: max(0, len(managed) - maximum)]:
             self._thaw_scope(scope, "automatic freeze limit reduced")
+        if guard_maintenance:
+            return []
         managed = self.store.data.get("frozen_scopes", {})
         automatic_count = len(managed)
         results = []

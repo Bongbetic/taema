@@ -114,22 +114,28 @@ class FreezeTests(unittest.TestCase):
         self.daemon.cfg["guard"] = {"enabled": True, "freeze_in_adopt": False}
         self.cg.set_cpu(self.scope, 0)
 
-        for now in range(0, 120, 10):
-            self.assertEqual(self.daemon.freeze_pass(now=now, guard=True), [])
-        results = self.daemon.freeze_pass(now=120, guard=True)
+        for now in range(0, 130, 10):
+            self.assertEqual(
+                self.daemon.freeze_pass(now=now, guard=now not in (60, 120)), []
+            )
+        results = self.daemon.freeze_pass(now=130, guard=True)
 
         self.assertTrue(results[0]["ok"])
         self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
         self.assertEqual(
             self.daemon.store.data["frozen_scopes"][self.scope]["source"], "auto"
         )
+        self.daemon.freeze_pass(now=180, guard=False)
+        self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
 
     def test_pressure_guard_freeze_in_adopt_requires_explicit_opt_in(self):
         self.daemon.cfg["mode"] = "adopt"
         self.daemon.cfg["mem"] = {"enabled": True}
         self.daemon.mem_enabled = True
         self.daemon.cfg["experimental"]["guard"] = True
+        self.daemon.cfg["experimental"]["freeze"] = False
         self.daemon.cfg["guard"] = {"enabled": True, "freeze_in_adopt": False}
+        self.daemon.cfg["freeze"]["adopt"] = False
         self.cg.set_cpu(self.scope, 0)
 
         for now in (0, 60, 120):
@@ -138,7 +144,7 @@ class FreezeTests(unittest.TestCase):
 
         self.daemon.cfg["guard"]["freeze_in_adopt"] = True
         self.daemon.freeze_pass(now=180, guard=True)
-        self.daemon.freeze_pass(now=240, guard=True)
+        self.daemon.freeze_pass(now=240, guard=False)
         results = self.daemon.freeze_pass(now=300, guard=True)
 
         self.assertTrue(results[0]["ok"])

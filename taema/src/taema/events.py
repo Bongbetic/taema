@@ -46,12 +46,17 @@ _DECISION = {
 }
 _MEMORY = {
     "answer",
+    "freed",
+    "gc_quit",
     "forget",
     "keep",
     "kill",
     "launcher_learned",
     "mute",
+    "memory_save_state",
+    "rebalance",
     "regret",
+    "runtime_pause",
     "standalone",
     "teach",
 }

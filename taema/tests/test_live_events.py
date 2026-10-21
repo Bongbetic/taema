@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from taema import protocol
+from taema import events
 from taema.cli import commands, framework
 from taema.daemon import service
 from taema.store import knowledge
@@ -40,6 +41,17 @@ class LiveEventTests(unittest.TestCase):
                 break
             data += chunk
         return [json.loads(line) for line in data.splitlines()]
+
+    def test_runtime_cleanup_events_are_exposed_under_memory_topic(self):
+        for name in (
+            "gc_quit",
+            "freed",
+            "rebalance",
+            "runtime_pause",
+            "memory_save_state",
+        ):
+            with self.subTest(event=name):
+                self.assertIn("memory", events.event_topics({"event": name}))
 
     def open_subscription(self, since_seq=0, topics=("status", "review")):
         server, client = socket.socketpair()

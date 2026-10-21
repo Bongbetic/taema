@@ -1,6 +1,7 @@
 """Decision and action engine: plan_stop/stop, adopt_pass, gc_pass."""
 
 from contextlib import nullcontext
+import fnmatch
 import hashlib
 import os
 import signal
@@ -189,10 +190,24 @@ def plan_stop(
         elif vetoes:
             d.update(action="skip", why="vetoed " + store.describe_veto(vetoes[0]))
         elif d["edges"] and not hard:
+
+            def describe_edge(edge):
+                peers = edge.get("peers", [])
+                detail = "%s %s" % (edge["kind"], edge["detail"])
+                if edge["kind"] not in ("qmp", "podman_api"):
+                    return detail
+                names = []
+                for peer in peers:
+                    try:
+                        name = inspect.comm(peer) or "process"
+                    except (KeyError, OSError):
+                        name = "process"
+                    names.append("%s (pid %d)" % (name, peer))
+                return detail + (" via " + ", ".join(names) if names else "")
+
             d.update(
                 action="share",
-                why="outside users: "
-                + "; ".join("%s %s" % (e["kind"], e["detail"]) for e in d["edges"]),
+                why="outside users: " + "; ".join(describe_edge(e) for e in d["edges"]),
             )
         elif not edges_ok and not hard:
             d.update(action="share", why="edge scan failed")
@@ -755,7 +770,7 @@ def _matches(m, pid, env=None):
         return False
     if "exe" in m and inspect.exe(pid) != m["exe"]:
         return False
-    if "comm" in m and inspect.comm(pid) != m["comm"]:
+    if "comm" in m and not fnmatch.fnmatchcase(inspect.comm(pid), m["comm"]):
         return False
     if "cmdline_contains" in m and m["cmdline_contains"] not in inspect.cmdline(pid):
         return False
@@ -794,12 +809,19 @@ def adopt_plan(cfg, units, pp=None):
                 groups.setdefault(
                     name + "-" + hashlib.sha1(val.encode()).hexdigest()[:8], (val, [])
                 )[1].append(r)
+            elif u["unit"].get("group_by_qmp") is True:
+                sockets = inspect.qmp_socket_paths(r)
+                val = sockets[0] if sockets else "%s#%d" % (cgroup.proc_cgroup(r), r)
+                groups.setdefault(
+                    name + "-" + hashlib.sha1(val.encode()).hexdigest()[:8],
+                    (None, []),
+                )[1].append(r)
             else:
                 groups.setdefault(name, (None, []))[1].append(r)
         for scope, (val, rs) in groups.items():
             extra = []
             for c in u.get("children", []):
-                if "same_env" in c and val is not None:
+                if "same_env" in c and gb and val is not None:
                     extra += [
                         p
                         for p in in_session
@@ -1133,12 +1155,33 @@ def gc_candidates(
             dirs.discard(None)
             if dirs and all(not os.path.isdir(x) for x in dirs):
                 env_reason = "%s gone: %s" % (var, sorted(dirs)[0])
+        socket_env = gc.get("socket_env")
+        socket_path = gc.get("socket_path")
+        if (
+            isinstance(socket_env, str)
+            and socket_env
+            and isinstance(socket_path, str)
+            and socket_path
+            and not os.path.isabs(socket_path)
+            and ".." not in socket_path.split(os.sep)
+        ):
+            socket_paths = {
+                os.path.join(value, socket_path)
+                for p in pids
+                if (value := inspect.environ(p).get(socket_env))
+            }
+            if socket_paths and all(not os.path.exists(path) for path in socket_paths):
+                env_reason = "runtime socket gone: %s" % sorted(socket_paths)[0]
+        if gc.get("qmp_socket") is True:
+            qmp_paths = {path for p in pids for path in inspect.qmp_socket_paths(p)}
+            if qmp_paths and all(not os.path.exists(path) for path in qmp_paths):
+                env_reason = "QMP socket gone: %s" % sorted(qmp_paths)[0]
         s = snap.get()
         edge_map = inspect.edges(set(pids), s)
         busy = bool(edge_map) or not getattr(s, "ok", True)
         if gc.get("keep_while_children") and u:
-            root_comm = (u.get("match") or {}).get("comm")
-            busy = busy or any(inspect.comm(p) != root_comm for p in pids)
+            root_match = u.get("match") or {}
+            busy = busy or any(not _matches(root_match, p) for p in pids)
         if busy:
             idle_since.pop(rel, None)
             usage.pop(rel, None)
@@ -1159,6 +1202,16 @@ def gc_candidates(
         if env_reason:
             if not cpu_moved:
                 out.append((d, env_reason))
+            continue
+        no_attach_grace = gc.get("no_attach_grace")
+        if (
+            isinstance(no_attach_grace, (int, float))
+            and not isinstance(no_attach_grace, bool)
+            and no_attach_grace >= 0
+            and now() - first >= no_attach_grace
+            and not cpu_moved
+        ):
+            out.append((d, "no attachment for %ds" % int(now() - first)))
             continue
         key = policy.app_key(pids[0], units=units)
         grace = store.idle_grace(key, policy.timer(cfg, "idle_grace", 600))

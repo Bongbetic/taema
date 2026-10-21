@@ -319,6 +319,17 @@ class KnowledgeTests(unittest.TestCase):
         )
         self.assertIsNone(self.s.match_veto(members=[{"pid": 42, "start": 1235}]))
 
+    def test_scope_review_keeps_estimated_memory_for_the_review_view(self):
+        review = self.s.add_scope_review(
+            "leftover/runtime-42", "runtime stop needs review", memory=987654
+        )
+
+        self.assertEqual(review["mem"], 987654)
+        self.assertEqual(
+            self.s.review_details([review])[0]["mem"],
+            987654,
+        )
+
     def test_offline_veto_feedback_is_versioned_and_idempotent(self):
         op = {
             "v": 1,

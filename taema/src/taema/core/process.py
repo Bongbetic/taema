@@ -49,6 +49,95 @@ def cmdline(pid):
     return read(pid, "cmdline").replace(b"\0", b" ").decode(errors="replace").strip()
 
 
+def argv(pid):
+    """Return a process's NUL-separated argument vector without shell parsing."""
+    return [
+        item.decode(errors="replace")
+        for item in read(pid, "cmdline").split(b"\0")
+        if item
+    ]
+
+
+def runtime_identity(pid):
+    """Return runtime identifiers exposed by conmon or QEMU argv."""
+    process_name = comm(pid)
+    args = argv(pid)
+    identity = {}
+    if process_name == "conmon":
+        for index, arg in enumerate(args[:-1]):
+            if arg in ("-c", "--cid", "--container-id"):
+                identity["container"] = args[index + 1]
+                break
+    elif process_name.startswith("qemu-system"):
+        for index, arg in enumerate(args):
+            if arg.startswith("-name="):
+                value = arg.partition("=")[2]
+            elif arg == "-name" and index + 1 < len(args):
+                value = args[index + 1]
+            else:
+                continue
+            domain = re.search(r"(?:^|,)guest=([^,]+)", value)
+            identity["domain"] = (domain.group(1) if domain else value).split(",", 1)[0]
+            break
+    return identity
+
+
+def qmp_socket_paths(pid):
+    """Unix QMP/monitor socket paths declared in a QEMU process argument vector."""
+    args = argv(pid)
+    found = []
+    chardev_paths = {}
+    control_ids = set()
+
+    def record_monitor_option(option, value):
+        settings = dict(item.split("=", 1) for item in value.split(",") if "=" in item)
+        if option == "-chardev":
+            path = settings.get("path")
+            if (
+                value.partition(",")[0] == "socket"
+                and settings.get("id")
+                and isinstance(path, str)
+                and path.startswith("/")
+            ):
+                chardev_paths[settings["id"]] = path
+        elif settings.get("mode") == "control" and settings.get("chardev"):
+            control_ids.add(settings["chardev"])
+
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value in ("-qmp", "-monitor") and index + 1 < len(args):
+            value = args[index + 1]
+            index += 1
+        elif value.startswith(("-qmp=", "-monitor=")):
+            value = value.partition("=")[2]
+        elif value in ("-chardev", "-mon") and index + 1 < len(args):
+            option = value
+            value = args[index + 1]
+            index += 1
+            record_monitor_option(option, value)
+            index += 1
+            continue
+        elif value.startswith(("-chardev=", "-mon=")):
+            option, value = value.split("=", 1)
+            record_monitor_option(option, value)
+            index += 1
+            continue
+        else:
+            index += 1
+            continue
+        if value.startswith("unix:"):
+            path = value[5:].split(",", 1)[0]
+            if path.startswith("/") and path not in found:
+                found.append(path)
+        index += 1
+    for chardev_id in control_ids:
+        path = chardev_paths.get(chardev_id)
+        if path and path not in found:
+            found.append(path)
+    return found
+
+
 def restore_command(pid):
     """Capture only argv and cwd for an explicitly opted-in, still-live process."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
@@ -393,6 +482,23 @@ def edges(members, snap=None, pids_info=None):
             {"kind": kind, "detail": detail, "peers": sorted(peers)}
         )
 
+    def unix_kind(path, unresolved=False):
+        normalized = path.lower().replace("\\", "/")
+        if path in qmp_paths:
+            return "qmp"
+        if "podman.sock" in normalized or "/podman/" in normalized:
+            return "podman_api"
+        if "/libvirt/qemu/" in normalized or "/qmp" in normalized:
+            return "qmp"
+        return "unix_server_unresolved" if unresolved else "unix_server"
+
+    qmp_paths = {
+        path
+        for pid in members
+        if get_comm(pid).startswith("qemu-system")
+        for path in qmp_socket_paths(pid)
+    }
+
     # unix: the member holds the server-side end (that end carries the bound path)
     for r in snap.unix:
         mine = r["pids"] & members
@@ -404,11 +510,40 @@ def edges(members, snap=None, pids_info=None):
         outside = peer["pids"] - members
         if outside:
             for pid in mine:
-                add(pid, "unix_server", r["path"], outside)
+                add(pid, unix_kind(r["path"]), r["path"], outside)
         elif not peer["pids"]:
             # peer end not visible to this user (root process): conservative
             for pid in mine:
-                add(pid, "unix_server_unresolved", r["path"], [])
+                add(pid, unix_kind(r["path"], unresolved=True), r["path"], [])
+
+    # Rootless Podman's API service lives outside the container scope. Associate its
+    # connected socket peers with the catatonit scope that shares its runtime directory.
+    podman_members = {}
+    for pid in members:
+        if get_comm(pid) != "catatonit":
+            continue
+        runtime_dir = get_env(pid).get("XDG_RUNTIME_DIR")
+        if isinstance(runtime_dir, str) and runtime_dir:
+            socket_path = os.path.join(runtime_dir, "podman", "podman.sock")
+            podman_members.setdefault(socket_path, set()).add(pid)
+    for row in snap.unix:
+        path = row["path"]
+        scoped_members = podman_members.get(path)
+        if not scoped_members or row["state"] == "LISTEN":
+            continue
+        # A member-owned server was handled by the ordinary Unix edge scan above.
+        if row["pids"] & members:
+            continue
+        peer = snap.by_inode.get(row["peer_inode"])
+        if peer is None:
+            continue
+        clients = peer["pids"] - members - row["pids"]
+        if clients:
+            for pid in scoped_members:
+                add(pid, "podman_api", path, clients)
+        elif not peer["pids"]:
+            for pid in scoped_members:
+                add(pid, "podman_api", path, [])
 
     # tcp: the member LISTENs; an established connection onto that port from outside
     listen = {}

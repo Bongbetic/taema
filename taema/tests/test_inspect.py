@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from taema.core import process as inspect
 
@@ -40,6 +41,53 @@ class UnixEdges(unittest.TestCase):
 
     def test_listen_socket_alone_is_not_an_edge(self):
         self.assertEqual(inspect.edges({50}, self.snap(LISTEN)), {})
+
+    def test_runtime_management_sockets_have_explicit_edge_kinds(self):
+        for path, kind in (
+            ("/run/user/1000/podman/podman.sock", "podman_api"),
+            ("/run/user/1000/libvirt/qemu/vm.monitor", "qmp"),
+        ):
+            with self.subTest(path=path):
+                server = SERVER.replace("/run/user/1000/herdr.sock", path)
+                edges = inspect.edges({50}, self.snap(server, CLIENT_OUT))
+                self.assertEqual(edges[50][0]["kind"], kind)
+                self.assertEqual(edges[50][0]["peers"], [70])
+
+    def test_rootless_podman_service_client_attaches_to_runtime_scope(self):
+        path = "/run/user/1000/podman/podman.sock"
+        server = SERVER.replace("/run/user/1000/herdr.sock", path).replace(
+            "pid=50", "pid=80"
+        )
+        edges = inspect.edges(
+            {50},
+            self.snap(server, CLIENT_OUT),
+            {
+                "comm": {50: "catatonit", 70: "podman", 80: "podman"},
+                "environ": {50: {"XDG_RUNTIME_DIR": "/run/user/1000"}},
+            },
+        )
+
+        self.assertEqual(edges[50][0]["kind"], "podman_api")
+        self.assertEqual(edges[50][0]["detail"], path)
+        self.assertEqual(edges[50][0]["peers"], [70])
+
+    def test_qmp_socket_paths_label_arbitrary_management_socket_names(self):
+        with mock.patch.object(
+            inspect,
+            "qmp_socket_paths",
+            return_value=["/tmp/guest-monitor.sock"],
+        ):
+            edges = inspect.edges(
+                {50},
+                self.snap(
+                    SERVER.replace(
+                        "/run/user/1000/herdr.sock", "/tmp/guest-monitor.sock"
+                    ),
+                    CLIENT_OUT,
+                ),
+                {"comm": {50: "qemu-system-x86_64"}},
+            )
+        self.assertEqual(edges[50][0]["kind"], "qmp")
 
 
 TCP_LISTEN = 'LISTEN 0 128 127.0.0.1:5037 0.0.0.0:* users:(("adb",pid=90,fd=10))'
@@ -110,6 +158,53 @@ class OtherEdges(unittest.TestCase):
 
 
 class Parse(unittest.TestCase):
+    def test_runtime_identity_reads_container_and_guest_names_from_argv(self):
+        with (
+            mock.patch.object(
+                inspect,
+                "comm",
+                side_effect={10: "conmon", 20: "qemu-system-x86"}.__getitem__,
+            ),
+            mock.patch.object(
+                inspect,
+                "argv",
+                side_effect={
+                    10: ["conmon", "-c", "container-id"],
+                    20: ["qemu-system-x86", "-name=guest=work-vm,debug-threads=on"],
+                }.__getitem__,
+            ),
+        ):
+            self.assertEqual(
+                inspect.runtime_identity(10), {"container": "container-id"}
+            )
+            self.assertEqual(inspect.runtime_identity(20), {"domain": "work-vm"})
+
+    def test_qmp_socket_paths_are_read_from_argv_without_a_runtime_cli(self):
+        with mock.patch.object(
+            inspect,
+            "argv",
+            return_value=[
+                "qemu-system-x86_64",
+                "-qmp",
+                "unix:/run/user/1000/libvirt/qemu/vm.monitor,server=on,wait=off",
+                "-monitor=unix:/tmp/monitor.sock,server=on",
+                "-chardev",
+                "socket,id=charmonitor,path=/run/user/1000/libvirt/qemu/chardev.monitor,server=on",
+                "-mon",
+                "chardev=charmonitor,id=monitor,mode=control",
+                "-chardev=socket,id=human,path=/tmp/human.monitor,server=on",
+                "-mon=chardev=human,id=human-monitor,mode=readline",
+            ],
+        ):
+            self.assertEqual(
+                inspect.qmp_socket_paths(42),
+                [
+                    "/run/user/1000/libvirt/qemu/vm.monitor",
+                    "/tmp/monitor.sock",
+                    "/run/user/1000/libvirt/qemu/chardev.monitor",
+                ],
+            )
+
     def test_parse_real_format(self):
         txt = 'u_str ESTAB 0      0                                                         * 2302403             * 2302404  users:(("herdr",pid=11549,fd=11),("herdr",pid=11549,fd=9))'
         r = inspect.parse_ss_unix(txt)[0]

@@ -478,18 +478,18 @@ class DaemonReclaimTests(unittest.TestCase):
         scope = "vm-reclaim-test"
         unit = {
             "unit": {"name": scope, "kind": "vm", "domain": "work vm"},
-            "mem": {"save_state": "virsh managedsave %(domain)s"},
+            "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
         }
         process = mock.Mock(returncode=0)
         process.communicate.return_value = ("saved\n", None)
-        with mock.patch.object(service.subprocess, "Popen", return_value=process) as popen:
+        with mock.patch.object(
+            service.subprocess, "Popen", return_value=process
+        ) as popen:
             success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
         self.assertTrue(success)
         self.assertIn("succeeded", reason)
         self.assertIn(scope, self.daemon.saved_vm_scopes)
-        self.assertEqual(
-            popen.call_args.args[0], ["virsh", "managedsave", "work vm"]
-        )
+        self.assertEqual(popen.call_args.args[0], ["virsh", "managedsave", "work vm"])
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertNotIn("shell", popen.call_args.kwargs)
 
@@ -497,12 +497,61 @@ class DaemonReclaimTests(unittest.TestCase):
         scope = "vm-reclaim-test"
         unit = {
             "unit": {"name": scope, "kind": "vm"},
-            "mem": {"save_state": "virsh managedsave %(domain)s"},
+            "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
         }
         with mock.patch.object(service.subprocess, "Popen") as popen:
             success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
         self.assertFalse(success)
         self.assertIn("unit.domain", reason)
+        popen.assert_not_called()
+
+    def test_runtime_hook_accepts_argv_and_derives_the_qemu_domain(self):
+        scope = "vm-reclaim-test"
+        self.cg.leaf(scope, [4244])
+        unit = {
+            "unit": {"name": scope, "kind": "vm", "class": "vm"},
+            "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
+        }
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = ("saved\n", None)
+        with (
+            mock.patch.object(
+                service.inspect,
+                "runtime_identity",
+                return_value={"domain": "work-vm"},
+            ),
+            mock.patch.object(
+                service.subprocess, "Popen", return_value=process
+            ) as popen,
+        ):
+            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+
+        self.assertTrue(success, reason)
+        self.assertEqual(popen.call_args.args[0], ["virsh", "managedsave", "work-vm"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_runtime_hook_rejects_invalid_template_values_before_execution(self):
+        scope = "vm-reclaim-test"
+        unit = {
+            "unit": {"name": scope, "kind": "vm", "class": "vm", "domain": "-unsafe"},
+            "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
+        }
+        with mock.patch.object(service.subprocess, "Popen") as popen:
+            success, reason = self.daemon._run_vm_save_hook(scope, unit, 1000)
+
+        self.assertFalse(success)
+        self.assertIn("valid unit.domain", reason)
+        popen.assert_not_called()
+
+    def test_runtime_hook_rejects_command_strings(self):
+        unit = {"mem": {"pause": "podman pause %(container)s"}}
+        with mock.patch.object(service.subprocess, "Popen") as popen:
+            success, reason = self.daemon._run_vm_save_hook(
+                "podman-test", unit, 1000, field="pause"
+            )
+
+        self.assertFalse(success)
+        self.assertIn("explicit argv list", reason)
         popen.assert_not_called()
 
     def test_vm_save_hook_waits_for_idle_grace_even_when_taema_frozen(self):
@@ -519,7 +568,7 @@ class DaemonReclaimTests(unittest.TestCase):
                     "domain": "test-vm",
                     "stop_when_unneeded": True,
                 },
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
         with (
@@ -550,7 +599,7 @@ class DaemonReclaimTests(unittest.TestCase):
                     "domain": "test-vm",
                     "stop_when_unneeded": True,
                 },
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
         self.daemon._infos = lambda pids: [
@@ -581,7 +630,7 @@ class DaemonReclaimTests(unittest.TestCase):
                     "domain": "test-vm",
                     "stop_when_unneeded": True,
                 },
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
 
@@ -617,7 +666,7 @@ class DaemonReclaimTests(unittest.TestCase):
         self.daemon.units = [
             {
                 "unit": {"name": scope, "kind": "vm", "domain": "test-vm"},
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
         with (
@@ -632,7 +681,7 @@ class DaemonReclaimTests(unittest.TestCase):
 
     def test_adopt_allows_save_hook_for_pair_authorized_leftover(self):
         scope = "leftover/vm-save-paired"
-        unit = {"mem": {"save_state": "virsh managedsave test-vm"}}
+        unit = {"mem": {"save_state": ["virsh", "managedsave", "test-vm"]}}
         self.daemon.cfg["mode"] = "adopt"
         facts = authorization.Facts(
             scope=scope,
@@ -661,7 +710,7 @@ class DaemonReclaimTests(unittest.TestCase):
                     "domain": "test-vm",
                     "stop_when_unneeded": True,
                 },
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
         with (
@@ -697,7 +746,7 @@ class DaemonReclaimTests(unittest.TestCase):
                     "domain": "test-vm",
                     "stop_when_unneeded": True,
                 },
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
         with (
@@ -723,7 +772,7 @@ class DaemonReclaimTests(unittest.TestCase):
         self.daemon.units = [
             {
                 "unit": {"name": scope, "kind": "vm", "domain": "test-vm"},
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
         with (
@@ -752,7 +801,7 @@ class DaemonReclaimTests(unittest.TestCase):
                     "domain": "test-vm",
                     "stop_when_unneeded": True,
                 },
-                "mem": {"save_state": "virsh managedsave %(domain)s"},
+                "mem": {"save_state": ["virsh", "managedsave", "%(domain)s"]},
             }
         ]
 

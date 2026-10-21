@@ -1323,8 +1323,8 @@ high = "6G"
 swap_max = "2G"
 idle_reclaim = true
 min_headroom = "512M"
-save_state = "virsh managedsave %(domain)s"
-resume = "virsh start %(domain)s"
+save_state = ["virsh", "managedsave", "%(domain)s"]
+resume = ["virsh", "start", "%(domain)s"]
 
 [gc]
 keep_while_children = true
@@ -1342,7 +1342,7 @@ reservation = "1G"
 high = "2G"
 swap_max = "1G"
 idle_reclaim = true
-save_state = "podman stop --time 10 %(container)s"   # only if the user opts in
+save_state = ["podman", "stop", "--time", "10", "%(container)s"] # opt in explicitly
 ```
 
 **Quit detection and the GC order.** When a container or VM quits:
@@ -2461,10 +2461,10 @@ low = "1G"
 swap_max = "2G"
 idle_reclaim = true
 min_headroom = "256M"
-save_state = "virsh managedsave %(domain)s"
-resume = "virsh start %(domain)s"
-pause = "podman pause %(container)s"
-resume_container = "podman unpause %(container)s"
+save_state = ["virsh", "managedsave", "%(domain)s"]
+resume = ["virsh", "start", "%(domain)s"]
+pause = ["podman", "pause", "%(container)s"]
+resume_container = ["podman", "unpause", "%(container)s"]
 oom_group = false
 
 [kill]
@@ -3517,7 +3517,7 @@ keep = ["adb"]
 [mem]
 reservation = "4G"
 high = "6G"
-save_state = "$HOME/bin/satcyber-save"   # optional, explicit
+save_state = ["/home/user/bin/satcyber-save"] # optional, explicit
 ```
 
 ## Appendix E — Live evidence snapshot (0.2.1, mode `adopt`)

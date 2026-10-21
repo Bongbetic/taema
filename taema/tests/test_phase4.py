@@ -930,6 +930,346 @@ class GuiClose(AutoCase):
 # ---- 5. GC rules for leftover/* --------------------------------------------------------------
 
 
+class RuntimeGc(AutoCase):
+    def runtime_unit(self, mode="enforce", hook=None):
+        pid = 303
+        self.fp.add(pid, 1, comm="qemu-system-x86_64", born=self.fp.up - 300)
+        self.d.lineage.observe(self.fp.table())
+        self.idle(pid)
+        path = self.cg.leaf("app-libvirt-qemu-abcdef12", [pid], cpu=100)
+        unit = {
+            "unit": {
+                "name": "app-libvirt-qemu",
+                "kind": "app",
+                "class": "vm",
+                "stop_when_unneeded": True,
+            },
+            "mem": {"idle_reclaim": True},
+            "gc": {"qmp_socket": True, "no_attach_grace": 120},
+        }
+        if hook:
+            unit["mem"][hook[0]] = hook[1]
+        self.d.units = [unit]
+        self.d.cfg["mode"] = mode
+        return path, unit, pid
+
+    def assert_empty_runtime_lifecycle(self, remove):
+        path, _unit, _pid = self.runtime_unit()
+        leaf = cgroup.rel(path)
+        self.cg.set_procs(leaf, [])
+        self.d.cfg["mem"] = {"enabled": True}
+        self.d.memory_scope_seen.add(leaf)
+        with (
+            mock.patch.object(self.d, "_review_memory", side_effect=[4096, 4096]),
+            mock.patch.object(self.d, "memory_governor_pass") as rebalance,
+            mock.patch.object(
+                engine, "remove_empty", return_value=True
+            ) as remove_empty,
+        ):
+            self.assertTrue(remove(path, leaf))
+
+        lifecycle = [
+            event
+            for event in self.log()
+            if event["event"] in ("gc_quit", "gc_removed_empty", "freed")
+        ]
+        self.assertEqual(
+            [event["event"] for event in lifecycle],
+            ["gc_quit", "gc_removed_empty", "freed"],
+        )
+        self.assertEqual(lifecycle[0]["before"], {"memory_bytes": 4096, "pids": 0})
+        self.assertEqual(lifecycle[0]["after"], {"memory_bytes": 4096, "pids": 0})
+        self.assertIn("already exited", lifecycle[0]["hook"]["result"])
+        self.assertEqual(lifecycle[2]["before"]["memory_bytes"], 4096)
+        self.assertEqual(lifecycle[2]["after"]["memory_bytes"], 0)
+        remove_empty.assert_called_once_with(path)
+        rebalance.assert_called_once()
+
+    def test_populated_zero_runtime_exit_releases_budget(self):
+        with mock.patch.object(self.d, "_drop_leaf_watch"):
+            self.assert_empty_runtime_lifecycle(
+                lambda _path, leaf: self.d._remove_if_currently_empty(
+                    73, leaf, {"populated": "0"}
+                )
+            )
+
+    def test_scheduled_empty_runtime_exit_releases_budget(self):
+        def remove(path, leaf):
+            self.d.empty_seen.add(leaf)
+            with mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "empty")]
+            ):
+                result = self.d.gc_pass()
+            return result == [[leaf, "empty", "remove"]]
+
+        self.assert_empty_runtime_lifecycle(remove)
+
+    def test_runtime_class_resolution_preserves_legacy_unit_fields(self):
+        path, unit, _pid = self.runtime_unit()
+        unit["unit"].pop("class")
+        unit["unit"]["mem_class"] = "vm"
+
+        self.assertIs(self.d._runtime_gc_unit(path), unit)
+        self.assertEqual(self.d._reclaim_class("app-libvirt-qemu-abcdef12", path), "vm")
+
+    def test_cleanup_orders_hook_reclaim_stop_and_records_freed_state(self):
+        path, _unit, pid = self.runtime_unit(
+            hook=("save_state", ["virsh", "managedsave", "%(domain)s"])
+        )
+        order = []
+        report = {
+            "removed": True,
+            "decisions": [{"action": "kill", "key": "qemu", "pid": pid}],
+            "left": [],
+            "stopped": [pid],
+        }
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "no attachment for 120s")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=4096),
+            mock.patch.object(
+                self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(self.d, "_runtime_stop_preflight", return_value=True),
+            mock.patch.object(
+                self.d,
+                "_run_vm_save_hook",
+                side_effect=lambda *args, **kwargs: (
+                    order.append("hook") or True,
+                    "saved",
+                ),
+            ),
+            mock.patch.object(
+                self.d,
+                "_reclaim_one",
+                side_effect=lambda *args, **kwargs: (
+                    order.append("reclaim")
+                    or {"status": "reclaimed", "reclaimed_bytes": 128}
+                ),
+            ) as reclaim,
+            mock.patch.object(daemon.memory, "pressure", return_value={}),
+            mock.patch.object(
+                engine,
+                "stop",
+                side_effect=lambda *args, **kwargs: order.append("stop") or report,
+            ),
+            mock.patch.object(self.d, "note_stop", return_value=[pid]),
+            mock.patch.object(self.d, "stopped_apps", return_value=[]),
+        ):
+            self.d.gc_pass()
+
+        self.assertEqual(order, ["hook", "reclaim", "stop"])
+        self.assertTrue(reclaim.call_args.kwargs["idle_grace_prevalidated"])
+        events = self.log()
+        quit_event = next(event for event in events if event["event"] == "gc_quit")
+        freed_event = next(event for event in events if event["event"] == "freed")
+        self.assertEqual(quit_event["before"]["memory_bytes"], 4096)
+        self.assertEqual(freed_event["before"]["memory_bytes"], 4096)
+        self.assertEqual(freed_event["after"]["memory_bytes"], 0)
+
+    def test_failed_preservation_hook_prevents_reclaim_and_stop(self):
+        path, _unit, _pid = self.runtime_unit(
+            hook=("save_state", ["virsh", "managedsave", "%(domain)s"])
+        )
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "no attachment for 120s")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=2048),
+            mock.patch.object(
+                self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(self.d, "_runtime_stop_preflight", return_value=True),
+            mock.patch.object(
+                self.d, "_run_vm_save_hook", return_value=(False, "hook exited 1")
+            ),
+            mock.patch.object(self.d, "_reclaim_one") as reclaim,
+            mock.patch.object(engine, "stop") as stop,
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "kept")
+        reclaim.assert_not_called()
+        stop.assert_not_called()
+        self.assertTrue(any(event["event"] == "gc_refused" for event in self.log()))
+
+    def test_preservation_waits_for_idle_reclaim_grace(self):
+        path, _unit, _pid = self.runtime_unit(
+            hook=("save_state", ["virsh", "managedsave", "%(domain)s"])
+        )
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "QMP socket gone")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=2048),
+            mock.patch.object(
+                self.d,
+                "_reclaim_idle",
+                return_value=(False, "idle for 120s; needs 300s"),
+            ),
+            mock.patch.object(self.d, "_runtime_stop_preflight") as preflight,
+            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_reclaim_one") as reclaim,
+            mock.patch.object(engine, "stop") as stop,
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "kept")
+        preflight.assert_not_called()
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+        stop.assert_not_called()
+
+    def test_refused_stop_preflight_blocks_preservation_and_cleanup(self):
+        path, _unit, _pid = self.runtime_unit(
+            hook=("save_state", ["virsh", "managedsave", "%(domain)s"])
+        )
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "QMP socket gone")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=2048),
+            mock.patch.object(
+                self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(self.d, "_runtime_stop_preflight", return_value=False),
+            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_reclaim_one") as reclaim,
+            mock.patch.object(engine, "stop") as stop,
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "kept")
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+        stop.assert_not_called()
+        self.assertTrue(any(event["event"] == "gc_refused" for event in self.log()))
+
+    def test_adopt_rechecks_attachments_before_preservation(self):
+        path, _unit, pid = self.runtime_unit(
+            mode="adopt",
+            hook=("pause", ["podman", "pause", "%(container)s"]),
+        )
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "QMP socket gone")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=2048),
+            mock.patch.object(
+                self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(
+                self.d,
+                "_reclaim_safety_reason",
+                return_value="scope has external dependency edges",
+            ) as safety,
+            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_reclaim_one") as reclaim,
+            mock.patch.object(engine, "stop") as stop,
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "kept")
+        safety.assert_called_once_with("app-libvirt-qemu-abcdef12", path, [pid])
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+        stop.assert_not_called()
+
+    def test_reclaim_reuses_runtime_gc_idle_validation(self):
+        path, _unit, _pid = self.runtime_unit()
+        self.d.cfg["mem"] = {"enabled": True, "reclaim": True}
+        with (
+            mock.patch.object(self.d, "_reclaim_safety_reason", return_value=""),
+            mock.patch.object(self.d, "_reclaim_warm", return_value=False),
+            mock.patch.object(self.d, "_reclaim_idle") as idle,
+            mock.patch.object(
+                daemon.memory,
+                "pressure",
+                return_value={"full_avg10": 0, "some_avg10": 0},
+            ),
+        ):
+            result = self.d._reclaim_one(
+                "app-libvirt-qemu-abcdef12",
+                path,
+                time.time(),
+                {"full_avg10": 0, "some_avg10": 0},
+                stage="page_cache",
+                idle_grace_prevalidated=True,
+            )
+
+        idle.assert_not_called()
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(
+            result["reason"], "global some pressure is below the reclaim gate"
+        )
+
+    def test_observe_does_not_run_runtime_hooks_or_reclaim(self):
+        path, _unit, _pid = self.runtime_unit(
+            mode="observe",
+            hook=("pause", ["podman", "pause", "%(container)s"]),
+        )
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "no attachment for 120s")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=1024),
+            mock.patch.object(self.d, "_run_vm_save_hook") as hook,
+            mock.patch.object(self.d, "_reclaim_one") as reclaim,
+            mock.patch.object(self.d, "_contain_runtime_gc_review") as contain,
+            mock.patch.object(engine, "stop") as stop,
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "would")
+        hook.assert_not_called()
+        reclaim.assert_not_called()
+        contain.assert_not_called()
+        stop.assert_not_called()
+
+    def test_adopt_contains_unauthorized_runtime_and_review_shows_memory(self):
+        path, _unit, pid = self.runtime_unit(
+            mode="adopt",
+            hook=("save_state", ["virsh", "managedsave", "%(domain)s"]),
+        )
+        order = []
+        with (
+            mock.patch.object(
+                engine, "gc_candidates", return_value=[(path, "no attachment for 120s")]
+            ),
+            mock.patch.object(self.d, "_review_memory", return_value=8192),
+            mock.patch.object(
+                self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+            ),
+            mock.patch.object(
+                self.d,
+                "_run_vm_save_hook",
+                side_effect=lambda *args, **kwargs: (
+                    order.append("save") or True,
+                    "saved",
+                ),
+            ),
+            mock.patch.object(
+                self.d,
+                "_reclaim_one",
+                side_effect=lambda *args, **kwargs: (
+                    order.append("reclaim") or {"status": "skipped"}
+                ),
+            ),
+            mock.patch.object(daemon.memory, "pressure", return_value={}),
+        ):
+            result = self.d.gc_pass()
+
+        self.assertEqual(result[0][2], "review")
+        self.assertEqual(order, ["save", "reclaim"])
+        destination = "leftover/" + engine.leaf_slug("app-libvirt-qemu-abcdef12", pid)
+        with open(os.path.join(self.cg.base, destination, "cgroup.procs")) as source:
+            self.assertEqual(source.read().split(), [str(pid)])
+        review = self.d.store.open_reviews()[0]
+        self.assertEqual(review["scope"], destination)
+        self.assertEqual(review["mem"], 8192)
+
+
 class LeftoverGc(AutoCase):
     def leaf(self, pids=(301,), key="vite", origin="foo", cpu=100):
         for p in pids:

@@ -2649,7 +2649,7 @@ class Store:
         self.dirty = True
         return dict(review)
 
-    def add_scope_review(self, scope, reason):
+    def add_scope_review(self, scope, reason, memory=None):
         """Queue a durable GC review without inventing an owner/member pair."""
         if (
             not isinstance(scope, str)
@@ -2697,6 +2697,8 @@ class Store:
             "expires": now + REVIEW_TTL,
             "state": "open",
         }
+        if isinstance(memory, int) and not isinstance(memory, bool) and memory >= 0:
+            review["mem"] = memory
         reviews.append(review)
         self.data["review_seq"] = review_id
         self.dirty = True

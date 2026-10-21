@@ -484,7 +484,17 @@ class GcRules(unittest.TestCase):
         self.t = [1000.0]
         self.keys = {}
 
-    def run_gc(self, cfg=None, idle=None, usage=None, skip=None, noted=None, snap=None):
+    def run_gc(
+        self,
+        cfg=None,
+        idle=None,
+        usage=None,
+        skip=None,
+        noted=None,
+        snap=None,
+        units=(),
+        edge_map=None,
+    ):
         cfg = cfg or make_cfg(tmp(), seeds={"share": ["adb"], "persist": ["tmux"]})
         with (
             mock.patch.object(
@@ -495,7 +505,11 @@ class GcRules(unittest.TestCase):
             mock.patch.object(
                 engine.inspect, "Snapshot", return_value=snap or OkSnap()
             ),
-            mock.patch.object(engine.inspect, "edges", return_value={}),
+            mock.patch.object(
+                engine.inspect,
+                "edges",
+                return_value={} if edge_map is None else edge_map,
+            ),
             mock.patch.object(
                 engine.policy,
                 "app_key",
@@ -504,7 +518,7 @@ class GcRules(unittest.TestCase):
         ):
             return engine.gc_candidates(
                 cfg,
-                [],
+                list(units),
                 self.store,
                 {} if idle is None else idle,
                 now=lambda: self.t[0],
@@ -571,6 +585,172 @@ class GcRules(unittest.TestCase):
         self.run_gc(idle=idle, snap=BadSnap())
         self.t[0] += 5000
         self.assertEqual(self.run_gc(idle=idle, snap=BadSnap()), [])
+
+    def test_runtime_unit_uses_configured_no_attachment_grace(self):
+        path = self.cg.leaf("app-vm-test", [42], cpu=1)
+        unit = {
+            "unit": {"name": "app-vm", "kind": "app", "stop_when_unneeded": True},
+            "gc": {"no_attach_grace": 120},
+        }
+        idle = {}
+
+        self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+        self.t[0] += 119
+        self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+        self.t[0] += 1
+        candidates = self.run_gc(idle=idle, units=[unit])
+        self.assertEqual(candidates, [(path, "no attachment for 120s")])
+
+    def test_runtime_socket_peers_hold_the_scope_past_no_attachment_grace(self):
+        self.cg.leaf("app-vm-test", [42], cpu=1)
+        unit = {
+            "unit": {"name": "app-vm", "kind": "app", "stop_when_unneeded": True},
+            "gc": {"no_attach_grace": 10},
+        }
+        idle = {}
+        self.run_gc(idle=idle, units=[unit], edge_map={42: [{"kind": "qmp"}]})
+        self.t[0] += 20
+        self.assertEqual(
+            self.run_gc(idle=idle, units=[unit], edge_map={42: [{"kind": "qmp"}]}),
+            [],
+        )
+
+    def test_missing_qmp_socket_is_a_runtime_quit_signal(self):
+        path = self.cg.leaf("app-vm-test", [42], cpu=1)
+        unit = {
+            "unit": {"name": "app-vm", "kind": "app", "stop_when_unneeded": True},
+            "gc": {"qmp_socket": True},
+        }
+        with mock.patch.object(
+            engine.inspect, "qmp_socket_paths", return_value=[path + ".monitor"]
+        ):
+            candidates = self.run_gc(units=[unit])
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("QMP socket gone:"))
+
+    def test_missing_podman_api_socket_is_a_runtime_quit_signal(self):
+        path = self.cg.leaf("app-podman-test", [42], cpu=1)
+        runtime = os.path.join(self.cg.root, "runtime")
+        os.makedirs(runtime)
+        unit = {
+            "unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
+            "gc": {
+                "socket_env": "XDG_RUNTIME_DIR",
+                "socket_path": "podman/podman.sock",
+            },
+        }
+        with mock.patch.object(
+            engine.inspect,
+            "environ",
+            return_value={"XDG_RUNTIME_DIR": runtime},
+        ):
+            candidates = self.run_gc(units=[unit])
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
+
+    def test_libvirt_unit_groups_qemu_roots_by_qmp_socket(self):
+        unit = {
+            "unit": {"name": "app-libvirt-qemu", "kind": "app", "group_by_qmp": True},
+            "match": {"cmdline_contains": "qemu-system-"},
+        }
+        table = engine.inspect.ProcTable.from_ppid({42: 1, 43: 1})
+        with (
+            mock.patch.object(
+                engine.policy, "session_cgroups", return_value=["session"]
+            ),
+            mock.patch.object(engine.cgroup, "procs", return_value=[42, 43]),
+            mock.patch.object(engine.inspect.ProcTable, "scan", return_value=table),
+            mock.patch.object(engine, "_matches", return_value=True),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(
+                engine.inspect,
+                "qmp_socket_paths",
+                side_effect=lambda pid: [
+                    "/run/user/1000/libvirt/qemu/vm-%d.monitor" % pid
+                ],
+            ),
+        ):
+            ops = engine.adopt_plan(make_cfg(tmp()), [unit])
+
+        self.assertEqual(len(ops), 2)
+        self.assertEqual({tuple(op["pids"]) for op in ops}, {(42,), (43,)})
+        self.assertEqual(len({op["scope"] for op in ops}), 2)
+
+    def test_libvirt_roots_without_qmp_sockets_do_not_merge_by_session(self):
+        unit = {
+            "unit": {"name": "app-libvirt-qemu", "kind": "app", "group_by_qmp": True},
+            "match": {"cmdline_contains": "qemu-system-"},
+        }
+        table = engine.inspect.ProcTable.from_ppid({42: 1, 43: 1})
+        with (
+            mock.patch.object(
+                engine.policy, "session_cgroups", return_value=["session"]
+            ),
+            mock.patch.object(engine.cgroup, "procs", return_value=[42, 43]),
+            mock.patch.object(engine.inspect.ProcTable, "scan", return_value=table),
+            mock.patch.object(engine, "_matches", return_value=True),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(engine.inspect, "qmp_socket_paths", return_value=[]),
+            mock.patch.object(engine.cgroup, "proc_cgroup", return_value="/session-1"),
+        ):
+            ops = engine.adopt_plan(make_cfg(tmp()), [unit])
+
+        self.assertEqual(len(ops), 2)
+        self.assertEqual(len({op["scope"] for op in ops}), 2)
+
+    def test_stop_why_names_the_management_client(self):
+        path = self.cg.leaf("app-vm-42", [42])
+        unit = {"unit": {"name": "app-vm", "kind": "app"}}
+        for edge_kind, detail in (
+            ("qmp", "/run/user/1000/libvirt/qemu/vm.monitor"),
+            ("podman_api", "/run/user/1000/podman/podman.sock"),
+        ):
+            with self.subTest(edge_kind=edge_kind):
+                with (
+                    mock.patch.object(engine, "vetoes_for_scope", return_value=[]),
+                    mock.patch.object(
+                        engine.policy, "protected_reason", return_value=None
+                    ),
+                    mock.patch.object(
+                        engine.inspect.ProcTable,
+                        "scan",
+                        return_value=engine.inspect.ProcTable.from_ppid({}),
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "LazySnapshot",
+                        return_value=types.SimpleNamespace(get=lambda: OkSnap()),
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "edges",
+                        return_value={
+                            42: [
+                                {
+                                    "kind": edge_kind,
+                                    "detail": detail,
+                                    "peers": [43],
+                                }
+                            ]
+                        },
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "comm",
+                        side_effect={
+                            42: "qemu-system-x86",
+                            43: "virt-manager",
+                        }.__getitem__,
+                    ),
+                    mock.patch.object(engine.policy, "app_key", return_value="qemu"),
+                ):
+                    [decision] = engine.plan_stop(
+                        path, make_cfg(tmp()), self.store, unit, force=True
+                    )
+
+                self.assertEqual(decision["action"], "share")
+                self.assertIn(edge_kind, decision["why"])
+                self.assertIn("virt-manager (pid 43)", decision["why"])
 
     def test_skip_set_leaves_ignored_and_pruned(self):
         self.cg.leaf("shared/foo-8", [], cpu=1)

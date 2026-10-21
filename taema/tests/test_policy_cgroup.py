@@ -260,6 +260,24 @@ class PolicyTests(unittest.TestCase):
         cfg["protected"].update(protected)
         return cfg
 
+    def test_shipped_runtime_units_define_memory_and_quit_detection(self):
+        units = policy.load_units(
+            {"paths": {"units_dir": os.path.join(ROOT, "etc", "units")}}
+        )
+        by_name = {unit["unit"]["name"]: unit for unit in units}
+        podman = by_name["app-podman"]
+        libvirt = by_name["app-libvirt-qemu"]
+
+        self.assertEqual(podman["unit"]["class"], "container")
+        self.assertEqual(podman["mem"]["idle_reclaim"], True)
+        self.assertEqual(podman["gc"]["no_attach_grace"], 120)
+        self.assertEqual(libvirt["unit"]["class"], "vm")
+        self.assertEqual(libvirt["match"]["comm"], "qemu-system-*")
+        self.assertTrue(libvirt["unit"]["group_by_qmp"])
+        self.assertTrue(libvirt["gc"]["qmp_socket"])
+        self.assertEqual(libvirt["gc"]["no_attach_grace"], 120)
+        self.assertFalse(self.cfg()["mem"]["probe"])
+
     def test_protected_comm_and_pid1_and_root(self):
         cfg = self.cfg()
         with Patched(neutral(comm="niri")):
@@ -308,7 +326,14 @@ class PolicyTests(unittest.TestCase):
             cfg["paths"]["units_dir"] = os.path.join(ROOT, d)
             names |= {u["unit"]["name"] for u in policy.load_units(cfg)}
         self.assertEqual(
-            names, {"app-claude-desktop", "app-herdr", "app-podman", "scope-emulator"}
+            names,
+            {
+                "app-claude-desktop",
+                "app-herdr",
+                "app-podman",
+                "app-libvirt-qemu",
+                "scope-emulator",
+            },
         )
 
     def test_user_unit_replaces_system_unit_of_same_file(self):

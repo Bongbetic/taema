@@ -16,7 +16,6 @@ import secrets
 import select
 import selectors
 import signal
-import shlex
 import socket
 import stat
 import struct
@@ -2364,9 +2363,35 @@ class Daemon:
         if self.authorize(authorization.GC_REMOVE_EMPTY).verdict != authorization.ACT:
             return False
         leaf = cgroup.rel(path)
+        runtime_unit = self._runtime_gc_unit(path)
+        memory_before = self._review_memory(leaf) if runtime_unit is not None else None
+        if runtime_unit is not None:
+            unit_mem = runtime_unit.get("mem", {})
+            unit_mem = unit_mem if isinstance(unit_mem, dict) else {}
+            hook_field = next(
+                (name for name in ("save_state", "pause") if name in unit_mem), None
+            )
+            self._log_runtime_gc_quit(
+                path,
+                leaf,
+                why,
+                memory_before,
+                cgroup.tree_procs(path),
+                {
+                    "field": hook_field,
+                    "result": "runtime already exited; preservation hook not run",
+                },
+                reclaim={
+                    "status": "skipped",
+                    "reason": "scope already empty",
+                    "reclaimed_bytes": 0,
+                },
+            )
         if engine.remove_empty(path):
             self.empty_seen.discard(leaf)
             self.store.log(event="gc_removed_empty", scope=leaf, why=why)
+            if runtime_unit is not None:
+                self._runtime_gc_freed(leaf, memory_before)
             return True
         return False
 
@@ -2387,10 +2412,12 @@ class Daemon:
         else:
             now_empty.add(leaf)
 
-    def _queue_gc_review(self, path, leaf, why):
+    def _queue_gc_review(self, path, leaf, why, memory_bytes=None):
         """Queue a pair review for known leftover ownership, otherwise a scope-level GC review."""
         before = self.store.data.get("review_seq", 0)
         pids = cgroup.tree_procs(path)
+        if memory_bytes is None:
+            memory_bytes = self._review_memory(leaf)
         infos = self._infos(pids)
         owners = {}
         for info in infos:
@@ -2405,7 +2432,7 @@ class Daemon:
                     owner,
                     members,
                     leaf,
-                    memory=self._review_memory(leaf),
+                    memory=memory_bytes,
                     provenance=self._review_provenance(owner, members),
                 )
                 if review and review["id"] > before:
@@ -2420,13 +2447,263 @@ class Daemon:
                     )
                     before = review["id"]
         else:
-            review = self.store.add_scope_review(leaf, why)
+            review = self.store.add_scope_review(leaf, why, memory=memory_bytes)
             if review and review["id"] > before:
                 self.store.log(
                     event="gc_review_created", id=review["id"], scope=leaf, why=why
                 )
         self._save_if_idle()
         return self.store.review_holds_scope(leaf)
+
+    def _runtime_unit_class(self, unit):
+        metadata = (unit or {}).get("unit", {})
+        unit_mem = (unit or {}).get("mem", {})
+        if not isinstance(metadata, dict) or not isinstance(unit_mem, dict):
+            return None
+        resource_class = next(
+            (
+                value
+                for value in (
+                    unit_mem.get("class"),
+                    metadata.get("mem_class"),
+                    metadata.get("qos_class"),
+                    metadata.get("class"),
+                    metadata.get("kind"),
+                )
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        return resource_class
+
+    def _runtime_gc_unit(self, path):
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        resource_class = self._runtime_unit_class(unit)
+        metadata = (unit or {}).get("unit", {})
+        runtime_kind = metadata.get("kind") if isinstance(metadata, dict) else None
+        return (
+            unit
+            if resource_class in ("container", "vm")
+            or runtime_kind in ("container", "vm")
+            else None
+        )
+
+    def _runtime_stop_preflight(self, path, unit):
+        """Do not save or pause a runtime until the following stop can act safely."""
+        pids = cgroup.tree_procs(path)
+        if not pids:
+            return False
+        plan = engine.plan_stop(path, self.cfg, self.store, unit)
+        if any(item.get("action") != "kill" for item in plan):
+            return False
+        if self.mode == "auto":
+            for info in self._infos(pids):
+                cpu = info.get("cpu")
+                if (
+                    info.get("edges") is None
+                    or info.get("edges")
+                    or info.get("protected")
+                    or info.get("ptmx")
+                    or cpu is None
+                    or cpu > engine.AUTO_MAX_CPU
+                ):
+                    return False
+        return True
+
+    def _contain_runtime_gc_review(self, path, leaf, why, memory_bytes):
+        """Move an unauthorized runtime survivor into a reviewed leftover scope."""
+        pids = cgroup.tree_procs(path)
+        if not pids:
+            self._queue_gc_review(path, leaf, why, memory_bytes=memory_bytes)
+            return
+        destination = "%s/%s" % (
+            engine.LEFTOVER,
+            engine.leaf_slug(leaf.replace("/", "-"), min(pids)),
+        )
+        try:
+            operations = engine.run_ops(
+                self.cfg,
+                self.store,
+                [{"op": "move", "scope": destination, "pids": pids}],
+                True,
+                decision_kind="containment",
+                authority="safety",
+            )
+        except engine.Refused as error:
+            self.store.log(
+                event="gc_refused",
+                scope=leaf,
+                why="runtime containment failed: %s" % error,
+            )
+            self._queue_gc_review(path, leaf, why, memory_bytes=memory_bytes)
+            return
+        if not any(operation.get("done") for operation in operations):
+            self._queue_gc_review(path, leaf, why, memory_bytes=memory_bytes)
+            return
+        dest_path = os.path.join(cgroup.base(), destination)
+        self._queue_gc_review(dest_path, destination, why, memory_bytes=memory_bytes)
+
+    def _runtime_hook_fields(self, path, metadata):
+        fields = {
+            "name": metadata.get("name"),
+            "domain": metadata.get("domain"),
+            "container": metadata.get("container_id", metadata.get("container")),
+        }
+        for pid in cgroup.tree_procs(path):
+            identity = inspect.runtime_identity(pid)
+            for field in ("domain", "container"):
+                if not fields[field] and identity.get(field):
+                    fields[field] = identity[field]
+        return fields
+
+    def _log_runtime_gc_quit(
+        self, path, leaf, why, memory_before, pids_before, hook, reclaim=None
+    ):
+        """Write the runtime's observed state around a quit-preservation pass."""
+        fields = {
+            "event": "gc_quit",
+            "scope": leaf,
+            "runtime_class": self._reclaim_class(leaf, path),
+            "reason": why,
+            "before": {"memory_bytes": memory_before, "pids": len(pids_before)},
+            "after": {
+                "memory_bytes": self._review_memory(leaf),
+                "pids": len(cgroup.tree_procs(path)),
+            },
+            "hook": hook,
+        }
+        if reclaim is not None:
+            fields["reclaim"] = reclaim
+        self.store.log(**fields)
+
+    def _runtime_gc_prepare(
+        self, path, leaf, why, unit, decision, memory_before, dry_run=False
+    ):
+        """Apply a configured preservation hook and the ordinary page-cache reclaim gate."""
+        if dry_run or self.mode == "observe":
+            return True
+        pids_before = cgroup.tree_procs(path)
+        unit_mem = (unit or {}).get("mem", {})
+        unit_mem = unit_mem if isinstance(unit_mem, dict) else {}
+        metadata = (unit or {}).get("unit", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        hook_field = next(
+            (name for name in ("save_state", "pause") if name in unit_mem), None
+        )
+        hook_result = "not configured"
+        idle_grace_prevalidated = False
+        if hook_field and decision.verdict != authorization.KEEP:
+            mem_config = self.cfg.get("mem", {})
+            mem_config = mem_config if isinstance(mem_config, dict) else {}
+            now = time.time()
+            cooldown = float(mem_config.get("reclaim_cooldown", 300))
+            idle_grace = float(mem_config.get("idle_reclaim_grace", 300))
+            warm = self._reclaim_warm(leaf, path, now, cooldown)
+            idle, idle_reason = self._reclaim_idle(leaf, path, now, warm, idle_grace)
+            if not idle:
+                hook_result = "waiting for idle reclaim grace: " + idle_reason
+                return False
+            idle_grace_prevalidated = True
+            safety = self._reclaim_safety_reason(leaf, path, cgroup.tree_procs(path))
+            if safety:
+                hook_result = "runtime hook blocked by safety check: " + safety
+                self.store.log(
+                    event="gc_refused",
+                    scope=leaf,
+                    why=hook_result,
+                )
+                self._log_runtime_gc_quit(
+                    path,
+                    leaf,
+                    why,
+                    memory_before,
+                    pids_before,
+                    {"field": hook_field, "success": False, "reason": hook_result},
+                )
+                return False
+            if (
+                decision.verdict == authorization.ACT
+                and not self._runtime_stop_preflight(path, unit)
+            ):
+                hook_result = "runtime stop preflight refused"
+                self.store.log(
+                    event="gc_refused",
+                    scope=leaf,
+                    why="runtime %s hook blocked: %s" % (hook_field, hook_result),
+                )
+                self._log_runtime_gc_quit(
+                    path,
+                    leaf,
+                    why,
+                    memory_before,
+                    pids_before,
+                    {"field": hook_field, "success": False, "reason": hook_result},
+                )
+                return False
+            success, hook_result = self._run_vm_save_hook(
+                leaf, unit, now, field=hook_field
+            )
+            if not success:
+                self.store.log(
+                    event="gc_refused",
+                    scope=leaf,
+                    why="runtime %s hook failed: %s" % (hook_field, hook_result),
+                )
+                self._log_runtime_gc_quit(
+                    path,
+                    leaf,
+                    why,
+                    memory_before,
+                    pids_before,
+                    {"field": hook_field, "success": False},
+                )
+                return False
+
+        reclaim_result = {"status": "skipped", "reason": "reclaim disabled"}
+        if (
+            decision.verdict != authorization.KEEP
+            and memory.enabled(self.cfg)
+            and self.cfg.get("mem", {}).get("reclaim", True) is True
+        ):
+            reclaim_result = self._reclaim_one(
+                leaf,
+                path,
+                time.time(),
+                memory.pressure(),
+                manual=False,
+                stage="page_cache",
+                resource_class=self._reclaim_class(leaf, path),
+                idle_grace_prevalidated=idle_grace_prevalidated,
+            )
+        self._log_runtime_gc_quit(
+            path,
+            leaf,
+            why,
+            memory_before,
+            pids_before,
+            {"field": hook_field, "result": hook_result},
+            reclaim={
+                "status": reclaim_result.get("status"),
+                "reason": reclaim_result.get("reason"),
+                "reclaimed_bytes": reclaim_result.get("reclaimed_bytes", 0),
+            },
+        )
+        return True
+
+    def _runtime_gc_freed(self, scope, memory_before):
+        """Record the removed scope's memory estimate and immediately release its budget."""
+        self.store.log(
+            event="freed",
+            scope=scope,
+            before={"memory_bytes": memory_before},
+            after={"memory_bytes": 0, "scope_present": False},
+            freed_bytes=memory_before,
+        )
+        states = self.store.data.get("memory_scopes", {})
+        if scope in self.memory_scope_seen or (
+            isinstance(states, dict) and scope in states
+        ):
+            self.memory_governor_pass(now=time.time())
 
     def _gc_signature(self, path, pids):
         """Build the same survivor signature used by the automatic-stop path."""
@@ -2500,9 +2777,28 @@ class Daemon:
             )
             if dry_run:
                 continue
+            runtime_unit = self._runtime_gc_unit(path)
+            runtime_memory_before = (
+                self._review_memory(leaf) if runtime_unit is not None else None
+            )
+            if runtime_unit is not None and not self._runtime_gc_prepare(
+                path,
+                leaf,
+                why,
+                runtime_unit,
+                dec,
+                runtime_memory_before,
+            ):
+                res[-1][2] = "kept"
+                continue
             if dec.verdict == authorization.WOULD_ACT:
                 self.log_would_stop("gc_would_stop", leaf, why)
-                if self.mode == "adopt" and (
+                if runtime_unit is not None and self.mode != "observe":
+                    res[-1][2] = "review"
+                    self._contain_runtime_gc_review(
+                        path, leaf, why, runtime_memory_before
+                    )
+                elif self.mode == "adopt" and (
                     leaf.startswith("shared/")
                     or engine.unit_for_leaf(self.units, os.path.basename(path))
                     or (
@@ -2535,7 +2831,7 @@ class Daemon:
             if dec.authority == authorization.AUTHORITY_PAIR and why.startswith(
                 "pair stop"
             ):
-                self.guarded(
+                removed = self.guarded(
                     lambda: self.auto_stop_path(
                         path,
                         why,
@@ -2543,13 +2839,15 @@ class Daemon:
                         authority=self.effective_authority["value"],
                     )
                 )
+                if runtime_unit is not None and removed:
+                    self._runtime_gc_freed(leaf, runtime_memory_before)
                 continue
             if self.mode == "auto":
                 require_pair = (
                     dec.authority == authorization.AUTHORITY_PAIR
                     and why.startswith("pair stop")
                 )
-                self.guarded(
+                removed = self.guarded(
                     lambda: self.auto_stop_path(
                         path,
                         why,
@@ -2557,6 +2855,8 @@ class Daemon:
                         authority=self.effective_authority["value"],
                     )
                 )
+                if runtime_unit is not None and removed:
+                    self._runtime_gc_freed(leaf, runtime_memory_before)
                 continue
             with self.store.decision_context(
                 "stop",
@@ -2591,6 +2891,8 @@ class Daemon:
                     )
                 if rep["removed"]:
                     self.store.log(event="gc_stopped", scope=leaf, why=why)
+                    if runtime_unit is not None:
+                        self._runtime_gc_freed(leaf, runtime_memory_before)
                 elif any(d["action"] == "skip" for d in rep["decisions"]):
                     self.gc_skip.add(leaf)
                     self.store.log(
@@ -3570,7 +3872,7 @@ class Daemon:
 
     def guarded(self, fn):
         try:
-            fn()
+            return fn()
         except Exception as e:  # a failed pass must not stop the daemon
             self.store.log(
                 event="error",
@@ -6533,6 +6835,14 @@ class Daemon:
         """Reconcile reversible scope limits from one bounded accounting snapshot."""
         now = time.time() if now is None else float(now)
         states = self._memory_control_state()
+        before_state = {
+            "scope_count": len(self.memory_scope_seen),
+            "reserved_bytes": sum(
+                value
+                for value in self.memory_scope_allocations.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            ),
+        }
         if force_restore or not memory.enabled(self.cfg):
             paths = self._memory_paths()
             for scope, state in list(states.items()):
@@ -6573,6 +6883,10 @@ class Daemon:
             ):
                 row_data[scope]["desired_swap_max_bytes"] = 0
         active = {row["name"] for row in rows if row["pids"]}
+        after_state = {
+            "scope_count": len(active),
+            "reserved_bytes": report.get("reserved_bytes", 0),
+        }
         exited = self.memory_scope_seen - active
         stale = {scope for scope in states if scope not in observed_paths}
         released = exited | stale
@@ -6593,6 +6907,8 @@ class Daemon:
                 scope=scope,
                 released_bytes=released_bytes,
                 remaining_scopes=len(active),
+                before=before_state,
+                after=after_state,
             )
         # A restarted daemon has no in-memory active set. Persisted ownership records
         # still tell us that an empty scope needs its reservation released and logged.
@@ -6622,6 +6938,8 @@ class Daemon:
                     scope=scope,
                     released_bytes=released_bytes,
                     remaining_scopes=len(active),
+                    before=before_state,
+                    after=after_state,
                 )
         self.memory_scope_allocations = {
             row["name"]: row_data.get(row["name"], {}).get("reservation_bytes")
@@ -6899,42 +7217,50 @@ class Daemon:
             )
         return True, decision.reason
 
-    def _run_vm_save_hook(self, scope, unit, now):
-        """Run an explicitly configured save command without invoking a shell."""
+    def _run_vm_save_hook(self, scope, unit, now, field="save_state"):
+        """Run one explicitly configured runtime argv hook without invoking a shell."""
         unit_mem = (unit or {}).get("mem", {})
         metadata = (unit or {}).get("unit", {})
         if not isinstance(unit_mem, dict) or not isinstance(metadata, dict):
-            return False, "VM save hook configuration is invalid"
-        command = unit_mem.get("save_state")
-        if not isinstance(command, str) or not command.strip():
-            return False, "no VM save hook is configured"
+            return False, "runtime hook configuration is invalid"
+        command = unit_mem.get(field)
+        if (
+            isinstance(command, list)
+            and command
+            and all(isinstance(item, str) and item for item in command)
+        ):
+            argv = list(command)
+        else:
+            return False, "runtime %s hook must be an explicit argv list" % field
         previous = self.memory_save_attempts.get(scope)
         cooldown = float(self.cfg.get("mem", {}).get("reclaim_cooldown", 300))
         if isinstance(previous, (int, float)) and now - previous < cooldown:
-            return False, "VM save hook cooldown has %ds remaining" % int(
+            return False, "runtime hook cooldown has %ds remaining" % int(
                 cooldown - (now - previous)
             )
-        try:
-            argv = shlex.split(command)
-        except ValueError as error:
-            return False, "VM save hook command is invalid: %s" % error
-        fields = {
-            "name": metadata.get("name"),
-            "domain": metadata.get("domain"),
-            "container": metadata.get("container_id"),
-        }
+        fields = self._runtime_hook_fields(os.path.join(cgroup.base(), scope), metadata)
         for index, item in enumerate(argv):
-            for key, value in fields.items():
-                marker = "%%(%s)s" % key
-                if marker in item:
-                    if not isinstance(value, str) or not value:
-                        return False, "VM save hook needs unit.%s" % key
-                    item = item.replace(marker, value)
-            if re.search(r"%\([^)]*\)[a-zA-Z]", item):
-                return False, "VM save hook contains an unsupported template field"
+            for match in re.finditer(r"%\(([^)]+)\)([a-zA-Z])", item):
+                key, conversion = match.groups()
+                if key not in fields or conversion != "s":
+                    return False, "runtime hook contains an unsupported template field"
+                value = fields[key]
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or len(value) > 256
+                    or value.startswith("-")
+                    or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                ):
+                    return False, "runtime hook needs a valid unit.%s" % key
+                item = item.replace(match.group(0), value)
+            if re.search(r"%\([^)]*\)", item):
+                return False, "runtime hook contains an unsupported template field"
+            if "\x00" in item or "\n" in item or "\r" in item:
+                return False, "runtime hook argv contains a control character"
             argv[index] = item
         if not argv:
-            return False, "VM save hook command is empty"
+            return False, "runtime hook command is empty"
         self.memory_save_attempts[scope] = now
         try:
             process = subprocess.Popen(
@@ -6952,22 +7278,23 @@ class Daemon:
                 except OSError:
                     pass
                 output, _ = process.communicate()
-                reason = "VM save hook timed out after 30 seconds"
+                reason = "runtime hook timed out after 30 seconds"
                 success = False
             else:
                 reason = (
                     ""
                     if process.returncode == 0
-                    else "VM save hook exited %d" % process.returncode
+                    else "runtime hook exited %d" % process.returncode
                 )
                 success = process.returncode == 0
         except OSError as error:
             output = ""
-            reason = "VM save hook could not run: %s" % error
+            reason = "runtime hook could not run: %s" % error
             success = False
         self.store.log(
-            event="memory_save_state",
+            event="memory_save_state" if field == "save_state" else "runtime_pause",
             scope=scope,
+            field=field,
             hook=argv[0],
             success=success,
             reason=reason or None,
@@ -6975,8 +7302,11 @@ class Daemon:
             output_truncated=len(output or "") > 4096,
         )
         if success:
-            self.mark_vm_saved(scope)
-            return True, "VM save hook succeeded"
+            if field == "save_state" and (
+                self._runtime_unit_class(unit) == "vm" or metadata.get("kind") == "vm"
+            ):
+                self.mark_vm_saved(scope)
+            return True, "runtime %s hook succeeded" % field
         return False, reason
 
     def _reclaim_class(self, scope, path):
@@ -6987,16 +7317,10 @@ class Daemon:
             return "leftover"
         unit = engine.unit_for_leaf(self.units, os.path.basename(path))
         metadata = (unit or {}).get("unit", {})
-        unit_mem = (unit or {}).get("mem", {})
         if not isinstance(metadata, dict):
             metadata = {}
-        if not isinstance(unit_mem, dict):
-            unit_mem = {}
         unit_gc = (unit or {}).get("gc", {})
-        resource_class = unit_mem.get(
-            "class",
-            metadata.get("mem_class", metadata.get("qos_class", metadata.get("class"))),
-        )
+        resource_class = self._runtime_unit_class(unit)
         bundled_podman = (
             metadata.get("name") == "app-podman"
             and metadata.get("kind") == "app"
@@ -7141,6 +7465,7 @@ class Daemon:
         resource_class=None,
         guard=False,
         stage="all",
+        idle_grace_prevalidated=False,
     ):
         if stage not in ("all", "page_cache", "anonymous"):
             return {
@@ -7186,10 +7511,16 @@ class Daemon:
                 "status": "skipped",
                 "reason": "guard anonymous reclaim requires a taema-frozen scope",
             }
-        idle_eligible = managed_frozen
-        idle_reason = "scope is frozen by taema" if managed_frozen else ""
-        idle_grace_met = False
-        if not manual and not managed_frozen:
+        idle_eligible = managed_frozen or idle_grace_prevalidated
+        idle_reason = (
+            "scope is frozen by taema"
+            if managed_frozen
+            else "idle grace verified by runtime GC"
+            if idle_grace_prevalidated
+            else ""
+        )
+        idle_grace_met = idle_grace_prevalidated
+        if not manual and not managed_frozen and not idle_grace_prevalidated:
             idle, reason = self._reclaim_idle(
                 scope,
                 path,

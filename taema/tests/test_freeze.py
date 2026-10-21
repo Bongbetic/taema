@@ -150,6 +150,20 @@ class FreezeTests(unittest.TestCase):
         self.assertTrue(results[0]["ok"])
         self.assertEqual(Path(self.path, "cgroup.freeze").read_text(), "1\n")
 
+        other_scope = "leftover/guard-only-adopt"
+        other_path = self.cg.leaf(other_scope, [4243])
+        write(os.path.join(other_path, "cgroup.freeze"), "0\n")
+        self.cg.set_cpu(other_scope, 0)
+        self.daemon.cfg["experimental"]["freeze"] = True
+        self.daemon.cfg["freeze"]["after"] = 0
+        with mock.patch.object(
+            self.daemon, "freeze_scope", wraps=self.daemon.freeze_scope
+        ) as freeze_scope:
+            for now in (360, 420, 480):
+                self.assertEqual(self.daemon.freeze_pass(now=now, guard=False), [])
+        freeze_scope.assert_not_called()
+        self.assertEqual(Path(other_path, "cgroup.freeze").read_text(), "0\n")
+
     def test_socket_safety_rejects_unreadable_descriptors_audio_and_unknown_peers(self):
         self.assertIsNone(freezing.ListenerDescriptor.from_record("invalid"))
         self.assertIsNone(

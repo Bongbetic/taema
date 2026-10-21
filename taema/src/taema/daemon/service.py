@@ -5118,7 +5118,7 @@ class Daemon:
         managed = self.store.data.get("frozen_scopes", {})
         guard_freeze_authorized = self._guard_freeze_authorized()
         guard_maintenance = (
-            not guard and guard_freeze_authorized and not self._freeze_config_enabled()
+            not guard and guard_freeze_authorized and not self._freeze_auto_enabled()
         )
         if not self._freeze_config_enabled() and not guard_freeze_authorized:
             self.freeze_usage.clear()

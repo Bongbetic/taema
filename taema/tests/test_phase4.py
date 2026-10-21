@@ -1046,6 +1046,157 @@ class RuntimeGc(AutoCase):
         self.assertTrue(success, reason)
         self.assertEqual(popen.call_args.args[0], ["podman", "pause", "container-id"])
 
+    def test_podman_hook_preserves_each_container_in_a_shared_runtime_scope(self):
+        self.fp.add(330, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": self.rt})
+        self.fp.add(
+            331,
+            330,
+            comm="conmon",
+            argv=["conmon", "-c", "first-container"],
+            env={"XDG_RUNTIME_DIR": self.rt},
+        )
+        self.fp.add(
+            332,
+            330,
+            comm="conmon",
+            argv=["conmon", "-c", "second-container"],
+            env={"XDG_RUNTIME_DIR": self.rt},
+        )
+        scope = "app-podman-abcdef12"
+        self.cg.leaf(scope, [330, 331, 332])
+        unit = {
+            "unit": {
+                "name": "app-podman",
+                "kind": "app",
+                "class": "container",
+            },
+            "mem": {"pause": ["podman", "pause", "%(container)s"]},
+        }
+        self.d.units = [unit]
+        self.d._remember_runtime_identities()
+        self.cg.set_procs(scope, [330, 332])
+        self.d._runtime_hook_fields(os.path.join(cgroup.base(), scope), unit["unit"])
+        self.cg.set_procs(scope, [330])
+        processes = []
+        for output in ("paused first\n", "paused second\n"):
+            process = mock.Mock(returncode=0)
+            process.communicate.return_value = (output, None)
+            processes.append(process)
+
+        with mock.patch.object(
+            daemon.subprocess, "Popen", side_effect=processes
+        ) as popen:
+            success, reason = self.d._run_runtime_hook(scope, unit, 1000, field="pause")
+
+        self.assertTrue(success, reason)
+        self.assertEqual(
+            [call.args[0] for call in popen.call_args_list],
+            [
+                ["podman", "pause", "first-container"],
+                ["podman", "pause", "second-container"],
+            ],
+        )
+        pause_events = [
+            event for event in self.log() if event["event"] == "runtime_pause"
+        ]
+        self.assertEqual(
+            [event["container"] for event in pause_events],
+            ["first-container", "second-container"],
+        )
+
+    def test_podman_hook_retries_only_containers_not_already_paused(self):
+        self.fp.add(330, 1, comm="catatonit", env={"XDG_RUNTIME_DIR": self.rt})
+        self.fp.add(
+            331,
+            330,
+            comm="conmon",
+            argv=["conmon", "-c", "first-container"],
+            env={"XDG_RUNTIME_DIR": self.rt},
+        )
+        self.fp.add(
+            332,
+            330,
+            comm="conmon",
+            argv=["conmon", "-c", "second-container"],
+            env={"XDG_RUNTIME_DIR": self.rt},
+        )
+        scope = "app-podman-abcdef12"
+        self.cg.leaf(scope, [330, 331, 332])
+        unit = {
+            "unit": {
+                "name": "app-podman",
+                "kind": "app",
+                "class": "container",
+            },
+            "mem": {"pause": ["podman", "pause", "%(container)s"]},
+        }
+        self.d.units = [unit]
+        self.d._remember_runtime_identities()
+        self.cg.set_procs(scope, [330])
+        first = mock.Mock(returncode=0)
+        first.communicate.return_value = ("paused first\n", None)
+        second = mock.Mock(returncode=1)
+        second.communicate.return_value = ("already running\n", None)
+
+        with mock.patch.object(
+            daemon.subprocess, "Popen", side_effect=[first, second]
+        ) as popen:
+            success, reason = self.d._run_runtime_hook(scope, unit, 1000, field="pause")
+
+        self.assertFalse(success)
+        self.assertEqual(reason, "runtime hook exited 1")
+        self.assertEqual(
+            [call.args[0] for call in popen.call_args_list],
+            [
+                ["podman", "pause", "first-container"],
+                ["podman", "pause", "second-container"],
+            ],
+        )
+
+        retry = mock.Mock(returncode=0)
+        retry.communicate.return_value = ("paused second\n", None)
+        with mock.patch.object(daemon.subprocess, "Popen", return_value=retry) as popen:
+            success, reason = self.d._run_runtime_hook(scope, unit, 1301, field="pause")
+
+        self.assertTrue(success, reason)
+        popen.assert_called_once_with(
+            ["podman", "pause", "second-container"],
+            start_new_session=True,
+            stdout=daemon.subprocess.PIPE,
+            stderr=daemon.subprocess.STDOUT,
+            text=True,
+        )
+
+    def test_vm_resume_allows_a_new_save_hook_attempt(self):
+        path, unit, _pid = self.runtime_unit(
+            hook=("save_state", ["virsh", "managedsave", "guest"])
+        )
+        scope = cgroup.rel(path)
+        first = mock.Mock(returncode=0)
+        first.communicate.return_value = ("saved\n", None)
+        second = mock.Mock(returncode=0)
+        second.communicate.return_value = ("saved again\n", None)
+
+        with mock.patch.object(
+            daemon.subprocess, "Popen", side_effect=[first, second]
+        ) as popen:
+            success, reason = self.d._run_runtime_hook(
+                scope, unit, 1000, field="save_state"
+            )
+            self.assertTrue(success, reason)
+            self.assertIn(scope, self.d.saved_vm_scopes)
+
+            self.d.mark_vm_resumed(scope)
+            self.assertNotIn(scope, self.d.saved_vm_scopes)
+            self.assertNotIn(scope, self.d.runtime_hook_completed)
+            success, reason = self.d._run_runtime_hook(
+                scope, unit, 1301, field="save_state"
+            )
+
+        self.assertTrue(success, reason)
+        self.assertIn(scope, self.d.saved_vm_scopes)
+        self.assertEqual(popen.call_count, 2)
+
     def test_cleanup_orders_hook_reclaim_stop_and_records_freed_state(self):
         path, _unit, pid = self.runtime_unit(
             hook=("save_state", ["virsh", "managedsave", "%(domain)s"])

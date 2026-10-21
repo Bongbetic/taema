@@ -179,6 +179,7 @@ class Daemon:
         self.saved_vm_scopes = set()  # VM save success, until the guest resumes
         self.saved_vm_members = {}  # scope -> member pids observed after save
         self.memory_save_attempts = {}  # scope -> last save-state hook attempt
+        self.runtime_hook_completed = {}  # scope -> (field, argv, runtime id) successes
         self.runtime_identity_seen = {}  # scope -> last observed runtime id values
         self.reclaim_cursor = 0
         self.qos_pending = {}  # scope -> (candidate class, first observed time)
@@ -2559,8 +2560,14 @@ class Daemon:
                     current.setdefault(field, set()).add(value)
         scope = cgroup.rel(path)
         if current:
-            self.runtime_identity_seen.setdefault(scope, {}).update(current)
+            seen = self.runtime_identity_seen.setdefault(scope, {})
+            for field, values in current.items():
+                seen.setdefault(field, set()).update(values)
         previous = self.runtime_identity_seen.get(scope, {})
+        container_ids = sorted(previous.get("container", set()))
+        if not container_ids and isinstance(fields["container"], str):
+            container_ids = [fields["container"]]
+        fields["container_ids"] = container_ids
         for field in ("domain", "container"):
             values = previous.get(field, set())
             if not fields[field] and len(values) == 1:
@@ -2614,11 +2621,11 @@ class Daemon:
         hook_result = "not configured"
         idle_grace_prevalidated = False
         if hook_field and decision.verdict == authorization.ACT:
-            allowed, authority_reason = self._runtime_hook_authority(
-                leaf, path, unit
-            )
+            allowed, authority_reason = self._runtime_hook_authority(leaf, path, unit)
             if not allowed:
-                hook_result = "runtime hook blocked by stop authority: " + authority_reason
+                hook_result = (
+                    "runtime hook blocked by stop authority: " + authority_reason
+                )
                 self.store.log(event="gc_refused", scope=leaf, why=hook_result)
                 self._log_runtime_gc_quit(
                     path,
@@ -2738,6 +2745,7 @@ class Daemon:
             freed_bytes=memory_before,
         )
         self.runtime_identity_seen.pop(scope, None)
+        self.runtime_hook_completed.pop(scope, None)
         states = self.store.data.get("memory_scopes", {})
         if scope in self.memory_scope_seen or (
             isinstance(states, dict) and scope in states
@@ -7200,10 +7208,11 @@ class Daemon:
             )
 
     def mark_vm_resumed(self, scope):
-        """Restore the VM swap guard after a saved guest resumes."""
+        """Restore VM reclaim guards and hook eligibility after a saved guest resumes."""
         if isinstance(scope, str):
             self.saved_vm_scopes.discard(scope)
             self.saved_vm_members.pop(scope, None)
+            self.runtime_hook_completed.pop(scope, None)
 
     def _reconcile_saved_vm_scopes(self, rows):
         """Forget save authorization when a VM scope is replaced by new members."""
@@ -7272,82 +7281,113 @@ class Daemon:
             argv = list(command)
         else:
             return False, "runtime %s hook must be an explicit argv list" % field
+        fields = self._runtime_hook_fields(os.path.join(cgroup.base(), scope), metadata)
+        template_fields = {
+            key: fields.get(key) for key in ("name", "domain", "container")
+        }
+        uses_container = any(re.search(r"%\(container\)s", item) for item in argv)
+        container_ids = fields.get("container_ids", [])
+        targets = container_ids if uses_container and container_ids else [None]
+        commands = []
+        for container_id in targets:
+            values = dict(template_fields)
+            if uses_container and container_id is not None:
+                values["container"] = container_id
+            resolved = []
+            for item in argv:
+                for match in re.finditer(r"%\(([^)]+)\)([a-zA-Z])", item):
+                    key, conversion = match.groups()
+                    if key not in values or conversion != "s":
+                        return (
+                            False,
+                            "runtime hook contains an unsupported template field",
+                        )
+                    value = values[key]
+                    if (
+                        not isinstance(value, str)
+                        or not value
+                        or len(value) > 256
+                        or value.startswith("-")
+                        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                    ):
+                        return False, "runtime hook needs a valid unit.%s" % key
+                    item = item.replace(match.group(0), value)
+                if re.search(r"%\([^)]*\)", item):
+                    return False, "runtime hook contains an unsupported template field"
+                if "\x00" in item or "\n" in item or "\r" in item:
+                    return False, "runtime hook argv contains a control character"
+                resolved.append(item)
+            if not resolved:
+                return False, "runtime hook command is empty"
+            target = container_id if uses_container else None
+            completed_key = (field, tuple(argv), target)
+            commands.append((resolved, target, completed_key))
+        if not commands:
+            return False, "runtime hook command is empty"
+        completed = self.runtime_hook_completed.get(scope, set())
+        commands = [command for command in commands if command[2] not in completed]
+        if not commands:
+            return True, "runtime %s hook already succeeded" % field
         previous = self.memory_save_attempts.get(scope)
         cooldown = float(self.cfg.get("mem", {}).get("reclaim_cooldown", 300))
         if isinstance(previous, (int, float)) and now - previous < cooldown:
             return False, "runtime hook cooldown has %ds remaining" % int(
                 cooldown - (now - previous)
             )
-        fields = self._runtime_hook_fields(os.path.join(cgroup.base(), scope), metadata)
-        for index, item in enumerate(argv):
-            for match in re.finditer(r"%\(([^)]+)\)([a-zA-Z])", item):
-                key, conversion = match.groups()
-                if key not in fields or conversion != "s":
-                    return False, "runtime hook contains an unsupported template field"
-                value = fields[key]
-                if (
-                    not isinstance(value, str)
-                    or not value
-                    or len(value) > 256
-                    or value.startswith("-")
-                    or any(ord(char) < 32 or ord(char) == 127 for char in value)
-                ):
-                    return False, "runtime hook needs a valid unit.%s" % key
-                item = item.replace(match.group(0), value)
-            if re.search(r"%\([^)]*\)", item):
-                return False, "runtime hook contains an unsupported template field"
-            if "\x00" in item or "\n" in item or "\r" in item:
-                return False, "runtime hook argv contains a control character"
-            argv[index] = item
-        if not argv:
-            return False, "runtime hook command is empty"
         self.memory_save_attempts[scope] = now
-        try:
-            process = subprocess.Popen(
-                argv,
-                start_new_session=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+        for hook_argv, container_id, completed_key in commands:
             try:
-                output, _ = process.communicate(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                output, _ = process.communicate()
-                reason = "runtime hook timed out after 30 seconds"
-                success = False
-            else:
-                reason = (
-                    ""
-                    if process.returncode == 0
-                    else "runtime hook exited %d" % process.returncode
+                process = subprocess.Popen(
+                    hook_argv,
+                    start_new_session=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
                 )
-                success = process.returncode == 0
-        except OSError as error:
-            output = ""
-            reason = "runtime hook could not run: %s" % error
-            success = False
-        self.store.log(
-            event="memory_save_state" if field == "save_state" else "runtime_pause",
-            scope=scope,
-            field=field,
-            hook=argv[0],
-            success=success,
-            reason=reason or None,
-            output=(output or "")[:4096],
-            output_truncated=len(output or "") > 4096,
-        )
-        if success:
-            if field == "save_state" and (
-                self._runtime_unit_class(unit) == "vm" or metadata.get("kind") == "vm"
-            ):
-                self.mark_vm_saved(scope)
-            return True, "runtime %s hook succeeded" % field
-        return False, reason
+                try:
+                    output, _ = process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    output, _ = process.communicate()
+                    reason = "runtime hook timed out after 30 seconds"
+                    success = False
+                else:
+                    reason = (
+                        ""
+                        if process.returncode == 0
+                        else "runtime hook exited %d" % process.returncode
+                    )
+                    success = process.returncode == 0
+            except OSError as error:
+                output = ""
+                reason = "runtime hook could not run: %s" % error
+                success = False
+            event = {
+                "event": "memory_save_state"
+                if field == "save_state"
+                else "runtime_pause",
+                "scope": scope,
+                "field": field,
+                "hook": hook_argv[0],
+                "success": success,
+                "reason": reason or None,
+                "output": (output or "")[:4096],
+                "output_truncated": len(output or "") > 4096,
+            }
+            if container_id is not None:
+                event["container"] = container_id
+            self.store.log(**event)
+            if not success:
+                return False, reason
+            self.runtime_hook_completed.setdefault(scope, set()).add(completed_key)
+        if field == "save_state" and (
+            self._runtime_unit_class(unit) == "vm" or metadata.get("kind") == "vm"
+        ):
+            self.mark_vm_saved(scope)
+        return True, "runtime %s hook succeeded" % field
 
     def _reclaim_class(self, scope, path):
         """Resolve the deliberately small set of scope classes eligible for idle reclaim."""

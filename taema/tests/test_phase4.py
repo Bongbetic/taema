@@ -1272,17 +1272,17 @@ class RuntimeGc(AutoCase):
                         "name": name,
                         "kind": "app",
                         "class": resource_class,
-                        "stop_when_unneeded": True,
                     },
                     "match": {"comm": "generic-runtime-*"},
                     "mem": {
-                        "idle_reclaim": True,
                         "save_state": ["runtime-save", "%(name)s"],
                     },
-                    "gc": {"no_attach_grace": 120},
                 }
                 self.d.units = [unit]
                 self.assertIs(self.d._runtime_gc_unit(path), unit)
+                leaf = cgroup.rel(path)
+                self.d.cfg["mode"] = "enforce"
+                self.d.idle_since[leaf] = time.time() - 601
                 order = []
                 report = {
                     "removed": True,
@@ -1291,14 +1291,12 @@ class RuntimeGc(AutoCase):
                     "stopped": [pid],
                 }
                 with (
-                    mock.patch.object(
-                        engine,
-                        "gc_candidates",
-                        return_value=[(path, "runtime process gone")],
-                    ),
                     mock.patch.object(self.d, "_review_memory", return_value=4096),
                     mock.patch.object(
                         self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+                    ),
+                    mock.patch.object(
+                        self.d, "_reclaim_safety_reason", return_value=""
                     ),
                     mock.patch.object(
                         self.d, "_runtime_stop_preflight", return_value=True

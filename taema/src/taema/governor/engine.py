@@ -139,6 +139,24 @@ def unit_for_leaf(units, leaf):
     return None
 
 
+def generic_runtime_save_state_unit(unit):
+    """Whether an explicitly matched generic container/VM opts into saved cleanup."""
+    metadata = (unit or {}).get("unit", {})
+    match = (unit or {}).get("match", {})
+    unit_mem = (unit or {}).get("mem", {})
+    command = unit_mem.get("save_state") if isinstance(unit_mem, dict) else None
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("kind") == "app"
+        and metadata.get("class") in ("container", "vm")
+        and isinstance(match, dict)
+        and bool(match)
+        and isinstance(command, list)
+        and bool(command)
+        and all(isinstance(arg, str) and arg for arg in command)
+    )
+
+
 # ---- stop ---------------------------------------------------------------------------------
 
 
@@ -1042,8 +1060,9 @@ def gc_candidates(
     for d in top:
         n = os.path.basename(d)
         for un, u in unit_by_prefix.items():
-            if (n == un or n.startswith(un + "-")) and u["unit"].get(
-                "stop_when_unneeded"
+            if (n == un or n.startswith(un + "-")) and (
+                u["unit"].get("stop_when_unneeded")
+                or generic_runtime_save_state_unit(u)
             ):
                 leaves.append(d)
     left_dirs = cgroup.subdirs(base + "/" + LEFTOVER)
@@ -1066,6 +1085,8 @@ def gc_candidates(
     out = []
     snap = inspect.LazySnapshot()
     runtime_process_names = None
+    runtime_process_scan_failed = False
+    runtime_process_scan_done = False
     seeds = cfg.get("seeds", {})
     protect = set(seeds.get("share", [])) | set(seeds.get("persist", []))
     for d in leaves:
@@ -1155,14 +1176,14 @@ def gc_candidates(
             and not isinstance(no_attach_grace, bool)
             and no_attach_grace >= 0
         )
-        # detector: pause process whose runtime directory is gone
-        env_reason = None
+        # A missing runtime endpoint or process provides evidence that the app has quit.
+        runtime_quit_reason = None
         var = gc.get("env_dir_missing")
         if var:
             dirs = {inspect.environ(p).get(var) for p in pids}
             dirs.discard(None)
             if dirs and all(not os.path.isdir(x) for x in dirs):
-                env_reason = "%s gone: %s" % (var, sorted(dirs)[0])
+                runtime_quit_reason = "%s gone: %s" % (var, sorted(dirs)[0])
         socket_env = gc.get("socket_env")
         socket_path = gc.get("socket_path")
         if (
@@ -1179,7 +1200,7 @@ def gc_candidates(
                 if (value := inspect.environ(p).get(socket_env))
             }
             if socket_paths and all(not os.path.exists(path) for path in socket_paths):
-                env_reason = "runtime socket gone: %s" % sorted(socket_paths)[0]
+                runtime_quit_reason = "runtime socket gone: %s" % sorted(socket_paths)[0]
         socket_glob = gc.get("socket_glob")
         if (
             isinstance(socket_glob, str)
@@ -1188,7 +1209,7 @@ def gc_candidates(
         ):
             socket_paths = glob.glob(socket_glob)
             if not any(os.path.exists(path) for path in socket_paths):
-                env_reason = "runtime socket gone: %s" % socket_glob
+                runtime_quit_reason = "runtime socket gone: %s" % socket_glob
         quit_process_missing = gc.get("quit_process_missing")
         runtime_process_live = False
         if (
@@ -1196,28 +1217,39 @@ def gc_candidates(
             and quit_process_missing
             and not any(ord(char) < 32 for char in quit_process_missing)
         ):
-            if runtime_process_names is None:
+            if not runtime_process_scan_done:
+                runtime_process_scan_done = True
+                runtime_process_names = []
                 try:
-                    runtime_process_names = [
-                        inspect.comm(pid)
-                        for pid in inspect.all_pids()
-                        if inspect.uid_of(pid) == os.getuid()
-                    ]
+                    for pid in inspect.all_pids():
+                        process_uid = inspect.uid_of(pid)
+                        if (
+                            not isinstance(process_uid, int)
+                            or isinstance(process_uid, bool)
+                            or process_uid < 0
+                        ):
+                            runtime_process_scan_failed = True
+                            break
+                        if process_uid != os.getuid():
+                            continue
+                        process_name = inspect.comm(pid)
+                        if not process_name:
+                            runtime_process_scan_failed = True
+                            break
+                        runtime_process_names.append(process_name)
                 except OSError:
                     # A failed process scan is not proof that a runtime has quit.
-                    runtime_process_names = None
-                    runtime_process_live = True
-            if runtime_process_names is not None:
-                runtime_process_live = any(
-                    fnmatch.fnmatchcase(name, quit_process_missing)
-                    for name in runtime_process_names
-                )
-                if not runtime_process_live and env_reason is None:
-                    env_reason = "runtime process gone: %s" % quit_process_missing
+                    runtime_process_scan_failed = True
+            runtime_process_live = runtime_process_scan_failed or any(
+                fnmatch.fnmatchcase(name, quit_process_missing)
+                for name in runtime_process_names
+            )
+            if not runtime_process_live and runtime_quit_reason is None:
+                runtime_quit_reason = "runtime process gone: %s" % quit_process_missing
         if gc.get("qmp_socket") is True:
             qmp_paths = {path for p in pids for path in inspect.qmp_socket_paths(p)}
             if qmp_paths and all(not os.path.exists(path) for path in qmp_paths):
-                env_reason = "QMP socket gone: %s" % sorted(qmp_paths)[0]
+                runtime_quit_reason = "QMP socket gone: %s" % sorted(qmp_paths)[0]
         s = snap.get()
         edge_map = inspect.edges(set(pids), s)
         busy = (
@@ -1239,14 +1271,14 @@ def gc_candidates(
             and usage.get(rel) is not None
             and cpu != usage[rel]
             and not has_no_attach_grace
-            and env_reason is None
+            and runtime_quit_reason is None
         ):
             idle_since[rel] = now()  # CPU moved: not idle, restart the window
         first = idle_since.setdefault(rel, now())
         if cpu is not None:
             usage[rel] = cpu
-        if env_reason:
-            out.append((d, env_reason))
+        if runtime_quit_reason:
+            out.append((d, runtime_quit_reason))
             continue
         if (
             has_no_attach_grace

@@ -269,6 +269,7 @@ class PolicyTests(unittest.TestCase):
         libvirt = by_name["app-libvirt-qemu"]
         docker = by_name["app-docker-rootless"]
         incus = by_name["app-incus"]
+        lxc = by_name["app-lxc"]
         virtualbox = by_name["app-virtualbox"]
 
         self.assertEqual(podman["unit"]["class"], "container")
@@ -294,6 +295,12 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(incus["gc"]["socket_path"], "incus/unix.socket")
         self.assertEqual(incus["gc"]["quit_process_missing"], "lxc-start*")
         self.assertEqual(incus["gc"]["no_attach_grace"], 120)
+
+        self.assertEqual(lxc["unit"]["class"], "container")
+        self.assertEqual(lxc["unit"]["group_by_env"], "XDG_RUNTIME_DIR")
+        self.assertEqual(lxc["match"]["comm"], "lxc-start")
+        self.assertEqual(lxc["gc"]["quit_process_missing"], "lxc-start*")
+        self.assertEqual(lxc["gc"]["no_attach_grace"], 120)
 
         self.assertEqual(virtualbox["unit"]["class"], "vm")
         self.assertEqual(virtualbox["match"]["comm"], "VBoxHeadless")
@@ -370,6 +377,7 @@ class PolicyTests(unittest.TestCase):
                 "app-herdr",
                 "app-docker-rootless",
                 "app-incus",
+                "app-lxc",
                 "app-podman",
                 "app-libvirt-qemu",
                 "app-virtualbox",

@@ -7244,7 +7244,7 @@ class Daemon:
         metadata = (unit or {}).get("unit", {})
         unit_stop_allowed = (
             isinstance(metadata, dict) and metadata.get("stop_when_unneeded") is True
-        )
+        ) or engine.generic_runtime_save_state_unit(unit)
         leftover = scope.startswith(engine.LEFTOVER + "/")
         facts = (
             self._pair_scope_facts(path)

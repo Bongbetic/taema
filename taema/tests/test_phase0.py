@@ -18,8 +18,10 @@ import taema.cli.commands as cli
 from taema.core import cgroup, process as inspect
 from taema.governor import engine
 from taema.store import knowledge
+from taema.config import policy
 
 UID = os.getuid()
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def tmp():
@@ -701,6 +703,67 @@ class GcRules(unittest.TestCase):
         candidates = self.run_gc(units=[unit])
         self.assertEqual(candidates[0][0], path)
         self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
+
+    def test_runtime_quit_scan_fails_closed_for_unreadable_proc_entries(self):
+        path = self.cg.leaf("app-runtime-test", [42], cpu=1)
+        unit = {
+            "unit": {
+                "name": "app-runtime",
+                "kind": "app",
+                "class": "container",
+                "stop_when_unneeded": True,
+            },
+            "gc": {"no_attach_grace": 0, "quit_process_missing": "VBoxSVC"},
+        }
+        cases = (
+            ("uid unreadable", {42: UID, 43: -1}, {42: "worker"}),
+            ("comm unreadable", {42: UID, 43: UID}, {42: "worker", 43: ""}),
+        )
+        for label, uids, names in cases:
+            with self.subTest(entry=label):
+                with (
+                    mock.patch.object(engine.inspect, "all_pids", return_value=[42, 43]),
+                    mock.patch.object(
+                        engine.inspect,
+                        "uid_of",
+                        side_effect=lambda pid: uids.get(pid, -1),
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "comm",
+                        side_effect=lambda pid: names.get(pid, ""),
+                    ),
+                ):
+                    self.assertEqual(self.run_gc(units=[unit]), [])
+
+    def test_lxc_shipped_unit_holds_and_quits_from_fake_proc_tree(self):
+        units = policy.load_units(
+            {"paths": {"units_dir": os.path.join(ROOT, "etc", "units")}}
+        )
+        unit = next(unit for unit in units if unit["unit"]["name"] == "app-lxc")
+        path = self.cg.leaf("app-lxc-test", [42], cpu=1)
+        proc_root = os.path.join(self.cg.root, "proc-lxc")
+        os.makedirs(proc_root)
+
+        def add_process(pid, name):
+            process_dir = os.path.join(proc_root, str(pid))
+            os.makedirs(process_dir)
+            with open(os.path.join(process_dir, "comm"), "w") as comm:
+                comm.write(name + "\n")
+
+        add_process(42, "lxc-monitor-helper")
+        add_process(43, "lxc-start")
+        idle = {}
+        with mock.patch.object(engine.inspect, "PROC", proc_root):
+            self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+            self.t[0] += 121
+            self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+            os.unlink(os.path.join(proc_root, "43", "comm"))
+            os.rmdir(os.path.join(proc_root, "43"))
+            candidates = self.run_gc(idle=idle, units=[unit])
+
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("runtime process gone:"))
 
     def test_runtime_quit_signals_use_fake_proc_and_runtime_trees(self):
         cases = (

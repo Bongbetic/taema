@@ -1,0 +1,21 @@
+# Standalone rootless LXC instances that are not managed by Incus.
+[unit]
+name = "app-lxc"
+kind = "app"
+class = "container"
+group_by_env = "XDG_RUNTIME_DIR"
+stop_when_unneeded = true
+
+[match]
+comm = "lxc-start"
+
+[mem]
+class = "container"
+
+[gc]
+no_attach_grace = 120
+quit_process_missing = "lxc-start*"
+
+[kill]
+survive_logout = true
+graceful = 5

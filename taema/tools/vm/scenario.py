@@ -114,18 +114,27 @@ while True:
     time.sleep(1.0)
 """
 
+M3_GUARD_PSI_THRESHOLDS = {"some": "1us/2s", "full": "1us/2s"}
+
 M3_CACHE_WORKER = """\
-import ctypes, os, sys, time
-path, ready = sys.argv[1:]
+import ctypes, json, mmap, os, sys, time
+path, gate, ready = sys.argv[1:]
 ctypes.CDLL(None).prctl(15, b'm3cache', 0, 0, 0)
+while not os.path.exists(gate):
+    time.sleep(0.05)
 with open(path, 'w+b') as cache:
     cache.write(b'x' * (16 * 1024 * 1024))
     cache.flush()
     os.fsync(cache.fileno())
-    cache.seek(0)
-    cache.read()
+    with mmap.mmap(cache.fileno(), 0, access=mmap.ACCESS_WRITE) as mapped:
+        mapped.seek(0)
+        mapped.read()
+        cold_advice = getattr(mmap, 'MADV_COLD', 20)
+        mapped.madvise(cold_advice)
 with open(ready, 'w') as marker:
-    marker.write('ready')
+    json.dump({'file_bytes': os.path.getsize(path), 'cold_advice': cold_advice,
+               'cold_advice_applied': True,
+               'gate_observed': os.path.exists(gate)}, marker)
 time.sleep(3600)
 """
 
@@ -769,7 +778,8 @@ def _m3_enable_wake_freeze():
     with open(config_path, "w", encoding="utf-8") as target:
         target.write(
             'mode = "enforce"\n\n'
-            "[timers]\nadopt_interval = 1\ngc_interval = 3600\n"
+            # Adoption is independent of wake-on-connect's two-second poll below.
+            "[timers]\nadopt_interval = 15\ngc_interval = 3600\n"
             "idle_grace = 3600\nleftover_expire_days = 0\n\n"
             "[mem]\nidle_reclaim_grace = 0\n\n"
             "[freeze]\nenabled = true\nadopt = false\nafter = 0\n"
@@ -832,22 +842,30 @@ def _m3_enable_pressure_policy():
     config_path, _unit_path = _m0_config_paths()
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     with open(config_path, "w", encoding="utf-8") as target:
-        target.write(
+        pressure_config = (
             'mode = "adopt"\n\n'
             "[timers]\nadopt_interval = 1\ngc_interval = 3600\n"
             "idle_grace = 3600\nleftover_expire_days = 0\n\n"
             "[mem]\nreclaim = true\nreclaim_interval = 2\n"
-            "reclaim_cooldown = 0\nreclaim_max = \"4M\"\n"
+            "reclaim_cooldown = 0\npressure_gate = 100\n"
+            "reclaim_max = \"4M\"\n"
             "reclaim_minimum = \"1M\"\nmin_headroom = \"0M\"\n"
             "headroom_percent = 0\nidle_reclaim_grace = 0\n"
             "swap_reclaim = false\n\n"
             "[freeze]\nenabled = true\nadopt = false\nafter = 0\n"
             "wake_on_connect = false\nmax_frozen = 4\ncpu_idle_max = 0.5\n\n"
             "[guard]\nenabled = true\navailable_floor = 35\n"
-            'psi_some = "1ms/2s"\npsi_full = "1ms/2s"\n'
+            'psi_some = "%s"\npsi_full = "%s"\n'
             "cooldown = 10\nfreeze_in_adopt = true\n"
             "oom_adj_leftover = 500\noom_group_leftover = true\n\n"
             "[experimental]\nfreeze = true\nguard = true\n"
+        )
+        target.write(
+            pressure_config
+            % (
+                M3_GUARD_PSI_THRESHOLDS["some"],
+                M3_GUARD_PSI_THRESHOLDS["full"],
+            )
         )
     restart = run_privileged(["sv", "restart", "taema"], timeout=45)
     if restart.returncode != 0:
@@ -1009,6 +1027,184 @@ def _m3_worker_progress(item):
     return max(0, value)
 
 
+def _m3_cache_fixture_paths(artifact_dir, home=None):
+    """Keep pressure markers in artifacts and the charged cache file on guest disk."""
+    home = home or os.path.expanduser("~")
+    marker_dir = os.path.join(artifact_dir, "m3-cache")
+    os.makedirs(marker_dir, exist_ok=True)
+    cache_root = os.path.join(home, ".cache", "taema")
+    os.makedirs(cache_root, mode=0o700, exist_ok=True)
+    cache_dir = tempfile.mkdtemp(prefix="m3-cache-", dir=cache_root)
+    cache_file = os.path.join(cache_dir, "cache.bin")
+    # An empty inode lets findmnt verify the backing filesystem before the
+    # worker is released. File contents are created only after leftover move.
+    with open(cache_file, "wb"):
+        pass
+    return {
+        "marker_dir": marker_dir,
+        "cache_dir": cache_dir,
+        "cache_file": cache_file,
+        "gate": os.path.join(marker_dir, "populate"),
+        "ready": os.path.join(marker_dir, "ready"),
+    }
+
+
+def _m3_cache_mount_info(path):
+    """Use findmnt to identify the real filesystem backing the M3 cache file."""
+    if not shutil.which("findmnt"):
+        return {"ok": False, "path": path, "error": "findmnt is unavailable"}
+    result = _run(
+        ["findmnt", "--json", "--target", path, "--output", "FSTYPE,TARGET,SOURCE"],
+        timeout=10,
+    )
+    try:
+        filesystems = json.loads(result.stdout).get("filesystems", [])
+    except (TypeError, ValueError):
+        filesystems = []
+    mount = filesystems[0] if filesystems and isinstance(filesystems[0], dict) else {}
+    fstype = mount.get("fstype")
+    return {
+        "ok": result.returncode == 0 and fstype == "ext4",
+        "path": path,
+        "fstype": fstype,
+        "target": mount.get("target"),
+        "source": mount.get("source"),
+        "error": result.stderr.strip()[-300:] if result.returncode else None,
+    }
+
+
+def _m3_cache_scope_counters(scope):
+    """Read the cgroup file-LRU counters used to decide page-cache reclaim."""
+    path = os.path.join(CGROOT, scope)
+    values = {}
+    try:
+        with open(os.path.join(path, "memory.stat"), encoding="ascii") as source:
+            for line in source:
+                fields = line.split()
+                if len(fields) < 2:
+                    continue
+                try:
+                    values[fields[0]] = int(fields[1])
+                except ValueError:
+                    continue
+    except OSError as error:
+        return {
+            "scope": scope,
+            "cgroup_path": path,
+            "error": "%s: %s" % (type(error).__name__, error),
+        }
+    file_bytes = values.get("file")
+    inactive_file = values.get("inactive_file")
+    shmem = values.get("shmem", 0)
+    reclaimable = (
+        max(0, min(inactive_file, file_bytes - shmem))
+        if isinstance(file_bytes, int) and isinstance(inactive_file, int)
+        else None
+    )
+    return {
+        "scope": scope,
+        "cgroup_path": path,
+        "file_bytes": file_bytes,
+        "inactive_file_bytes": inactive_file,
+        "shmem_bytes": shmem,
+        "reclaimable_bytes": reclaimable,
+    }
+
+
+def _m3_wait_for_reclaimable_cache(scope, timeout=15):
+    """Wait for the promoted worker's file pages to be visible as reclaimable."""
+    deadline = time.monotonic() + timeout
+    counters = _m3_cache_scope_counters(scope)
+    while time.monotonic() < deadline:
+        if all(
+            isinstance(counters.get(name), int) and counters[name] > 0
+            for name in ("file_bytes", "inactive_file_bytes", "reclaimable_bytes")
+        ):
+            return True, counters
+        time.sleep(0.1)
+        counters = _m3_cache_scope_counters(scope)
+    return False, counters
+
+
+def _m3_guard_trigger_evidence():
+    """Return the active trigger source from the public status JSON view."""
+    result = _run(["/usr/bin/taema", "status", "--json"], timeout=10)
+    try:
+        model = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        model = {}
+    status = model.get("status") if isinstance(model, dict) else None
+    guard = status.get("guard") if isinstance(status, dict) else None
+    guard = guard if isinstance(guard, dict) else {}
+    return {
+        "source": guard.get("psi_trigger_source"),
+        "path": guard.get("psi_trigger_path"),
+        "writable": guard.get("psi_trigger_writable") is True,
+        "metrics": guard.get("psi_trigger_metrics", []),
+        "status_error": result.stderr.strip()[-200:] if result.returncode else None,
+    }
+
+
+def _m3_compact_guard_action(event, sample):
+    """Keep only evidence needed to prove selected guard ordering in the artifact."""
+    event = event if isinstance(event, dict) else {}
+    sample = sample if isinstance(sample, dict) else {}
+    return {
+        "event": {
+            key: event.get(key)
+            for key in ("step", "status", "scopes", "bytes_freed", "trigger")
+            if key in event
+        },
+        "sample": sample.get("pressure_sample"),
+        "guard_psi_thresholds": sample.get("guard_psi_thresholds"),
+        "worker_progress_bytes": sample.get("worker_progress_bytes"),
+        "psi_trigger": sample.get("psi_trigger"),
+    }
+
+
+def _m3_decision_events_since(path, offset):
+    """Read complete JSON decision records appended after an existing offset."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as source:
+            source.seek(offset)
+            lines = source.readlines()
+            next_offset = source.tell()
+    except OSError:
+        return [], offset
+    events = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events, next_offset
+
+
+def _m3_cache_reclaims_before_pressure(events, scope):
+    """Find ordinary reclaim actions against the prepared cache leftover."""
+    target = daemon_scope(scope)
+    return [
+        event
+        for event in events
+        if event.get("event") == "memory_reclaimed" and event.get("scope") == target
+    ]
+
+
+def _m3_selected_guard_evidence(guard_events, action_samples, page_index, freeze_index):
+    """Build compact, parseable evidence for the selected page-cache and freeze events."""
+    def selected(index):
+        if index is None or index >= len(guard_events) or index >= len(action_samples):
+            return None
+        return _m3_compact_guard_action(guard_events[index], action_samples[index])
+
+    return {
+        "page_cache": selected(page_index),
+        "freeze": selected(freeze_index),
+    }
+
+
 def _m3_memory_allocation_evidence(expected_memory_mb):
     """Compare guest MemTotal with the QEMU memory requested by the harness."""
     sample = _m3_pressure_snapshot()
@@ -1046,18 +1242,28 @@ def _m3_promote_to_leftover(tree, pid, timeout=90):
 
 def _m3_pressure_run(rec, args, tracked):
     """Apply bounded guest pressure, then verify earlyoom's score choice."""
+    decision_path = os.path.join(args.state_dir, "decisions.log")
+    try:
+        prepressure_offset = os.path.getsize(decision_path)
+    except OSError:
+        prepressure_offset = 0
     _m3_enable_pressure_policy()
     baseline = _m3_pressure_snapshot()
+    psi_trigger = _m3_guard_trigger_evidence()
     total, available = baseline["MemTotal_bytes"], baseline["MemAvailable_bytes"]
     floor_percent = baseline["MemAvailable_percent"]
     rec.step(
         "pressure-starts-above-guard-floor",
-        isinstance(floor_percent, (int, float)) and floor_percent > 40,
+        isinstance(floor_percent, (int, float))
+        and floor_percent > 40
+        and psi_trigger["writable"]
+        and psi_trigger["source"] in ("delegated-cgroup", "host-proc"),
         json.dumps(
             {
                 "sample": baseline,
                 "guard_floor_percent": 35,
                 "fallback_floor_percent": 12,
+                "psi_trigger": psi_trigger,
             },
             sort_keys=True,
         ),
@@ -1066,11 +1272,16 @@ def _m3_pressure_run(rec, args, tracked):
         raise ScenarioError("M3 pressure run requires MemTotal and MemAvailable")
     if floor_percent <= 40:
         raise ScenarioError("guest begins too close to the configured 35% guard floor")
+    if not psi_trigger["writable"] or psi_trigger["source"] not in (
+        "delegated-cgroup",
+        "host-proc",
+    ):
+        raise ScenarioError("M3 requires a writable guard PSI trigger source")
 
-    cache_dir = os.path.join(args.artifacts, "m3-cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_file = os.path.join(cache_dir, "cache.bin")
-    cache_ready = os.path.join(cache_dir, "ready")
+    cache_paths = _m3_cache_fixture_paths(args.artifacts)
+    cache_dir = cache_paths["marker_dir"]
+    cache_file = cache_paths["cache_file"]
+    cache_ready = cache_paths["ready"]
     cache_tree = spawn_gui_tree(
         cache_dir,
         children=1,
@@ -1079,26 +1290,138 @@ def _m3_pressure_run(rec, args, tracked):
             "-c",
             M3_CACHE_WORKER,
             cache_file,
+            cache_paths["gate"],
             cache_ready,
         ],
         root_comm="m3cache-root",
         root_exec=["/bin/sleep", "3600"],
     )
+    cache_tree["m3_cleanup_cache_dir"] = cache_paths["cache_dir"]
     tracked.append(cache_tree)
     cache_pid = cache_tree["children"][0]
+    cache_app_scope, cache_scope = _m3_promote_to_leftover(cache_tree, cache_pid)
+    cache_item = {"pid": cache_pid, "scope": cache_scope}
+    cache_member_ok, cache_preflight = _m3_pressure_scope_preflight(
+        cache_item, "leftover/"
+    )
+    cache_scope = cache_item.get("scope", cache_scope)
+    cache_mount = _m3_cache_mount_info(cache_file)
+    home = os.path.realpath(os.path.expanduser("~"))
+    cache_realpath = os.path.realpath(cache_file)
+    cache_inside_home = os.path.commonpath((home, cache_realpath)) == home
+    cache_inside_artifacts = os.path.commonpath(
+        (os.path.realpath(args.artifacts), cache_realpath)
+    ) == os.path.realpath(args.artifacts)
+    gate_preconditions = (
+        cache_member_ok
+        and cache_preflight.get("scope") == cache_scope
+        and cache_mount.get("ok") is True
+        and cache_inside_home
+        and not cache_inside_artifacts
+        and os.path.getsize(cache_file) == 0
+        and not os.path.exists(cache_paths["gate"])
+    )
+    rec.step(
+        "pressure-cache-ext4-leftover-before-population",
+        gate_preconditions,
+        json.dumps(
+            {
+                "proc_cgroup": cache_preflight.get("proc_cgroup"),
+                "pid": cache_pid,
+                "scope": cache_scope,
+                "cgroup_member": cache_preflight.get("cgroup_member"),
+                "cgroup_path": cache_preflight.get("cgroup_path"),
+                "findmnt": cache_mount,
+                "inside_guest_home": cache_inside_home,
+                "inside_artifacts_tmpfs": cache_inside_artifacts,
+                "file_size_before_worker_gate": os.path.getsize(cache_file),
+                "worker_gate_open": os.path.exists(cache_paths["gate"]),
+            },
+            sort_keys=True,
+        ),
+    )
+    if not gate_preconditions:
+        raise ScenarioError(
+            "M3 cache worker must be in its leftover cgroup on ext4 before file population"
+        )
+    with open(cache_paths["gate"], "w", encoding="ascii") as target:
+        target.write("populate\n")
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline and not os.path.isfile(cache_ready):
+        if not _alive(cache_pid):
+            break
         time.sleep(0.1)
-    cache_ready_ok = os.path.isfile(cache_ready)
-    rec.step("pressure-cache-leftover-prepared", cache_ready_ok, "16 MiB file cache")
+    try:
+        with open(cache_ready, encoding="utf-8") as source:
+            cache_ready_detail = json.load(source)
+    except (OSError, ValueError):
+        cache_ready_detail = {}
+    cache_ready_ok = (
+        os.path.isfile(cache_ready)
+        and os.path.getsize(cache_file) == 16 * 1024 * 1024
+        and cache_ready_detail.get("file_bytes") == 16 * 1024 * 1024
+        and cache_ready_detail.get("cold_advice_applied") is True
+        and cache_ready_detail.get("gate_observed") is True
+    )
+    rec.step(
+        "pressure-cache-worker-populated-after-leftover",
+        cache_ready_ok,
+        json.dumps(
+            {
+                "pid": cache_pid,
+                "scope": cache_scope,
+                "cache_file": cache_file,
+                "ready": cache_ready_detail,
+            },
+            sort_keys=True,
+        ),
+    )
     if not cache_ready_ok:
-        raise ScenarioError("M3 cache process did not prepare its bounded file")
-    cache_app_scope, cache_scope = _m3_promote_to_leftover(cache_tree, cache_pid)
+        raise ScenarioError("M3 cache process did not populate its 16 MiB file after promotion")
+    counters_ok, cache_counters = _m3_wait_for_reclaimable_cache(cache_scope)
+    rec.step(
+        "pressure-cache-leftover-has-reclaimable-file-pages",
+        counters_ok,
+        json.dumps(cache_counters, sort_keys=True),
+    )
+    if not counters_ok:
+        raise ScenarioError(
+            "M3 cache leftover has no nonzero file/inactive_file/reclaimable counters"
+        )
+    prepressure_events, _ = _m3_decision_events_since(
+        decision_path, prepressure_offset
+    )
+    prepressure_cache_reclaims = _m3_cache_reclaims_before_pressure(
+        prepressure_events, cache_scope
+    )
+    rec.step(
+        "pressure-cache-not-reclaimed-before-workload-start",
+        not prepressure_cache_reclaims,
+        json.dumps(
+            {
+                "cache_scope": daemon_scope(cache_scope),
+                "non_guard_pressure_gate_percent": 100,
+                "prepressure_memory_reclaimed": prepressure_cache_reclaims,
+            },
+            sort_keys=True,
+        ),
+    )
+    if prepressure_cache_reclaims:
+        raise ScenarioError(
+            "ordinary reclaim acted on the prepared cache before pressure started"
+        )
     rec.step(
         "pressure-cache-adopted-before-leftover",
         True,
-        "app_scope=%s leftover_scope=%s pid=%d"
-        % (cache_app_scope, cache_scope, cache_pid),
+        json.dumps(
+            {
+                "app_scope": cache_app_scope,
+                "leftover_scope": cache_scope,
+                "pid": cache_pid,
+                "file_counters_before_pressure": cache_counters,
+            },
+            sort_keys=True,
+        ),
     )
 
     phase1_start = _m3_pressure_snapshot()
@@ -1186,7 +1509,6 @@ def _m3_pressure_run(rec, args, tracked):
                 "M3 %s worker failed live cgroup membership preflight" % name
             )
 
-    decision_path = os.path.join(args.state_dir, "decisions.log")
     try:
         offset = os.path.getsize(decision_path)
     except OSError:
@@ -1217,10 +1539,12 @@ def _m3_pressure_run(rec, args, tracked):
                         {
                             "event": event,
                             "pressure_sample": _m3_pressure_snapshot(),
+                            "guard_psi_thresholds": dict(M3_GUARD_PSI_THRESHOLDS),
                             "worker_progress_bytes": {
                                 "hog": _m3_worker_progress(hog),
                                 "peer": _m3_worker_progress(peer),
                             },
+                            "psi_trigger": psi_trigger,
                         }
                     )
             page_cache_seen = any(
@@ -1278,15 +1602,11 @@ def _m3_pressure_run(rec, args, tracked):
         evidence = {
             "guard_floor_percent": 35,
             "fallback_floor_percent": 12,
-            "page_cache_event": guard_events[page_index] if page_index is not None else None,
-            "page_cache_sample": page_sample,
-            "freeze_event": guard_events[freeze_index] if freeze_index is not None else None,
-            "freeze_sample": freeze_sample,
-            "page_cache_worker_progress_bytes": action_samples[page_index]["worker_progress_bytes"] if page_index is not None else None,
-            "freeze_worker_progress_bytes": action_samples[freeze_index]["worker_progress_bytes"] if freeze_index is not None else None,
-            "initial_worker_scope_preflight": preflight,
+            "page_cache_pre_pressure_counters": cache_counters,
             "bounded_worker_budget_bytes": phase1_cap,
-            "all_guard_events": guard_events,
+            "selected_actions": _m3_selected_guard_evidence(
+                guard_events, action_samples, page_index, freeze_index
+            ),
         }
         rec.step(
             "guard-page-cache-then-freezes-above-floors",
@@ -1539,42 +1859,132 @@ def _m3_pressure_run(rec, args, tracked):
     return {"cache_tree": cache_tree, "hog_tree": hog["tree"], "peer_tree": peer["tree"]}
 
 
-def _m3_daemon_metrics():
-    """Return taema daemon PID, resident KiB, and CPU ticks from procfs."""
+def _m3_daemon_process_ids(current_uid_only=False):
+    """Return matching daemons, preferring or requiring the scenario user's UID."""
+    matches = []
+    scenario_uid = os.getuid()
     for entry in os.listdir(PROCROOT):
         if not entry.isdigit():
             continue
-        pid = int(entry)
+        proc_dir = os.path.join(PROCROOT, entry)
         try:
-            with open(os.path.join(PROCROOT, entry, "cmdline"), "rb") as source:
+            with open(os.path.join(proc_dir, "cmdline"), "rb") as source:
                 argv = [item.decode("utf-8", "replace") for item in source.read().split(b"\0")]
-            module_launcher = any(
-                argv[index : index + 3] == ["-m", "taema", "daemon"]
-                for index in range(max(0, len(argv) - 2))
-            )
-            script_launcher = any(
-                os.path.basename(argv[index]) == "taema"
-                and index + 1 < len(argv)
-                and argv[index + 1] == "daemon"
-                for index in range(len(argv))
-            )
-            if not module_launcher and not script_launcher:
+        except OSError:
+            continue
+        module_launcher = any(
+            argv[index : index + 3] == ["-m", "taema", "daemon"]
+            for index in range(max(0, len(argv) - 2))
+        )
+        script_launcher = any(
+            os.path.basename(argv[index]) == "taema"
+            and index + 1 < len(argv)
+            and argv[index + 1] == "daemon"
+            for index in range(len(argv))
+        )
+        if module_launcher or script_launcher:
+            uid = None
+            try:
+                with open(os.path.join(proc_dir, "status"), encoding="ascii") as source:
+                    uid_line = next(line for line in source if line.startswith("Uid:"))
+                uid = int(uid_line.split()[1])
+            except (OSError, StopIteration, ValueError, IndexError):
+                pass
+            if current_uid_only and uid != scenario_uid:
                 continue
-            with open(os.path.join(PROCROOT, entry, "status"), encoding="ascii") as source:
+            matches.append((uid != scenario_uid, int(entry)))
+    return [pid for _other_uid, pid in sorted(matches)]
+
+
+def _m3_daemon_metrics():
+    """Return scenario-UID daemon PID, resident KiB, and CPU ticks from procfs."""
+    for pid in _m3_daemon_process_ids(current_uid_only=True):
+        proc_dir = os.path.join(PROCROOT, str(pid))
+        try:
+            with open(os.path.join(proc_dir, "status"), encoding="ascii") as source:
                 status = source.read()
             rss = next(
                 int(line.split()[1])
                 for line in status.splitlines()
                 if line.startswith("VmRSS:")
             )
-            with open(os.path.join(PROCROOT, entry, "stat"), encoding="ascii") as source:
+            with open(os.path.join(proc_dir, "stat"), encoding="ascii") as source:
                 stat = source.read()
             fields = stat[stat.rfind(")") + 1 :].split()
             ticks = int(fields[11]) + int(fields[12])
             return pid, rss, ticks
         except (OSError, StopIteration, ValueError, IndexError):
             continue
-    raise ScenarioError("could not find the taema daemon in procfs")
+    raise ScenarioError("could not find the taema daemon for the scenario UID in procfs")
+
+
+def _m3_daemon_profiles():
+    """Read concise RSS and smaps_rollup evidence for each matching daemon process."""
+    selected = (
+        "Rss",
+        "Pss",
+        "Anonymous",
+        "Pss_Anon",
+        "Pss_File",
+        "Pss_Shmem",
+        "Shared_Clean",
+        "Shared_Dirty",
+        "Private_Clean",
+        "Private_Dirty",
+        "Swap",
+    )
+    profiles = []
+    for pid in _m3_daemon_process_ids():
+        proc_dir = os.path.join(PROCROOT, str(pid))
+        profile = {"pid": pid, "rss_kib": None, "smaps_rollup": {}}
+        try:
+            with open(os.path.join(proc_dir, "status"), encoding="ascii") as source:
+                profile["rss_kib"] = next(
+                    int(line.split()[1])
+                    for line in source
+                    if line.startswith("VmRSS:")
+                )
+        except (OSError, StopIteration, ValueError, IndexError) as error:
+            profile["status_error"] = "%s: %s" % (type(error).__name__, error)
+        try:
+            values = {}
+            with open(
+                os.path.join(proc_dir, "smaps_rollup"), encoding="ascii"
+            ) as source:
+                for line in source:
+                    name, separator, raw = line.partition(":")
+                    if name not in selected or not separator:
+                        continue
+                    fields = raw.split()
+                    if fields and fields[0].isdecimal():
+                        values[name] = int(fields[0])
+            rss = values.get("Rss")
+            anonymous = values.get("Anonymous")
+            rollup = {
+                "rss_kib": rss,
+                "pss_kib": values.get("Pss"),
+                "anonymous_kib": anonymous,
+                "file_or_shmem_kib": (
+                    max(0, rss - anonymous)
+                    if isinstance(rss, int) and isinstance(anonymous, int)
+                    else None
+                ),
+                "pss_anon_kib": values.get("Pss_Anon"),
+                "pss_file_kib": values.get("Pss_File"),
+                "pss_shmem_kib": values.get("Pss_Shmem"),
+                "shared_clean_kib": values.get("Shared_Clean"),
+                "shared_dirty_kib": values.get("Shared_Dirty"),
+                "private_clean_kib": values.get("Private_Clean"),
+                "private_dirty_kib": values.get("Private_Dirty"),
+                "swap_kib": values.get("Swap"),
+            }
+            profile["smaps_rollup"] = rollup
+            if rss is None or anonymous is None:
+                profile["smaps_error"] = "smaps_rollup lacks Rss or Anonymous"
+        except OSError as error:
+            profile["smaps_error"] = "%s: %s" % (type(error).__name__, error)
+        profiles.append(profile)
+    return profiles
 
 
 def _m3_memory_samples(state_dir):
@@ -1602,6 +2012,7 @@ def _m3_idle_footprint(rec, state_dir, duration=600):
         raise ScenarioError("M3 idle gate requires memory sampling and pressure triggers")
 
     before = _m3_memory_samples(state_dir)
+    daemon_profiles_start = _m3_daemon_profiles()
     started_wall = time.time()
     started = time.monotonic()
     previous_pid, previous_rss, previous_ticks = _m3_daemon_metrics()
@@ -1618,6 +2029,7 @@ def _m3_idle_footprint(rec, state_dir, duration=600):
         samples += 1
     elapsed = time.monotonic() - started
     cpu_percent = 100.0 * total_ticks / os.sysconf("SC_CLK_TCK") / elapsed
+    daemon_profiles_end = _m3_daemon_profiles()
 
     deadline = time.monotonic() + 75
     after = {}
@@ -1640,6 +2052,8 @@ def _m3_idle_footprint(rec, state_dir, duration=600):
         "samples": samples,
         "max_rss_kib": max_rss,
         "cpu_percent_one_core": round(cpu_percent, 4),
+        "daemon_profiles_start": daemon_profiles_start,
+        "daemon_profiles_end": daemon_profiles_end,
         "memory_sample_scopes_before": len(before),
         "memory_sample_scopes_after": len(after),
         "sample_heartbeat": sample_heartbeat,
@@ -1670,6 +2084,114 @@ def _wait_process_dead(pid, timeout=20):
             return True
         time.sleep(0.1)
     return not _process_running(pid)
+
+
+def _m3_qmp_release_probe(pid, scope, saved_path, timeout=45):
+    """Poll memory GC through its stable-CPU wait until the fake VM stops."""
+    daemon_scope_name = daemon_scope(scope)
+    deadline = time.monotonic() + timeout
+    evidence = {
+        "eligible": False,
+        "eligible_candidates": [],
+        "first_reason": "",
+        "hook_called": False,
+        "stopped": False,
+        "gc_calls": 0,
+        "stable_cpu_waits": 0,
+        "last_gc": "",
+    }
+    first_call = True
+    while time.monotonic() < deadline:
+        remaining = max(1, int(deadline - time.monotonic()))
+        result = _run(
+            ["/usr/bin/taema", "gc", "--memory", "--json"],
+            timeout=min(15, remaining),
+        )
+        evidence["gc_calls"] += 1
+        evidence["last_gc"] = (result.stdout + result.stderr).strip()[-700:]
+        try:
+            model = json.loads(result.stdout)
+            gc_result = model.get("result", {})
+        except (ValueError, AttributeError):
+            gc_result = {}
+        candidates = gc_result.get("candidates", [])
+        if first_call:
+            evidence["eligible_candidates"] = [
+                row
+                for row in candidates
+                if isinstance(row, list)
+                and row
+                and row[0] == daemon_scope_name
+            ]
+            evidence["eligible"] = any(
+                len(row) >= 2 and str(row[1]).startswith("no attachment for")
+                for row in evidence["eligible_candidates"]
+            )
+            first_call = False
+        memory_rows = gc_result.get("memory", [])
+        scope_result = next(
+            (
+                row
+                for row in memory_rows
+                if isinstance(row, dict) and row.get("scope") == daemon_scope_name
+            ),
+            {},
+        )
+        reason = str(scope_result.get("reason", ""))
+        if not evidence["first_reason"]:
+            evidence["first_reason"] = reason
+        if reason == "waiting for a stable CPU sample":
+            evidence["stable_cpu_waits"] += 1
+        if result.returncode != 0:
+            break
+        if not _process_running(pid):
+            evidence["stopped"] = True
+            break
+        if reason == "waiting for a stable CPU sample":
+            time.sleep(min(5.25, max(0.0, deadline - time.monotonic())))
+        else:
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    evidence["hook_called"] = os.path.isfile(saved_path)
+    evidence["stopped"] = evidence["stopped"] or not _process_running(pid)
+    return evidence
+
+
+def _m3_wait_for_daemon(timeout=30, poll=0.25):
+    """Wait for status JSON to confirm that this guest's daemon is serving."""
+    deadline = time.monotonic() + timeout
+    last_detail = "no status response"
+    while True:
+        result = _run(["/usr/bin/taema", "status", "--json"], timeout=10)
+        last_detail = (result.stdout or result.stderr).strip()[-500:]
+        try:
+            status = json.loads(result.stdout).get("status", {})
+        except (ValueError, AttributeError):
+            status = {}
+        if result.returncode == 0 and status.get("daemon") == "running":
+            return True, last_detail
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, last_detail
+        if poll > 0:
+            time.sleep(min(poll, remaining))
+
+
+def _m3_ensure_daemon_ready(timeout=30):
+    """Wait for a restored daemon, then restart the guest service once if needed."""
+    ready, detail = _m3_wait_for_daemon(timeout=min(timeout, 10))
+    if ready:
+        return True, detail
+    restarted = run_privileged(["sv", "restart", "taema"], timeout=45)
+    ready, final_detail = _m3_wait_for_daemon(timeout=timeout)
+    return ready, json.dumps(
+        {
+            "initial_status": detail,
+            "restart_rc": restarted.returncode,
+            "restart_output": (restarted.stdout + restarted.stderr).strip()[-300:],
+            "final_status": final_detail,
+        },
+        sort_keys=True,
+    )
 
 
 def _spawn_bound_tree(name, workdir, child_argv, timeout=10):
@@ -2923,55 +3445,41 @@ def _m3_qmp_save_hook(rec, args, tracked):
 
         client.close()
         client = None
-        deadline = time.monotonic() + 45
-        stopped = False
-        gc_output = ""
-        eligible = False
-        first_gc = True
-        while time.monotonic() < deadline and not os.path.exists(saved):
-            result = _run(
-                ["/usr/bin/taema", "gc", "--memory", "--json"], timeout=60
-            )
-            gc_output = (result.stdout + result.stderr).strip()
-            if result.returncode != 0:
-                break
-            try:
-                model = json.loads(result.stdout)
-                gc_result = model.get("result", {})
-            except (ValueError, AttributeError):
-                gc_result = {}
-            if first_gc:
-                eligible = any(
-                    isinstance(row, list)
-                    and row
-                    and row[0] == daemon_scope(scope)
-                    and len(row) >= 2
-                    and str(row[1]).startswith("no attachment for")
-                    for row in gc_result.get("candidates", [])
-                )
-                rec.step(
-                    "qmp-scope-eligible-immediately-after-disconnect",
-                    eligible,
-                    "scope=%s candidates=%s" % (
-                        daemon_scope(scope),
-                        gc_result.get("candidates", []),
-                    ),
-                )
-                first_gc = False
-            if _wait_process_dead(server_pid, timeout=0.2):
-                stopped = True
-                break
-            # _reclaim_idle needs two CPU samples at least five seconds apart.
-            time.sleep(5.25)
-        hook_called = os.path.isfile(saved)
-        stopped = stopped or _wait_process_dead(server_pid, timeout=2)
+        evidence = _m3_qmp_release_probe(server_pid, scope, saved, timeout=45)
+        rec.step(
+            "qmp-scope-eligible-immediately-after-disconnect",
+            evidence["eligible"],
+            json.dumps(
+                {
+                    "scope": daemon_scope(scope),
+                    "candidates": evidence["eligible_candidates"],
+                    "first_memory_reason": evidence["first_reason"],
+                },
+                sort_keys=True,
+            ),
+        )
         rec.step(
             "qmp-disconnect-allows-save-and-stop",
-            hook_called and stopped and eligible,
-            "scope=%s pid=%d hook_marker=%s stopped=%s eligible=%s gc=%s"
-            % (scope, server_pid, hook_called, stopped, eligible, gc_output[-600:]),
+            evidence["hook_called"] and evidence["stopped"] and evidence["eligible"],
+            json.dumps(
+                {
+                    "scope": scope,
+                    "pid": server_pid,
+                    "hook_marker": evidence["hook_called"],
+                    "stopped": evidence["stopped"],
+                    "eligible": evidence["eligible"],
+                    "gc_calls": evidence["gc_calls"],
+                    "stable_cpu_waits": evidence["stable_cpu_waits"],
+                    "last_gc": evidence["last_gc"],
+                },
+                sort_keys=True,
+            ),
         )
-        if not (hook_called and stopped and eligible):
+        if not (
+            evidence["hook_called"]
+            and evidence["stopped"]
+            and evidence["eligible"]
+        ):
             raise ScenarioError("QMP disconnect did not permit the fake save hook and VM stop")
         return tree
     finally:
@@ -2979,7 +3487,20 @@ def _m3_qmp_save_hook(rec, args, tracked):
             client.close()
         if tree is not None and _process_running(tree["children"][0]):
             kill_tree(tree, timeout=5)
-        _m0_restore(config_snapshot)
+        restored = _m0_restore(config_snapshot)
+        ready, readiness = _m3_ensure_daemon_ready()
+        rec.step(
+            "qmp-probe-daemon-restored",
+            restored.returncode == 0 and ready,
+            json.dumps(
+                {
+                    "restore_rc": restored.returncode,
+                    "restore_output": (restored.stdout + restored.stderr).strip()[-300:],
+                    "readiness": readiness,
+                },
+                sort_keys=True,
+            ),
+        )
 
 
 def _m3_qmp_probe_config():
@@ -3143,20 +3664,32 @@ def scenario_m3(rec, args, tree_holder):
                 "status=%s elapsed=%.3fs body=%r" % (status, elapsed, body[:80]),
             )
     finally:
-        thaw = _run(["/usr/bin/taema", "thaw", "--all"], timeout=30)
-        rec.step(
-            "m3-managed-freezes-thawed",
-            thaw.returncode == 0,
-            (thaw.stdout or thaw.stderr).strip()[:300],
-        )
         for item in tracked:
             kill_tree(item, timeout=10)
+            cache_dir = item.get("m3_cleanup_cache_dir")
+            if isinstance(cache_dir, str):
+                shutil.rmtree(cache_dir, ignore_errors=True)
         if config_snapshot is not None:
             restored = _m0_restore(config_snapshot)
             rec.step(
                 "m3-config-restored",
                 restored.returncode == 0,
                 (restored.stdout + restored.stderr).strip()[:300],
+            )
+        ready, readiness = _m3_ensure_daemon_ready()
+        rec.step("daemon-ready-before-m3-thaw", ready, readiness)
+        if ready:
+            thaw = _run(["/usr/bin/taema", "thaw", "--all"], timeout=30)
+            rec.step(
+                "m3-managed-freezes-thawed",
+                thaw.returncode == 0,
+                (thaw.stdout or thaw.stderr).strip()[:300],
+            )
+        else:
+            rec.step(
+                "m3-managed-freezes-thawed",
+                False,
+                "skipped because guest daemon did not become ready: %s" % readiness,
             )
     return all(step["ok"] for step in rec.steps)
 

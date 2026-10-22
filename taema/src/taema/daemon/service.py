@@ -7580,18 +7580,20 @@ class Daemon:
             self.reclaim_usage.pop(scope, None)
             self.reclaim_idle_since.pop(scope, None)
             return False, "CPU usage is unavailable"
-        self.reclaim_usage[scope] = (usage, now)
         if previous is None or now <= previous[1]:
+            self.reclaim_usage[scope] = (usage, now)
             self.reclaim_idle_since[scope] = now
             return False, "waiting for a second idle sample"
         elapsed = now - previous[1]
         if usage < previous[0]:
+            self.reclaim_usage[scope] = (usage, now)
             self.reclaim_idle_since[scope] = now
             return False, "CPU counter changed"
         if elapsed < qos.BACKGROUND_SAMPLE_SECONDS:
             return False, "waiting for a stable CPU sample"
         cpu_percent = 100.0 * (usage - previous[0]) / (elapsed * 1_000_000)
         if cpu_percent > RECLAIM_CPU_PERCENT:
+            self.reclaim_usage[scope] = (usage, now)
             self.reclaim_idle_since[scope] = now
             return False, "scope is active (%.2f%% CPU)" % cpu_percent
         idle_since = self.reclaim_idle_since.setdefault(scope, previous[1])

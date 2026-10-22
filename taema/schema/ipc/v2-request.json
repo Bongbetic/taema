@@ -1,0 +1,311 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taema-ipc-v2-request",
+  "oneOf": [
+    {"$ref": "#/$defs/status"},
+    {"$ref": "#/$defs/memory_budget"},
+    {"$ref": "#/$defs/reload"},
+    {"$ref": "#/$defs/review"},
+    {"$ref": "#/$defs/subscribe"},
+    {"$ref": "#/$defs/register"},
+    {"$ref": "#/$defs/attach"},
+    {"$ref": "#/$defs/job_done"},
+    {"$ref": "#/$defs/kill_done"},
+    {"$ref": "#/$defs/ask"},
+    {"$ref": "#/$defs/answer"},
+    {"$ref": "#/$defs/gc"},
+    {"$ref": "#/$defs/reclaim"},
+    {"$ref": "#/$defs/freeze"},
+    {"$ref": "#/$defs/thaw"},
+    {"$ref": "#/$defs/feedback"}
+  ],
+  "$defs": {
+    "id": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "empty": {"type": "object", "maxProperties": 0, "additionalProperties": false},
+    "target": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"enum": ["pid", "scope", "pair", "signature", "app", "owner", "unit", "cgroup", "path"]},
+        "value": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+        "start": {"type": ["integer", "null"]},
+        "owner": {"type": "string", "minLength": 1, "maxLength": 256},
+        "leftover": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "additionalProperties": false
+    },
+    "feedback_args": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["op", "key"],
+          "properties": {
+            "op": {"enum": ["keep", "forget", "kill"]},
+            "key": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "veto"},
+            "target": {"$ref": "#/$defs/target"},
+            "reason": {"type": "string", "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "unveto"},
+            "target": {"$ref": "#/$defs/target"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "action_id"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "undo"},
+            "action_id": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target", "trigger"],
+          "properties": {
+            "v": {"const": 1},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "vetoed"},
+            "target": {"$ref": "#/$defs/target"},
+            "trigger": {"type": "string"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "key"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"enum": ["keep", "kill"]},
+            "key": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "key"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "forget"},
+            "key": {"type": "string", "minLength": 1, "maxLength": 256},
+            "all": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "veto"},
+            "target": {"$ref": "#/$defs/target"},
+            "reason": {"type": "string", "maxLength": 256},
+            "expires": {"type": "number"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "target"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "unveto"},
+            "target": {"$ref": "#/$defs/target"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "action_id"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "undo"},
+            "action_id": {"type": "string", "minLength": 1},
+            "restore": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "owner", "leftovers", "choice"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"enum": ["answer", "teach"]},
+            "owner": {"type": "string", "minLength": 1, "maxLength": 256},
+            "leftovers": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+            "choice": {"enum": ["stop", "keep", "standalone", "never"]}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "review_id", "choice"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "review_answer"},
+            "review_id": {"type": "integer", "minimum": 1},
+            "choice": {"enum": ["stop", "keep", "standalone", "never"]},
+            "owner": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "review_id"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "review_shown"},
+            "review_id": {"type": "integer", "minimum": 1},
+            "owner": {"type": "string", "minLength": 1, "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "app", "muted"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "mute"},
+            "app": {"type": "string", "minLength": 1, "maxLength": 256},
+            "muted": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "held"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "hold"},
+            "scope": {"type": "string", "minLength": 1, "maxLength": 256},
+            "held": {"type": "boolean"},
+            "reason": {"type": "string", "maxLength": 256}
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "until"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "snooze"},
+            "until": {"type": "number", "minimum": 0},
+            "reason": {"type": "string", "maxLength": 256}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "status": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "status"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "memory_budget": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "memory_budget"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "reload": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "reload"}, "args": {"type": "object", "properties": {"reason": {"type": "string", "maxLength": 256}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "review"}, "args": {"$ref": "#/$defs/empty"}},
+      "additionalProperties": false
+    },
+    "subscribe": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "subscribe"}, "args": {"type": "object", "required": ["topics", "since_seq"], "properties": {"topics": {"type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}}, "since_seq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "register": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "register"}, "args": {"type": "object", "required": ["scope", "owner"], "properties": {"scope": {"type": "string", "minLength": 1}, "owner": {"type": "integer", "minimum": 2}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "attach": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "attach"}, "args": {"type": "object", "required": ["scope", "pids"], "properties": {"scope": {"type": "string", "minLength": 1}, "pids": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "integer", "minimum": 2}}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "job_done": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "job_done"}, "args": {"type": "object", "required": ["shell_pid", "tag", "status", "word"], "properties": {"shell_pid": {"type": "integer", "minimum": 2}, "tag": {"type": "string", "minLength": 1, "maxLength": 128}, "status": {"type": "integer", "minimum": 0, "maximum": 255}, "word": {"type": "string", "maxLength": 32}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "kill_done": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "kill_done"}, "args": {"type": "object", "required": ["shell_pid", "word"], "properties": {"shell_pid": {"type": "integer", "minimum": 2}, "word": {"enum": ["kill", "pkill", "killall", "taema"]}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "ask": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "ask"}, "args": {"type": "object", "required": ["shell_pid"], "properties": {"shell_pid": {"type": "integer", "minimum": 2}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "answer": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "answer"}, "args": {"type": "object", "required": ["nonce", "choice"], "properties": {"nonce": {"type": "string", "minLength": 1, "maxLength": 64}, "choice": {"enum": ["stop", "keep", "standalone", "never"]}, "owner": {"type": "string"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "gc": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "gc"}, "args": {"type": "object", "properties": {"dry_run": {"type": "boolean"}, "memory": {"type": "boolean"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "reclaim": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "reclaim"}, "args": {"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}, "force_veto": {"type": "boolean"}, "dry_run": {"type": "boolean"}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "freeze": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "freeze"}, "args": {"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "thaw": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "thaw"}, "args": {"oneOf": [{"type": "object", "required": ["scope"], "properties": {"scope": {"type": "string", "minLength": 1, "maxLength": 96}, "all": {"const": false}}, "additionalProperties": false}, {"type": "object", "required": ["all"], "properties": {"all": {"const": true}}, "additionalProperties": false}]}},
+      "additionalProperties": false
+    },
+    "feedback": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "feedback"}, "args": {"$ref": "#/$defs/feedback_args"}},
+      "additionalProperties": false
+    }
+  }
+}

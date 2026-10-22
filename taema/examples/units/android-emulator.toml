@@ -7,6 +7,10 @@
 name = "scope-emulator"
 kind = "scope"
 
+[mem]
+# Android Emulator runs a guest VM even though this unit is an explicit scope.
+class = "vm"
+
 [kill]
 graceful = 15
 # exe basenames that are moved to shared/ instead of killed, even without a detected edge:

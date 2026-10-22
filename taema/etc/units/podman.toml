@@ -3,6 +3,7 @@
 [unit]
 name = "app-podman"
 kind = "app"
+class = "container"
 group_by_env = "XDG_RUNTIME_DIR"
 stop_when_unneeded = true
 
@@ -17,8 +18,15 @@ same_env = "XDG_RUNTIME_DIR"
 [gc]
 # A pause process whose runtime directory is gone is dead weight.
 env_dir_missing = "XDG_RUNTIME_DIR"
-# A scope that holds conmon (a running container) is needed.
+# Keep conmon children unless the configured no-attachment grace has elapsed.
 keep_while_children = true
+no_attach_grace = 120
+socket_env = "XDG_RUNTIME_DIR"
+socket_path = "podman/podman.sock"
+
+[mem]
+idle_reclaim = true
+swap_max = "1G"
 
 [kill]
 # Detached servers are designed to outlive the login session.

@@ -2,24 +2,44 @@ import tempfile
 import unittest
 from unittest import mock
 
-from taema import engine, knowledge
+from taema.governor import engine
+from taema.store import knowledge
 
 
-def decide(members, edges, protected=(), seed_share=(), comms=None, ppids=None, force=False,
-           hard=False, keep=()):
+def decide(
+    members,
+    edges,
+    protected=(),
+    seed_share=(),
+    comms=None,
+    ppids=None,
+    force=False,
+    hard=False,
+    keep=(),
+):
     """Run plan_stop with a fake process world. members: pids in the scope."""
     comms = comms or {p: "proc%d" % p for p in members}
     store = knowledge.Store(tempfile.mkdtemp(), {"share": list(seed_share), "kill": []})
     pp = ppids or {p: 1 for p in members}
-    with mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)), \
-         mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid(pp)), \
-         mock.patch.object(engine.inspect, "Snapshot", return_value=None), \
-         mock.patch.object(engine.inspect, "edges", return_value=edges), \
-         mock.patch.object(engine.inspect, "comm", side_effect=lambda p: comms[p]), \
-         mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: comms[p]), \
-         mock.patch.object(engine.policy, "protected_reason",
-                           side_effect=lambda p, c, pp=None: "protected" if p in protected else None):
+    with (
+        mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)),
+        mock.patch.object(
+            engine.inspect.ProcTable,
+            "scan",
+            return_value=engine.inspect.ProcTable.from_ppid(pp),
+        ),
+        mock.patch.object(engine.inspect, "Snapshot", return_value=None),
+        mock.patch.object(engine.inspect, "edges", return_value=edges),
+        mock.patch.object(engine.inspect, "comm", side_effect=lambda p: comms[p]),
+        mock.patch.object(
+            engine.policy, "app_key", side_effect=lambda p, **kw: comms[p]
+        ),
+        mock.patch.object(
+            engine.policy,
+            "protected_reason",
+            side_effect=lambda p, c, pp=None: "protected" if p in protected else None,
+        ),
+    ):
         plan = engine.plan_stop("/x", {}, store, None, force, hard, keep)
     return {d["pid"]: d["action"] for d in plan}
 
@@ -41,7 +61,9 @@ class PlanStop(unittest.TestCase):
         self.assertEqual(decide([10], {}, seed_share=["proc10"]), {10: "share"})
 
     def test_force_ignores_seed_but_not_edges(self):
-        self.assertEqual(decide([10], {}, seed_share=["proc10"], force=True), {10: "kill"})
+        self.assertEqual(
+            decide([10], {}, seed_share=["proc10"], force=True), {10: "kill"}
+        )
         self.assertEqual(decide([10], {10: EDGE}, force=True), {10: "share"})
 
     def test_hard_ignores_edges(self):
@@ -51,10 +73,69 @@ class PlanStop(unittest.TestCase):
         self.assertEqual(decide([10], {}, keep=["proc10"]), {10: "share"})
 
     def test_descendant_of_shared_moves_with_it(self):
-        self.assertEqual(decide([10, 11], {10: EDGE}, ppids={10: 1, 11: 10}), {10: "share", 11: "share"})
+        self.assertEqual(
+            decide([10, 11], {10: EDGE}, ppids={10: 1, 11: 10}),
+            {10: "share", 11: "share"},
+        )
 
     def test_child_of_killed_parent_is_independent(self):
-        self.assertEqual(decide([10, 11], {11: EDGE}, ppids={10: 1, 11: 10}), {10: "kill", 11: "share"})
+        self.assertEqual(
+            decide([10, 11], {11: EDGE}, ppids={10: 1, 11: 10}),
+            {10: "kill", 11: "share"},
+        )
+
+
+class OOMHelperCommands(unittest.TestCase):
+    def setUp(self):
+        self.cfg = {"paths": {"helper": "/usr/libexec/taema-attach"}}
+
+    def test_restore_uses_the_helper_recorded_pair(self):
+        with (
+            mock.patch.object(engine, "helper_path", return_value="/helper"),
+            mock.patch.object(
+                engine.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0, stderr=""),
+            ) as run,
+        ):
+            engine.helper_oom_restore(self.cfg, 42, 900, -100, 500)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "-n", "/helper", "oom-restore", "42", "900", "-100", "500"],
+        )
+
+    def test_record_registers_original_and_applied_values(self):
+        with (
+            mock.patch.object(engine, "helper_path", return_value="/helper"),
+            mock.patch.object(
+                engine.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0, stderr=""),
+            ) as run,
+        ):
+            engine.helper_oom_record(self.cfg, 42, 900, -100, 500)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "-n", "/helper", "oom-record", "42", "900", "-100", "500"],
+        )
+
+    def test_invalid_restore_and_record_pairs_are_refused_before_sudo(self):
+        with mock.patch.object(engine.subprocess, "run") as run:
+            for args in (
+                (42, 900, 501, 500),
+                (42, 900, -100, -101),
+                (True, 900, -100, 500),
+            ):
+                with self.subTest(args=args), self.assertRaises(engine.Refused):
+                    engine.helper_oom_restore(self.cfg, *args)
+            for args in (
+                (42, 900, 500, 200),
+                (42, 900, -100, -100),
+                (True, 900, -100, 500),
+            ):
+                with self.subTest(args=args), self.assertRaises(engine.Refused):
+                    engine.helper_oom_record(self.cfg, *args)
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

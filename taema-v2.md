@@ -1032,11 +1032,13 @@ and offline enforcement. Both exist; they answer different questions.
 ID     OWNER              SURVIVORS                         CLOSES  MEM     AGE
 r-9c1  firefox            node:esbuild, node:vite.js             7   812M    2h
         ↳ last seen under app-firefox-3f2a1c; sig a1b2c3d4e5f6; answered? no
-        1 stop on close    2 keep / standalone    3 never (do-not-kill)    Enter later
+        1 stop on close    2 keep    3 standalone    4 never (do-not-kill)    Enter later
 ```
 
-- `taema answer r-9c1 1` (or `taema review --interactive`) applies the answer to the
-  signature and its pairs. The dashboard can answer too.
+- `taema answer r-9c1 stop` (or `taema review --interactive`) applies the answer to the
+  signature and its pairs. `never` adds an app veto; `standalone` adopts the survivors into their
+  own app scopes. `taema teach OWNER LEFTOVER stop|keep|standalone` records a relationship without
+  a pending review. The dashboard and notifications use the same answer operation.
 - Rate limits stay: at most 3 questions/day, one per pair/signature per 7 days. A review is
   not a question until it is shown; it does not consume the daily budget.
 - **Desktop notifications go through the session agent (§9.1), never from the daemon**,
@@ -1321,8 +1323,8 @@ high = "6G"
 swap_max = "2G"
 idle_reclaim = true
 min_headroom = "512M"
-save_state = "virsh managedsave %(domain)s"
-resume = "virsh start %(domain)s"
+save_state = ["virsh", "managedsave", "%(domain)s"]
+resume = ["virsh", "start", "%(domain)s"]
 
 [gc]
 keep_while_children = true
@@ -1340,7 +1342,7 @@ reservation = "1G"
 high = "2G"
 swap_max = "1G"
 idle_reclaim = true
-save_state = "podman stop --time 10 %(container)s"   # only if the user opts in
+save_state = ["podman", "stop", "--time", "10", "%(container)s"] # opt in explicitly
 ```
 
 **Quit detection and the GC order.** When a container or VM quits:
@@ -2459,10 +2461,10 @@ low = "1G"
 swap_max = "2G"
 idle_reclaim = true
 min_headroom = "256M"
-save_state = "virsh managedsave %(domain)s"
-resume = "virsh start %(domain)s"
-pause = "podman pause %(container)s"
-resume_container = "podman unpause %(container)s"
+save_state = ["virsh", "managedsave", "%(domain)s"]
+resume = ["virsh", "start", "%(domain)s"]
+pause = ["podman", "pause", "%(container)s"]
+resume_container = ["podman", "unpause", "%(container)s"]
 oom_group = false
 
 [kill]
@@ -2632,7 +2634,7 @@ swap_max = "0"                   # VMs default to 0 unless a save hook ran
 
 Directory modes are 0700 and file modes 0600. Nothing is world-readable.
 
-### 13.2 Schema (`PRAGMA user_version = 3`)
+### 13.2 Schema (`PRAGMA user_version = 5`)
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);   -- created, closes, last_decay
@@ -2650,16 +2652,21 @@ CREATE TABLE instances (
   born REAL, windowless REAL, exited REAL, parent_app TEXT, scope TEXT,
   terminal INTEGER, class TEXT, runtime TEXT,
   launched_by TEXT,                                    -- launch | adopt | unit | run
+  parent_evidence TEXT NOT NULL DEFAULT '[]',           -- per-instance evidence set (JSON)
+  last_seen REAL,                                       -- most recent pass that saw the pid/start
   survivors TEXT);                                     -- signature id
 CREATE INDEX instances_app_born ON instances(app, born);
 
 CREATE TABLE parents (
   app TEXT, parent TEXT, co_birth INTEGER, cgroup INTEGER, job INTEGER, runtime INTEGER,
   window INTEGER, launch INTEGER, last REAL, PRIMARY KEY (app, parent));
+CREATE INDEX parents_last ON parents(last);
 
 CREATE TABLE signatures (
   id TEXT PRIMARY KEY, owner TEXT NOT NULL, members TEXT NOT NULL,  -- JSON [[key,count],...]
-  runtime TEXT, tty INTEGER, kind TEXT NOT NULL DEFAULT 'exit',     -- exit | windowless
+  runtime TEXT, runtime_hash TEXT, tty INTEGER,
+  kind TEXT NOT NULL DEFAULT 'exit',                             -- exit | windowless
+  veto INTEGER NOT NULL DEFAULT 0,                                  -- signature veto outcomes
   closes INTEGER DEFAULT 0, stop_ok INTEGER DEFAULT 0, respawn INTEGER DEFAULT 0,
   ex_stop REAL DEFAULT 0, ex_keep REAL DEFAULT 0, ex_last TEXT, first_seen REAL, last_seen REAL);
 CREATE INDEX signatures_owner ON signatures(owner);
@@ -2718,7 +2725,7 @@ database.
 
 | Table | Cap | Retention |
 |---|---|---|
-| `instances` | 50,000 rows | 90 days (`store.retention_days`) |
+| `instances` | 50,000 rows | 90 days since exit or last observation; answer/veto-referenced rows are protected |
 | `events` | 200,000 rows | 90 days |
 | `decisions` | 10,000 rows | 180 days, longer when referenced by a veto or an undo |
 | `mem_samples` | — | 7 days raw |
@@ -3362,7 +3369,10 @@ documented in `doctor` and `taema help safety`.
   `taema doctor` call it out. `observe` and `enforce` keep their contracts. `auto` becomes
   safer (no unlearned idle stop).
 - **Store:** the JSON store is migrated once to SQLite (§13.5), and `knowledge.json` is kept
-  as a 30-day backup. A downgrade needs `taema learn export --format v2` first (§13.8).
+  as a 30-day backup. Schema v4 adds `instances.parent_evidence` with an empty default and
+  `instances.last_seen`, preserving v3 rows. A downgrade needs `taema learn export --format v2`
+  first (§13.8); see
+  `docs/identity-resolution.md` for the v4 SQLite rollback steps.
 - **Package:** versions follow §17.1 (0.3.0 → 1.0.0). `conf_files` gains the new units and
   `/etc/taema/taema.d/`. Runtime dependencies are unchanged (Python stdlib); `libnotify` is
   optional. Rust adds build-time `cargo` only, and `scdoc` is added for man pages.
@@ -3507,7 +3517,7 @@ keep = ["adb"]
 [mem]
 reservation = "4G"
 high = "6G"
-save_state = "$HOME/bin/satcyber-save"   # optional, explicit
+save_state = ["/home/user/bin/satcyber-save"] # optional, explicit
 ```
 
 ## Appendix E — Live evidence snapshot (0.2.1, mode `adopt`)

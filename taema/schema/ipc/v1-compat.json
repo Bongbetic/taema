@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taema-ipc-v1-compat",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "required": ["cmd"],
+      "properties": {
+        "cmd": {"enum": ["status", "review", "register", "attach", "job_done", "kill_done", "ask", "answer", "gc", "reclaim", "feedback"]}
+      },
+      "additionalProperties": true
+    },
+    "reply": {
+      "type": "object",
+      "description": "Unversioned one-shot response retained for v1 clients during the compatibility release."
+    }
+  }
+}

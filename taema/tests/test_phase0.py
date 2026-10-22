@@ -1,5 +1,7 @@
 """Phase 0 regression tests: fake /proc and cgroup trees, malformed sockets, learner fixes."""
+
 import json
+import io
 import os
 import socket
 import stat
@@ -8,11 +10,18 @@ import tempfile
 import time
 import types
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
-from taema import cgroup, cli, daemon, engine, inspect, knowledge, policy
+from taema.daemon import service as daemon
+import taema.cli.commands as cli
+from taema.core import cgroup, process as inspect
+from taema.governor import engine
+from taema.store import knowledge
+from taema.config import policy
 
 UID = os.getuid()
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def tmp():
@@ -20,10 +29,20 @@ def tmp():
 
 
 def make_cfg(state, **extra):
-    cfg = {"mode": "observe", "paths": {"state_dir": state, "units_dir": tmp(), "hooks_dir": tmp(),
-                                        "socket": os.path.join(state, "a.sock"),
-                                        "socket_fallback": os.path.join(state, "b.sock")},
-           "timers": {}, "protected": {}, "seeds": {}, "_sources": []}
+    cfg = {
+        "mode": "observe",
+        "paths": {
+            "state_dir": state,
+            "units_dir": tmp(),
+            "hooks_dir": tmp(),
+            "socket": os.path.join(state, "a.sock"),
+            "socket_fallback": os.path.join(state, "b.sock"),
+        },
+        "timers": {},
+        "protected": {},
+        "seeds": {},
+        "_sources": [],
+    }
     cfg.update(extra)
     return cfg
 
@@ -74,6 +93,7 @@ class BadSnap:
 
 # ---- inspect / injectable roots -----------------------------------------------------------
 
+
 class ProcRoot(unittest.TestCase):
     def test_fake_proc_tree(self):
         root = tmp()
@@ -81,7 +101,9 @@ class ProcRoot(unittest.TestCase):
         with open(root + "/77/comm", "w") as f:
             f.write("my app\n")
         with open(root + "/77/stat", "w") as f:
-            f.write("77 (my (app)) S 5 77 77 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4242 0 0\n")
+            f.write(
+                "77 (my (app)) S 5 77 77 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4242 0 0\n"
+            )
         with mock.patch.object(inspect, "PROC", root):
             self.assertEqual(inspect.comm(77), "my app")
             self.assertEqual(inspect.ppid_map(), {77: 5})
@@ -98,23 +120,36 @@ class ProcRoot(unittest.TestCase):
         r = types.SimpleNamespace(returncode=1, stdout="")
         with mock.patch.object(inspect.subprocess, "run", return_value=r):
             self.assertIsNone(inspect._ss("-xpn"))
-        with mock.patch.object(inspect.subprocess, "run", side_effect=subprocess.TimeoutExpired("ss", 1)):
+        with mock.patch.object(
+            inspect.subprocess, "run", side_effect=subprocess.TimeoutExpired("ss", 1)
+        ):
             self.assertIsNone(inspect._ss("-xpn"))
 
 
 # ---- plan_stop with failed ss ---------------------------------------------------------------
 
+
 def plan(snap, members=(10, 11), protected=(), hard=False):
     store = knowledge.Store(tmp(), {})
-    with mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)), \
-         mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in members})), \
-         mock.patch.object(engine.inspect, "Snapshot", return_value=snap), \
-         mock.patch.object(engine.inspect, "edges", return_value={}), \
-         mock.patch.object(engine.inspect, "comm", side_effect=lambda p: "p%d" % p), \
-         mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: "p%d" % p), \
-         mock.patch.object(engine.policy, "protected_reason",
-                           side_effect=lambda p, c, pp=None: "protected" if p in protected else None):
+    with (
+        mock.patch.object(engine.cgroup, "tree_procs", return_value=list(members)),
+        mock.patch.object(
+            engine.inspect.ProcTable,
+            "scan",
+            return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in members}),
+        ),
+        mock.patch.object(engine.inspect, "Snapshot", return_value=snap),
+        mock.patch.object(engine.inspect, "edges", return_value={}),
+        mock.patch.object(engine.inspect, "comm", side_effect=lambda p: "p%d" % p),
+        mock.patch.object(
+            engine.policy, "app_key", side_effect=lambda p, **kw: "p%d" % p
+        ),
+        mock.patch.object(
+            engine.policy,
+            "protected_reason",
+            side_effect=lambda p, c, pp=None: "protected" if p in protected else None,
+        ),
+    ):
         out = engine.plan_stop("/x/user/1/y", {}, store, hard=hard)
     return {d["pid"]: (d["action"], d["why"]) for d in out}
 
@@ -135,6 +170,7 @@ class EdgeScanFailed(unittest.TestCase):
 
 # ---- stop: tautology, signalling, hook -------------------------------------------------------
 
+
 class StopAccounting(unittest.TestCase):
     def run_stop(self, pids, keys, term_survivors, grace=0.3):
         """Fake scope: SIGTERM removes every pid except term_survivors; SIGKILL removes the rest."""
@@ -145,26 +181,42 @@ class StopAccounting(unittest.TestCase):
 
             def fake_signal(p, pids_, sig, cfg):
                 sent.append((sig, sorted(pids_)))
-                cur = [x for x in cgroup.tree_procs(p)
-                       if sig == engine.signal.SIGTERM and x in term_survivors]
+                cur = [
+                    x
+                    for x in cgroup.tree_procs(p)
+                    if sig == engine.signal.SIGTERM and x in term_survivors
+                ]
                 cg.set_procs("scope-t", cur)
                 return list(pids_)
 
-            with mock.patch.object(engine, "_signal_all", side_effect=fake_signal), \
-                 mock.patch.object(engine, "self_guard"), \
-                 mock.patch.object(engine, "_wait_each", wraps=engine._wait_each), \
-                 mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid({p: 1 for p in pids})), \
-                 mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()), \
-                 mock.patch.object(engine.inspect, "edges", return_value={}), \
-                 mock.patch.object(engine.inspect, "comm", side_effect=lambda p: keys[p]), \
-                 mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: keys[p]), \
-                 mock.patch.object(engine.policy, "protected_reason", return_value=None):
+            with (
+                mock.patch.object(engine, "_signal_all", side_effect=fake_signal),
+                mock.patch.object(engine, "self_guard"),
+                mock.patch.object(engine, "_wait_each", wraps=engine._wait_each),
+                mock.patch.object(
+                    engine.inspect.ProcTable,
+                    "scan",
+                    return_value=engine.inspect.ProcTable.from_ppid(
+                        {p: 1 for p in pids}
+                    ),
+                ),
+                mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()),
+                mock.patch.object(engine.inspect, "edges", return_value={}),
+                mock.patch.object(
+                    engine.inspect, "comm", side_effect=lambda p: keys[p]
+                ),
+                mock.patch.object(
+                    engine.policy, "app_key", side_effect=lambda p, **kw: keys[p]
+                ),
+                mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            ):
                 engine.stop(path, make_cfg(tmp()), store, timeout=grace, passes=1)
         return store, sent
 
     def test_only_survivors_count_as_sigkill_needed(self):
-        store, sent = self.run_stop([4001, 4002], {4001: "polite", 4002: "stubborn"}, {4002})
+        store, sent = self.run_stop(
+            [4001, 4002], {4001: "polite", 4002: "stubborn"}, {4002}
+        )
         self.assertEqual(store.peek("polite")["sigkill_needed"], 0)
         self.assertEqual(store.peek("stubborn")["sigkill_needed"], 1)
         self.assertEqual(store.peek("polite")["killed"], 1)
@@ -188,10 +240,18 @@ class SignalAll(unittest.TestCase):
     def patched(self, members, protected=None, send=None):
         fd = os.open(os.devnull, os.O_RDONLY)
         send = send or mock.Mock()
-        return fd, send, [mock.patch.object(engine.os, "pidfd_open", return_value=fd),
-                          mock.patch.object(engine.signal, "pidfd_send_signal", send),
-                          mock.patch.object(engine.cgroup, "tree_procs", return_value=members),
-                          mock.patch.object(engine.policy, "protected_reason", return_value=protected)]
+        return (
+            fd,
+            send,
+            [
+                mock.patch.object(engine.os, "pidfd_open", return_value=fd),
+                mock.patch.object(engine.signal, "pidfd_send_signal", send),
+                mock.patch.object(engine.cgroup, "tree_procs", return_value=members),
+                mock.patch.object(
+                    engine.policy, "protected_reason", return_value=protected
+                ),
+            ],
+        )
 
     def run_it(self, members, protected=None, send=None):
         fd, send, ps = self.patched(members, protected, send)
@@ -224,10 +284,14 @@ class SignalAll(unittest.TestCase):
             self.assertEqual(sent, [])
 
     def test_fallback_to_os_kill(self):
-        with mock.patch.object(engine.os, "pidfd_open", side_effect=OSError(38, "nosys")), \
-             mock.patch.object(engine.cgroup, "tree_procs", return_value=[123]), \
-             mock.patch.object(engine.policy, "protected_reason", return_value=None), \
-             mock.patch.object(engine.os, "kill", side_effect=PermissionError) as k:
+        with (
+            mock.patch.object(
+                engine.os, "pidfd_open", side_effect=OSError(38, "nosys")
+            ),
+            mock.patch.object(engine.cgroup, "tree_procs", return_value=[123]),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(engine.os, "kill", side_effect=PermissionError) as k,
+        ):
             self.assertEqual(engine._signal_all("/x", [123], 15, {}), [])
             k.assert_called_once_with(123, 15)
 
@@ -250,6 +314,7 @@ class Hook(unittest.TestCase):
 
 # ---- knowledge ---------------------------------------------------------------------------------
 
+
 class KnowledgeHardening(unittest.TestCase):
     def test_graceful_floor_and_reprobe(self):
         s = knowledge.Store(tmp(), {})
@@ -257,41 +322,33 @@ class KnowledgeHardening(unittest.TestCase):
         r["killed"], r["sigkill_needed"] = 10, 10
         self.assertEqual(s.graceful_timeout("k", 0), (2.0, True))
         self.assertEqual(s.graceful_timeout("k", 10), (2.0, True))
-        s.rec("k")["stops"] = 9    # the 10th stop re-probes with the full grace
+        s.rec("k")["stops"] = 9  # the 10th stop re-probes with the full grace
         self.assertEqual(s.graceful_timeout("k", 10), (10.0, True))
         s2 = knowledge.Store(tmp(), {})
         self.assertEqual(s2.graceful_timeout("fresh", 0.5), (2.0, True))
         for v in (0.0, 1.0, 3.0):
             self.assertGreater(s2.graceful_timeout("fresh", v)[0], 0)
 
-    def test_save_fsyncs_and_is_private(self):
+    def test_state_database_and_log_are_private(self):
         d = os.path.join(tmp(), "state")
         s = knowledge.Store(d, {})
         s.bump("x", "seen")
-        with mock.patch.object(knowledge.os, "fsync", wraps=os.fsync) as fs:
-            s.save()
-        fs.assert_called_once()
+        s.save()
+        self.assertEqual(knowledge.Store(d, {}).peek("x")["seen"], 1)
         self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(os.stat(s.path).st_mode), 0o600)
         s.log(event="t")
         self.assertEqual(stat.S_IMODE(os.stat(s.log_path).st_mode), 0o600)
 
-    def test_corrupt_file_kept_once(self):
+    def test_legacy_json_is_left_untouched_for_the_importer(self):
         d = tmp()
         path = os.path.join(d, "knowledge.json")
         with open(path, "w") as f:
             f.write("{not json")
         s = knowledge.Store(d, {})
         self.assertEqual(s.data["exes"], {})
-        kept = [n for n in os.listdir(d) if n.startswith("knowledge.json.corrupt-")]
-        self.assertEqual(len(kept), 1)
-        with open(os.path.join(d, kept[0])) as f:
-            self.assertEqual(f.read(), "{not json")
-        with open(path, "w") as f:
-            f.write("[1]")      # wrong shape, but a .corrupt copy already exists: left alone
-        knowledge.Store(d, {})
-        self.assertEqual(len([n for n in os.listdir(d) if ".corrupt" in n]), 1)
-        with open(os.path.join(d, kept[0])) as f:
+        self.assertTrue(os.path.isfile(s.path))
+        with open(path) as f:
             self.assertEqual(f.read(), "{not json")
 
     def test_dirty_flag(self):
@@ -337,9 +394,28 @@ class KnowledgeHardening(unittest.TestCase):
         self.assertEqual(cli.feedback(cfg, s, "forget", "x"), "queued")
         with open(s.feedback_path) as f:
             ops = [json.loads(l) for l in f]
-        self.assertEqual(ops, [{"op": "keep", "key": "adb"}, {"op": "forget", "key": "x"}])
+        self.assertEqual([op["v"] for op in ops], [2, 2])
+        self.assertEqual([op["op"] for op in ops], ["keep", "forget"])
+        self.assertEqual([op["key"] for op in ops], ["adb", "x"])
+        self.assertEqual(len({op["id"] for op in ops}), 2)
         self.assertEqual(stat.S_IMODE(os.stat(s.feedback_path).st_mode), 0o600)
         self.assertEqual(knowledge.Store(d, {}).apply_feedback(), 2)
+
+    def test_cli_status_counts_invalid_queued_feedback(self):
+        state = tmp()
+        store = knowledge.Store(state, {}, read_only=True)
+        with open(store.feedback_path, "w") as queue:
+            queue.write('{"v":2,"id":"bad","op":"mode","value":"auto"}\n')
+            queue.write("{truncated\n")
+        cfg = make_cfg(state)
+        out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_load_status", return_value=(cfg, store)),
+            mock.patch.object(cli, "ask", return_value=None),
+            redirect_stdout(out),
+        ):
+            self.assertEqual(cli.cmd_status(types.SimpleNamespace()), 3)
+        self.assertIn("feedback_invalid: 2", out.getvalue())
 
     def test_persist_seed(self):
         s = knowledge.Store(tmp(), {"persist": ["tmux"]})
@@ -350,15 +426,18 @@ class KnowledgeHardening(unittest.TestCase):
 
 # ---- engine: matches, names, gc ----------------------------------------------------------------
 
+
 class MatchesAndNames(unittest.TestCase):
     def test_empty_match_table_rejected(self):
         engine._warned.clear()
-        with mock.patch.object(engine.inspect, "exe", return_value="/x"), \
-             mock.patch.object(engine.sys, "stderr") as err:
+        with (
+            mock.patch.object(engine.inspect, "exe", return_value="/x"),
+            mock.patch.object(engine.sys, "stderr") as err,
+        ):
             self.assertFalse(engine._matches({}, 1))
             self.assertFalse(engine._matches({"env_exclude": {"A": "b"}}, 1))
             self.assertFalse(engine._matches({}, 1))
-        self.assertEqual(len(engine._warned), 2)     # logged once per table
+        self.assertEqual(len(engine._warned), 2)  # logged once per table
         self.assertTrue(err.write.called)
 
     def test_known_key_matches(self):
@@ -367,8 +446,10 @@ class MatchesAndNames(unittest.TestCase):
             self.assertFalse(engine._matches({"comm": "bar"}, 1))
 
     def test_unit_for_leaf_prefix(self):
-        units = [{"unit": {"name": "claude-desktop", "kind": "app"}},
-                 {"unit": {"name": "vm", "kind": "scope"}}]
+        units = [
+            {"unit": {"name": "claude-desktop", "kind": "app"}},
+            {"unit": {"name": "vm", "kind": "scope"}},
+        ]
         self.assertIs(engine.unit_for_leaf(units, "claude-desktop"), units[0])
         self.assertIs(engine.unit_for_leaf(units, "claude-desktop-ab12cd34"), units[0])
         self.assertIsNone(engine.unit_for_leaf(units, "vm-1"))
@@ -376,7 +457,16 @@ class MatchesAndNames(unittest.TestCase):
 
     def test_leaf_slug_always_valid(self):
         seen = set()
-        for name in ("Xwayland", "g++", "my app", "", "UPPER_case.x", "plain-name", "ünï", "a" * 80):
+        for name in (
+            "Xwayland",
+            "g++",
+            "my app",
+            "",
+            "UPPER_case.x",
+            "plain-name",
+            "ünï",
+            "a" * 80,
+        ):
             for pid in (None, 42):
                 slug = engine.leaf_slug(name, pid)
                 self.assertTrue(cgroup.valid_rel("shared/" + slug), slug)
@@ -396,15 +486,48 @@ class GcRules(unittest.TestCase):
         self.t = [1000.0]
         self.keys = {}
 
-    def run_gc(self, cfg=None, idle=None, usage=None, skip=None, noted=None, snap=None):
+    def run_gc(
+        self,
+        cfg=None,
+        idle=None,
+        usage=None,
+        skip=None,
+        noted=None,
+        snap=None,
+        units=(),
+        edge_map=None,
+    ):
         cfg = cfg or make_cfg(tmp(), seeds={"share": ["adb"], "persist": ["tmux"]})
-        with mock.patch.object(engine.inspect.ProcTable, "scan",
-                           return_value=engine.inspect.ProcTable.from_ppid({})), \
-             mock.patch.object(engine.inspect, "Snapshot", return_value=snap or OkSnap()), \
-             mock.patch.object(engine.inspect, "edges", return_value={}), \
-             mock.patch.object(engine.policy, "exe_key", side_effect=lambda p: self.keys.get(p, "x")):
-            return engine.gc_candidates(cfg, [], self.store, {} if idle is None else idle,
-                                        now=lambda: self.t[0], usage=usage, skip=skip, noted=noted)
+        with (
+            mock.patch.object(
+                engine.inspect.ProcTable,
+                "scan",
+                return_value=engine.inspect.ProcTable.from_ppid({}),
+            ),
+            mock.patch.object(
+                engine.inspect, "Snapshot", return_value=snap or OkSnap()
+            ),
+            mock.patch.object(
+                engine.inspect,
+                "edges",
+                return_value={} if edge_map is None else edge_map,
+            ),
+            mock.patch.object(
+                engine.policy,
+                "app_key",
+                side_effect=lambda p, **kw: self.keys.get(p, "x"),
+            ),
+        ):
+            return engine.gc_candidates(
+                cfg,
+                list(units),
+                self.store,
+                {} if idle is None else idle,
+                now=lambda: self.t[0],
+                usage=usage,
+                skip=skip,
+                noted=noted,
+            )
 
     def test_persist_and_share_seed_leaves_never_candidates(self):
         self.cg.leaf("shared/tmux-5", [5], cpu=1)
@@ -417,7 +540,7 @@ class GcRules(unittest.TestCase):
         self.assertEqual(self.run_gc(idle=idle, noted=noted), [])
         self.assertEqual(noted, {"shared/tmux-5", "shared/adb-6"})
         with open(self.store.log_path) as f:
-            self.assertEqual(f.read().count("gc_skip"), 2)     # logged once each
+            self.assertEqual(f.read().count("gc_skip"), 2)  # logged once each
 
     def test_user_keep_leaf_skipped(self):
         self.cg.leaf("shared/foo-7", [7], cpu=1)
@@ -443,11 +566,11 @@ class GcRules(unittest.TestCase):
         idle, usage = {}, {}
         self.run_gc(idle=idle, usage=usage)
         self.t[0] += 400
-        self.cg.set_cpu("shared/foo-8", 99999)          # busy: window restarts
+        self.cg.set_cpu("shared/foo-8", 99999)  # busy: window restarts
         self.assertEqual(self.run_gc(idle=idle, usage=usage), [])
-        self.t[0] += 400                                # 800 s since first sight, 400 since restart
+        self.t[0] += 400  # 800 s since first sight, 400 since restart
         self.assertEqual(self.run_gc(idle=idle, usage=usage), [])
-        self.t[0] += 300                                # flat for 700 s >= 600
+        self.t[0] += 300  # flat for 700 s >= 600
         self.assertEqual(len(self.run_gc(idle=idle, usage=usage)), 1)
 
     def test_missing_cpu_stat_falls_back_to_edges_only(self):
@@ -465,6 +588,388 @@ class GcRules(unittest.TestCase):
         self.t[0] += 5000
         self.assertEqual(self.run_gc(idle=idle, snap=BadSnap()), [])
 
+    def test_runtime_unit_uses_configured_no_attachment_grace(self):
+        path = self.cg.leaf("app-vm-test", [42], cpu=1)
+        unit = {
+            "unit": {"name": "app-vm", "kind": "app", "stop_when_unneeded": True},
+            "gc": {"no_attach_grace": 120},
+        }
+        idle = {}
+
+        self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+        self.t[0] += 119
+        self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+        self.t[0] += 1
+        candidates = self.run_gc(idle=idle, units=[unit])
+        self.assertEqual(candidates, [(path, "no attachment for 120s")])
+
+    def test_detached_runtime_grace_ignores_cpu_activity_and_child_processes(self):
+        path = self.cg.leaf("app-podman-test", [42, 43], cpu=1)
+        unit = {
+            "unit": {
+                "name": "app-podman",
+                "kind": "app",
+                "stop_when_unneeded": True,
+            },
+            "match": {"comm": "catatonit"},
+            "children": [{"name": "conmon", "comm": "conmon"}],
+            "gc": {"keep_while_children": True, "no_attach_grace": 120},
+        }
+        idle, usage = {}, {}
+
+        self.assertEqual(self.run_gc(idle=idle, usage=usage, units=[unit]), [])
+        self.t[0] += 60
+        self.cg.set_cpu("app-podman-test", 10000)
+        self.assertEqual(self.run_gc(idle=idle, usage=usage, units=[unit]), [])
+        self.t[0] += 60
+
+        self.assertEqual(
+            self.run_gc(idle=idle, usage=usage, units=[unit]),
+            [(path, "no attachment for 120s")],
+        )
+
+    def test_runtime_socket_peers_hold_the_scope_past_no_attachment_grace(self):
+        self.cg.leaf("app-vm-test", [42], cpu=1)
+        unit = {
+            "unit": {"name": "app-vm", "kind": "app", "stop_when_unneeded": True},
+            "gc": {"no_attach_grace": 10},
+        }
+        idle = {}
+        self.run_gc(idle=idle, units=[unit], edge_map={42: [{"kind": "qmp"}]})
+        self.t[0] += 20
+        self.assertEqual(
+            self.run_gc(idle=idle, units=[unit], edge_map={42: [{"kind": "qmp"}]}),
+            [],
+        )
+
+    def test_missing_qmp_socket_is_a_runtime_quit_signal(self):
+        path = self.cg.leaf("app-vm-test", [42], cpu=1)
+        unit = {
+            "unit": {"name": "app-vm", "kind": "app", "stop_when_unneeded": True},
+            "gc": {"qmp_socket": True},
+        }
+        with mock.patch.object(
+            engine.inspect, "qmp_socket_paths", return_value=[path + ".monitor"]
+        ):
+            candidates = self.run_gc(units=[unit])
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("QMP socket gone:"))
+
+    def test_missing_podman_api_socket_is_a_runtime_quit_signal(self):
+        path = self.cg.leaf("app-podman-test", [42], cpu=1)
+        runtime = os.path.join(self.cg.root, "runtime")
+        os.makedirs(runtime)
+        unit = {
+            "unit": {"name": "app-podman", "kind": "app", "stop_when_unneeded": True},
+            "gc": {
+                "socket_env": "XDG_RUNTIME_DIR",
+                "socket_path": "podman/podman.sock",
+            },
+        }
+        with mock.patch.object(
+            engine.inspect,
+            "environ",
+            return_value={"XDG_RUNTIME_DIR": runtime},
+        ):
+            candidates = self.run_gc(units=[unit])
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
+
+    def test_missing_virtualbox_socket_glob_is_a_runtime_quit_signal(self):
+        path = self.cg.leaf("app-virtualbox-test", [42], cpu=1)
+        runtime = os.path.join(self.cg.root, "runtime-vbox", ".vbox-user-ipc")
+        os.makedirs(runtime)
+        socket_path = os.path.join(runtime, "ipcd")
+        with open(socket_path, "w") as socket_file:
+            socket_file.write("fake VBoxSVC socket")
+        unit = {
+            "unit": {
+                "name": "app-virtualbox",
+                "kind": "app",
+                "class": "vm",
+                "stop_when_unneeded": True,
+            },
+            "match": {"comm": "VBoxHeadless"},
+            "gc": {
+                "socket_glob": os.path.join(
+                    self.cg.root, "runtime-*", ".vbox-user-ipc", "ipcd"
+                )
+            },
+        }
+
+        self.assertEqual(self.run_gc(units=[unit]), [])
+        os.unlink(socket_path)
+
+        candidates = self.run_gc(units=[unit])
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
+
+    def test_runtime_quit_scan_fails_closed_for_unreadable_proc_entries(self):
+        path = self.cg.leaf("app-runtime-test", [42], cpu=1)
+        unit = {
+            "unit": {
+                "name": "app-runtime",
+                "kind": "app",
+                "class": "container",
+                "stop_when_unneeded": True,
+            },
+            "gc": {"no_attach_grace": 0, "quit_process_missing": "VBoxSVC"},
+        }
+        cases = (
+            ("uid unreadable", {42: UID, 43: -1}, {42: "worker"}),
+            ("comm unreadable", {42: UID, 43: UID}, {42: "worker", 43: ""}),
+        )
+        for label, uids, names in cases:
+            with self.subTest(entry=label):
+                with (
+                    mock.patch.object(engine.inspect, "all_pids", return_value=[42, 43]),
+                    mock.patch.object(
+                        engine.inspect,
+                        "uid_of",
+                        side_effect=lambda pid: uids.get(pid, -1),
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "comm",
+                        side_effect=lambda pid: names.get(pid, ""),
+                    ),
+                ):
+                    self.assertEqual(self.run_gc(units=[unit]), [])
+
+    def test_lxc_shipped_unit_holds_and_quits_from_fake_proc_tree(self):
+        units = policy.load_units(
+            {"paths": {"units_dir": os.path.join(ROOT, "etc", "units")}}
+        )
+        unit = next(unit for unit in units if unit["unit"]["name"] == "app-lxc")
+        path = self.cg.leaf("app-lxc-test", [42], cpu=1)
+        proc_root = os.path.join(self.cg.root, "proc-lxc")
+        os.makedirs(proc_root)
+
+        def add_process(pid, name):
+            process_dir = os.path.join(proc_root, str(pid))
+            os.makedirs(process_dir)
+            with open(os.path.join(process_dir, "comm"), "w") as comm:
+                comm.write(name + "\n")
+
+        add_process(42, "lxc-monitor-helper")
+        add_process(43, "lxc-start")
+        idle = {}
+        with mock.patch.object(engine.inspect, "PROC", proc_root):
+            self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+            self.t[0] += 121
+            self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+            os.unlink(os.path.join(proc_root, "43", "comm"))
+            os.rmdir(os.path.join(proc_root, "43"))
+            candidates = self.run_gc(idle=idle, units=[unit])
+
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("runtime process gone:"))
+
+    def test_runtime_quit_signals_use_fake_proc_and_runtime_trees(self):
+        cases = (
+            (
+                "docker",
+                "app-docker-rootless",
+                "dockerd",
+                "containerd-shim-runc-v2",
+                {"socket_env": "XDG_RUNTIME_DIR", "socket_path": "docker.sock"},
+                "docker.sock",
+            ),
+            (
+                "incus",
+                "app-incus",
+                "incusd",
+                "lxc-start",
+                {"socket_env": "XDG_RUNTIME_DIR", "socket_path": "incus/unix.socket"},
+                "incus/unix.socket",
+            ),
+            (
+                "virtualbox",
+                "app-virtualbox",
+                "VBoxHeadless",
+                "VBoxSVC",
+                {
+                    "socket_glob": "",
+                },
+                ".vbox-user-ipc/ipcd",
+            ),
+        )
+        proc_root = os.path.join(self.cg.root, "proc")
+        os.makedirs(proc_root)
+
+        def add_process(pid, process_name, runtime_dir):
+            process_dir = os.path.join(proc_root, str(pid))
+            os.makedirs(process_dir)
+            with open(os.path.join(process_dir, "comm"), "w") as comm:
+                comm.write(process_name + "\n")
+            with open(os.path.join(process_dir, "environ"), "wb") as environ:
+                environ.write(("XDG_RUNTIME_DIR=" + runtime_dir + "\0").encode())
+
+        for index, (runtime, name, root_comm, live_comm, gc, socket_rel) in enumerate(
+            cases
+        ):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory(
+                prefix="runtime-", dir=self.cg.root
+            ) as runtime_dir:
+                path = self.cg.leaf("%s-test" % name, [42 + index], cpu=1)
+                socket_path = os.path.join(runtime_dir, socket_rel)
+                os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+                with open(socket_path, "w") as socket_file:
+                    socket_file.write("fake runtime socket")
+                root_pid = 42 + index
+                live_pid = 90 + index
+                add_process(root_pid, root_comm, runtime_dir)
+                add_process(live_pid, live_comm, runtime_dir)
+                configured_gc = dict(gc)
+                configured_gc["no_attach_grace"] = 120
+                configured_gc["quit_process_missing"] = live_comm
+                if runtime == "virtualbox":
+                    configured_gc["socket_glob"] = os.path.join(
+                        self.cg.root, "runtime-*", socket_rel
+                    )
+                unit = {
+                    "unit": {
+                        "name": name,
+                        "kind": "app",
+                        "class": "vm" if runtime == "virtualbox" else "container",
+                        "stop_when_unneeded": True,
+                    },
+                    "match": {"comm": root_comm},
+                    "mem": {"idle_reclaim": True},
+                    "gc": configured_gc,
+                }
+                idle = {}
+                with mock.patch.object(engine.inspect, "PROC", proc_root):
+                    self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+                    self.t[0] += 121
+                    self.assertEqual(
+                        self.run_gc(idle=idle, units=[unit]),
+                        [],
+                        "a live runtime process must hold its scope",
+                    )
+                    os.unlink(socket_path)
+                    self.assertEqual(
+                        self.run_gc(idle=idle, units=[unit]),
+                        [],
+                        "a missing socket must not outvote a live instance",
+                    )
+                    with open(socket_path, "w") as socket_file:
+                        socket_file.write("fake runtime socket")
+                    os.unlink(os.path.join(proc_root, str(live_pid), "environ"))
+                    os.unlink(os.path.join(proc_root, str(live_pid), "comm"))
+                    os.rmdir(os.path.join(proc_root, str(live_pid)))
+                    candidates = self.run_gc(idle=idle, units=[unit])
+
+                self.assertEqual(candidates[0][0], path)
+                self.assertTrue(
+                    candidates[0][1].startswith("runtime process gone:"),
+                    candidates[0][1],
+                )
+
+    def test_libvirt_unit_groups_qemu_roots_by_qmp_socket(self):
+        unit = {
+            "unit": {"name": "app-libvirt-qemu", "kind": "app", "group_by_qmp": True},
+            "match": {"cmdline_contains": "qemu-system-"},
+        }
+        table = engine.inspect.ProcTable.from_ppid({42: 1, 43: 1})
+        with (
+            mock.patch.object(
+                engine.policy, "session_cgroups", return_value=["session"]
+            ),
+            mock.patch.object(engine.cgroup, "procs", return_value=[42, 43]),
+            mock.patch.object(engine.inspect.ProcTable, "scan", return_value=table),
+            mock.patch.object(engine, "_matches", return_value=True),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(
+                engine.inspect,
+                "qmp_socket_paths",
+                side_effect=lambda pid: [
+                    "/run/user/1000/libvirt/qemu/vm-%d.monitor" % pid
+                ],
+            ),
+        ):
+            ops = engine.adopt_plan(make_cfg(tmp()), [unit])
+
+        self.assertEqual(len(ops), 2)
+        self.assertEqual({tuple(op["pids"]) for op in ops}, {(42,), (43,)})
+        self.assertEqual(len({op["scope"] for op in ops}), 2)
+
+    def test_libvirt_roots_without_qmp_sockets_do_not_merge_by_session(self):
+        unit = {
+            "unit": {"name": "app-libvirt-qemu", "kind": "app", "group_by_qmp": True},
+            "match": {"cmdline_contains": "qemu-system-"},
+        }
+        table = engine.inspect.ProcTable.from_ppid({42: 1, 43: 1})
+        with (
+            mock.patch.object(
+                engine.policy, "session_cgroups", return_value=["session"]
+            ),
+            mock.patch.object(engine.cgroup, "procs", return_value=[42, 43]),
+            mock.patch.object(engine.inspect.ProcTable, "scan", return_value=table),
+            mock.patch.object(engine, "_matches", return_value=True),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(engine.inspect, "qmp_socket_paths", return_value=[]),
+            mock.patch.object(engine.cgroup, "proc_cgroup", return_value="/session-1"),
+        ):
+            ops = engine.adopt_plan(make_cfg(tmp()), [unit])
+
+        self.assertEqual(len(ops), 2)
+        self.assertEqual(len({op["scope"] for op in ops}), 2)
+
+    def test_stop_why_names_the_management_client(self):
+        path = self.cg.leaf("app-vm-42", [42])
+        unit = {"unit": {"name": "app-vm", "kind": "app"}}
+        for edge_kind, detail in (
+            ("qmp", "/run/user/1000/libvirt/qemu/vm.monitor"),
+            ("podman_api", "/run/user/1000/podman/podman.sock"),
+        ):
+            with self.subTest(edge_kind=edge_kind):
+                with (
+                    mock.patch.object(engine, "vetoes_for_scope", return_value=[]),
+                    mock.patch.object(
+                        engine.policy, "protected_reason", return_value=None
+                    ),
+                    mock.patch.object(
+                        engine.inspect.ProcTable,
+                        "scan",
+                        return_value=engine.inspect.ProcTable.from_ppid({}),
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "LazySnapshot",
+                        return_value=types.SimpleNamespace(get=lambda: OkSnap()),
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "edges",
+                        return_value={
+                            42: [
+                                {
+                                    "kind": edge_kind,
+                                    "detail": detail,
+                                    "peers": [43],
+                                }
+                            ]
+                        },
+                    ),
+                    mock.patch.object(
+                        engine.inspect,
+                        "comm",
+                        side_effect={
+                            42: "qemu-system-x86",
+                            43: "virt-manager",
+                        }.__getitem__,
+                    ),
+                    mock.patch.object(engine.policy, "app_key", return_value="qemu"),
+                ):
+                    [decision] = engine.plan_stop(
+                        path, make_cfg(tmp()), self.store, unit, force=True
+                    )
+
+                self.assertEqual(decision["action"], "share")
+                self.assertIn(edge_kind, decision["why"])
+                self.assertIn("virt-manager (pid 43)", decision["why"])
+
     def test_skip_set_leaves_ignored_and_pruned(self):
         self.cg.leaf("shared/foo-8", [], cpu=1)
         skip = {"shared/foo-8", "shared/gone-1"}
@@ -473,6 +978,7 @@ class GcRules(unittest.TestCase):
 
 
 # ---- daemon ------------------------------------------------------------------------------------
+
 
 class DaemonSocket(unittest.TestCase):
     def setUp(self):
@@ -487,22 +993,47 @@ class DaemonSocket(unittest.TestCase):
             self.d.srv.close()
 
     def test_bad_shapes(self):
-        for msg in ([], "x", None, 5, 1.5, {"cmd": 5}, {"cmd": None}, {}, {"cmd": "register"},
-                    {"cmd": "register", "scope": 5, "owner": 1}, {"cmd": "register", "scope": "scope-x"},
-                    {"cmd": "register", "scope": "scope-x", "owner": "7"},
-                    {"cmd": "register", "scope": "scope-x", "owner": True},
-                    {"cmd": "feedback", "op": 1, "key": []}, {"cmd": "feedback"}):
+        for msg in (
+            [],
+            "x",
+            None,
+            5,
+            1.5,
+            {"cmd": 5},
+            {"cmd": None},
+            {},
+            {"cmd": "register"},
+            {"cmd": "register", "scope": 5, "owner": 1},
+            {"cmd": "register", "scope": "scope-x"},
+            {"cmd": "register", "scope": "scope-x", "owner": "7"},
+            {"cmd": "register", "scope": "scope-x", "owner": True},
+            {"cmd": "feedback", "op": 1, "key": []},
+            {"cmd": "feedback"},
+        ):
             r = self.d.handle(msg)
             self.assertIn("error", r, msg)
 
     def test_register_validation(self):
         me = os.getpid()
-        for scope, owner in (("scope-x", 1), ("scope-x", 0), ("scope-x", -4), ("../etc", me),
-                             ("Scope-X", me), ("a//b", me), ("", me)):
-            self.assertIn("error", self.d.handle({"cmd": "register", "scope": scope, "owner": owner}),
-                          (scope, owner))
+        for scope, owner in (
+            ("scope-x", 1),
+            ("scope-x", 0),
+            ("scope-x", -4),
+            ("../etc", me),
+            ("Scope-X", me),
+            ("a//b", me),
+            ("", me),
+        ):
+            self.assertIn(
+                "error",
+                self.d.handle({"cmd": "register", "scope": scope, "owner": owner}),
+                (scope, owner),
+            )
         with mock.patch.object(daemon.inspect, "uid_of", return_value=UID + 1):
-            self.assertIn("error", self.d.handle({"cmd": "register", "scope": "scope-x", "owner": me}))
+            self.assertIn(
+                "error",
+                self.d.handle({"cmd": "register", "scope": "scope-x", "owner": me}),
+            )
         self.assertEqual(self.d.owners, {})
 
     def test_register_ok_and_deduped(self):
@@ -510,13 +1041,20 @@ class DaemonSocket(unittest.TestCase):
         self.assertEqual(self.d.handle(msg), {"watching": True})
         self.assertEqual(self.d.handle(msg), {"watching": True})
         self.assertEqual(len(self.d.owners), 1)
-        self.assertEqual(self.d.handle({"cmd": "status"})["owners"], [{"scope": "scope-x", "owner": os.getpid()}])
+        self.assertEqual(
+            self.d.handle({"cmd": "status"})["owners"],
+            [{"scope": "scope-x", "owner": os.getpid()}],
+        )
 
     def test_feedback_command(self):
-        self.assertEqual(self.d.handle({"cmd": "feedback", "op": "keep", "key": "adb"}), {"ok": True})
+        self.assertEqual(
+            self.d.handle({"cmd": "feedback", "op": "keep", "key": "adb"}), {"ok": True}
+        )
         self.assertEqual(self.d.store.peek("adb")["user_keep"], 3.0)
-        self.assertFalse(self.d.store.dirty)    # saved
-        self.assertIn("error", self.d.handle({"cmd": "feedback", "op": "nuke", "key": "adb"}))
+        self.assertFalse(self.d.store.dirty)  # saved
+        self.assertIn(
+            "error", self.d.handle({"cmd": "feedback", "op": "nuke", "key": "adb"})
+        )
 
     def converse(self, payload, send_close=False):
         """One real round trip over a unix socket pair against Daemon.serve."""
@@ -537,8 +1075,16 @@ class DaemonSocket(unittest.TestCase):
         return json.loads(c.recv(65536))
 
     def test_serve_survives_junk(self):
-        for payload in (b"[1,2\n", b"\xff\xfe\n", b"[]\n", b"5\n", b'"x"\n', b"null\n",
-                        b'{"cmd": []}\n', b'{"cmd":"register","scope":{},"owner":[]}\n'):
+        for payload in (
+            b"[1,2\n",
+            b"\xff\xfe\n",
+            b"[]\n",
+            b"5\n",
+            b'"x"\n',
+            b"null\n",
+            b'{"cmd": []}\n',
+            b'{"cmd":"register","scope":{},"owner":[]}\n',
+        ):
             self.assertIn("error", self.converse(payload), payload)
 
     def test_serve_accepts_eof_framed_and_valid(self):
@@ -565,17 +1111,20 @@ class DaemonSocket(unittest.TestCase):
         path = os.path.join(tmp(), "t.sock")
         with mock.patch.dict(os.environ, {"TAEMA_SOCKET": path}):
             self.d.check_socket()
-            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode) & 0o077, 0)   # owner only
+            self.assertEqual(
+                stat.S_IMODE(os.stat(path).st_mode) & 0o077, 0
+            )  # owner only
             os.unlink(path)
             self.d.check_socket()
             self.assertTrue(os.path.exists(path))
             first = self.d.srv
             self.d.check_socket()
-            self.assertIs(self.d.srv, first)       # untouched while the path is there
+            self.assertIs(self.d.srv, first)  # untouched while the path is there
 
     def test_guarded_logs_instead_of_raising(self):
         def boom():
             raise RuntimeError("x")
+
         self.d.guarded(boom)
         self.d.guarded(lambda: 1 / 0)
         with open(self.d.store.log_path) as f:
@@ -599,15 +1148,19 @@ class DaemonActions(unittest.TestCase):
         unit = {"unit": {"name": "claude-desktop", "kind": "app"}}
         self.d.units = [unit]
         self.cg.leaf("claude-desktop-ab12cd34", [])
-        with mock.patch.object(daemon.engine, "stop") as st, \
-             mock.patch.object(daemon.policy, "hook_for", return_value="/h"):
+        with (
+            mock.patch.object(daemon.engine, "stop") as st,
+            mock.patch.object(daemon.policy, "hook_for", return_value="/h"),
+        ):
             self.d.stop_leaf("claude-desktop-ab12cd34", "t")
         self.assertIs(st.call_args[0][3], unit)
         self.assertEqual(st.call_args[1]["hook"], "/h")
 
     def test_stop_leaf_broad_errors_caught(self):
         self.cg.leaf("scope-x", [])
-        with mock.patch.object(daemon.engine, "stop", side_effect=PermissionError("no")):
+        with mock.patch.object(
+            daemon.engine, "stop", side_effect=PermissionError("no")
+        ):
             self.d.stop_leaf("scope-x", "t")
         self.assertIn("stop_error", self.log())
 
@@ -624,18 +1177,30 @@ class DaemonActions(unittest.TestCase):
     def test_gc_stopped_only_when_removed(self):
         self.cg.leaf("shared/foo-1", [])
         path = self.cg.base + "/shared/foo-1"
-        rep = {"scope": "shared/foo-1", "removed": False, "left": [1],
-               "decisions": [{"action": "skip", "pid": 1}]}
-        with mock.patch.object(daemon.engine, "gc_candidates", return_value=[(path, "idle")]), \
-             mock.patch.object(daemon.engine, "stop", return_value=rep):
+        rep = {
+            "scope": "shared/foo-1",
+            "removed": False,
+            "left": [1],
+            "decisions": [{"action": "skip", "pid": 1}],
+        }
+        with (
+            mock.patch.object(
+                daemon.engine, "gc_candidates", return_value=[(path, "idle")]
+            ),
+            mock.patch.object(daemon.engine, "stop", return_value=rep),
+        ):
             self.d.gc_pass()
         out = self.log()
         self.assertNotIn("gc_stopped", out)
         self.assertIn("kept: protected member", out)
         self.assertIn("shared/foo-1", self.d.gc_skip)
         rep2 = dict(rep, removed=True)
-        with mock.patch.object(daemon.engine, "gc_candidates", return_value=[(path, "idle")]), \
-             mock.patch.object(daemon.engine, "stop", return_value=rep2):
+        with (
+            mock.patch.object(
+                daemon.engine, "gc_candidates", return_value=[(path, "idle")]
+            ),
+            mock.patch.object(daemon.engine, "stop", return_value=rep2),
+        ):
             self.d.gc_pass()
         self.assertIn("gc_stopped", self.log())
 
@@ -643,12 +1208,16 @@ class DaemonActions(unittest.TestCase):
 class CliRun(unittest.TestCase):
     def test_owner_gone_dies_before_attach(self):
         with FakeCg() as cg:
-            args = types.SimpleNamespace(name="x", join=False, owner=2 ** 22 + 12345, bind=False, cmd=["true"])
+            args = types.SimpleNamespace(
+                name="x", join=False, owner=2**22 + 12345, bind=False, cmd=["true"]
+            )
             cfg = make_cfg(tmp())
-            with mock.patch.object(cli, "_load", return_value=(cfg, None, [])), \
-                 mock.patch.object(cli.engine, "helper_attach") as att, \
-                 mock.patch.object(cli.os, "execvp") as ex, \
-                 mock.patch.object(inspect, "PROC", tmp()):
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, None, [])),
+                mock.patch.object(cli.engine, "helper_attach") as att,
+                mock.patch.object(cli.os, "execvp") as ex,
+                mock.patch.object(inspect, "PROC", tmp()),
+            ):
                 rc = cli.cmd_run(args)
             self.assertNotEqual(rc, 0)
             att.assert_not_called()
@@ -658,12 +1227,26 @@ class CliRun(unittest.TestCase):
     def test_register_before_attach(self):
         order = []
         with FakeCg():
-            args = types.SimpleNamespace(name="x", join=False, owner=os.getpid(), bind=False, cmd=["true"])
+            args = types.SimpleNamespace(
+                name="x", join=False, owner=os.getpid(), bind=False, cmd=["true"]
+            )
             cfg = make_cfg(tmp())
-            with mock.patch.object(cli, "_load", return_value=(cfg, None, [])), \
-                 mock.patch.object(cli, "ask", side_effect=lambda *a, **k: order.append("ask") or {"watching": True}), \
-                 mock.patch.object(cli.engine, "helper_attach", side_effect=lambda *a: order.append("attach")), \
-                 mock.patch.object(cli.os, "execvp"):
+            with (
+                mock.patch.object(cli, "_load", return_value=(cfg, None, [])),
+                mock.patch.object(
+                    cli,
+                    "ask",
+                    side_effect=lambda *a, **k: (
+                        order.append("ask") or {"watching": True}
+                    ),
+                ),
+                mock.patch.object(
+                    cli.engine,
+                    "helper_attach",
+                    side_effect=lambda *a: order.append("attach"),
+                ),
+                mock.patch.object(cli.os, "execvp"),
+            ):
                 cli.cmd_run(args)
         self.assertEqual(order, ["ask", "attach"])
 

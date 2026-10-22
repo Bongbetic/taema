@@ -1,0 +1,48 @@
+# Disposable Void VM test harness defaults. See docs/vm-harness.md.
+#
+# Every value here is a default; the CLI can override state_dir, libcs, scenarios
+# and accel. Network fetches (base images, previous release) only happen with
+# --allow-network; runs with a populated cache work offline.
+
+libcs = ["glibc", "musl"]          # libcs to boot for `run`
+scenarios = ["smoke", "m0"]        # M1/M2 acceptance: smoke,m1,m2,upgrade
+accel = "auto"                     # auto | kvm | tcg; auto uses KVM when /dev/kvm is usable
+memory_mb = 1536
+cpus = 2
+boot_timeout_s = 300               # ssh readiness after qemu starts
+scenario_timeout_s = 4500          # M0 includes a real one-hour idle GC window
+test_user = "taematest"            # login session the scenarios run as
+
+[paths]
+# Relative paths resolve against the taema/ directory.
+state_dir = "build/vm"             # images, run dirs, artifacts (gitignored build output)
+package_repo = "build/repo"        # build-xbps.sh output repository
+
+[tools]
+qemu = "qemu-system-x86_64"
+qemu_img = "qemu-img"
+ssh = "ssh"
+scp = "scp"
+ssh_keygen = "ssh-keygen"
+mke2fs = "mke2fs"
+make = "make"
+xbps_create = "xbps-create"
+xbps_rindex = "xbps-rindex"
+tar = "tar"
+git = "git"
+unshare = "unshare"
+
+[images]
+# Official Void rootfs tarballs (no upstream qcow2 exists); the harness builds a
+# bootable qcow2 per libc from these and pins their digests.
+base_url = "https://repo-default.voidlinux.org/live/current"
+previous_url = "https://github.com/Bongbetic/taema/releases/download/taema-v0.3.0/taema-0.3.0_1.noarch.xbps"
+previous_ref = "taema-v0.3.0"     # build locally from this tag when its package is not cached
+
+[images.glibc]
+tarball = "void-x86_64-ROOTFS-20250202.tar.xz"
+sha256 = "3f48e6673ac5907a897d913c97eb96edbfb230162731b4016562c51b3b8f1876"
+
+[images.musl]
+tarball = "void-x86_64-musl-ROOTFS-20250202.tar.xz"
+sha256 = "27b2945ea7e2ca2a6ab123ce6f284b255adea2182820da25483d700ffe16e7c2"

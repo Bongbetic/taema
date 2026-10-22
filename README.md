@@ -191,9 +191,20 @@ for 7 days and asks you again. You never need a command to undo it.
 
 | Mode | What happens |
 |---|---|
-| `auto` | Adopts, learns and cleans up as described above. |
-| `adopt` | Gives apps their own scopes. Never stops anything. |
-| `observe` | Only writes what it *would* do to the log. Changes nothing. |
+| `auto` | Learns from app closes, reviews unlearned idle leftovers, and stops eligible idle shared or `stop_when_unneeded` scopes after safety and veto checks. |
+| `adopt` | Adopts eligible apps, contains GUI survivors under `leftover/` for review, and honors `taema run --bind` by stopping that scope when its command exits; idle shared and unit scopes are reviewed, not stopped. |
+| `observe` | Logs what it *would* do and leaves scopes and processes in place. |
+| `enforce` | Applies unit and lifecycle rules, including GC for `stop_when_unneeded` scopes, with safety and veto checks. |
+
+Leftover expiry is opt-in. `leftover_expire_days = 0` (the default) keeps unlearned
+leftovers indefinitely. A positive value allows an aged, idle leftover to expire after that many
+days, subject to the usual safety checks; an explicit keep or veto still wins. Review timeouts
+resolve to keep and do not enable expiry.
+
+```toml
+[timers]
+leftover_expire_days = 30 # optional; default 0 disables expiry
+```
 
 ```toml
 # ~/.config/taema/taema.toml
@@ -208,9 +219,22 @@ program.
 
 ```sh
 taema run emulator emulator -avd Pixel_8 -no-window   # start a program in a scope
-taema ls                                              # scopes and process counts
+taema ls                                              # scopes, counts, memory, pressure
 taema kill emulator                                   # empty the scope
 ```
+
+```
+name                         procs       MEM    PSI  comms
+scope-emulator                 12      1.5G   0.42  emulator,qemu-system-x86
+  qemu-9                        1      1.4G   0.42  qemu-system-x86
+scope-web                       3     24.7M   1.20  firefox,WebExtensions
+scope-fresh                     1         -      -  sleep
+shared                          0         -      -
+  adb-1                         1    768.0K   0.00  adb
+```
+
+`MEM` is the scope's current memory in human-readable bytes, `PSI` its recent memory
+pressure (`some avg10`); a scope without readable memory files shows `-`.
 
 ```
 kill    41210 qemu-system-x86    no outside users
@@ -266,7 +290,7 @@ A release needs no manual work. Bump `__version__` in `taema/src/taema/__init__.
 then push a tag named `taema-vX.Y.Z`:
 
 ```sh
-git tag taema-v0.3.0 && git push origin taema-v0.3.0
+git tag taema-v0.4.0 && git push origin taema-v0.4.0
 ```
 
 The `release` workflow runs the tests, builds the `.xbps`, signs an XBPS repository, and
@@ -282,6 +306,40 @@ Once the template is merged into void-packages, `srcpkgs/taema/update` lets
 Maintainer setup, once: the repository is signed with an RSA key. Store the private key as
 the Actions secret `XBPS_PRIVKEY`. Nothing else is needed. If the key ever changes, every
 user has to accept the new fingerprint.
+
+## Checks
+
+The `ci` workflow runs on every push and pull request: the unit and packaging test
+suites and package build, as an unprivileged user, in the Void glibc and Void musl
+containers with the distribution Python. Its Python 3.11 job also runs Ruff lint and
+format checks, mypy, and the coverage report and gate. Reproduce that quality job from
+the repository root with:
+
+```sh
+python3 -m venv /tmp/taema-quality-venv
+/tmp/taema-quality-venv/bin/python -m pip install ruff==0.17.1 mypy==2.4.0 coverage==7.16.2
+cd taema
+/tmp/taema-quality-venv/bin/ruff check src tests tools
+/tmp/taema-quality-venv/bin/ruff format --check src tests tools
+/tmp/taema-quality-venv/bin/mypy src/taema
+PYTHONPATH=src /tmp/taema-quality-venv/bin/coverage run -m unittest discover -s tests -t .
+/tmp/taema-quality-venv/bin/coverage report
+/tmp/taema-quality-venv/bin/coverage json -o /tmp/taema-coverage.json
+/tmp/taema-quality-venv/bin/python tools/check_coverage.py /tmp/taema-coverage.json
+cd ..
+```
+
+Run the Void test and package build steps locally from the repository root with:
+
+```sh
+make -C taema test        # the test suites (unit and packaging)
+taema/tools/build-xbps.sh # the package build; runs the suites first, needs xbps-create/xbps-rindex
+```
+
+The test suites need only Python 3.11+ and `make`; the package build also needs
+`xbps-create` and `xbps-rindex`. A failing step fails the workflow run, which marks the
+commit and the pull request as failed. The tag-triggered `release` workflow is separate
+and unchanged.
 
 ## Layout
 

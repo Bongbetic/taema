@@ -1,0 +1,23 @@
+# Libvirt guests are identified by their QMP socket, so each guest gets its own scope.
+[unit]
+name = "app-libvirt-qemu"
+kind = "app"
+class = "vm"
+group_by_qmp = true
+stop_when_unneeded = true
+survive_logout = false
+
+[match]
+comm = "qemu-system-*"
+cmdline_contains = "qemu-system-"
+
+[mem]
+idle_reclaim = true
+# Add an explicit [mem] save_state or pause argv only when guest preservation is desired.
+
+[gc]
+qmp_socket = true
+no_attach_grace = 120
+
+[kill]
+graceful = 30

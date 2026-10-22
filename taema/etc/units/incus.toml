@@ -1,0 +1,25 @@
+# Per-user Incus daemon and its LXC workloads.
+[unit]
+name = "app-incus"
+kind = "app"
+class = "container"
+group_by_env = "XDG_RUNTIME_DIR"
+stop_when_unneeded = true
+
+[match]
+comm = "incusd"
+
+[mem]
+class = "container"
+
+[gc]
+env_dir_missing = "XDG_RUNTIME_DIR"
+keep_while_children = true
+no_attach_grace = 120
+socket_env = "XDG_RUNTIME_DIR"
+socket_path = "incus/unix.socket"
+quit_process_missing = "lxc-start*"
+
+[kill]
+survive_logout = true
+graceful = 5

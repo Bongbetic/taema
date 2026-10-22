@@ -1,0 +1,21 @@
+# VirtualBox headless guests share the per-user VBoxSVC IPC endpoint.
+[unit]
+name = "app-virtualbox"
+kind = "app"
+class = "vm"
+stop_when_unneeded = true
+
+[match]
+comm = "VBoxHeadless"
+
+[mem]
+class = "vm"
+
+[gc]
+keep_while_children = true
+no_attach_grace = 120
+socket_glob = "/tmp/.vbox-*-ipc/ipcd"
+quit_process_missing = "VBoxSVC"
+
+[kill]
+graceful = 30

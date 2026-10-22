@@ -172,13 +172,30 @@ logout unless their pair is confidently "stop on close". Unknown is never "no": 
 
 ## Leftover scopes
 
-When an app closes (a GUI close is silent, no prompt), its survivors move to
-`leftover/<owner>-<id>`. GC stops such a scope when it is idle (no edges, flat CPU in
-`cpu.stat`, no ptmx) after the learned grace, and only when the pair allows it. Pairs
-answered in a terminal apply to GUI closes too. Persist seeds and share seeds are never
-drained. The scope is removed when empty (`cgroup.events` shows `populated 0`).
+When a GUI app closes, its non-standalone survivors move to `leftover/<owner>-<id>` and a
+review is queued. Pending reviews hold their scope; expiry records a keep answer and never
+authorizes a stop. `taema review` lists each open review's owner, survivor keys, and age.
+Standalone survivors get their own app scope. Terminal-job roots do not create leftover scopes.
+Persist seeds and share seeds are never drained. The scope is removed when empty
+(`cgroup.events` shows `populated 0`).
+
+In active modes, the daemon applies reversible resource priorities after a scope's class stays
+stable for two seconds. Leftovers use `cpu.idle=1` (CPU weight 10 when unsupported) and IO weight
+10 where available. Shared helpers and idle background app scopes use CPU and IO weight 50.
+Original control values are retained for undo and restored when a user answers keep or standalone.
+Observe mode logs planned changes without enabling controllers or writing controls. Missing
+controls are reported by `doctor`; leftover PID limits remain disabled.
 
 ## Resource budget
+
+Memory shares are computed from the lower of the configured RAM fraction and a finite delegated
+`memory.max`, with the availability floor and infrastructure use reserved before distributing
+class shares. Active VM, container, and app scopes receive bounded `memory.low` reservations;
+idle background scopes receive `memory.high` at no less than current use plus headroom. The
+daemon records original controls, restores only values it still owns, and recalculates shares when
+a scope exits. `memory.max` remains opt-in through hard management and a unit's explicit `mem.max`.
+The `taema memory budget` view reports the ceiling, reservations, shares, live controls, and
+ownership state.
 
 Targets for an idle daemon (no app starting or stopping): RSS at most 25 MB, CPU at most
 0.1 % of one core. How the loops stay inside them:

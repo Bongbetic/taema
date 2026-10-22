@@ -31,6 +31,7 @@ printf '%s\n' "$$" > "$cg/manager/cgroup.procs"
 
 exec setpriv --reuid="$uid" --regid="$gid" --init-groups --inh-caps=-all --reset-env \
     env HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/$uid" \
+    TAEMA_HOLD="${TAEMA_HOLD:-0}" \
     XDG_CONFIG_HOME="$home/.config" XDG_STATE_HOME="$home/.local/state" \
     PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
     /usr/bin/taema daemon

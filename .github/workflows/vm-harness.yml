@@ -1,0 +1,49 @@
+# Disposable Void VM test harness (taema/docs/vm-harness.md).
+#
+# Opt-in only: needs a self-hosted runner with /dev/kvm, so it never runs on
+# GitHub-hosted runners where KVM is unavailable.  Dispatch manually (e.g.
+# before a release) with the libcs/scenarios you want verified.
+name: vm-harness
+
+on:
+  workflow_dispatch:
+    inputs:
+      libcs:
+        description: "Comma-separated libcs to boot"
+        default: "glibc,musl"
+        required: true
+      scenarios:
+        description: "Comma-separated scenarios or 'all'"
+        default: "smoke,m0"
+        required: true
+      allow_network:
+        description: "Permit first-time image/package downloads"
+        type: boolean
+        default: true
+
+jobs:
+  vm:
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Harness prerequisites
+        run: make -C taema vm-doctor
+
+      - name: Run scenarios in disposable Void VMs
+        run: >
+          make -C taema vm-test
+          VMFLAGS="--libc ${{ inputs.libcs }}
+          --scenarios ${{ inputs.scenarios }}
+          ${{ inputs.allow_network && '--allow-network' || '' }}"
+
+      - name: Upload VM artifacts (logs and results)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-harness-artifacts
+          path: taema/build/vm/runs/
+          if-no-files-found: ignore

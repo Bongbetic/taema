@@ -1,0 +1,63 @@
+{
+  "version": 2,
+  "created": 1792400000.0,
+  "last_decay": 1792400000.0,
+  "closes": 11,
+  "review_seq": 0,
+  "exes": {
+    "npm": {"seen": 8.0},
+    "vite": {"seen": 5.0},
+    "editor": {"seen": 6.0},
+    "language-server": {"seen": 3.0},
+    "sh": {"seen": 3.0}
+  },
+  "pairs": {
+    "npm\u0000vite": {
+      "first_seen": 1791700000.0,
+      "last_seen": 1792400000.0,
+      "stop": 0.0,
+      "keep": 0.0,
+      "ex_stop": 3.0,
+      "ex_keep": 0.0,
+      "ex_last": "stop",
+      "ex_ts": 1792300000.0,
+      "closes": 5,
+      "kills": 2,
+      "days": [20720, 20721, 20723]
+    },
+    "editor\u0000language-server": {
+      "first_seen": 1791700000.0,
+      "last_seen": 1792400000.0,
+      "stop": 0.0,
+      "keep": 0.0,
+      "ex_stop": 0.0,
+      "ex_keep": 3.0,
+      "ex_last": "keep",
+      "ex_ts": 1792300000.0,
+      "closes": 4,
+      "kills": 0,
+      "days": [20720, 20721, 20722]
+    },
+    "MainThread\u0000sh": {
+      "first_seen": 1791700000.0,
+      "last_seen": 1792400000.0,
+      "stop": 0.0,
+      "keep": 0.0,
+      "ex_stop": 3.0,
+      "ex_keep": 0.0,
+      "ex_last": "stop",
+      "ex_ts": 1792300000.0,
+      "closes": 2,
+      "kills": 1,
+      "days": [20721]
+    }
+  },
+  "standalone": {},
+  "noise": {},
+  "asked": {"day": 20722, "n": 1},
+  "reviews": [],
+  "vetoes": [],
+  "auto_actions": [],
+  "feedback_ids": [],
+  "leftover_expiries": {}
+}

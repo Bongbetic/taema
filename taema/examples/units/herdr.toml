@@ -9,6 +9,11 @@ stop_when_unneeded = true
 comm = "herdr"
 cmdline_contains = "server"
 
+[mem]
+# The detached workspace server is background work when it remains scoped.
+class = "app"
+background = true
+
 [kill]
 # Detached servers are designed to outlive the login session.
 survive_logout = true

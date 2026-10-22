@@ -30,4 +30,7 @@ rm -f "$repo/$pkg.noarch.xbps"
     --config-files "/etc/taema/taema.toml /etc/taema/units/podman.toml" \
     "$stage")
 xbps-rindex -f -a "$repo/$pkg.noarch.xbps"
+# The local repository is consumed by both glibc and musl test guests. Keep
+# the host-architecture index above and add the musl target index as well.
+XBPS_ARCH=x86_64-musl xbps-rindex -f -a "$repo/$pkg.noarch.xbps"
 echo "built $repo/$pkg.noarch.xbps"

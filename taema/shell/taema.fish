@@ -37,6 +37,12 @@ if status is-interactive; and isatty stdin; and isatty stdout; and not set -q TA
 
     # before each prompt: a pending question is a file that exists
     function __taema_prompt --on-event fish_prompt
+        if not set -q __taema_review_hint_shown; and test -e "$XDG_RUNTIME_DIR/taema/review"
+            set -g __taema_review_hint_shown 1
+            set -l __taema_review_count some
+            read -l __taema_review_count < "$XDG_RUNTIME_DIR/taema/review"
+            printf 'tæma: %s closes waiting for a decision — taema review\n' $__taema_review_count
+        end
         if test -e "$XDG_RUNTIME_DIR/taema/q.$fish_pid"
             $__taema_hook ask $fish_pid 2>/dev/null
         end

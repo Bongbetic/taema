@@ -28,6 +28,13 @@ log() {
     printf '%s\n' "taema: $*" >&2
 }
 
+case ${TAEMA_HOLD:-0} in
+    1) TAEMA_HOLD=1 ;;
+    0|'') TAEMA_HOLD=0 ;;
+    *) log "invalid TAEMA_HOLD value; using 0"; TAEMA_HOLD=0 ;;
+esac
+export TAEMA_HOLD
+
 # enable_controllers DIR: write +CTRL for each wanted controller DIR offers and has not
 # enabled. One refusing controller is logged and skipped.
 enable_controllers() {

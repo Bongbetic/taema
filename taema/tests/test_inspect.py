@@ -1,16 +1,23 @@
 import unittest
+from unittest import mock
 
-from taema import inspect
+from taema.core import process as inspect
 
-SERVER = 'u_str ESTAB 0 0 /run/user/1000/herdr.sock 100 * 101 users:(("herdr",pid=50,fd=9))'
+SERVER = (
+    'u_str ESTAB 0 0 /run/user/1000/herdr.sock 100 * 101 users:(("herdr",pid=50,fd=9))'
+)
 CLIENT_OUT = 'u_str ESTAB 0 0 * 101 * 100 users:(("fzf",pid=70,fd=3))'
-LISTEN = 'u_str LISTEN 0 128 /run/user/1000/herdr.sock 99 * 0 users:(("herdr",pid=50,fd=5))'
+LISTEN = (
+    'u_str LISTEN 0 128 /run/user/1000/herdr.sock 99 * 0 users:(("herdr",pid=50,fd=5))'
+)
 # member (pid 60) is a client of niri (outside); niri's end carries the path
 M_CLIENT = 'u_str ESTAB 0 0 * 200 * 201 users:(("foot",pid=60,fd=4))'
-NIRI_END = 'u_str ESTAB 0 0 /run/user/1000/wayland-1 201 * 200 users:(("niri",pid=1,fd=40))'
+NIRI_END = (
+    'u_str ESTAB 0 0 /run/user/1000/wayland-1 201 * 200 users:(("niri",pid=1,fd=40))'
+)
 # member server whose client is a root process (peer end has no visible pids)
 ROOT_SRV = 'u_str ESTAB 0 0 /run/foo.sock 300 * 301 users:(("srv",pid=80,fd=4))'
-ROOT_CLI = 'u_str ESTAB 0 0 * 301 * 300'
+ROOT_CLI = "u_str ESTAB 0 0 * 301 * 300"
 
 
 class UnixEdges(unittest.TestCase):
@@ -35,11 +42,65 @@ class UnixEdges(unittest.TestCase):
     def test_listen_socket_alone_is_not_an_edge(self):
         self.assertEqual(inspect.edges({50}, self.snap(LISTEN)), {})
 
+    def test_runtime_management_sockets_have_explicit_edge_kinds(self):
+        for path, kind in (
+            ("/run/user/1000/podman/podman.sock", "podman_api"),
+            ("/run/user/1000/libvirt/qemu/vm.monitor", "qmp"),
+            ("/run/user/1000/docker.sock", "docker_api"),
+            ("/run/user/1000/incus/unix.socket", "incus_api"),
+            ("@lxc/0123456789abcdef//var/lib/lxc", "lxc_api"),
+            ("@/var/lib/lxc/alpine/command", "lxc_api"),
+            ("/tmp/.vbox-user-ipc/ipcd", "vboxsvc"),
+        ):
+            with self.subTest(path=path):
+                server = SERVER.replace("/run/user/1000/herdr.sock", path)
+                edges = inspect.edges({50}, self.snap(server, CLIENT_OUT))
+                self.assertEqual(edges[50][0]["kind"], kind)
+                self.assertEqual(edges[50][0]["peers"], [70])
+
+    def test_rootless_podman_service_client_attaches_to_runtime_scope(self):
+        path = "/run/user/1000/podman/podman.sock"
+        server = SERVER.replace("/run/user/1000/herdr.sock", path).replace(
+            "pid=50", "pid=80"
+        )
+        edges = inspect.edges(
+            {50},
+            self.snap(server, CLIENT_OUT),
+            {
+                "comm": {50: "catatonit", 70: "podman", 80: "podman"},
+                "environ": {50: {"XDG_RUNTIME_DIR": "/run/user/1000"}},
+            },
+        )
+
+        self.assertEqual(edges[50][0]["kind"], "podman_api")
+        self.assertEqual(edges[50][0]["detail"], path)
+        self.assertEqual(edges[50][0]["peers"], [70])
+
+    def test_qmp_socket_paths_label_arbitrary_management_socket_names(self):
+        with mock.patch.object(
+            inspect,
+            "qmp_socket_paths",
+            return_value=["/tmp/guest-monitor.sock"],
+        ):
+            edges = inspect.edges(
+                {50},
+                self.snap(
+                    SERVER.replace(
+                        "/run/user/1000/herdr.sock", "/tmp/guest-monitor.sock"
+                    ),
+                    CLIENT_OUT,
+                ),
+                {"comm": {50: "qemu-system-x86_64"}},
+            )
+        self.assertEqual(edges[50][0]["kind"], "qmp")
+
 
 TCP_LISTEN = 'LISTEN 0 128 127.0.0.1:5037 0.0.0.0:* users:(("adb",pid=90,fd=10))'
 TCP_SRV_SIDE = 'ESTAB 0 0 127.0.0.1:5037 127.0.0.1:40000 users:(("adb",pid=90,fd=11))'
-TCP_CLIENT_SIDE = 'ESTAB 0 0 127.0.0.1:40000 127.0.0.1:5037 users:(("studio",pid=91,fd=7))'
-TCP_REMOTE = 'ESTAB 0 0 127.0.0.1:5037 10.0.0.5:51000'
+TCP_CLIENT_SIDE = (
+    'ESTAB 0 0 127.0.0.1:40000 127.0.0.1:5037 users:(("studio",pid=91,fd=7))'
+)
+TCP_REMOTE = "ESTAB 0 0 127.0.0.1:5037 10.0.0.5:51000"
 
 
 class TcpEdges(unittest.TestCase):
@@ -52,7 +113,12 @@ class TcpEdges(unittest.TestCase):
         self.assertEqual(e[90][0]["peers"], [91])
 
     def test_loopback_client_inside_set_is_not(self):
-        self.assertEqual(inspect.edges({90, 91}, self.snap(TCP_LISTEN, TCP_SRV_SIDE, TCP_CLIENT_SIDE)), {})
+        self.assertEqual(
+            inspect.edges(
+                {90, 91}, self.snap(TCP_LISTEN, TCP_SRV_SIDE, TCP_CLIENT_SIDE)
+            ),
+            {},
+        )
 
     def test_remote_client_is_an_edge(self):
         e = inspect.edges({90}, self.snap(TCP_LISTEN, TCP_REMOTE))
@@ -64,17 +130,26 @@ class TcpEdges(unittest.TestCase):
 
 class OtherEdges(unittest.TestCase):
     def test_podman_pause_used_by_outside_conmon(self):
-        info = {"comm": {10: "catatonit", 11: "conmon", 12: "conmon"},
-                "environ": {10: {"XDG_RUNTIME_DIR": "/r"}, 11: {"XDG_RUNTIME_DIR": "/r"},
-                            12: {"XDG_RUNTIME_DIR": "/other"}}}
+        info = {
+            "comm": {10: "catatonit", 11: "conmon", 12: "conmon"},
+            "environ": {
+                10: {"XDG_RUNTIME_DIR": "/r"},
+                11: {"XDG_RUNTIME_DIR": "/r"},
+                12: {"XDG_RUNTIME_DIR": "/other"},
+            },
+        }
         e = inspect.edges({10}, inspect.Snapshot("", "", ""), info)
         self.assertEqual(e[10][0]["kind"], "podman_pause")
         self.assertEqual(e[10][0]["peers"], [11])
 
     def test_podman_conmon_inside_set_is_not_outside(self):
-        info = {"comm": {10: "catatonit", 11: "conmon"},
-                "environ": {10: {"XDG_RUNTIME_DIR": "/r"}, 11: {"XDG_RUNTIME_DIR": "/r"}}}
-        self.assertEqual(inspect.edges({10, 11}, inspect.Snapshot("", "", ""), info), {})
+        info = {
+            "comm": {10: "catatonit", 11: "conmon"},
+            "environ": {10: {"XDG_RUNTIME_DIR": "/r"}, 11: {"XDG_RUNTIME_DIR": "/r"}},
+        }
+        self.assertEqual(
+            inspect.edges({10, 11}, inspect.Snapshot("", "", ""), info), {}
+        )
 
     def test_ptrace_from_outside(self):
         info = {"comm": {5: "x"}, "tracer": {5: 99}, "environ": {}}
@@ -88,14 +163,93 @@ class OtherEdges(unittest.TestCase):
 
 
 class Parse(unittest.TestCase):
+    def test_runtime_identity_reads_container_and_guest_names_from_argv(self):
+        with (
+            mock.patch.object(
+                inspect,
+                "comm",
+                side_effect={10: "conmon", 20: "qemu-system-x86"}.__getitem__,
+            ),
+            mock.patch.object(
+                inspect,
+                "argv",
+                side_effect={
+                    10: ["conmon", "-c", "container-id"],
+                    20: ["qemu-system-x86", "-name=guest=work-vm,debug-threads=on"],
+                }.__getitem__,
+            ),
+        ):
+            self.assertEqual(
+                inspect.runtime_identity(10), {"container": "container-id"}
+            )
+            self.assertEqual(inspect.runtime_identity(20), {"domain": "work-vm"})
+
+    def test_qmp_socket_paths_are_read_from_argv_without_a_runtime_cli(self):
+        with mock.patch.object(
+            inspect,
+            "argv",
+            return_value=[
+                "qemu-system-x86_64",
+                "-qmp",
+                "unix:/run/user/1000/libvirt/qemu/vm.monitor,server=on,wait=off",
+                "-monitor=unix:/tmp/monitor.sock,server=on",
+                "-chardev",
+                "socket,id=charmonitor,path=/run/user/1000/libvirt/qemu/chardev.monitor,server=on",
+                "-mon",
+                "chardev=charmonitor,id=monitor,mode=control",
+                "-chardev=socket,id=human,path=/tmp/human.monitor,server=on",
+                "-mon=chardev=human,id=human-monitor,mode=readline",
+            ],
+        ):
+            self.assertEqual(
+                inspect.qmp_socket_paths(42),
+                [
+                    "/run/user/1000/libvirt/qemu/vm.monitor",
+                    "/tmp/monitor.sock",
+                    "/run/user/1000/libvirt/qemu/chardev.monitor",
+                ],
+            )
+
     def test_parse_real_format(self):
         txt = 'u_str ESTAB 0      0                                                         * 2302403             * 2302404  users:(("herdr",pid=11549,fd=11),("herdr",pid=11549,fd=9))'
         r = inspect.parse_ss_unix(txt)[0]
-        self.assertEqual((r["inode"], r["peer_inode"], r["pids"], r["path"]), (2302403, 2302404, {11549}, ""))
+        self.assertEqual(
+            (
+                r["inode"],
+                r["peer_inode"],
+                r["pids"],
+                r["path"],
+                r["recv_q"],
+                r["send_q"],
+            ),
+            (2302403, 2302404, {11549}, "", 0, 0),
+        )
+
+    def test_parse_unix_listener_queue_and_socket_inode(self):
+        row = inspect.parse_ss_unix(
+            'u_str LISTEN 0 8 /run/user/1000/test.sock 64634660 * 0 '
+            'users:(("python3",pid=42,fd=3)) <-> ino:19010946 dev:0/66306 peers:'
+        )[0]
+        self.assertEqual(
+            (row["state"], row["inode"], row["recv_q"], row["send_q"], row["path"]),
+            ("LISTEN", 64634660, 0, 8, "/run/user/1000/test.sock"),
+        )
 
     def test_parse_tcp_no_users(self):
-        r = inspect.parse_ss_tcp("LISTEN 0      128          0.0.0.0:22         0.0.0.0:*")[0]
-        self.assertEqual((r["local"], r["pids"]), ("0.0.0.0:22", set()))
+        r = inspect.parse_ss_tcp(
+            "LISTEN 0      128          0.0.0.0:22         0.0.0.0:*"
+        )[0]
+        self.assertEqual(
+            (r["local"], r["pids"], r["recv_q"], r["send_q"]),
+            ("0.0.0.0:22", set(), 0, 128),
+        )
+
+    def test_parse_tcp_extended_inode(self):
+        row = inspect.parse_ss_tcp(
+            'ESTAB 0 0 127.0.0.1:80 127.0.0.1:5555 '
+            'users:(("browser",pid=55,fd=8)) uid:1000 ino:12345 sk:abc'
+        )[0]
+        self.assertEqual((row["pids"], row["inode"]), ({55}, 12345))
 
 
 if __name__ == "__main__":

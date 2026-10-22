@@ -26,7 +26,8 @@ session_cgroup = "auto"
 [timers]
 adopt_interval = 15      # seconds between adopt passes
 gc_interval = 60         # seconds between GC passes
-idle_grace = 600         # seconds a shared scope must stay unused before GC stops it
+idle_grace = 600         # seconds a shared or stop_when_unneeded scope must stay unused before GC
+leftover_expire_days = 0 # off; positive days opt into expiry for aged, idle leftovers
 graceful_timeout = 10    # seconds between SIGTERM and SIGKILL
 respawn_window = 60      # seconds: a kill followed by the same exe reappearing counts as "needed"
 
@@ -64,3 +65,11 @@ share = ["catatonit", "conmon", "adb", "herdr", "GradleDaemon", "kotlin-daemon"]
 # Long-lived by design: never garbage-collected as idle, only stopped by an explicit answer.
 persist = ["tmux", "screen", "zellij", "abduco", "dtach", "mosh-server", "ssh-agent", "gpg-agent", "keyboxd", "dirmngr"]
 kill = ["qemu-system-x86_64", "qemu-system-x86_64-headless", "emulator", "node", "python3", "java"]
+
+# Learner hygiene: names that must never own a learned (owner, leftover) pair. Generic thread
+# names, digit-led names, shells, trivial commands and scriptless interpreters are always
+# rejected; entries here extend that built-in list (shell-style globs allowed), and a user
+# file may only add to the list set here. Launcher jobs and closes with no real application
+# ancestor are recorded as noise instead of pairs.
+# [learner]
+# deny_owners = ["gpu-render", "wrapper-*"]

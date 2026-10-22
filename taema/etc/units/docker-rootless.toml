@@ -1,0 +1,26 @@
+# Rootless Docker daemon and its per-user runtime socket.
+# Container shims keep this scope alive while any container is running.
+[unit]
+name = "app-docker-rootless"
+kind = "app"
+class = "container"
+group_by_env = "XDG_RUNTIME_DIR"
+stop_when_unneeded = true
+
+[match]
+comm = "dockerd"
+
+[mem]
+class = "container"
+
+[gc]
+env_dir_missing = "XDG_RUNTIME_DIR"
+keep_while_children = true
+no_attach_grace = 120
+socket_env = "XDG_RUNTIME_DIR"
+socket_path = "docker.sock"
+quit_process_missing = "containerd-shim*"
+
+[kill]
+survive_logout = true
+graceful = 5

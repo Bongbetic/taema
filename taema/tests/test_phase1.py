@@ -1,14 +1,21 @@
 """Phase 1 tests: one proc snapshot per pass, fork gate, lazy ss, deadline loop, empty leaves,
 store bounds, log dedupe/rotation, direct cgroup moves."""
+
 import json
 import os
 import select
 import shutil
+import subprocess
+import sys
 import time
 import unittest
 from unittest import mock
 
-from taema import cgroup, daemon, engine, inspect, knowledge, policy
+from taema.daemon import service as daemon
+from taema.core import cgroup, process as inspect
+from taema.governor import engine
+from taema.store import knowledge
+from taema.config import policy
 from tests.test_phase0 import FakeCg, OkSnap, UID, make_cfg, tmp
 
 
@@ -20,13 +27,23 @@ def write(path, text):
 
 def stat_line(pid, ppid, state="S", pgrp=None, sid=None, tty=0, start=100):
     return "%d (c m)d) %s %d %d %d %d -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %d 0 0\n" % (
-        pid, state, ppid, pgrp or pid, sid or pid, tty, start)
+        pid,
+        state,
+        ppid,
+        pgrp or pid,
+        sid or pid,
+        tty,
+        start,
+    )
 
 
 def fake_proc(rows, loadavg=None):
     root = tmp()
     for pid, args in rows.items():
-        write("%s/%d/stat" % (root, pid), stat_line(pid, *args[:1], **args[1] if len(args) > 1 else {}))
+        write(
+            "%s/%d/stat" % (root, pid),
+            stat_line(pid, *args[:1], **args[1] if len(args) > 1 else {}),
+        )
     if loadavg:
         write(root + "/loadavg", loadavg)
     return root
@@ -34,18 +51,29 @@ def fake_proc(rows, loadavg=None):
 
 # ---- 1. ProcTable ------------------------------------------------------------------------------
 
+
 class ProcTableTests(unittest.TestCase):
     def test_fields_and_zombie_skip(self):
-        root = fake_proc({10: (1, {"pgrp": 10, "sid": 5, "tty": 34816, "start": 777}),
-                          11: (10,), 12: (10, {"state": "Z"})})
+        root = fake_proc(
+            {
+                10: (1, {"pgrp": 10, "sid": 5, "tty": 34816, "start": 777}),
+                11: (10,),
+                12: (10, {"state": "Z"}),
+            }
+        )
         with mock.patch.object(inspect, "PROC", root):
             pt = inspect.ProcTable.scan()
             self.assertEqual(sorted(pt.rows), [10, 11])
             r = pt.rows[10]
-            self.assertEqual((r.ppid, r.pgrp, r.sid, r.tty, r.start, r.state), (1, 10, 5, 34816, 777, "S"))
+            self.assertEqual(
+                (r.ppid, r.pgrp, r.sid, r.tty, r.start, r.state),
+                (1, 10, 5, 34816, 777, "S"),
+            )
             self.assertEqual(sorted(pt.descendants([10])), [10, 11])
             self.assertEqual(pt.ancestors(11), [10, 1])
-            self.assertEqual(inspect.ppid_map(), {10: 1, 11: 10})     # compatibility wrapper
+            self.assertEqual(
+                inspect.ppid_map(), {10: 1, 11: 10}
+            )  # compatibility wrapper
 
     def test_helpers_accept_table_or_map(self):
         pt = inspect.ProcTable.from_ppid({2: 1, 3: 2})
@@ -53,20 +81,34 @@ class ProcTableTests(unittest.TestCase):
         self.assertEqual(sorted(inspect.descendants([2], {2: 1, 3: 2})), [2, 3])
         self.assertEqual(inspect.ancestors(3, pt), [2, 1])
 
-    def test_one_scan_per_adopt_pass(self):
+    def test_queued_reconciliation_scans_proc_once(self):
         cg = FakeCg()
         with cg:
             d = daemon.Daemon(make_cfg(tmp()))
-            d.units = [{"unit": {"name": "app-x", "kind": "app"}, "match": {"comm": "x"},
-                        "children": [{"name": "s", "comm": "y"}]}]
-            with mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable.from_ppid({})) as sc, \
-                 mock.patch.object(inspect, "ppid_map") as old:
-                d.adopt_pass()
+            d.units = [
+                {
+                    "unit": {"name": "app-x", "kind": "app"},
+                    "match": {"comm": "x"},
+                    "children": [{"name": "s", "comm": "y"}],
+                }
+            ]
+            with (
+                mock.patch.object(
+                    inspect.ProcTable,
+                    "scan",
+                    return_value=inspect.ProcTable.from_ppid({}),
+                ) as sc,
+                mock.patch.object(inspect, "ppid_map") as old,
+                mock.patch.object(d, "session_ended", return_value=False),
+            ):
+                d.queue_collector_event(daemon.ProcessReconcile())
+                d.drain_collector_events()
             self.assertEqual(sc.call_count, 1)
             old.assert_not_called()
 
 
 # ---- 2. fork gate -------------------------------------------------------------------------------
+
 
 class ForkGate(unittest.TestCase):
     def setUp(self):
@@ -81,17 +123,23 @@ class ForkGate(unittest.TestCase):
         os.makedirs(self.cg.root + "/2")
         write(self.cg.root + "/2/cgroup.procs", "40\n")
         self.d = daemon.Daemon(make_cfg(tmp()))
-        self.d.units = [{"unit": {"name": "app-x", "kind": "app"}, "match": {"comm": "x"}}]
+        self.d.units = [
+            {"unit": {"name": "app-x", "kind": "app"}, "match": {"comm": "x"}}
+        ]
 
     def passes(self, n):
-        with mock.patch.object(daemon.engine, "adopt_plan", return_value=[]) as ap, \
-             mock.patch.object(inspect.ProcTable, "scan", return_value=inspect.ProcTable.from_ppid({})):
+        with (
+            mock.patch.object(daemon.engine, "adopt_plan", return_value=[]) as ap,
+            mock.patch.object(
+                inspect.ProcTable, "scan", return_value=inspect.ProcTable.from_ppid({})
+            ),
+        ):
             for _ in range(n):
                 self.d.adopt_pass()
         return ap.call_count
 
     def test_unchanged_passes_skipped_every_fifth_runs(self):
-        self.assertEqual(self.passes(10), 2)    # runs on #1 and #6
+        self.assertEqual(self.passes(10), 2)  # runs on #1 and #6
 
     def test_new_pid_or_session_member_runs(self):
         self.assertEqual(self.passes(3), 1)
@@ -108,25 +156,35 @@ class ForkGate(unittest.TestCase):
 
 # ---- 3. lazy / merged ss ----------------------------------------------------------------------------
 
+
 class LazySs(unittest.TestCase):
-    def test_snapshot_runs_two_ss_calls(self):
+    def test_snapshot_runs_socket_inventory_ss_calls(self):
         calls = []
-        tcp = "LISTEN 0 4096 127.0.0.1:80 0.0.0.0:* users:((\"a\",pid=5,fd=3))\n" \
-              "ESTAB 0 0 127.0.0.1:80 127.0.0.1:5555 users:((\"a\",pid=5,fd=4))\n"
-        with mock.patch.object(inspect, "_ss", side_effect=lambda *a: calls.append(a) or (tcp if "-tanp" in a else "")):
+        tcp = (
+            'LISTEN 0 4096 127.0.0.1:80 0.0.0.0:* users:(("a",pid=5,fd=3))\n'
+            'ESTAB 0 0 127.0.0.1:80 127.0.0.1:5555 users:(("a",pid=5,fd=4))\n'
+        )
+        with mock.patch.object(
+            inspect,
+            "_ss",
+            side_effect=lambda *a: calls.append(a)
+            or (tcp if "-tanpe" in a else ""),
+        ):
             s = inspect.Snapshot()
-        self.assertEqual(calls, [("-xapn",), ("-tanp",)])
+        self.assertEqual(calls, [("-xapne",), ("-tanpe",), ("-uanpe",)])
         self.assertEqual([r["state"] for r in s.tcp_listen], ["LISTEN"])
         self.assertEqual([r["state"] for r in s.tcp], ["ESTAB"])
         self.assertTrue(s.ok)
 
     def test_all_protected_builds_no_snapshot(self):
         store = knowledge.Store(tmp(), {})
-        with mock.patch.object(engine.cgroup, "tree_procs", return_value=[5, 6]), \
-             mock.patch.object(engine.policy, "protected_reason", return_value="x"), \
-             mock.patch.object(engine.policy, "exe_key", return_value="k"), \
-             mock.patch.object(engine.inspect, "comm", return_value="c"), \
-             mock.patch.object(engine.inspect, "Snapshot") as sn:
+        with (
+            mock.patch.object(engine.cgroup, "tree_procs", return_value=[5, 6]),
+            mock.patch.object(engine.policy, "protected_reason", return_value="x"),
+            mock.patch.object(engine.policy, "app_key", return_value="k"),
+            mock.patch.object(engine.inspect, "comm", return_value="c"),
+            mock.patch.object(engine.inspect, "Snapshot") as sn,
+        ):
             out = engine.plan_stop("/x", {}, store, pt=inspect.ProcTable.from_ppid({}))
         sn.assert_not_called()
         self.assertTrue(all(d["action"] == "skip" for d in out))
@@ -134,14 +192,18 @@ class LazySs(unittest.TestCase):
     def test_one_snapshot_across_passes(self):
         store = knowledge.Store(tmp(), {})
         lazy = inspect.LazySnapshot()
-        with mock.patch.object(engine.cgroup, "tree_procs", return_value=[5]), \
-             mock.patch.object(engine.policy, "protected_reason", return_value=None), \
-             mock.patch.object(engine.policy, "exe_key", return_value="k"), \
-             mock.patch.object(engine.inspect, "comm", return_value="c"), \
-             mock.patch.object(engine.inspect, "edges", return_value={}), \
-             mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()) as sn:
+        with (
+            mock.patch.object(engine.cgroup, "tree_procs", return_value=[5]),
+            mock.patch.object(engine.policy, "protected_reason", return_value=None),
+            mock.patch.object(engine.policy, "app_key", return_value="k"),
+            mock.patch.object(engine.inspect, "comm", return_value="c"),
+            mock.patch.object(engine.inspect, "edges", return_value={}),
+            mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()) as sn,
+        ):
             for _ in range(3):
-                engine.plan_stop("/x", {}, store, pt=inspect.ProcTable.from_ppid({5: 1}), snap=lazy)
+                engine.plan_stop(
+                    "/x", {}, store, pt=inspect.ProcTable.from_ppid({5: 1}), snap=lazy
+                )
         self.assertEqual(sn.call_count, 1)
 
     def test_gc_builds_snapshot_only_for_edge_checks(self):
@@ -149,21 +211,32 @@ class LazySs(unittest.TestCase):
             cg.leaf("shared/empty-1", [])
             cfg = make_cfg(tmp())
             store = knowledge.Store(tmp(), {})
-            with mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()) as sn:
+            with mock.patch.object(
+                engine.inspect, "Snapshot", return_value=OkSnap()
+            ) as sn:
                 out = engine.gc_candidates(cfg, [], store, {})
             self.assertEqual([w for _p, w in out], ["empty"])
             sn.assert_not_called()
             cg.leaf("shared/a-2", [7], cpu=1)
             cg.leaf("shared/b-3", [8], cpu=1)
-            with mock.patch.object(engine.inspect, "Snapshot", return_value=OkSnap()) as sn, \
-                 mock.patch.object(engine.inspect, "edges", return_value={}), \
-                 mock.patch.object(engine.inspect.ProcTable, "scan", return_value=inspect.ProcTable.from_ppid({})), \
-                 mock.patch.object(engine.policy, "exe_key", return_value="x"):
+            with (
+                mock.patch.object(
+                    engine.inspect, "Snapshot", return_value=OkSnap()
+                ) as sn,
+                mock.patch.object(engine.inspect, "edges", return_value={}),
+                mock.patch.object(
+                    engine.inspect.ProcTable,
+                    "scan",
+                    return_value=inspect.ProcTable.from_ppid({}),
+                ),
+                mock.patch.object(engine.policy, "app_key", return_value="x"),
+            ):
                 engine.gc_candidates(cfg, [], store, {})
             self.assertEqual(sn.call_count, 1)
 
 
 # ---- 4. deadline loop and session state ------------------------------------------------------------
+
 
 class DeadlineLoop(unittest.TestCase):
     def test_timeout_follows_next_timer(self):
@@ -172,9 +245,258 @@ class DeadlineLoop(unittest.TestCase):
         self.assertAlmostEqual(d.next_timeout(now=101.0), 14.0)
         d.last["adopt"] = 110.0
         self.assertAlmostEqual(d.next_timeout(now=124.0), 1.0)
-        self.assertEqual(d.next_timeout(now=500.0), 0.0)             # overdue
-        d.iv_adopt = d.iv_gc = 10 ** 6
+        self.assertEqual(d.next_timeout(now=500.0), 0.0)  # overdue
+        d.iv_adopt = d.iv_gc = 10**6
         self.assertEqual(d.next_timeout(now=101.0), daemon.MAX_SLEEP)
+
+    def test_pending_collector_event_wakes_loop_without_idle_spin(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.last = {"adopt": 1000.0, "gc": 1000.0}
+        d.iv_adopt = d.iv_gc = 10**6
+        now = 1001.0
+        self.assertEqual(d.next_timeout(now=now), daemon.MAX_SLEEP)
+        with mock.patch.object(d, "adopt_pass"):
+            d.queue_collector_event(daemon.ProcessReconcile())
+            self.assertEqual(d.next_timeout(now=now), 0.0)
+            d.drain_collector_events()
+        self.assertEqual(d.next_timeout(now=now), daemon.MAX_SLEEP)
+
+    def test_duplicate_process_reconciliation_events_are_coalesced(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        with (
+            mock.patch.object(d, "adopt_pass") as adopt,
+            mock.patch.object(d, "session_ended", return_value=False),
+        ):
+            event = daemon.ProcessReconcile()
+            d.queue_collector_event(event)
+            d.queue_collector_event(event)
+            d.drain_collector_events()
+        adopt.assert_called_once_with()
+
+    def test_duplicate_owner_exit_events_stop_the_leaf_once(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        fd = os.open(os.devnull, os.O_RDONLY)
+        watch = ("scope-owned", 7001, 42)
+        d.owners[fd] = watch
+        event = daemon.OwnerExited(fd, watch)
+        with (
+            mock.patch.object(d.sel, "unregister"),
+            mock.patch.object(d, "stop_leaf") as stop,
+        ):
+            d.queue_collector_event(event)
+            d.queue_collector_event(event)
+            d.drain_collector_events()
+        stop.assert_called_once_with("scope-owned", "owner 7001 exited", owner=7001)
+        self.assertNotIn(fd, d.owners)
+
+    def test_stale_owner_exit_event_does_not_stop_reused_watch(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        fd = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        old_watch = ("scope-old", 7001, 42)
+        current_watch = ("scope-new", 7002, 99)
+        d.owners[fd] = current_watch
+        with mock.patch.object(d, "stop_leaf") as stop:
+            d.queue_collector_event(daemon.OwnerExited(fd, old_watch))
+            d.drain_collector_events()
+        stop.assert_not_called()
+        self.assertEqual(d.owners[fd], current_watch)
+
+    def test_collector_event_queue_has_a_fixed_bound(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        accepted = [
+            d.queue_collector_event(daemon.LeafFrozen(i, "leaf-%d" % i))
+            for i in range(daemon.MAX_COLLECTOR_EVENTS + 1)
+        ]
+        self.assertEqual(len(d.collector_events), daemon.MAX_COLLECTOR_EVENTS)
+        self.assertEqual(accepted[-1], False)
+        self.assertEqual(d.collector_event_drops, 1)
+
+    def test_tick_runs_proc_reconciliation_through_event_queue(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.last = {"adopt": time.time() - d.iv_adopt - 1, "gc": time.time()}
+        with (
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "adopt_pass") as adopt,
+            mock.patch.object(d, "session_ended", return_value=False),
+        ):
+            d.tick()
+        adopt.assert_called_once_with()
+
+    @unittest.skipUnless(hasattr(os, "pidfd_open"), "pidfds are unavailable")
+    def test_periodic_reconciliation_recovers_missed_pidfd_readiness(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE,
+        )
+        pidfd = os.pidfd_open(child.pid)
+        self.assertIsNotNone(child.stdin)
+        child.stdin.close()
+        child.wait(timeout=5)
+
+        def close_if_open():
+            try:
+                os.close(pidfd)
+            except OSError:
+                pass
+
+        self.addCleanup(close_if_open)
+        watch = ("scope-owned", child.pid, 42)
+        d.owners[pidfd] = watch
+        d.last = {"adopt": time.time() - d.iv_adopt - 1, "gc": time.time()}
+        with (
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "adopt_pass"),
+            mock.patch.object(d, "session_ended", return_value=False),
+            mock.patch.object(d.sel, "unregister"),
+            mock.patch.object(d, "stop_leaf") as stop,
+        ):
+            d.tick()
+        stop.assert_called_once_with(
+            "scope-owned", "owner %d exited" % child.pid, owner=child.pid
+        )
+        self.assertNotIn(pidfd, d.owners)
+
+    def test_idle_run_uses_bounded_wakeups_for_periodic_reconciliation(self):
+        with FakeCg() as cg:
+            d = daemon.Daemon(make_cfg(tmp()))
+            now = [1000.0]
+            d.last = {"adopt": now[0], "gc": now[0]}
+            d.iv_adopt = 120
+            d.iv_gc = 180
+            leaf_dir = cg.leaf("app-busy", [5])
+            events_path = leaf_dir + "/cgroup.events"
+            write(events_path, "populated 1\nfrozen 0\n")
+            leaf_file = open(events_path)
+            self.addCleanup(leaf_file.close)
+
+            class CountedEventFile:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+                    self.reads = 0
+
+                def fileno(self):
+                    return self.wrapped.fileno()
+
+                def seek(self, *args):
+                    return self.wrapped.seek(*args)
+
+                def read(self, *args):
+                    self.reads += 1
+                    return self.wrapped.read(*args)
+
+            watched_events = CountedEventFile(leaf_file)
+            d.leaf_watch[leaf_file.fileno()] = ("app-busy", watched_events)
+            d.leaf_frozen["app-busy"] = False
+
+            owner_fd, owner_writer = os.pipe()
+            os.write(owner_writer, b"ready")
+            os.close(owner_writer)
+            idle_owner_fd, idle_owner_writer = os.pipe()
+
+            def close_if_open(fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+            self.addCleanup(close_if_open, owner_fd)
+            self.addCleanup(close_if_open, idle_owner_fd)
+            self.addCleanup(close_if_open, idle_owner_writer)
+            d.owners[owner_fd] = ("scope-owned", 7001, 42)
+            d.owners[idle_owner_fd] = ("scope-idle", 7002, 43)
+            waits = []
+            poll_cost = {"instances": 0, "registrations": 0, "polls": 0}
+            real_poll = daemon.select.poll
+
+            class CountedPoll:
+                def __init__(self):
+                    poll_cost["instances"] += 1
+                    self.wrapped = real_poll()
+
+                def register(self, fd, events):
+                    poll_cost["registrations"] += 1
+                    return self.wrapped.register(fd, events)
+
+                def poll(self, *args):
+                    poll_cost["polls"] += 1
+                    return self.wrapped.poll(*args)
+
+            class IdleSelector:
+                def register(self, *_args, **_kwargs):
+                    pass
+
+                def unregister(self, *_args, **_kwargs):
+                    pass
+
+                def select(self, timeout):
+                    waits.append(timeout)
+                    now[0] += timeout
+                    if now[0] >= 1180.0:
+                        # Simulate a cgroup transition whose EPOLLPRI event is missed.
+                        write(events_path, "populated 1\nfrozen 1\n")
+                    if len(waits) == 3:
+                        d.stopping = True
+                    return []
+
+            real_selector = d.sel
+            self.addCleanup(real_selector.close)
+            d.sel = IdleSelector()
+            wake_r, wake_w = daemon.socket.socketpair()
+            self.addCleanup(wake_r.close)
+            self.addCleanup(wake_w.close)
+            d.stopping = False
+            with (
+                mock.patch.object(daemon.signal, "signal"),
+                mock.patch.object(daemon.signal, "set_wakeup_fd"),
+                mock.patch.object(daemon.select, "poll", CountedPoll),
+                mock.patch.object(daemon.time, "time", side_effect=lambda: now[0]),
+                mock.patch.object(
+                    daemon.socket, "socketpair", return_value=(wake_r, wake_w)
+                ),
+                mock.patch.object(d, "check_socket"),
+                mock.patch.object(d, "session_ended", return_value=False),
+                mock.patch.object(d, "stop_leaf"),
+                mock.patch.object(engine, "gc_candidates", return_value=[]),
+                mock.patch.object(
+                    inspect.ProcTable,
+                    "scan",
+                    return_value=inspect.ProcTable.from_ppid({}),
+                ) as proc_scan,
+                mock.patch.object(d, "tick", wraps=d.tick) as tick,
+                mock.patch.object(d, "adopt_pass", wraps=d.adopt_pass) as adopt,
+                mock.patch.object(d, "gc_pass", wraps=d.gc_pass) as gc_pass,
+                mock.patch.object(
+                    d, "poll_owner_watches", wraps=d.poll_owner_watches
+                ) as poll_owners,
+                mock.patch.object(d.store, "log"),
+                mock.patch.object(d.store, "save"),
+                mock.patch.object(d.store, "save_if_dirty"),
+                mock.patch.object(d.store, "export_daily_if_due"),
+                mock.patch.object(d, "_write_summary_if_dirty"),
+            ):
+                self.assertEqual(d.run(), 0)
+
+            # Over 180 simulated idle seconds, select blocks for exactly three bounded
+            # intervals: one wake per minute, with no zero-timeout busy-spin iterations.
+            self.assertEqual(waits, [daemon.MAX_SLEEP] * 3)
+            self.assertEqual(now[0], 1180.0)
+            # Bound periodic CPU work as operations: three ticks, one owner poll
+            # registering two pidfds, one proc snapshot, and one watched-leaf read.
+            self.assertEqual(tick.call_count, len(waits))
+            adopt.assert_called_once()
+            gc_pass.assert_called_once()
+            poll_owners.assert_called_once_with()
+            proc_scan.assert_called_once_with()
+            self.assertEqual(
+                poll_cost, {"instances": 1, "registrations": 2, "polls": 1}
+            )
+            self.assertEqual(watched_events.reads, 1)
+            self.assertIs(d.leaf_frozen["app-busy"], True)
+            self.assertNotIn(owner_fd, d.owners)
+            self.assertIn(idle_owner_fd, d.owners)
+            self.assertFalse(d.collector_events)
 
     def test_session_state_file(self):
         root = tmp()
@@ -185,7 +507,9 @@ class DeadlineLoop(unittest.TestCase):
             self.assertFalse(d.session_ended())
             self.assertTrue(d.session_seen)
             write("%s/%d" % (root, UID), "STATE=offline\nSESSIONS=\n")
-            with mock.patch.object(policy, "session_cgroups", side_effect=AssertionError("scanned")):
+            with mock.patch.object(
+                policy, "session_cgroups", side_effect=AssertionError("scanned")
+            ):
                 self.assertTrue(d.session_ended())
         with mock.patch.object(policy, "USERS_DIR", tmp()):
             self.assertIsNone(policy.session_state())
@@ -193,8 +517,11 @@ class DeadlineLoop(unittest.TestCase):
     def test_session_check_runs_at_adopt_interval(self):
         d = daemon.Daemon(make_cfg(tmp()))
         d.last["gc"] = time.time()
-        with mock.patch.object(d, "session_ended", return_value=False) as se, \
-             mock.patch.object(d, "check_socket"), mock.patch.object(d, "adopt_pass"):
+        with (
+            mock.patch.object(d, "session_ended", return_value=False) as se,
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "adopt_pass"),
+        ):
             d.tick()
             d.tick()
         self.assertEqual(se.call_count, 1)
@@ -204,6 +531,7 @@ class DeadlineLoop(unittest.TestCase):
 
 
 # ---- 5. empty leaves ------------------------------------------------------------------------------
+
 
 class EmptyLeaves(unittest.TestCase):
     def setUp(self):
@@ -229,15 +557,22 @@ class EmptyLeaves(unittest.TestCase):
         return os.path.isdir("%s/%s" % (self.cg.base, rel))
 
     def test_candidates_include_empty_never_manager(self):
-        out = dict((cgroup.rel(p), w) for p, w in engine.gc_candidates(make_cfg(tmp()), [], knowledge.Store(tmp(), {}), {}))
-        self.assertEqual(sorted(out), ["app-gone", "app-hollow", "scope-gone", "shared/gone-1"])
+        out = dict(
+            (cgroup.rel(p), w)
+            for p, w in engine.gc_candidates(
+                make_cfg(tmp()), [], knowledge.Store(tmp(), {}), {}
+            )
+        )
+        self.assertEqual(
+            sorted(out), ["app-gone", "app-hollow", "scope-gone", "shared/gone-1"]
+        )
         self.assertTrue(all(w == "empty" for w in out.values()))
 
     def test_gc_pass_fallback_removes_on_second_pass(self):
         d = self.daemon("adopt")
         d.gc_pass()
         for rel in ("app-gone", "scope-gone", "shared/gone-1", "app-hollow"):
-            self.assertTrue(self.exists(rel), rel)           # first sighting: kept
+            self.assertTrue(self.exists(rel), rel)  # first sighting: kept
         d.gc_pass()
         for rel in ("app-gone", "scope-gone", "shared/gone-1", "app-hollow"):
             self.assertFalse(self.exists(rel), rel)
@@ -266,7 +601,7 @@ class EmptyLeaves(unittest.TestCase):
     def test_unwatchable_leaf_falls_back(self):
         d = self.daemon("adopt")
         d.gc_pass()
-        self.assertIn("app-gone", d.leaf_nowatch)             # no cgroup.events in the fake tree
+        self.assertIn("app-gone", d.leaf_nowatch)  # no cgroup.events in the fake tree
         self.assertEqual(d.leaf_watch, {})
 
     def test_events_handler_removes_on_populated_0(self):
@@ -295,6 +630,83 @@ class EmptyLeaves(unittest.TestCase):
         self.assertTrue(self.exists("app-busy"))
         self.assertIn(f.fileno(), d.leaf_watch)
 
+    def test_stale_empty_event_does_not_remove_a_repopulated_leaf(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-busy/cgroup.events"
+        write(ev, "populated 1\nfrozen 1\n")
+        f = open(ev)
+        self.addCleanup(f.close)
+        d.leaf_ep = mock.Mock()
+        d.leaf_watch[f.fileno()] = ("app-busy", f)
+        d.queue_collector_event(daemon.LeafEmpty(f.fileno(), "app-busy"))
+        with mock.patch.object(d, "remove_leaf") as remove:
+            d.drain_collector_events()
+        remove.assert_not_called()
+        self.assertTrue(self.exists("app-busy"))
+        self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_frozen_event_uses_current_leaf_state(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-busy/cgroup.events"
+        write(ev, "populated 1\nfrozen 1\n")
+        f = open(ev)
+        self.addCleanup(f.close)
+        d.leaf_ep = mock.Mock()
+        d.leaf_watch[f.fileno()] = ("app-busy", f)
+        d.leaf_frozen["app-busy"] = False
+        d.queue_collector_event(daemon.LeafFrozen(f.fileno(), "app-busy"))
+        d.drain_collector_events()
+        self.assertIs(d.leaf_frozen["app-busy"], True)
+        self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_gc_reconciliation_repairs_a_missed_frozen_transition(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-busy/cgroup.events"
+        write(ev, "populated 1\nfrozen 0\n")
+        f = open(ev)
+        self.addCleanup(f.close)
+        d.leaf_watch[f.fileno()] = ("app-busy", f)
+        d.leaf_frozen["app-busy"] = False
+
+        # The source changes without a LeafFrozen event reaching the collector queue.
+        write(ev, "populated 1\nfrozen 1\n")
+        self.assertFalse(d.collector_events)
+        with mock.patch.object(engine, "gc_candidates", return_value=[]):
+            d.queue_collector_event(daemon.LeafReconcile())
+            d.drain_collector_events()
+
+        self.assertIs(d.leaf_frozen["app-busy"], True)
+        self.assertIn(f.fileno(), d.leaf_watch)
+
+    def test_duplicate_leaf_empty_event_is_harmless(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-gone/cgroup.events"
+        write(ev, "populated 0\nfrozen 0\n")
+        f = open(ev)
+        fd = f.fileno()
+        d.leaf_ep = mock.Mock()
+        d.leaf_watch[fd] = ("app-gone", f)
+        event = daemon.LeafEmpty(fd, "app-gone")
+        d.queue_collector_event(event)
+        d.queue_collector_event(event)
+        with mock.patch.object(d, "remove_leaf", return_value=True) as remove:
+            d.drain_collector_events()
+        remove.assert_called_once_with(self.cg.base + "/app-gone", "populated 0")
+        self.assertNotIn(fd, d.leaf_watch)
+
+    def test_reconciliation_removes_leaf_after_empty_event_is_missed(self):
+        d = self.daemon("adopt")
+        ev = self.cg.base + "/app-gone/cgroup.events"
+        write(ev, "populated 0\nfrozen 0\n")
+        # The watch cannot deliver the transition, so reconciliation records one empty
+        # observation; only the following confirmation pass may remove the leaf.
+        d.gc_pass()
+        self.assertTrue(self.exists("app-gone"))
+        self.assertIn("app-gone", d.empty_seen)
+        d.gc_pass()
+        self.assertFalse(self.exists("app-gone"))
+        self.assertNotIn("app-gone", d.empty_seen)
+
     def test_regular_file_cannot_be_epolled_falls_back(self):
         """cgroupfs files accept EPOLLPRI; a regular file does not (EPERM) and must fall back."""
         d = self.daemon("adopt")
@@ -305,18 +717,21 @@ class EmptyLeaves(unittest.TestCase):
 
 # ---- 6. store bounds ------------------------------------------------------------------------------------
 
+
 class StoreBounds(unittest.TestCase):
     def setUp(self):
         self.t = [1e7]
         self.store = knowledge.Store(tmp(), {}, now=lambda: self.t[0])
 
-    def test_compact_json_and_save_interval(self):
+    def test_sqlite_state_and_save_interval(self):
         self.store.bump("a", "seen")
         self.assertTrue(self.store.save_if_dirty(300))
-        with open(self.store.path) as f:
-            raw = f.read()
-        self.assertNotIn("\n", raw)
-        self.assertNotIn(" ", raw)
+        self.assertEqual(
+            knowledge.Store(self.store.dir, {}, now=lambda: self.t[0]).peek("a")[
+                "seen"
+            ],
+            1,
+        )
         self.store.bump("a", "seen")
         self.t[0] += 100
         self.assertFalse(self.store.save_if_dirty(300))
@@ -324,12 +739,47 @@ class StoreBounds(unittest.TestCase):
         self.t[0] += 250
         self.assertTrue(self.store.save_if_dirty(300))
 
+    def test_daemon_commits_routine_state_once_at_end_of_tick(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.store.bump("a", "seen")
+        d.last = {"adopt": time.time(), "gc": time.time()}
+        with (
+            mock.patch.object(d, "check_socket"),
+            mock.patch.object(d, "run_deadlines"),
+            mock.patch.object(
+                d.store.db, "save_state", wraps=d.store.db.save_state
+            ) as save,
+        ):
+            d.tick()
+        save.assert_called_once()
+
+    def test_gc_command_defers_pass_writes_then_commits_once(self):
+        d = daemon.Daemon(make_cfg(tmp()))
+        d.store.bump("a", "seen")
+        with (
+            mock.patch.object(d, "gc_pass", return_value=["candidate"]),
+            mock.patch.object(
+                d.store.db, "save_state", wraps=d.store.db.save_state
+            ) as save,
+        ):
+            self.assertEqual(
+                d.handle({"cmd": "gc", "dry_run": True}),
+                {"candidates": ["candidate"]},
+            )
+        save.assert_called_once()
+        self.assertFalse(d.store.defer_writes)
+
     def test_explicit_feedback_saves_at_once(self):
         d = daemon.Daemon(make_cfg(tmp()))
         d.store.save()
         d.store.last_save = time.time()
-        self.assertEqual(d.handle({"cmd": "feedback", "op": "keep", "key": "k"}), {"ok": True})
+        d.store.defer_writes = True
+        self.assertEqual(
+            d.handle({"cmd": "feedback", "op": "keep", "key": "k"}), {"ok": True}
+        )
         self.assertFalse(d.store.dirty)
+        reopened = knowledge.Store(d.store.dir, {}, read_only=True)
+        self.assertEqual(reopened.peek("k")["user_keep"], 3.0)
 
     def test_all_zero_records_dropped(self):
         self.store.rec("zero")
@@ -340,7 +790,9 @@ class StoreBounds(unittest.TestCase):
     def test_cap_evicts_stale_then_lowest_weight(self):
         for i in range(knowledge.MAX_EXES):
             self.store.bump("k%d" % i, "seen", 1.0 + i)
-        self.store.data["exes"]["k511"]["last_seen"] = self.t[0] - 91 * 86400    # stale but heaviest
+        self.store.data["exes"]["k511"]["last_seen"] = (
+            self.t[0] - 91 * 86400
+        )  # stale but heaviest
         self.store.bump("new", "seen", 100.0)
         self.store.data["exes"]["new"]["last_seen"] = self.t[0]
         self.store.enforce_caps()
@@ -354,7 +806,7 @@ class StoreBounds(unittest.TestCase):
         self.store.bump("newer", "seen", 100.0)
         self.store.enforce_caps()
         self.assertEqual(len(self.store.data["exes"]), knowledge.MAX_EXES)
-        self.assertNotIn("k0", self.store.data["exes"])           # lowest weight went
+        self.assertNotIn("k0", self.store.data["exes"])  # lowest weight went
 
     def test_gc_pass_decays_and_prunes_idle(self):
         d = daemon.Daemon(make_cfg(tmp()))
@@ -365,7 +817,7 @@ class StoreBounds(unittest.TestCase):
         d.idle_since["shared/gone-1"] = 5.0
         with FakeCg():
             d.gc_pass()
-        self.assertAlmostEqual(d.store.peek("a")["seen"], 10.0 * 0.9 ** 2)
+        self.assertAlmostEqual(d.store.peek("a")["seen"], 10.0 * 0.9**2)
         self.assertEqual(d.idle_since, {})
 
     def test_owner_watch_cap(self):
@@ -377,17 +829,21 @@ class StoreBounds(unittest.TestCase):
 
 # ---- 7. decisions.log -----------------------------------------------------------------------------------
 
+
 class DecisionLog(unittest.TestCase):
     def test_adopt_would_only_on_change(self):
         store = knowledge.Store(tmp(), {})
         cfg = make_cfg(tmp())
 
         def ops(pids):
-            return [{"op": "move", "scope": "app-x", "unit": "app-x", "pids": list(pids)}]
+            return [
+                {"op": "move", "scope": "app-x", "unit": "app-x", "pids": list(pids)}
+            ]
+
         with mock.patch.object(engine.policy, "protected_reason", return_value=None):
             for pids in ([1, 2], [2, 1], [1, 2], [1, 2, 3], [1, 2, 3]):
                 engine.run_ops(cfg, store, ops(pids), False)
-            engine.run_ops(cfg, store, [], False)       # scope vanished: signature forgotten
+            engine.run_ops(cfg, store, [], False)  # scope vanished: signature forgotten
             engine.run_ops(cfg, store, ops([1, 2, 3]), False)
         with open(store.log_path) as f:
             self.assertEqual(f.read().count("adopt_would"), 3)
@@ -405,16 +861,27 @@ class DecisionLog(unittest.TestCase):
 
 # ---- 8. direct moves ------------------------------------------------------------------------------------
 
+
 class DirectMoves(unittest.TestCase):
     def run_it(self, where, op="move"):
         with FakeCg():
             store = knowledge.Store(tmp(), {})
-            o = {"op": op, "scope": "app-x", "unit": "app-x", "pids": [10, 11], "root": 10}
-            with mock.patch.object(engine.policy, "protected_reason", return_value=None), \
-                 mock.patch.object(engine.cgroup, "proc_cgroup", side_effect=lambda p: where[p]), \
-                 mock.patch.object(engine.cgroup, "move", return_value=True) as mv, \
-                 mock.patch.object(engine.inspect, "descendants", return_value=[]), \
-                 mock.patch.object(engine, "helper_move") as hm:
+            o = {
+                "op": op,
+                "scope": "app-x",
+                "unit": "app-x",
+                "pids": [10, 11],
+                "root": 10,
+            }
+            with (
+                mock.patch.object(engine.policy, "protected_reason", return_value=None),
+                mock.patch.object(
+                    engine.cgroup, "proc_cgroup", side_effect=lambda p: where[p]
+                ),
+                mock.patch.object(engine.cgroup, "move", return_value=True) as mv,
+                mock.patch.object(engine.inspect, "descendants", return_value=[]),
+                mock.patch.object(engine, "helper_move") as hm,
+            ):
                 engine.run_ops(make_cfg(tmp()), store, [o], True)
         return mv, hm
 

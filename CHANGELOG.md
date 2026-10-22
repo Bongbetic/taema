@@ -1,3 +1,31 @@
+# 0.5.0
+
+## Behaviour changes
+
+### memory accounting and reclaim
+
+The memory view reports cgroup current and peak use, detailed `memory.stat` fields, swap and
+zswap use, pressure, and high/max events. Where the kernel omits peak accounting, the daemon
+keeps a sampled high-water mark. The daemon applies soft `memory.low` and `memory.high` budgets,
+and keeps hard `memory.max` caps opt-in. Reclaim prefers file cache, then eligible Taema-frozen
+anonymous memory, with a `memory.high` fallback on kernels without `memory.reclaim`.
+
+### pressure guard and idle freezes
+
+The opt-in pressure guard reacts to memory PSI or a configurable available-memory floor. It
+reclaims page cache, freezes eligible leftovers, then reclaims anonymous memory only from scopes
+it froze before considering an authorized stop. Listener freezes can wake on a pending connection.
+OOM priority adjustments for leftovers and shared helpers are recorded and restored with their
+original values.
+
+### diagnostics and release acceptance
+
+`taema doctor` reports the cgroup controls, accounting fields, pressure, swap/zswap state, OOM
+adjustment and helper support, and active OOM handlers with named non-fatal portability findings.
+The opt-in M3 disposable-VM scenario exercises wake-on-connect and bounded memory pressure with
+earlyoom installed only inside the guest; running it requires `vmh run --scenarios m3
+--allow-network`.
+
 # 0.4.0
 
 ## Behaviour changes

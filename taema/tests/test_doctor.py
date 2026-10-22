@@ -50,13 +50,18 @@ class DoctorChecks(unittest.TestCase):
         self.write(self.base + "/cgroup.subtree_control", "+cpu +io +memory +pids\n")
         for name, value in (
             ("memory.current", "0\n"),
-            ("memory.stat", "anon 0\nfile 0\ninactive_file 0\nshmem 0\n"),
+            (
+                "memory.stat",
+                "anon 0\nfile 0\ninactive_file 0\nshmem 0\nslab 0\n",
+            ),
             ("memory.peak", "0\n"),
             ("memory.reclaim", ""),
             ("memory.high", "max\n"),
+            ("memory.low", "0\n"),
             ("memory.max", "max\n"),
             ("memory.events", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"),
             ("memory.events.local", "oom 0\noom_kill 0\n"),
+            ("memory.oom.group", "1\n"),
             ("memory.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
             ("cgroup.freeze", "0\n"),
             ("cpu.idle", "0\n"),
@@ -81,7 +86,7 @@ class DoctorChecks(unittest.TestCase):
             "taema:x:%d:%s\n" % (self.group_gid, self.user),
         )
         helper = self.system_root + policy.HELPER
-        self.write(helper, "#!/bin/sh\nexit 0\n")
+        self.write(helper, "#!/bin/sh\n# oom-record oom-restore\nexit 0\n")
         os.chmod(helper, 0o755)
         self.write(
             self.system_root + "/etc/sudoers.d/taema",
@@ -95,6 +100,7 @@ class DoctorChecks(unittest.TestCase):
         os.makedirs(active_parent)
         os.symlink("../../etc/sv/taema", active_parent + "/taema")
         self.write(self.system_root + "/sys/module/zswap/parameters/enabled", "Y\n")
+        self.write(self.system_root + "/proc/self/oom_score_adj", "0\n")
         self.write(
             self.system_root + "/proc/swaps",
             "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1048576\t0\t-2\n",
@@ -133,7 +139,21 @@ class DoctorChecks(unittest.TestCase):
         return next(item for item in report["checks"] if item["name"] == name)
 
     def test_complete_report_checks_fake_process_tree_and_has_one_line_fixes(self):
-        report = self.report()
+        class WritableTriggerProbe:
+            metrics = ("some", "full")
+
+            def open_triggers(self, _path, _settings):
+                return []
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            doctor.pressure_guard,
+            "PsiTriggerMonitor",
+            return_value=WritableTriggerProbe(),
+        ):
+            report = self.report()
         self.assertEqual(report["schema"], "taema.doctor.v1")
         self.assertEqual(report["status"], "ok")
         self.assertTrue(all(item["status"] == "ok" for item in report["checks"]))
@@ -263,18 +283,53 @@ class DoctorChecks(unittest.TestCase):
         self.assertTrue(
             {
                 "memory accounting",
+                "memory.stat breakdown",
                 "memory peak usage",
                 "memory pressure",
+                "guard PSI triggers",
                 "memory reclaim",
                 "memory soft cap",
+                "memory low protection",
                 "memory hard cap",
+                "memory OOM group",
                 "swap accounting",
                 "zswap accounting",
                 "memory OOM events",
+                "memory high events",
+                "memory max events",
+                "OOM score adjustment",
+                "OOM restore helper",
             }
             <= names
         )
         self.assertEqual(self.check(report, "memory peak usage")["status"], "ok")
+        self.assertEqual(self.check(report, "memory.stat breakdown")["status"], "ok")
+        self.assertEqual(self.check(report, "memory high events")["status"], "ok")
+        self.assertEqual(self.check(report, "memory max events")["status"], "ok")
+        self.assertEqual(self.check(report, "memory OOM group")["status"], "ok")
+        self.assertEqual(self.check(report, "OOM score adjustment")["status"], "ok")
+        self.assertEqual(self.check(report, "OOM restore helper")["status"], "ok")
+        psi_triggers = self.check(report, "guard PSI triggers")
+        self.assertEqual(psi_triggers["status"], "warn")
+        self.assertIn("no writable PSI trigger source", psi_triggers["message"])
+
+    def test_missing_memory_breakdown_low_high_events_and_oom_restore_are_named(self):
+        self.write(self.base + "/memory.stat", "anon 0\nfile 0\n")
+        os.unlink(self.base + "/memory.low")
+        self.write(self.base + "/memory.events", "oom 0\noom_kill 0\n")
+        os.unlink(self.base + "/memory.oom.group")
+        os.unlink(self.system_root + "/proc/self/oom_score_adj")
+        self.write(self.system_root + policy.HELPER, "#!/bin/sh\nexit 0\n")
+        report = self.report()
+        self.assertEqual(self.check(report, "memory.stat breakdown")["status"], "warn")
+        self.assertIn("inactive_file", self.check(report, "memory.stat breakdown")["message"])
+        self.assertEqual(self.check(report, "memory low protection")["status"], "warn")
+        self.assertEqual(self.check(report, "memory high events")["status"], "warn")
+        self.assertEqual(self.check(report, "memory max events")["status"], "warn")
+        self.assertEqual(self.check(report, "memory OOM group")["status"], "warn")
+        self.assertEqual(self.check(report, "OOM score adjustment")["status"], "warn")
+        self.assertEqual(self.check(report, "OOM restore helper")["status"], "warn")
+        self.assertNotEqual(report["status"], "fail")
 
         os.unlink(self.base + "/memory.peak")
         os.unlink(self.base + "/memory.pressure")
@@ -306,12 +361,50 @@ class DoctorChecks(unittest.TestCase):
             report = self.report()
         for name in (
             "memory accounting",
+            "memory.stat breakdown",
             "memory peak usage",
             "memory pressure",
+            "guard PSI triggers",
+            "memory low protection",
+            "memory OOM group",
+            "memory OOM events",
+            "memory high events",
+            "memory max events",
         ):
             self.assertIn("disabled", self.check(report, name)["message"])
         self.assertIn("enabled", self.check(report, "zswap")["message"])
         self.assertIn("/swapfile", self.check(report, "swap devices")["message"])
+
+    def test_doctor_reports_writable_host_psi_fallback_after_cgroup_denial(self):
+        cgroup_path = self.base + "/memory.pressure"
+        proc_path = self.system_root + "/proc/pressure/memory"
+
+        class FakeMonitor:
+            def __init__(self):
+                self.metrics = ()
+
+            def open_triggers(self, path, _settings):
+                if path == cgroup_path:
+                    return [
+                        "some: PermissionError: cgroup trigger is not writable",
+                        "full: PermissionError: cgroup trigger is not writable",
+                    ]
+                self.metrics = ("some", "full")
+                return []
+
+            def close(self):
+                self.metrics = ()
+
+        with mock.patch.object(
+            doctor.pressure_guard, "PsiTriggerMonitor", FakeMonitor
+        ):
+            check = doctor._guard_psi_trigger_check(
+                self.cfg, self.base, self.system_root
+            )
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("writable PSI trigger source=host-proc", check["message"])
+        self.assertIn(proc_path, check["message"])
+        self.assertIn("delegated trigger unavailable", check["message"])
 
     def test_foreign_process_and_insecure_socket_fail_safely(self):
         with mock.patch.object(doctor.process, "uid_of", return_value=self.uid + 1):

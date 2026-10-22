@@ -337,6 +337,14 @@ Soft limits are protection and pressure signals; they do not transfer or pre-all
 memory. High controls change only when the requested value differs materially, and tæma restores
 the original value when a scope becomes active or leaves the managed set.
 
+`taema memory` reports `memory.current`, peak use, `memory.stat` anon/file/inactive-file/shmem/slab
+breakdowns, swap and zswap use, PSI, and `memory.events` high/max/OOM counters when the kernel
+exposes them. If `memory.peak` is missing, the daemon samples `memory.current` and keeps the
+sampled maximum. `taema doctor` names missing accounting fields, `memory.low`, `memory.oom.group`,
+reclaim controls and their fallback, swap/zswap support, event counters, cgroup controllers and
+freezer, OOM-score adjustment, and the helper operations used to restore OOM scores. Unsupported
+kernel features are reported as portability warnings; doctor does not write these controls.
+
 The default `[mem] manage = "soft"` does not apply unit `memory.max` caps. Hard caps require
 `[mem] manage = "hard"` in the user config and an explicit `[mem] max` in that unit's file,
 for example:
@@ -398,10 +406,13 @@ available.
 
 ### Pressure guard
 
-The experimental pressure guard reacts to user-cgroup PSI triggers (`some = 150ms/2s` and
-`full = 50ms/2s`) and to host `MemAvailable` dropping below `guard.available_floor`. The `auto`
-floor is earlyoom's configured `-m` threshold plus four percentage points, or 12% of installed
-memory when earlyoom is not running. It is gated by `[experimental] guard` and `[guard] enabled`.
+The experimental pressure guard reacts to PSI triggers (`some = 150ms/2s` and `full = 50ms/2s`)
+and to host `MemAvailable` dropping below `guard.available_floor`. It uses the delegated user-cgroup
+PSI trigger when writable, falling back to `/proc/pressure/memory` when the delegated trigger is
+unavailable. `taema doctor` reports the selected trigger source and whether it can register the
+configured triggers. The `auto` floor is earlyoom's configured `-m` threshold plus four percentage
+points, or 12% of installed memory when earlyoom is not running. It is gated by
+`[experimental] guard` and `[guard] enabled`.
 
 During pressure, tæma tries page-cache reclaim from idle scopes first, freezes eligible leftovers,
 reclaims anonymous memory only from scopes it froze, then stops one authorized scope at a time,
@@ -409,6 +420,11 @@ largest first. Each ladder step has a 10-second cooldown by default. The guard e
 soon as PSI and the available-memory floor clear. It never stops an unlearned scope; `observe` only
 records would-actions. In `adopt`, freezing also requires `guard.freeze_in_adopt = true`. Set
 `freeze.enabled = false` to prevent guard-triggered freezing.
+
+The opt-in `m3` disposable-VM release gate records `MemAvailable` and PSI at cache-reclaim and
+freeze events, and checks both actions precede the configured floor. It also compares live kernel
+OOM scores for an adjusted leftover and an equal-sized app peer while earlyoom runs in the guest.
+See [the VM harness instructions](docs/vm-harness.md) for its network opt-in and invocation.
 
 ```toml
 [experimental]

@@ -14,6 +14,7 @@ make -C taema vm-test                      # smoke + M0 acceptance on glibc + mu
 make -C taema vm-test VMFLAGS="--libc glibc"          # one libc only
 make -C taema vm-test VMFLAGS="--allow-network --scenarios all"
 make -C taema vm-test VMFLAGS="--allow-network --scenarios m1,m2,upgrade"  # M1/M2 release gate
+make -C taema vm-test VMFLAGS="--allow-network --libc glibc --scenarios m3"  # 0.5.0 memory release gate
 ```
 
 Equivalent direct invocation: `taema/tools/vm/vmh run [flags]`.
@@ -123,6 +124,25 @@ Built-in scenarios:
   decision preservation, invalid-owner review, the private backup, and no stop events.
 - **m2** — replay the anonymized learning fixture and check owner hygiene and authorization
   reasons; verify signature matching, stop undo, and offline veto refusal with exit 4.
+- **m3** — on a 768 MiB disposable guest, first check `/proc/meminfo` `MemTotal` against the
+  requested QEMU allocation, allowing for kernel-reserved memory. It installs earlyoom in the
+  guest. Synthetic workers allocate at most 50% of guest `MemTotal` and preserve a sampled
+  38% `MemAvailable` reserve without changing cgroup memory limits. Per-worker preflight records
+  `/proc/<pid>/cgroup`, the derived cgroup directory and members, and whether `memory.high` is
+  available. Action-time samples prove cache reclaim and leftover freezing occur while
+  `MemAvailable` is above the configured 35% and fallback 12% floors. The scenario then thaws the
+  workers and temporarily disables only `guard.freeze_in_adopt` while guard reclaim remains
+  enabled. Bounded global pressure confirms earlyoom's default score ordering selects an
+  `oom_score_adj=500` leftover over an equal-sized app peer. The temporary freeze setting is restored after the pressure phase and
+  during failure cleanup. M3 measures ten minutes of daemon RSS/CPU with sampling and pressure
+  triggers enabled, verifies a fake QMP client blocks a VM save hook until disconnected, and
+  checks a frozen loopback `http.server` wakes within three seconds. Raw pressure samples and the
+  earlyoom log are collected as scenario artifacts.
+
+M3 is opt-in and refuses to run without `--allow-network`: earlyoom is installed only inside the
+disposable guest on each M3 run, including runs with a cached base image. The default scenario
+set remains smoke + M0. All pressure processes and cleanup actions remain inside the disposable
+guest; the scenario does not alter host memory settings or services.
 
 ## Artifacts
 

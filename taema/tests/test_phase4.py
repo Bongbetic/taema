@@ -654,10 +654,67 @@ class GuiClose(AutoCase):
     def test_adopt_mode_contains_gui_survivors_in_one_pass(self):
         self.d.cfg["mode"] = "adopt"
         self.close_gui()
-        self.d.after_observe()
+        destination = self.cg.base + "/leftover/firefox-200"
+        with mock.patch.object(
+            self.d,
+            "_enable_memory_controllers",
+            wraps=self.d._enable_memory_controllers,
+        ) as enable_memory:
+            self.d.after_observe()
+        enable_memory.assert_called_once_with("leftover/firefox-200", destination)
         dest = self.cg.base + "/leftover/firefox-200"
         with open(dest + "/cgroup.procs") as f:
             self.assertEqual(f.read().split(), ["201"])
+
+    def test_leftover_parent_enables_memory_controller_before_leaf_creation(self):
+        self.d.cfg["mode"] = "adopt"
+        base = self.cg.base
+        leftover_parent = self.cg.leaf("leftover")
+        for path, value in (
+            (base + "/cgroup.controllers", "memory\n"),
+            (base + "/cgroup.subtree_control", "+memory\n"),
+            (base + "/cgroup.procs", ""),
+            (leftover_parent + "/cgroup.controllers", "memory\n"),
+            (leftover_parent + "/cgroup.subtree_control", ""),
+            (leftover_parent + "/cgroup.procs", ""),
+        ):
+            with open(path, "w", encoding="ascii") as target:
+                target.write(value)
+
+        self.close_gui()
+        self.d.after_observe()
+
+        with open(
+            leftover_parent + "/cgroup.subtree_control", encoding="ascii"
+        ) as source:
+            self.assertEqual(source.read(), "+memory\n")
+
+    def test_leftover_parent_respects_memory_disabled(self):
+        self.d.cfg["mode"] = "adopt"
+        self.d.cfg["mem"] = {"enabled": False}
+        base = self.cg.base
+        leftover_parent = self.cg.leaf("leftover")
+        for path, value in (
+            (base + "/cgroup.controllers", "memory\n"),
+            (base + "/cgroup.subtree_control", ""),
+            (base + "/cgroup.procs", ""),
+            (leftover_parent + "/cgroup.controllers", "memory\n"),
+            (leftover_parent + "/cgroup.subtree_control", ""),
+            (leftover_parent + "/cgroup.procs", ""),
+        ):
+            with open(path, "w", encoding="ascii") as target:
+                target.write(value)
+
+        self.close_gui()
+        self.d.after_observe()
+
+        with open(
+            leftover_parent + "/cgroup.subtree_control", encoding="ascii"
+        ) as source:
+            self.assertEqual(source.read(), "")
+        leaf = base + "/leftover/firefox-200"
+        with open(leaf + "/cgroup.procs", encoding="ascii") as source:
+            self.assertEqual(source.read().split(), ["201"])
 
     def test_adopt_stops_an_explicitly_answered_pair_on_gui_close(self):
         self.d.cfg["mode"] = "adopt"

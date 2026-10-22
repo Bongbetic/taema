@@ -207,6 +207,9 @@ class Daemon:
         )  # leaves that could not be watched: the GC pass checks them
         self.pressure_monitor = None
         self.pressure_watch_signature = None
+        self.pressure_watch_source = None
+        self.pressure_watch_path = None
+        self.pressure_watch_metrics = ()
         self.pressure_watch_failures = ()
         self.collector_events = collections.deque()
         self._collector_event_set = set()
@@ -1238,6 +1241,14 @@ class Daemon:
                 else self._provenance_scope(rid)
             )
             try:
+                # The delegated leftover parent can exist without the memory controller
+                # enabled for children. Enable it before creating the leaf so the newly
+                # contained process can be accounted and reclaimed like other scopes.
+                cgroup.mkleaf(engine.LEFTOVER)
+                if memory.enabled(self.cfg):
+                    self._enable_memory_controllers(
+                        name, os.path.join(cgroup.base(), name)
+                    )
                 ops = engine.run_ops(
                     self.cfg,
                     self.store,
@@ -4499,6 +4510,13 @@ class Daemon:
             "last_trigger": state.get("last_trigger"),
             "last_bytes_freed": int(state.get("last_bytes_freed", 0)),
             "last_duration_ms": state.get("last_duration_ms"),
+            "psi_trigger_source": self.pressure_watch_source,
+            "psi_trigger_path": self.pressure_watch_path,
+            "psi_trigger_writable": bool(
+                self.pressure_monitor and self.pressure_watch_metrics
+            ),
+            "psi_trigger_metrics": list(self.pressure_watch_metrics),
+            "psi_trigger_failures": list(self.pressure_watch_failures),
         }
 
     def attach(self, msg):
@@ -5818,6 +5836,10 @@ class Daemon:
         monitor = self.pressure_monitor
         if monitor is None:
             self.pressure_watch_signature = None
+            self.pressure_watch_source = None
+            self.pressure_watch_path = None
+            self.pressure_watch_metrics = ()
+            self.pressure_watch_failures = ()
             return
         try:
             self.sel.unregister(monitor.fileno())
@@ -5826,52 +5848,107 @@ class Daemon:
         monitor.close()
         self.pressure_monitor = None
         self.pressure_watch_signature = None
+        self.pressure_watch_source = None
+        self.pressure_watch_path = None
+        self.pressure_watch_metrics = ()
+        self.pressure_watch_failures = ()
 
     def _sync_pressure_monitor(self):
-        """Watch user-cgroup PSI trigger fds, keeping unsupported kernels on floor sampling."""
+        """Watch delegated PSI, falling back to a process-local host PSI trigger."""
         if not self._guard_enabled():
             self._close_pressure_monitor()
             return
         config = self.cfg.get("guard", {})
-        path = os.path.join(cgroup.base(), "memory.pressure")
+        cgroup_path = os.path.join(cgroup.base(), "memory.pressure")
         settings = {
             "some": config.get("psi_some", policy._DEFAULTS["guard"]["psi_some"]),
             "full": config.get("psi_full", policy._DEFAULTS["guard"]["psi_full"]),
         }
-        signature = (path, tuple(sorted(settings.items())))
+        sources = pressure_guard.psi_trigger_sources(cgroup_path)
+        signature = (tuple(sources), tuple(sorted(settings.items())))
         if self.pressure_watch_signature == signature:
             return
         self._close_pressure_monitor()
-        monitor = pressure_guard.PsiTriggerMonitor()
-        failures = monitor.open_triggers(path, settings)
+        failures = []
+        attempts = []
+        selected = None
+        for source, path in sources:
+            monitor = pressure_guard.PsiTriggerMonitor()
+            attempt_failures = monitor.open_triggers(path, settings)
+            attempt = {
+                "source": source,
+                "path": path,
+                "metrics": tuple(monitor.metrics),
+                "failures": tuple(attempt_failures),
+            }
+            attempts.append(attempt)
+            failures.extend(
+                "%s %s: %s" % (source, path, failure)
+                for failure in attempt_failures
+            )
+            if not monitor.metrics:
+                monitor.close()
+                failure = "%s %s: no configured PSI triggers are writable" % (
+                    source,
+                    path,
+                )
+                failures.append(failure)
+                attempts[-1]["failures"] += ("no configured PSI triggers are writable",)
+                continue
+            try:
+                self.sel.register(monitor.fileno(), selectors.EVENT_READ, "pressure")
+            except (KeyError, OSError, ValueError) as error:
+                monitor.close()
+                failure = "%s %s: selector registration failed: %s" % (
+                    source,
+                    path,
+                    error,
+                )
+                failures.append(failure)
+                attempts[-1]["failures"] += ("selector registration failed: %s" % error,)
+                continue
+            selected = (source, path, monitor)
+            break
         self.pressure_watch_failures = tuple(failures)
-        for failure in failures:
+        for attempt in attempts:
+            if attempt["metrics"] and not attempt["failures"]:
+                continue
+            failure = "%s %s: %s" % (
+                attempt["source"],
+                attempt["path"],
+                "; ".join(attempt["failures"])
+                or "no configured PSI triggers are writable",
+            )
             if self.store.changed("guard_trigger_unavailable:" + failure, failure):
                 self.store.log(
                     event="guard_trigger_unavailable",
-                    source="memory.pressure",
+                    source=attempt["source"],
+                    path=attempt["path"],
                     reason=failure,
                 )
-        if not monitor.metrics:
-            monitor.close()
-            self.pressure_watch_signature = signature
-            return
-        try:
-            self.sel.register(monitor.fileno(), selectors.EVENT_READ, "pressure")
-        except (KeyError, OSError, ValueError) as error:
-            monitor.close()
-            failure = "memory.pressure: selector registration failed: %s" % error
-            self.pressure_watch_failures = self.pressure_watch_failures + (failure,)
-            if self.store.changed("guard_trigger_unavailable:" + failure, failure):
-                self.store.log(
-                    event="guard_trigger_unavailable",
-                    source="memory.pressure",
-                    reason=failure,
-                )
-            self.pressure_watch_signature = signature
-            return
-        self.pressure_monitor = monitor
+        if selected is not None:
+            self.pressure_watch_source, self.pressure_watch_path, self.pressure_monitor = selected
+            self.pressure_watch_metrics = tuple(self.pressure_monitor.metrics)
+            if self.pressure_watch_source != "delegated-cgroup":
+                fallback = {
+                    "source": self.pressure_watch_source,
+                    "path": self.pressure_watch_path,
+                    "metrics": list(self.pressure_watch_metrics),
+                    "failed_sources": [
+                        {key: value for key, value in attempt.items()}
+                        for attempt in attempts[:-1]
+                    ],
+                }
+                key = "guard_trigger_fallback:" + repr(fallback)
+                if self.store.changed(key, fallback):
+                    self.store.log(event="guard_trigger_fallback", **fallback)
         self.pressure_watch_signature = signature
+
+    def _guard_psi_path(self):
+        """Read the same PSI source whose trigger fd was registered, if available."""
+        return self.pressure_watch_path or os.path.join(
+            cgroup.base(), "memory.pressure"
+        )
 
     def _collect_pressure_events(self):
         if self.pressure_monitor is None:
@@ -5900,8 +5977,7 @@ class Daemon:
         if available is not None and floor is not None and available < floor:
             return True
         config = self.cfg.get("guard", {})
-        psi_path = os.path.join(cgroup.base(), "memory.pressure")
-        psi = memory.pressure(psi_path)
+        psi = memory.pressure(self._guard_psi_path())
         for metric, key in (("some", "psi_some"), ("full", "psi_full")):
             value = psi.get(metric + "_avg10")
             setting = config.get(key, policy._DEFAULTS["guard"][key])
@@ -5979,7 +6055,7 @@ class Daemon:
                 scope,
                 path,
                 time.time(),
-                memory.pressure(os.path.join(cgroup.base(), "memory.pressure")),
+                memory.pressure(self._guard_psi_path()),
                 resource_class=resource_class,
                 guard=True,
                 stage=stage,

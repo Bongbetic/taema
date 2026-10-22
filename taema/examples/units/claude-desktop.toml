@@ -7,6 +7,10 @@ kind = "app"
 [match]
 exe = "/usr/lib/claude-desktop/claude-desktop"
 
+[mem]
+# Keep this desktop workload in the interactive app reservation class.
+class = "app"
+
 # Sub-scopes carved out of the adopted subtree. Each child scope is bound to its own root
 # process: when that process exits, the child scope is stopped.
 [[children]]

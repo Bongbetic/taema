@@ -488,6 +488,12 @@ def edges(members, snap=None, pids_info=None):
             return "qmp"
         if "podman.sock" in normalized or "/podman/" in normalized:
             return "podman_api"
+        if normalized.endswith("/docker.sock") or "/docker/" in normalized:
+            return "docker_api"
+        if normalized.endswith("/incus.sock") or "/incus/" in normalized:
+            return "incus_api"
+        if "/.vbox-" in normalized and normalized.endswith("/ipcd"):
+            return "vboxsvc"
         if "/libvirt/qemu/" in normalized or "/qmp" in normalized:
             return "qmp"
         return "unix_server_unresolved" if unresolved else "unix_server"

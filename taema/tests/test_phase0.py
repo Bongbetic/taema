@@ -673,6 +673,136 @@ class GcRules(unittest.TestCase):
         self.assertEqual(candidates[0][0], path)
         self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
 
+    def test_missing_virtualbox_socket_glob_is_a_runtime_quit_signal(self):
+        path = self.cg.leaf("app-virtualbox-test", [42], cpu=1)
+        runtime = os.path.join(self.cg.root, "runtime-vbox", ".vbox-user-ipc")
+        os.makedirs(runtime)
+        socket_path = os.path.join(runtime, "ipcd")
+        with open(socket_path, "w") as socket_file:
+            socket_file.write("fake VBoxSVC socket")
+        unit = {
+            "unit": {
+                "name": "app-virtualbox",
+                "kind": "app",
+                "class": "vm",
+                "stop_when_unneeded": True,
+            },
+            "match": {"comm": "VBoxHeadless"},
+            "gc": {
+                "socket_glob": os.path.join(
+                    self.cg.root, "runtime-*", ".vbox-user-ipc", "ipcd"
+                )
+            },
+        }
+
+        self.assertEqual(self.run_gc(units=[unit]), [])
+        os.unlink(socket_path)
+
+        candidates = self.run_gc(units=[unit])
+        self.assertEqual(candidates[0][0], path)
+        self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
+
+    def test_runtime_quit_signals_use_fake_proc_and_runtime_trees(self):
+        cases = (
+            (
+                "docker",
+                "app-docker-rootless",
+                "dockerd",
+                "containerd-shim-runc-v2",
+                {"socket_env": "XDG_RUNTIME_DIR", "socket_path": "docker.sock"},
+                "docker.sock",
+            ),
+            (
+                "incus",
+                "app-incus",
+                "incusd",
+                "lxc-start",
+                {"socket_env": "XDG_RUNTIME_DIR", "socket_path": "incus/unix.socket"},
+                "incus/unix.socket",
+            ),
+            (
+                "virtualbox",
+                "app-virtualbox",
+                "VBoxHeadless",
+                "VBoxSVC",
+                {
+                    "socket_glob": "",
+                },
+                ".vbox-user-ipc/ipcd",
+            ),
+        )
+        proc_root = os.path.join(self.cg.root, "proc")
+        os.makedirs(proc_root)
+
+        def add_process(pid, process_name, runtime_dir):
+            process_dir = os.path.join(proc_root, str(pid))
+            os.makedirs(process_dir)
+            with open(os.path.join(process_dir, "comm"), "w") as comm:
+                comm.write(process_name + "\n")
+            with open(os.path.join(process_dir, "environ"), "wb") as environ:
+                environ.write(("XDG_RUNTIME_DIR=" + runtime_dir + "\0").encode())
+
+        for index, (runtime, name, root_comm, live_comm, gc, socket_rel) in enumerate(
+            cases
+        ):
+            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory(
+                prefix="runtime-", dir=self.cg.root
+            ) as runtime_dir:
+                path = self.cg.leaf("%s-test" % name, [42 + index], cpu=1)
+                socket_path = os.path.join(runtime_dir, socket_rel)
+                os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+                with open(socket_path, "w") as socket_file:
+                    socket_file.write("fake runtime socket")
+                root_pid = 42 + index
+                live_pid = 90 + index
+                add_process(root_pid, root_comm, runtime_dir)
+                add_process(live_pid, live_comm, runtime_dir)
+                configured_gc = dict(gc)
+                configured_gc["no_attach_grace"] = 120
+                configured_gc["quit_process_missing"] = live_comm
+                if runtime == "virtualbox":
+                    configured_gc["socket_glob"] = os.path.join(
+                        self.cg.root, "runtime-*", socket_rel
+                    )
+                unit = {
+                    "unit": {
+                        "name": name,
+                        "kind": "app",
+                        "class": "vm" if runtime == "virtualbox" else "container",
+                        "stop_when_unneeded": True,
+                    },
+                    "match": {"comm": root_comm},
+                    "mem": {"idle_reclaim": True},
+                    "gc": configured_gc,
+                }
+                idle = {}
+                with mock.patch.object(engine.inspect, "PROC", proc_root):
+                    self.assertEqual(self.run_gc(idle=idle, units=[unit]), [])
+                    self.t[0] += 121
+                    self.assertEqual(
+                        self.run_gc(idle=idle, units=[unit]),
+                        [],
+                        "a live runtime process must hold its scope",
+                    )
+                    os.unlink(socket_path)
+                    self.assertEqual(
+                        self.run_gc(idle=idle, units=[unit]),
+                        [],
+                        "a missing socket must not outvote a live instance",
+                    )
+                    with open(socket_path, "w") as socket_file:
+                        socket_file.write("fake runtime socket")
+                    os.unlink(os.path.join(proc_root, str(live_pid), "environ"))
+                    os.unlink(os.path.join(proc_root, str(live_pid), "comm"))
+                    os.rmdir(os.path.join(proc_root, str(live_pid)))
+                    candidates = self.run_gc(idle=idle, units=[unit])
+
+                self.assertEqual(candidates[0][0], path)
+                self.assertTrue(
+                    candidates[0][1].startswith("runtime process gone:"),
+                    candidates[0][1],
+                )
+
     def test_libvirt_unit_groups_qemu_roots_by_qmp_socket(self):
         unit = {
             "unit": {"name": "app-libvirt-qemu", "kind": "app", "group_by_qmp": True},

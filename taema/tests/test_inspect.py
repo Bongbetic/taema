@@ -46,6 +46,9 @@ class UnixEdges(unittest.TestCase):
         for path, kind in (
             ("/run/user/1000/podman/podman.sock", "podman_api"),
             ("/run/user/1000/libvirt/qemu/vm.monitor", "qmp"),
+            ("/run/user/1000/docker.sock", "docker_api"),
+            ("/run/user/1000/incus/unix.socket", "incus_api"),
+            ("/tmp/.vbox-user-ipc/ipcd", "vboxsvc"),
         ):
             with self.subTest(path=path):
                 server = SERVER.replace("/run/user/1000/herdr.sock", path)

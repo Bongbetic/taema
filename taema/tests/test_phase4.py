@@ -1253,6 +1253,95 @@ class RuntimeGc(AutoCase):
         self.assertEqual(freed_event["before"]["memory_bytes"], 4096)
         self.assertEqual(freed_event["after"]["memory_bytes"], 0)
 
+    def test_generic_container_and_vm_units_use_save_state_cleanup(self):
+        for index, resource_class in enumerate(("container", "vm")):
+            with self.subTest(resource_class=resource_class):
+                name = "app-generic-" + resource_class
+                pid = 350 + index
+                self.fp.add(
+                    pid,
+                    1,
+                    comm="generic-runtime-worker",
+                    born=self.fp.up - 300,
+                )
+                self.d.lineage.observe(self.fp.table())
+                self.idle(pid)
+                path = self.cg.leaf(name + "-abcdef12", [pid], cpu=100)
+                unit = {
+                    "unit": {
+                        "name": name,
+                        "kind": "app",
+                        "class": resource_class,
+                        "stop_when_unneeded": True,
+                    },
+                    "match": {"comm": "generic-runtime-*"},
+                    "mem": {
+                        "idle_reclaim": True,
+                        "save_state": ["runtime-save", "%(name)s"],
+                    },
+                    "gc": {"no_attach_grace": 120},
+                }
+                self.d.units = [unit]
+                self.assertIs(self.d._runtime_gc_unit(path), unit)
+                order = []
+                report = {
+                    "removed": True,
+                    "decisions": [{"action": "kill", "key": "worker", "pid": pid}],
+                    "left": [],
+                    "stopped": [pid],
+                }
+                with (
+                    mock.patch.object(
+                        engine,
+                        "gc_candidates",
+                        return_value=[(path, "runtime process gone")],
+                    ),
+                    mock.patch.object(self.d, "_review_memory", return_value=4096),
+                    mock.patch.object(
+                        self.d, "_reclaim_idle", return_value=(True, "idle for 300s")
+                    ),
+                    mock.patch.object(
+                        self.d, "_runtime_stop_preflight", return_value=True
+                    ),
+                    mock.patch.object(
+                        self.d,
+                        "_run_runtime_hook",
+                        side_effect=lambda *args, **kwargs: (
+                            order.append("hook") or True,
+                            "saved",
+                        ),
+                    ) as hook,
+                    mock.patch.object(
+                        self.d,
+                        "_reclaim_one",
+                        side_effect=lambda *args, **kwargs: (
+                            order.append("reclaim")
+                            or {"status": "reclaimed", "reclaimed_bytes": 128}
+                        ),
+                    ),
+                    mock.patch.object(daemon.memory, "pressure", return_value={}),
+                    mock.patch.object(
+                        engine,
+                        "stop",
+                        side_effect=lambda *args, **kwargs: order.append("stop")
+                        or report,
+                    ),
+                    mock.patch.object(self.d, "note_stop", return_value=[pid]),
+                    mock.patch.object(self.d, "stopped_apps", return_value=[]),
+                ):
+                    self.d.gc_pass()
+
+                self.assertEqual(order, ["hook", "reclaim", "stop"])
+                self.assertEqual(hook.call_args.args[1], unit)
+                self.assertEqual(hook.call_args.kwargs["field"], "save_state")
+                self.assertTrue(
+                    any(
+                        event["event"] == "gc_quit"
+                        and event["runtime_class"] == resource_class
+                        for event in self.log()
+                    )
+                )
+
     def test_failed_preservation_hook_prevents_reclaim_and_stop(self):
         path, _unit, _pid = self.runtime_unit(
             hook=("save_state", ["virsh", "managedsave", "%(domain)s"])

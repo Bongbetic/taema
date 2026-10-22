@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 import fnmatch
+import glob
 import hashlib
 import os
 import signal
@@ -1064,6 +1065,7 @@ def gc_candidates(
             table.discard(k) if isinstance(table, set) else table.pop(k)
     out = []
     snap = inspect.LazySnapshot()
+    runtime_process_names = None
     seeds = cfg.get("seeds", {})
     protect = set(seeds.get("share", [])) | set(seeds.get("persist", []))
     for d in leaves:
@@ -1178,13 +1180,51 @@ def gc_candidates(
             }
             if socket_paths and all(not os.path.exists(path) for path in socket_paths):
                 env_reason = "runtime socket gone: %s" % sorted(socket_paths)[0]
+        socket_glob = gc.get("socket_glob")
+        if (
+            isinstance(socket_glob, str)
+            and socket_glob.startswith(os.sep)
+            and ".." not in socket_glob.split(os.sep)
+        ):
+            socket_paths = glob.glob(socket_glob)
+            if not any(os.path.exists(path) for path in socket_paths):
+                env_reason = "runtime socket gone: %s" % socket_glob
+        quit_process_missing = gc.get("quit_process_missing")
+        runtime_process_live = False
+        if (
+            isinstance(quit_process_missing, str)
+            and quit_process_missing
+            and not any(ord(char) < 32 for char in quit_process_missing)
+        ):
+            if runtime_process_names is None:
+                try:
+                    runtime_process_names = [
+                        inspect.comm(pid)
+                        for pid in inspect.all_pids()
+                        if inspect.uid_of(pid) == os.getuid()
+                    ]
+                except OSError:
+                    # A failed process scan is not proof that a runtime has quit.
+                    runtime_process_names = None
+                    runtime_process_live = True
+            if runtime_process_names is not None:
+                runtime_process_live = any(
+                    fnmatch.fnmatchcase(name, quit_process_missing)
+                    for name in runtime_process_names
+                )
+                if not runtime_process_live and env_reason is None:
+                    env_reason = "runtime process gone: %s" % quit_process_missing
         if gc.get("qmp_socket") is True:
             qmp_paths = {path for p in pids for path in inspect.qmp_socket_paths(p)}
             if qmp_paths and all(not os.path.exists(path) for path in qmp_paths):
                 env_reason = "QMP socket gone: %s" % sorted(qmp_paths)[0]
         s = snap.get()
         edge_map = inspect.edges(set(pids), s)
-        busy = bool(edge_map) or not getattr(s, "ok", True)
+        busy = (
+            bool(edge_map)
+            or not getattr(s, "ok", True)
+            or runtime_process_live
+        )
         if gc.get("keep_while_children") and u and not has_no_attach_grace:
             root_match = u.get("match") or {}
             busy = busy or any(not _matches(root_match, p) for p in pids)

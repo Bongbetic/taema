@@ -267,6 +267,9 @@ class PolicyTests(unittest.TestCase):
         by_name = {unit["unit"]["name"]: unit for unit in units}
         podman = by_name["app-podman"]
         libvirt = by_name["app-libvirt-qemu"]
+        docker = by_name["app-docker-rootless"]
+        incus = by_name["app-incus"]
+        virtualbox = by_name["app-virtualbox"]
 
         self.assertEqual(podman["unit"]["class"], "container")
         self.assertEqual(podman["mem"]["idle_reclaim"], True)
@@ -276,6 +279,41 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(libvirt["unit"]["group_by_qmp"])
         self.assertTrue(libvirt["gc"]["qmp_socket"])
         self.assertEqual(libvirt["gc"]["no_attach_grace"], 120)
+
+        self.assertEqual(docker["unit"]["class"], "container")
+        self.assertEqual(docker["unit"]["group_by_env"], "XDG_RUNTIME_DIR")
+        self.assertEqual(docker["match"]["comm"], "dockerd")
+        self.assertEqual(docker["mem"]["class"], "container")
+        self.assertEqual(docker["gc"]["socket_path"], "docker.sock")
+        self.assertEqual(docker["gc"]["quit_process_missing"], "containerd-shim*")
+        self.assertEqual(docker["gc"]["no_attach_grace"], 120)
+
+        self.assertEqual(incus["unit"]["class"], "container")
+        self.assertEqual(incus["match"]["comm"], "incusd")
+        self.assertEqual(incus["mem"]["class"], "container")
+        self.assertEqual(incus["gc"]["socket_path"], "incus/unix.socket")
+        self.assertEqual(incus["gc"]["quit_process_missing"], "lxc-start*")
+        self.assertEqual(incus["gc"]["no_attach_grace"], 120)
+
+        self.assertEqual(virtualbox["unit"]["class"], "vm")
+        self.assertEqual(virtualbox["match"]["comm"], "VBoxHeadless")
+        self.assertEqual(virtualbox["mem"]["class"], "vm")
+        self.assertEqual(
+            virtualbox["gc"]["socket_glob"], "/tmp/.vbox-*-ipc/ipcd"
+        )
+        self.assertEqual(virtualbox["gc"]["quit_process_missing"], "VBoxSVC")
+        self.assertEqual(virtualbox["gc"]["no_attach_grace"], 120)
+
+        examples = policy.load_units(
+            {"paths": {"units_dir": os.path.join(ROOT, "examples", "units")}}
+        )
+        examples_by_name = {unit["unit"]["name"]: unit for unit in examples}
+        self.assertEqual(examples_by_name["scope-emulator"]["mem"]["class"], "vm")
+        self.assertEqual(
+            examples_by_name["app-claude-desktop"]["mem"]["class"], "app"
+        )
+        self.assertEqual(examples_by_name["app-herdr"]["mem"]["class"], "app")
+        self.assertTrue(examples_by_name["app-herdr"]["mem"]["background"])
         self.assertFalse(self.cfg()["mem"]["probe"])
 
     def test_protected_comm_and_pid1_and_root(self):
@@ -330,8 +368,11 @@ class PolicyTests(unittest.TestCase):
             {
                 "app-claude-desktop",
                 "app-herdr",
+                "app-docker-rootless",
+                "app-incus",
                 "app-podman",
                 "app-libvirt-qemu",
+                "app-virtualbox",
                 "scope-emulator",
             },
         )

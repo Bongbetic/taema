@@ -48,6 +48,8 @@ class UnixEdges(unittest.TestCase):
             ("/run/user/1000/libvirt/qemu/vm.monitor", "qmp"),
             ("/run/user/1000/docker.sock", "docker_api"),
             ("/run/user/1000/incus/unix.socket", "incus_api"),
+            ("@lxc/0123456789abcdef//var/lib/lxc", "lxc_api"),
+            ("@/var/lib/lxc/alpine/command", "lxc_api"),
             ("/tmp/.vbox-user-ipc/ipcd", "vboxsvc"),
         ):
             with self.subTest(path=path):

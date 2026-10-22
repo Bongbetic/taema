@@ -492,6 +492,12 @@ def edges(members, snap=None, pids_info=None):
             return "docker_api"
         if normalized.endswith("/incus.sock") or "/incus/" in normalized:
             return "incus_api"
+        if normalized.startswith("@lxc/") or (
+            normalized.startswith("@/")
+            and "/lxc/" in normalized
+            and normalized.endswith("/command")
+        ):
+            return "lxc_api"
         if "/.vbox-" in normalized and normalized.endswith("/ipcd"):
             return "vboxsvc"
         if "/libvirt/qemu/" in normalized or "/qmp" in normalized:

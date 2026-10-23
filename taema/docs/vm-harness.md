@@ -14,6 +14,7 @@ make -C taema vm-test                      # smoke + M0 acceptance on glibc + mu
 make -C taema vm-test VMFLAGS="--libc glibc"          # one libc only
 make -C taema vm-test VMFLAGS="--allow-network --scenarios all"
 make -C taema vm-test VMFLAGS="--allow-network --scenarios m1,m2,upgrade"  # M1/M2 release gate
+make -C taema vm-test VMFLAGS="--allow-network --scenarios m3 --libc glibc --memory-mb 1024"  # M3 pressure gate
 ```
 
 Equivalent direct invocation: `taema/tools/vm/vmh run [flags]`.
@@ -41,7 +42,7 @@ prerequisite, missing `--allow-network`, bad configuration).
 - `git` for building the 0.3.0 comparison package from its local tag
 - Network **only** for first-time fetches, explicitly opted in with
   `--allow-network`: the official Void rootfs tarballs, the packages the image
-  build installs (kernel, sshd, dhcpcd, python3, iproute2, sudo), and the
+  build installs (kernel, sshd, dhcpcd, python3, iproute2, sudo, earlyoom), and the
   previous release package from GitHub.  With a populated cache the whole
   pipeline runs offline.
 
@@ -123,6 +124,11 @@ Built-in scenarios:
   decision preservation, invalid-owner review, the private backup, and no stop events.
 - **m2** — replay the anonymized learning fixture and check owner hygiene and authorization
   reasons; verify signature matching, stop undo, and offline veto refusal with exit 4.
+- **m3** — in a disposable 1 GiB QEMU guest, run live HTTP wake and fake QMP/save-hook
+  checks, apply bounded memory pressure, and require guard reclaim and freezing above the
+  earlyoom floor. Verify a leftover has `oom_score_adj=500`, record earlyoom's selected
+  process when it fires, then measure daemon RSS, CPU, sampling, and pressure triggers for
+  610 seconds. The two-libc run therefore takes at least 20 minutes plus guest setup.
 
 ## Artifacts
 
@@ -151,7 +157,7 @@ known_hosts, qemu.pid transport state for this run only
 - Root inside the guest is reached only through `sudo -n` from the harness
   admin created in the image; nothing privileged executes on the host.
 
-## M1 and M2 release acceptance
+## M1, M2, and M3 release acceptance
 
 Run the m1, m2, and upgrade scenarios on both libcs before the 0.4.0 tag. The m1 scenario
 builds the previous package from the local taema-v0.3.0 source tag when it is not cached,
@@ -162,6 +168,10 @@ confirms an offline veto makes a manual stop return exit code 4.
 
 The VM workflow checkout fetches full Git history so the previous source tag is available.
 Populate the root image cache with the explicit network option when needed.
+
+M3's pressure probe runs only inside QEMU and confines its memory hogs, cgroups, and temporary
+configuration to the disposable guest. It needs a low-memory guest and at least 610 seconds
+per libc to complete the idle-footprint gate.
 
 ## CI
 

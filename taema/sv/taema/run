@@ -50,6 +50,15 @@ enable_controllers() {
     return 0
 }
 
+# Delegate the user's cgroup controls and PSI trigger file when the kernel exposes it.
+chown_member_cgroup() {
+    chown "$1" "$2" "$2/cgroup.procs" "$2/cgroup.threads" "$2/cgroup.subtree_control" ||
+        return 1
+    if [ -e "$2/memory.pressure" ]; then
+        chown "$1" "$2/memory.pressure" || return 1
+    fi
+}
+
 # member_list: one member of the group per line (supplementary and primary).
 member_list() {
     gent=$(getent group "$GROUP") || return 1
@@ -64,7 +73,6 @@ member_list() {
 sync_members() {
     members=$(member_list) || return 1
     for user in $members; do
-        [ ! -e "$SVDIR/$user" ] || continue
         ent=$(getent passwd "$user") || { [ "${1-}" != start ] || log "no such user: $user"; continue; }
         uid=$(printf '%s' "$ent" | cut -d: -f3)
         ugid=$(printf '%s' "$ent" | cut -d: -f4)
@@ -72,8 +80,9 @@ sync_members() {
         d=$CG/user/$uid
         mkdir -p "$d" || { [ "${1-}" != start ] || log "mkdir $d failed"; continue; }
         enable_controllers "$d"
-        chown "$uid:$ugid" "$d" "$d/cgroup.procs" "$d/cgroup.threads" "$d/cgroup.subtree_control" ||
+        chown_member_cgroup "$uid:$ugid" "$d" ||
             { [ "${1-}" != start ] || log "chown $d failed"; continue; }
+        [ ! -e "$SVDIR/$user" ] || continue
         mkdir -p "$SVDIR/$user/log" "$LOGDIR/$user"
         # /run is mounted noexec: the run scripts are symlinks to executables in /usr/libexec,
         # which derive the user name from the service directory.

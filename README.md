@@ -246,6 +246,19 @@ scope scope-emulator stopped
 `kill` stopped the emulator and kept `adb`, because another program still talks to it.
 Each line is `kill`, `share` (kept, moved to `shared/`) or `skip` (protected).
 
+## Memory
+
+```sh
+taema memory budget
+taema memory budget --json
+```
+
+Tæma reports scope memory, swap, zswap, and pressure, and gives active scopes soft
+reservations while eligible idle scopes share a bounded background budget. Under pressure,
+the guard tries reclaim and reversible freezing before authorized stops. See the
+[memory budget, reclaim, and pressure guide](taema/README.md#memory-budget) for configuration
+and safety details.
+
 More commands:
 
 ```sh
@@ -290,7 +303,7 @@ A release needs no manual work. Bump `__version__` in `taema/src/taema/__init__.
 then push a tag named `taema-vX.Y.Z`:
 
 ```sh
-git tag taema-v0.4.0 && git push origin taema-v0.4.0
+git tag taema-v0.5.0 && git push origin taema-v0.5.0
 ```
 
 The `release` workflow runs the tests, builds the `.xbps`, signs an XBPS repository, and

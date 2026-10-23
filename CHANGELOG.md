@@ -1,3 +1,18 @@
+# 0.5.0
+
+## Resource governor
+
+### Memory budget and pressure response
+
+Per-scope memory accounting now supports class reservations, conservative soft limits,
+bounded page-cache and anonymous reclaim, and pressure-triggered reclaim and freezing.
+The pressure guard coordinates its available-memory floor with earlyoom and preserves leftovers
+as preferred external OOM victims. Memory documentation and `taema doctor` now cover the
+kernel controls required for these features.
+
+The disposable VM harness adds the `m3` release scenario for bounded low-memory pressure,
+HTTP wake-on-connect, QMP/save-hook safety, and the ten-minute idle footprint gate.
+
 # 0.4.0
 
 ## Behaviour changes

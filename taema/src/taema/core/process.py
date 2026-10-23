@@ -7,7 +7,17 @@ Clients of things outside the set, shared stdio, ptys and pipes are never edges.
 from collections import namedtuple
 import os
 import re
-import subprocess
+
+
+class _LazySubprocess:
+    def __getattr__(self, name):
+        import subprocess as module
+
+        return getattr(module, name)
+
+
+# Preserve the patchable module seam without importing subprocess during startup.
+subprocess = _LazySubprocess()
 
 PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
 MAX_RESTORE_ARGV_BYTES = 16 << 10

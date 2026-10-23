@@ -8,7 +8,7 @@ import subprocess
 from urllib.parse import quote
 
 from .config import policy
-from .core import cgroup, memory, process
+from .core import cgroup, memory, oom, process
 from .governor import guard as pressure_guard
 from .store import db
 
@@ -473,6 +473,78 @@ def _feature_check(name, path, controllers, required_controller=None):
     return _check(name, "ok", "%s is available" % os.path.basename(path))
 
 
+def _process_oom_score_check(system_root):
+    name = "process OOM score adjustment"
+    path = "/proc/self/oom_score_adj"
+    raw = _read(_rooted(system_root, path))
+    if raw is None:
+        return _check(
+            name,
+            "warn",
+            "%s is absent or unreadable" % path,
+            "Check that procfs is readable; taema skips per-process OOM score "
+            "adjustments when it cannot read a valid score.",
+        )
+
+    value = raw.strip()
+    digits = value[1:] if value.startswith("-") else value
+    try:
+        score = int(value) if digits and digits.isdecimal() else None
+    except ValueError:
+        score = None
+    if score is None or not oom.MIN_SCORE <= score <= oom.MAX_SCORE:
+        return _check(
+            name,
+            "warn",
+            "%s has an invalid value; expected an integer from %d to %d"
+            % (path, oom.MIN_SCORE, oom.MAX_SCORE),
+            "Check the procfs value; taema skips per-process OOM score "
+            "adjustments when it cannot read a valid score.",
+        )
+    return _check(
+        name,
+        "ok",
+        "%s is readable and valid (%d)" % (path, score),
+    )
+
+
+def _memory_oom_group_check(base, controllers):
+    name = "memory OOM group kill"
+    if "memory" not in controllers:
+        return _check(
+            name,
+            "warn",
+            "the memory controller is unavailable; delegated memory.oom.group is unsupported",
+            "Enable the delegated memory controller; per-process OOM score "
+            "adjustment remains available where configured.",
+        )
+
+    path = os.path.join(base, "memory.oom.group")
+    raw = _read(path)
+    if raw is None:
+        return _check(
+            name,
+            "warn",
+            "delegated memory.oom.group is absent or unreadable; group-wide OOM handling will be skipped",
+            "Expose the optional memory.oom.group control; per-process OOM score "
+            "adjustment remains available where configured.",
+        )
+    value = raw.strip()
+    if value not in ("0", "1"):
+        return _check(
+            name,
+            "warn",
+            "delegated memory.oom.group has an invalid value; group-wide OOM handling will be skipped",
+            "Expose a readable memory.oom.group control; per-process OOM score "
+            "adjustment remains available where configured.",
+        )
+    return _check(
+        name,
+        "ok",
+        "delegated memory.oom.group is readable and supported (value %s)" % value,
+    )
+
+
 def _kernel_checks(base, controllers, system_root, cfg=None):
     proc_swaps_path = _rooted(system_root, "/proc/swaps")
     proc_swaps = _read(proc_swaps_path)
@@ -534,11 +606,14 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 % (", ".join(zram_devices) if zram_devices else "none"),
             )
         )
+    checks.append(_process_oom_score_check(system_root))
     memory_features = {
         "memory accounting": "memory.current and memory.stat",
         "memory peak usage": "memory.peak",
         "memory pressure": "memory.pressure or /proc/pressure/memory",
         "memory reclaim": "memory.reclaim or memory.high fallback",
+        "memory low reservation": "memory.low",
+        "memory OOM group kill": "memory.oom.group",
         "memory soft cap": "memory.high",
         "memory hard cap": "memory.max",
         "swap accounting": "memory.swap.current and memory.swap.max",
@@ -634,6 +709,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
         checks.extend(
             _feature_check(name, os.path.join(base, filename), controllers, "memory")
             for name, filename in (
+                ("memory low reservation", "memory.low"),
                 ("memory soft cap", "memory.high"),
                 ("memory hard cap", "memory.max"),
             )
@@ -683,6 +759,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "No action required; event counters are optional.",
             )
         )
+        checks.append(_memory_oom_group_check(base, controllers))
 
     checks.extend(
         [

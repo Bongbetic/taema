@@ -6,12 +6,22 @@ import glob
 import hashlib
 import os
 import signal
-import subprocess
 import sys
 import time
 
 from ..core import cgroup, process as inspect, signature as survivor_signature
 from ..config import policy
+
+
+class _LazySubprocess:
+    def __getattr__(self, name):
+        import subprocess as module
+
+        return getattr(module, name)
+
+
+# Preserve the patchable module seam without importing subprocess during startup.
+subprocess = _LazySubprocess()
 
 
 HOOK_TIMEOUT = 30

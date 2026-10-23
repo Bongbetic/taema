@@ -268,6 +268,70 @@ class GuardDaemonTests(unittest.TestCase):
         )
         self.assertGreaterEqual(finished["duration_ms"], 0)
 
+    def test_page_cache_guard_step_logs_bounded_skipped_candidate_details(self):
+        paths = {
+            "leftover/cache-%d" % index: "/fake/cache-%d" % index
+            for index in range(6)
+        }
+        counters = {
+            path: {
+                "current_bytes": 1000 + index,
+                "file_bytes": 800 + index,
+                "anon_bytes": 200,
+                "reclaimable_bytes": 10 + index,
+            }
+            for index, path in enumerate(paths.values())
+        }
+        now_high = iter((False, False, True, True, True, True, True, False, False))
+
+        def skipped(scope, _path, _now, _pressure, **_kwargs):
+            return {"scope": scope, "status": "skipped", "reason": "scope is warm"}
+
+        with (
+            mock.patch.object(self.daemon, "_memory_paths", return_value=paths),
+            mock.patch.object(self.daemon, "_reclaim_class", return_value="leftover"),
+            mock.patch.object(self.daemon, "_freeze_value", return_value="0"),
+            mock.patch.object(
+                service.memory,
+                "scope_counters",
+                side_effect=lambda path: counters[path],
+            ),
+            mock.patch.object(service.memory, "pressure", return_value={}),
+            mock.patch.object(self.daemon, "_guard_pressure_high", return_value=True),
+            mock.patch.object(
+                self.daemon,
+                "_guard_pressure_now_high",
+                side_effect=lambda: next(now_high),
+            ),
+            mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 50)),
+            mock.patch.object(self.daemon, "_reclaim_one", side_effect=skipped),
+        ):
+            self.daemon.guard_pass("some")
+
+        with open(self.daemon.store.log_path, encoding="utf-8") as source:
+            events = [json.loads(line) for line in source]
+        event = next(
+            item
+            for item in events
+            if item.get("event") == "guard_step" and item.get("step") == "page_cache"
+        )
+        skipped_details = event["skipped_candidates"]
+        self.assertEqual(len(skipped_details), service.GUARD_STEP_SKIP_DETAIL_LIMIT)
+        self.assertEqual(event["skipped_candidates_truncated"], 2)
+        self.assertEqual(skipped_details[0]["scope"], "leftover/cache-5")
+        self.assertEqual(skipped_details[0]["status"], "skipped")
+        self.assertEqual(skipped_details[0]["reason"], "scope is warm")
+        self.assertEqual(skipped_details[0]["candidate_size_bytes"], 15)
+        self.assertEqual(
+            skipped_details[0]["candidate_counters"],
+            {
+                "current_bytes": 1005,
+                "file_bytes": 805,
+                "anon_bytes": 200,
+                "reclaimable_bytes": 15,
+            },
+        )
+
     def test_guard_closes_episode_when_pressure_clears_before_retry(self):
         self.daemon.guard_state.update(
             active=True,
@@ -371,6 +435,10 @@ class GuardDaemonTests(unittest.TestCase):
         self.daemon._collect_pressure_events()
         with mock.patch.object(self.daemon, "_guard_floor", return_value=(10, 20)):
             self.daemon._collect_available_floor_event(now=1.0)
+            self.assertEqual(
+                list(self.daemon.collector_events), [service.PressureHigh("some")]
+            )
+            self.daemon._collect_available_floor_event(now=5.0)
         os.close(write_fd)
         self.assertIn(service.PressureHigh("some"), self.daemon.collector_events)
         self.assertIn(service.PressureHigh("available"), self.daemon.collector_events)
@@ -540,19 +608,44 @@ class GuardDaemonTests(unittest.TestCase):
             self.daemon._collect_available_floor_event(now=0.5)
             self.assertEqual(list(self.daemon.collector_events), [])
             self.daemon._collect_available_floor_event(now=1.0)
+            self.assertEqual(list(self.daemon.collector_events), [])
+            self.daemon._collect_available_floor_event(now=5.0)
             self.assertEqual(
                 list(self.daemon.collector_events), [service.PressureHigh("available")]
             )
 
             self.daemon.collector_events.clear()
             self.daemon._collector_event_set.clear()
-            self.daemon.guard_state.update(active=True, retry_at=5.0)
-            self.daemon._collect_available_floor_event(now=2.0)
+            self.daemon.guard_state.update(active=True, retry_at=10.0)
+            self.daemon._collect_available_floor_event(now=7.0)
             self.assertEqual(list(self.daemon.collector_events), [])
-            self.daemon._collect_available_floor_event(now=5.0)
+            self.daemon._collect_available_floor_event(now=10.0)
         self.assertEqual(
             list(self.daemon.collector_events), [service.PressureHigh("retry")]
         )
+
+    def test_psi_trigger_event_dispatches_before_the_floor_fallback_deadline(self):
+        read_fd, write_fd = os.pipe()
+        monitor = guard.PsiTriggerMonitor()
+        self.addCleanup(monitor.close)
+        self.addCleanup(os.close, write_fd)
+        monitor.watch_fd("some", read_fd)
+        self.daemon.pressure_monitor = monitor
+        self.daemon.sel.register(
+            monitor.fileno(), service.selectors.EVENT_READ, "pressure"
+        )
+        self.addCleanup(self.daemon.sel.unregister, monitor.fileno())
+        self.daemon.last_guard_check = time.time()
+        self.daemon.guard_state.clear()
+
+        with mock.patch.object(self.daemon, "guard_pass") as guard_pass:
+            os.write(write_fd, b"pressure")
+            ready = self.daemon.sel.select(timeout=1.0)
+            self.assertEqual([key.data for key, _mask in ready], ["pressure"])
+            self.daemon._collect_pressure_events()
+            self.daemon.drain_collector_events()
+
+        guard_pass.assert_called_once_with("some")
 
     def test_guard_pass_merges_triggers_and_schedules_a_retry_when_pressure_persists(
         self,
@@ -608,14 +701,25 @@ class GuardDaemonTests(unittest.TestCase):
             self.daemon.drain_collector_events()
         guard_pass.assert_called_once_with("full")
 
-        self.daemon.guard_state.update(active=True, retry_at=time.time() + 5)
-        self.daemon.last_guard_check = time.time()
+        now = time.time()
+        self.daemon.guard_state.update(active=True, retry_at=now + 2)
+        self.daemon.last_guard_check = now
         with mock.patch.object(self.daemon, "_guard_enabled", return_value=True):
-            self.assertLessEqual(self.daemon.next_timeout(), 1.0)
+            self.assertLessEqual(self.daemon.next_timeout(), 2.0)
+
+            self.daemon.guard_state.clear()
+            self.daemon.last.update(
+                {key: 200.0 for key in ("adopt", "gc", "memory", "reclaim", "freeze")}
+            )
+            self.daemon.last_guard_check = 200.0
+            self.assertEqual(
+                self.daemon.next_timeout(now=200.0),
+                service.GUARD_FLOOR_POLL_SECONDS,
+            )
 
         self.daemon.collector_events.clear()
         self.daemon._collector_event_set.clear()
-        self.daemon.guard_state["retry_at"] = 199.0
+        self.daemon.guard_state.update(active=True, retry_at=199.0)
         self.daemon.last.update({key: 200.0 for key in self.daemon.last})
         with (
             mock.patch.object(service.time, "time", return_value=200.0),

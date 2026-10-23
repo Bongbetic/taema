@@ -1009,6 +1009,68 @@ class DaemonReclaimTests(unittest.TestCase):
         self.assertIn("needs 600s (warm scope)", reason)
         self.assertEqual(stats["workingset_refault_file"], 4)
 
+    def test_repeated_guard_retries_preserve_the_full_idle_cpu_sample(self):
+        self.daemon.cfg["mem"]["idle_reclaim_grace"] = 0
+        self.daemon.cfg["experimental"] = {"guard": True}
+        self.daemon.cfg["guard"] = {
+            "enabled": True,
+            "cooldown": 0,
+            "available_floor": 0,
+            "psi_some": "150ms/2s",
+            "psi_full": "50ms/2s",
+            "freeze_in_adopt": False,
+        }
+        now = [1000.0]
+        reclaim_times = []
+        page_cache_results = []
+        real_guard_reclaim = self.daemon._guard_reclaim_step
+
+        def guard_reclaim(stage):
+            if stage == "page_cache":
+                result = real_guard_reclaim(stage)
+                page_cache_results.append(result)
+                return result
+            return {"performed": 0, "bytes_freed": 0, "scopes": [], "results": []}
+
+        def reclaim(path, amount, high_target):
+            reclaim_times.append(now[0])
+            return self.reclaim_and_apply(path, amount, high_target)
+
+        with (
+            mock.patch.object(service.engine, "_cpu_usage", return_value=100),
+            mock.patch.object(service.memory, "reclaim_page_cache", side_effect=reclaim),
+            mock.patch.object(self.daemon, "_guard_reclaim_step", side_effect=guard_reclaim),
+            mock.patch.object(
+                self.daemon,
+                "_guard_pressure_high",
+                return_value=True,
+            ),
+            mock.patch.object(
+                self.daemon,
+                "_guard_pressure_now_high",
+                return_value=True,
+            ),
+            mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 50)),
+            mock.patch.object(
+                self.daemon,
+                "_guard_freeze_step",
+                return_value={"performed": 0, "bytes_freed": 0, "scopes": []},
+            ),
+            mock.patch.object(
+                self.daemon,
+                "_guard_stop_step",
+                return_value={"performed": 0, "bytes_freed": 0, "scopes": []},
+            ),
+            mock.patch.object(service.time, "time", side_effect=lambda: now[0]),
+        ):
+            for second in range(6):
+                now[0] = 1000.0 + second
+                self.daemon.guard_pass("retry")
+                if second < 5:
+                    self.assertEqual(reclaim_times, [])
+
+        self.assertEqual(reclaim_times, [1005.0], page_cache_results)
+
     def test_memory_high_event_growth_marks_scope_warm(self):
         self.daemon.reclaim_state[self.scope] = {
             "last_at": 950.0,

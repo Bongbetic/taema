@@ -8,18 +8,14 @@ a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re
 
 import collections
 from dataclasses import dataclass, replace
-import hmac
 import json
 import os
 import re
-import secrets
 import select
 import selectors
 import signal
 import socket
 import stat
-import struct
-import subprocess
 import sys
 import tempfile
 import time
@@ -39,9 +35,21 @@ from ..store import knowledge
 from ..config import policy
 from .. import events as event_views, protocol
 
+
+class _LazySubprocess:
+    def __getattr__(self, name):
+        import subprocess as module
+
+        return getattr(module, name)
+
+
+# Preserve the patchable module seam without importing subprocess during startup.
+subprocess = _LazySubprocess()
+
 MAX_OWNERS = 256  # pidfd owner watches
 MAX_LEAF_WATCH = 256  # cgroup.events watches (EPOLLPRI)
 MAX_SLEEP = 60.0  # longest select() sleep
+GUARD_FLOOR_POLL_SECONDS = 5.0  # PSI is event-driven; this only backs up MemAvailable
 JOB_SETTLE = (
     1.5  # seconds between job_done and the decision (survivors must outlive it)
 )
@@ -70,6 +78,46 @@ MAX_RECLAIM_SCOPES = 32
 RECLAIM_CPU_PERCENT = 1.0
 MAX_QOS_OOM_RECORDS = 4096
 MAX_QOS_OOM_UNDO_INPUT = 16384
+GUARD_STEP_SKIP_DETAIL_LIMIT = 4
+GUARD_STEP_REASON_LIMIT = 240
+
+
+def _secure_token_hex(size):
+    import secrets
+
+    return secrets.token_hex(size)
+
+
+def _guard_skipped_candidate_details(results, limit=GUARD_STEP_SKIP_DETAIL_LIMIT):
+    """Bound skipped reclaim diagnostics before writing guard-step events."""
+    details = []
+    skipped_count = 0
+    for result in results if isinstance(results, list) else ():
+        if not isinstance(result, dict) or result.get("status") != "skipped":
+            continue
+        skipped_count += 1
+        if len(details) >= limit:
+            continue
+        detail = {
+            "scope": result.get("scope"),
+            "status": "skipped",
+            "reason": str(result.get("reason", ""))[:GUARD_STEP_REASON_LIMIT],
+        }
+        size = result.get("candidate_size_bytes")
+        if isinstance(size, int) and not isinstance(size, bool):
+            detail["candidate_size_bytes"] = size
+        counters = result.get("candidate_counters")
+        if isinstance(counters, dict):
+            useful = {
+                key: counters[key]
+                for key in ("current_bytes", "file_bytes", "anon_bytes", "reclaimable_bytes")
+                if isinstance(counters.get(key), int)
+                and not isinstance(counters.get(key), bool)
+            }
+            if useful:
+                detail["candidate_counters"] = useful
+        details.append(detail)
+    return details, max(0, skipped_count - len(details))
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,7 +309,7 @@ class Daemon:
             self.store.apply_feedback_command(
                 {
                     "v": 2,
-                    "id": secrets.token_hex(16),
+                    "id": _secure_token_hex(16),
                     "op": "snooze",
                     "until": runtime_until,
                     "reason": runtime.get("reason")
@@ -273,7 +321,7 @@ class Daemon:
             self.store.apply_feedback_command(
                 {
                     "v": 2,
-                    "id": secrets.token_hex(16),
+                    "id": _secure_token_hex(16),
                     "op": "hold",
                     "held": True,
                     "reason": runtime.get("reason")
@@ -285,7 +333,7 @@ class Daemon:
             self.store.apply_feedback_command(
                 {
                     "v": 2,
-                    "id": secrets.token_hex(16),
+                    "id": _secure_token_hex(16),
                     "op": "hold",
                     "held": True,
                     "reason": "TAEMA_HOLD=1 service setting",
@@ -2029,7 +2077,7 @@ class Daemon:
         q = {
             "id": qid,
             "kind": kind,
-            "nonce": secrets.token_hex(8),
+            "nonce": _secure_token_hex(8),
             "shell_pid": shell,
             "tag": tag,
             "word": j["word"],
@@ -2149,6 +2197,8 @@ class Daemon:
             or (owner is not None and not isinstance(owner, str))
         ):
             return {"error": "bad request"}
+        import hmac
+
         q = next(
             (
                 x
@@ -4810,6 +4860,8 @@ class Daemon:
             return
         keep_open = False
         try:
+            import struct
+
             pid, uid, _gid = struct.unpack(
                 "3i",
                 conn.getsockopt(
@@ -5762,7 +5814,7 @@ class Daemon:
         self.store.apply_feedback_command(
             {
                 "v": 2,
-                "id": secrets.token_hex(16),
+                "id": _secure_token_hex(16),
                 "op": "hold",
                 "held": not active,
                 "reason": "SIGUSR1 toggled actions %s"
@@ -5918,7 +5970,7 @@ class Daemon:
         if not self._guard_enabled():
             return
         now = time.time() if now is None else float(now)
-        if now - self.last_guard_check < 1.0:
+        if now - self.last_guard_check < GUARD_FLOOR_POLL_SECONDS:
             return
         self.last_guard_check = now
         available, floor = self._guard_floor()
@@ -5962,12 +6014,20 @@ class Daemon:
             )
             if not isinstance(size, int) or size <= 0:
                 continue
-            candidates.append((size, scope, path, resource_class or "leftover"))
+            candidate_counters = {
+                key: counters.get(key)
+                for key in ("current_bytes", "file_bytes", "anon_bytes", "reclaimable_bytes")
+            }
+            candidates.append(
+                (size, scope, path, resource_class or "leftover", candidate_counters)
+            )
 
         candidates.sort(key=lambda item: (-item[0], item[1]))
         results = []
         measured = 0
-        for index, (_size, scope, path, resource_class) in enumerate(candidates):
+        for index, (size, scope, path, resource_class, candidate_counters) in enumerate(
+            candidates
+        ):
             pressure_high = (
                 self._guard_pressure_high()
                 if index == 0
@@ -5984,6 +6044,9 @@ class Daemon:
                 guard=True,
                 stage=stage,
             )
+            if stage == "page_cache":
+                result["candidate_size_bytes"] = size
+                result["candidate_counters"] = candidate_counters
             results.append(result)
             field = (
                 "file_reclaimed_bytes"
@@ -6278,6 +6341,17 @@ class Daemon:
                 "duration_ms": elapsed_ms,
                 "reason": result.get("reason"),
             }
+            event_details = {}
+            if name == "page_cache":
+                skipped_candidates, skipped_candidates_truncated = (
+                    _guard_skipped_candidate_details(result.get("results"))
+                )
+                step["skipped_candidates"] = skipped_candidates
+                step["skipped_candidates_truncated"] = skipped_candidates_truncated
+                event_details.update(
+                    skipped_candidates=skipped_candidates,
+                    skipped_candidates_truncated=skipped_candidates_truncated,
+                )
             state.setdefault("steps", []).append(step)
             state["bytes_freed"] = int(state.get("bytes_freed", 0)) + freed
             self.store.log(
@@ -6289,6 +6363,7 @@ class Daemon:
                 bytes_freed=freed,
                 duration_ms=elapsed_ms,
                 reason=step["reason"],
+                **event_details,
             )
             if not self._guard_pressure_now_high():
                 break
@@ -6344,7 +6419,7 @@ class Daemon:
         if self.memory_reclaim_enabled():
             due_times.append(self.last.get("reclaim", now) + self.iv_reclaim)
         if self._guard_enabled():
-            due_times.append(self.last_guard_check + 1.0)
+            due_times.append(self.last_guard_check + GUARD_FLOOR_POLL_SECONDS)
             if self.guard_state.get("active"):
                 retry_at = self.guard_state.get("retry_at")
                 if isinstance(retry_at, (int, float)) and retry_at > 0:
@@ -7504,16 +7579,17 @@ class Daemon:
             self.reclaim_usage.pop(scope, None)
             self.reclaim_idle_since.pop(scope, None)
             return False, "CPU usage is unavailable"
-        self.reclaim_usage[scope] = (usage, now)
         if previous is None or now <= previous[1]:
+            self.reclaim_usage[scope] = (usage, now)
             self.reclaim_idle_since[scope] = now
             return False, "waiting for a second idle sample"
         elapsed = now - previous[1]
+        if elapsed < qos.BACKGROUND_SAMPLE_SECONDS:
+            return False, "waiting for a stable CPU sample"
+        self.reclaim_usage[scope] = (usage, now)
         if usage < previous[0]:
             self.reclaim_idle_since[scope] = now
             return False, "CPU counter changed"
-        if elapsed < qos.BACKGROUND_SAMPLE_SECONDS:
-            return False, "waiting for a stable CPU sample"
         cpu_percent = 100.0 * (usage - previous[0]) / (elapsed * 1_000_000)
         if cpu_percent > RECLAIM_CPU_PERCENT:
             self.reclaim_idle_since[scope] = now

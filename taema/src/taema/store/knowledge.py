@@ -13,7 +13,6 @@ import os
 import re
 import tempfile
 import time
-import uuid
 
 from ..config import policy
 from .. import protocol
@@ -56,6 +55,12 @@ MAX_AUTO_ACTIONS = 10_000  # durable undo context; status exposes only a recent 
 MAX_FEEDBACK_IDS = 50_000
 DAILY_EXPORT_RE = re.compile(r"^state-export-(\d{8})\.json$")
 DAILY_EXPORTS_KEPT = 3
+
+
+def _new_id():
+    import uuid
+
+    return uuid.uuid4().hex
 
 # ---- pair model (Phase 2/4 thresholds; pure, see decide()) ----
 DAY = 86400.0
@@ -520,9 +525,9 @@ class Store:
         cwd=None,
     ):
         """Record one durable lifecycle decision and return its trace identifiers."""
-        correlation = corr or uuid.uuid4().hex
+        correlation = corr or _new_id()
         if self.read_only:
-            identifier = uuid.uuid4().hex
+            identifier = _new_id()
         else:
             self._decision_seq += 1
             identifier = self._decision_seq
@@ -741,7 +746,7 @@ class Store:
             return None
         if not isinstance(source, str) or not source or len(source) > 64:
             return None
-        identifier = identifier or uuid.uuid4().hex
+        identifier = identifier or _new_id()
         existing = next(
             (
                 v
@@ -1313,7 +1318,7 @@ class Store:
             if app not in normalized_apps:
                 normalized_apps.append(app)
         action = {
-            "id": uuid.uuid4().hex,
+            "id": _new_id(),
             "scope": str(scope)[:256],
             "why": str(why)[:512],
             "pairs": normalized_pairs[:32],
@@ -3481,7 +3486,7 @@ class Store:
             signature_id = signature_id or pair.get("sig")
             if signature_id:
                 pair["sig"] = signature_id
-            stop_id = stop_id or uuid.uuid4().hex
+            stop_id = stop_id or _new_id()
             pair["probation"] = int(pair.get("probation", 0)) + 1
             pair["last_auto_stop"] = now
             pair["pending_stop"] = {

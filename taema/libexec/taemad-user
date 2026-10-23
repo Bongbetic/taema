@@ -25,6 +25,21 @@ if [ ! -d "$cg" ] || [ "$(stat -c %u "$cg")" != "$uid" ]; then
     exit 1
 fi
 
+# Prime root-owned bytecode so the daemon avoids compiling its imported modules after setpriv.
+# It must stay readable to the target user, then restore the service's private umask.
+unset PYTHONDONTWRITEBYTECODE PYTHONPYCACHEPREFIX PYTHONHOME PYTHONPATH PYTHONOPTIMIZE
+umask 022
+if ! /usr/bin/python3 -P -m compileall -q /usr/lib/taema/taema; then
+    echo "taemad-user: bytecode precompile failed; continuing with source imports" >&2
+fi
+find /usr/lib/taema/taema -type d -name __pycache__ -prune \
+    -exec chmod 755 {} + 2>/dev/null ||
+    echo "taemad-user: could not make bytecode cache directories readable" >&2
+find /usr/lib/taema/taema -type f -name '*.pyc' \
+    -exec chmod 644 {} + 2>/dev/null ||
+    echo "taemad-user: could not make bytecode files readable" >&2
+umask 077
+
 mkdir -p "$cg/manager"
 chown "$uid:$gid" "$cg/manager" "$cg/manager/cgroup.procs"
 printf '%s\n' "$$" > "$cg/manager/cgroup.procs"
@@ -34,4 +49,4 @@ exec setpriv --reuid="$uid" --regid="$gid" --init-groups --inh-caps=-all --reset
     TAEMA_HOLD="${TAEMA_HOLD:-0}" \
     XDG_CONFIG_HOME="$home/.config" XDG_STATE_HOME="$home/.local/state" \
     PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
-    /usr/bin/taema daemon
+    /usr/bin/taemad

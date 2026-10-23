@@ -48,7 +48,7 @@ LEARNING_REPLAY_FIXTURE = os.path.join(
 GUEST_TMP = "/tmp/taema-vm"
 
 LIBCS = ("glibc", "musl")
-SCENARIOS = ("smoke", "m0", "m1", "m2", "upgrade", "remove")
+SCENARIOS = ("smoke", "m0", "m1", "m2", "m3", "upgrade", "remove")
 ACCELS = ("auto", "kvm", "tcg")
 IMAGE_KEYS = ("dir", "tarball", "rootfs", "base", "kernel", "initrd")
 
@@ -158,7 +158,9 @@ def _validate(raw, path="<config>"):
     return raw
 
 
-def with_overrides(cfg, state_dir=None, libcs=None, scenarios=None, accel=None):
+def with_overrides(
+    cfg, state_dir=None, libcs=None, scenarios=None, accel=None, memory_mb=None
+):
     """A validated copy of cfg with CLI overrides applied."""
     new = dict(cfg)
     new["paths"] = dict(cfg["paths"])
@@ -173,6 +175,8 @@ def with_overrides(cfg, state_dir=None, libcs=None, scenarios=None, accel=None):
         new["scenarios"] = list(scenarios)
     if accel:
         new["accel"] = accel
+    if memory_mb is not None:
+        new["memory_mb"] = memory_mb
     return _validate(new, "<cli>")
 
 
@@ -284,6 +288,10 @@ def bootstrap_sources(pub, package_repo, previous, scenarios):
         sources.append(MIGRATION_FIXTURE)
     if "m2" in scenarios:
         sources.append(LEARNING_REPLAY_FIXTURE)
+    if "m3" in scenarios:
+        sources.extend(
+            [os.path.join(TAEMA_ROOT, "tests"), os.path.join(TAEMA_ROOT, "schema")]
+        )
     return sources
 
 
@@ -1271,7 +1279,11 @@ def main(argv, out=None, err=None):
         "--libc", help="comma-separated libcs to boot (default from config)"
     )
     runp.add_argument(
-        "--scenarios", help="comma-separated: smoke,m0,upgrade,remove or all"
+        "--scenarios",
+        help="comma-separated: smoke,m0,m1,m2,m3,upgrade,remove or all",
+    )
+    runp.add_argument(
+        "--memory-mb", type=int, help="guest RAM in MiB (minimum 512)"
     )
     runp.add_argument("--tcg", action="store_true", help="force TCG emulation")
     runp.add_argument("--dry-run", action="store_true", help="print the plan and exit")
@@ -1312,6 +1324,7 @@ def main(argv, out=None, err=None):
             if getattr(args, "scenarios", None)
             else None,
             accel="tcg" if getattr(args, "tcg", False) else None,
+            memory_mb=getattr(args, "memory_mb", None),
         )
         if args.cmd == "doctor":
             return cmd_doctor(cfg, out, err)

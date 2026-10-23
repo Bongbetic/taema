@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -674,7 +675,7 @@ class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
         self.assertEqual(
             vmh.parse_scenarios("all"),
-            ["smoke", "m0", "m1", "m2", "upgrade", "remove"],
+            ["smoke", "m0", "m1", "m2", "m3", "upgrade", "remove"],
         )
 
     def test_m0_acceptance_is_a_registered_guest_scenario(self):
@@ -683,6 +684,40 @@ class HarnessCliParsingTest(VmTestCase):
         for name in ("m1", "m2"):
             self.assertIn(name, vmh.SCENARIOS)
             self.assertIn(name, scenario.SCENARIOS)
+
+    def test_m3_release_acceptance_is_a_registered_guest_scenario(self):
+        self.assertIn("m3", vmh.SCENARIOS)
+        self.assertIn("m3", scenario.SCENARIOS)
+        cfg = vmh.load_config(self.write_config(libcs=["glibc"], scenarios=["m3"]))
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["m3"], kvm=False)
+        step = next(
+            item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:m3"
+        )
+        self.assertIn("scenario.py m3", step["argv"][-1])
+
+    def test_m3_can_boot_a_low_memory_guest(self):
+        config = self.write_config(libcs=["glibc"], scenarios=["m3"])
+        code, out, err = self.run_main(
+            "run",
+            "--dry-run",
+            "--config",
+            config,
+            "--state-dir",
+            self.state,
+            "--libc",
+            "glibc",
+            "--memory-mb",
+            "512",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("-m 512", out)
+
+    def test_m3_bootstraps_fake_libvirt_acceptance_tests(self):
+        sources = vmh.bootstrap_sources(
+            "/tmp/key.pub", "/tmp/repo", "/tmp/previous.xbps", ["m3"]
+        )
+        self.assertIn(os.path.join(ROOT, "tests"), sources)
+        self.assertIn(os.path.join(ROOT, "schema"), sources)
 
     def test_parse_libcs(self):
         self.assertEqual(vmh.parse_libcs("glibc, musl"), ["glibc", "musl"])
@@ -709,7 +744,20 @@ class HarnessSurfacesTest(unittest.TestCase):
 
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
-        self.assertEqual(vmh.read_version(ROOT), "0.4.0")
+        self.assertEqual(vmh.read_version(ROOT), "0.5.0")
+
+    def test_release_notes_document_0_5_0_resource_governor(self):
+        notes = read_text(os.path.join(REPO, "CHANGELOG.md"))
+        release = " ".join(
+            notes.split("# 0.5.0", 1)[1].split("# 0.4.0", 1)[0].split()
+        ).lower()
+        self.assertIn("pressure guard", release)
+        self.assertIn("memory budget", release)
+        self.assertIn("low-memory", release)
+        readme = read_text(os.path.join(REPO, "README.md"))
+        self.assertIn("## Memory", readme)
+        self.assertIn("taema memory budget", readme)
+        self.assertIn("git tag taema-v0.5.0", readme)
 
     def test_release_notes_document_forget_all_and_feedback_field(self):
         notes = read_text(os.path.join(REPO, "CHANGELOG.md"))
@@ -764,6 +812,617 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn("timeout-minutes: 180", wf)
         self.assertIn("upload-artifact", wf)
         self.assertNotIn("continue-on-error", wf)
+
+
+class ScenarioM3MoveTest(unittest.TestCase):
+    def test_m3_move_keeps_direct_write_when_delegated(self):
+        cgroot = os.path.join(tempfile.mkdtemp(), "cg")
+        self.addCleanup(shutil.rmtree, os.path.dirname(cgroot), True)
+        dest = os.path.join(cgroot, "user", str(os.getuid()), "leftover", "cache")
+        os.makedirs(dest)
+        open(os.path.join(dest, "cgroup.procs"), "w", encoding="ascii").close()
+        with mock.patch.object(scenario, "CGROOT", cgroot):
+            with mock.patch.object(scenario.subprocess, "run") as run:
+                scenario._m3_move(123, dest)
+        with open(os.path.join(dest, "cgroup.procs"), encoding="ascii") as source:
+            self.assertEqual(source.read(), "123\n")
+        run.assert_not_called()
+
+    def test_m3_move_uses_sudo_tee_only_when_direct_write_is_denied(self):
+        cgroot = os.path.join(tempfile.mkdtemp(), "cg")
+        self.addCleanup(shutil.rmtree, os.path.dirname(cgroot), True)
+        base = os.path.join(cgroot, "user", str(os.getuid()))
+        dest = os.path.join(base, "leftover", "cache")
+        os.makedirs(dest)
+        open(os.path.join(dest, "cgroup.procs"), "w", encoding="ascii").close()
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(scenario, "CGROOT", cgroot):
+            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+                with mock.patch.object(
+                    scenario.subprocess, "run", return_value=completed
+                ) as run:
+                    scenario._m3_move(123, dest)
+        run.assert_called_once_with(
+            ["sudo", "-n", "tee", os.path.join(dest, "cgroup.procs")],
+            input="123\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_m3_move_reports_privileged_write_failure(self):
+        cgroot = os.path.join(tempfile.mkdtemp(), "cg")
+        self.addCleanup(shutil.rmtree, os.path.dirname(cgroot), True)
+        dest = os.path.join(cgroot, "user", str(os.getuid()), "leftover", "cache")
+        os.makedirs(dest)
+        denied = subprocess.CompletedProcess([], 1, "", "sudo denied cgroup write")
+        with mock.patch.object(scenario, "CGROOT", cgroot):
+            with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+                with mock.patch.object(scenario.subprocess, "run", return_value=denied):
+                    with self.assertRaisesRegex(
+                        scenario.ScenarioError, "sudo denied cgroup write"
+                    ):
+                        scenario._m3_move(123, dest)
+
+    def test_m3_move_does_not_use_sudo_for_other_write_errors(self):
+        cgroot = os.path.join(tempfile.mkdtemp(), "cg")
+        self.addCleanup(shutil.rmtree, os.path.dirname(cgroot), True)
+        dest = os.path.join(cgroot, "user", str(os.getuid()), "leftover", "cache")
+        os.makedirs(dest)
+        with mock.patch.object(scenario, "CGROOT", cgroot):
+            with mock.patch("builtins.open", side_effect=OSError("read-only")):
+                with mock.patch.object(scenario.subprocess, "run") as run:
+                    with self.assertRaisesRegex(OSError, "read-only"):
+                        scenario._m3_move(123, dest)
+        run.assert_not_called()
+
+
+class ScenarioM3MemoryControllerTest(unittest.TestCase):
+    def make_controller_tree(self, base_state="memory", leftover_state="memory"):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        base = os.path.join(root, "user", str(os.getuid()))
+        leftover = os.path.join(base, "leftover")
+        os.makedirs(leftover)
+        for path, controllers, active in (
+            (base, "memory", base_state),
+            (leftover, "memory", leftover_state),
+        ):
+            with open(os.path.join(path, "cgroup.controllers"), "w") as target:
+                target.write(controllers + "\n")
+            with open(os.path.join(path, "cgroup.subtree_control"), "w") as target:
+                target.write(active + "\n")
+        return base, leftover
+
+    def test_already_enabled_memory_controller_needs_no_writes(self):
+        base, leftover = self.make_controller_tree("memory", "memory")
+        with mock.patch.object(scenario.subprocess, "run") as run:
+            scenario._m3_enable_memory_controllers(base, leftover)
+        run.assert_not_called()
+
+    def test_enables_memory_directly_at_each_parent(self):
+        base, leftover = self.make_controller_tree("", "")
+        with mock.patch.object(scenario.subprocess, "run") as run:
+            scenario._m3_enable_memory_controllers(base, leftover)
+        for path in (base, leftover):
+            with open(os.path.join(path, "cgroup.subtree_control")) as source:
+                self.assertEqual(source.read(), "+memory\n")
+        run.assert_not_called()
+
+    def test_permission_error_uses_noninteractive_sudo_tee(self):
+        base, leftover = self.make_controller_tree("", "memory")
+        subtree = os.path.join(base, "cgroup.subtree_control")
+        real_open = open
+        completed = subprocess.CompletedProcess([], 0, "", "")
+
+        def privileged_write(argv, input, **kwargs):
+            with real_open(subtree, "w") as target:
+                target.write(input)
+            return completed
+
+        def deny_direct_subtree_write(path, mode="r", *args, **kwargs):
+            if path == subtree and "w" in mode:
+                raise PermissionError("denied")
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=deny_direct_subtree_write):
+            with mock.patch.object(
+                scenario.subprocess, "run", side_effect=privileged_write
+            ) as run:
+                scenario._m3_enable_memory_controllers(base, leftover)
+        run.assert_called_once_with(
+            ["sudo", "-n", "tee", subtree],
+            input="+memory\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_missing_memory_controller_fails_with_parent_detail(self):
+        base, leftover = self.make_controller_tree("memory", "memory")
+        with open(os.path.join(leftover, "cgroup.controllers"), "w") as target:
+            target.write("cpu\n")
+        with self.assertRaisesRegex(
+            scenario.ScenarioError,
+            "memory controller unavailable.*%s" % leftover,
+        ):
+            scenario._m3_enable_memory_controllers(base, leftover)
+
+    def test_other_enable_error_is_reported_without_sudo_fallback(self):
+        base, leftover = self.make_controller_tree("", "memory")
+        subtree = os.path.join(base, "cgroup.subtree_control")
+        real_open = open
+
+        def deny_write(path, mode="r", *args, **kwargs):
+            if path == subtree and "w" in mode:
+                raise OSError("controller busy")
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=deny_write):
+            with mock.patch.object(scenario.subprocess, "run") as run:
+                with self.assertRaisesRegex(
+                    scenario.ScenarioError,
+                    "cannot enable memory controller.*controller busy",
+                ):
+                    scenario._m3_enable_memory_controllers(base, leftover)
+        run.assert_not_called()
+
+
+class ScenarioM3FixtureHelpersTest(unittest.TestCase):
+    @staticmethod
+    def _quiet_status(active=False):
+        return {"status": {"details": {"guard": {"active": active}}}}
+
+    @staticmethod
+    def _quiet_pressure(some_total=0, some_avg10=0.0, full_total=0, full_avg10=0.0):
+        return {
+            "some": {"total": some_total, "avg10": some_avg10},
+            "full": {"total": full_total, "avg10": full_avg10},
+        }
+
+    def test_footprint_quiet_wait_requires_guard_to_finish(self):
+        clock = [0.0]
+
+        def sleep(duration):
+            clock[0] += duration
+
+        with (
+            mock.patch.object(scenario.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(scenario.time, "sleep", side_effect=sleep),
+        ):
+            result = scenario._m3_wait_for_footprint_quiet(
+                status_reader=lambda: self._quiet_status(active=clock[0] < 4),
+                psi_reader=lambda: self._quiet_pressure(),
+                timeout=20,
+                quiet_seconds=2,
+                poll_interval=1,
+            )
+
+        self.assertGreaterEqual(result["waited_seconds"], 6)
+        self.assertEqual(result["stable_seconds"], 2)
+
+    def test_footprint_quiet_wait_resets_when_psi_counters_change(self):
+        clock = [0.0]
+
+        def sleep(duration):
+            clock[0] += duration
+
+        def pressure():
+            some_total = 1 if clock[0] >= 3 else 0
+            return self._quiet_pressure(some_total=some_total)
+
+        with (
+            mock.patch.object(scenario.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(scenario.time, "sleep", side_effect=sleep),
+        ):
+            result = scenario._m3_wait_for_footprint_quiet(
+                status_reader=lambda: self._quiet_status(),
+                psi_reader=pressure,
+                timeout=20,
+                quiet_seconds=3,
+                poll_interval=1,
+            )
+
+        self.assertGreaterEqual(result["waited_seconds"], 7)
+        self.assertEqual(result["stable_seconds"], 3)
+        self.assertEqual(result["some_total"], 1)
+
+    def test_footprint_quiet_wait_finishes_after_stable_pressure_window(self):
+        clock = [0.0]
+
+        def sleep(duration):
+            clock[0] += duration
+
+        with (
+            mock.patch.object(scenario.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(scenario.time, "sleep", side_effect=sleep),
+        ):
+            result = scenario._m3_wait_for_footprint_quiet(
+                status_reader=lambda: self._quiet_status(),
+                psi_reader=lambda: self._quiet_pressure(),
+                timeout=20,
+                quiet_seconds=3,
+                poll_interval=1,
+            )
+
+        self.assertEqual(result["stable_seconds"], 3)
+        self.assertGreaterEqual(result["waited_seconds"], 3)
+
+    def test_footprint_psi_reader_parses_avg10_and_total_counters(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as source:
+            source.write(
+                "some avg10=0.12 avg60=4.21 avg300=11.80 total=69040792\n"
+                "full avg10=0.00 avg60=4.11 avg300=11.52 total=67415772\n"
+            )
+            path = source.name
+        self.addCleanup(os.unlink, path)
+
+        result = scenario._m3_psi_pressure_snapshot(path)
+
+        self.assertEqual(result["some"], {"avg10": 0.12, "total": 69040792})
+        self.assertEqual(result["full"], {"avg10": 0.0, "total": 67415772})
+
+    def test_idle_footprint_guard_uses_production_thresholds_and_cooldown(self):
+        idle_config = scenario._m3_guard_config(pressure_fixture=False)
+        pressure_config = scenario._m3_guard_config()
+
+        self.assertIn("cooldown = 10", idle_config)
+        self.assertIn('psi_some = "150ms/2s"', idle_config)
+        self.assertIn('psi_full = "50ms/2s"', idle_config)
+        self.assertIn("cooldown = 1", pressure_config)
+        self.assertIn('psi_some = "1ms/2s"', pressure_config)
+
+    def test_required_live_unittest_gate_rejects_a_skipped_test(self):
+        self.assertFalse(
+            scenario._m3_unittest_passed(
+                0, "Ran 1 test in 0.001s\n\nOK (skipped=1)\n", fail_on_skip=True
+            )
+        )
+        self.assertTrue(scenario._m3_unittest_passed(0, "Ran 1 test\n\nOK\n"))
+        self.assertFalse(
+            scenario._m3_unittest_passed(1, "Ran 1 test\n\nFAILED (errors=1)\n")
+        )
+
+    def test_required_live_unittest_runner_records_a_skip_as_failure(self):
+        output = "Ran 1 test in 0.001s\n\nOK (skipped=1)\n"
+        result = subprocess.CompletedProcess([], 0, output, None)
+        with tempfile.TemporaryDirectory() as artifacts:
+            rec = scenario.ResultRecorder("m3", artifacts)
+            args = types.SimpleNamespace(artifacts=artifacts)
+            with mock.patch.object(scenario.subprocess, "run", return_value=result):
+                passed = scenario._m3_run_tests(
+                    rec,
+                    args,
+                    "required-live-test",
+                    [
+                        "tests.test_freeze_live.LiveListenerWakeTests.test_http_request_thaws_listener_with_p95_under_three_seconds"
+                    ],
+                    fail_on_skip=True,
+                )
+
+        self.assertFalse(passed)
+        self.assertFalse(rec.steps[0]["ok"])
+        self.assertIn("skipped=1", rec.steps[0]["detail"])
+
+    def test_footprint_gate_requires_enabled_guard_and_two_production_psi_fds(self):
+        status = {
+            "status": {
+                "daemon": "running",
+                "mode": "auto",
+                "config_error": None,
+            },
+            "memory": {"enabled": True},
+        }
+        config = scenario._m3_guard_config(pressure_fixture=False)
+
+        self.assertTrue(scenario._m3_footprint_guard_inputs(config, 2, status))
+        self.assertFalse(scenario._m3_footprint_guard_inputs(config, 1, status))
+        self.assertFalse(scenario._m3_footprint_guard_inputs(config, 3, status))
+        self.assertFalse(
+            scenario._m3_footprint_guard_inputs(
+                scenario._m3_guard_config(pressure_fixture=True), 2, status
+            )
+        )
+        self.assertFalse(
+            scenario._m3_footprint_guard_inputs(
+                config,
+                2,
+                {
+                    "status": dict(status["status"], mode="observe"),
+                    "memory": status["memory"],
+                },
+            )
+        )
+
+    def test_daemon_sample_counts_both_user_memory_pressure_fds(self):
+        with (
+            tempfile.TemporaryDirectory() as proc_root,
+            tempfile.TemporaryDirectory() as cg_root,
+        ):
+            pid = 1234
+            process_root = os.path.join(proc_root, str(pid))
+            fd_root = os.path.join(process_root, "fd")
+            os.makedirs(fd_root)
+            with open(
+                os.path.join(process_root, "status"), "w", encoding="ascii"
+            ) as target:
+                target.write("VmRSS:\t2048 kB\n")
+            stat_fields = ["S"] + ["0"] * 13
+            stat_fields[11] = "7"
+            stat_fields[12] = "9"
+            with open(
+                os.path.join(process_root, "stat"), "w", encoding="ascii"
+            ) as target:
+                target.write("1234 (taemad) " + " ".join(stat_fields))
+            for fd in ("3", "4", "5"):
+                open(os.path.join(fd_root, fd), "w").close()
+            pressure_path = os.path.join(cg_root, "user", "1000", "memory.pressure")
+            links = {
+                os.path.join(fd_root, "3"): pressure_path,
+                os.path.join(fd_root, "4"): pressure_path,
+                os.path.join(fd_root, "5"): os.path.join(cg_root, "memory.pressure"),
+            }
+            with (
+                mock.patch.object(scenario, "PROCROOT", proc_root),
+                mock.patch.object(scenario, "CGROOT", cg_root),
+                mock.patch.object(scenario.os, "getuid", return_value=1000),
+                mock.patch.object(
+                    scenario.os, "readlink", side_effect=links.__getitem__
+                ),
+            ):
+                sample = scenario._m3_daemon_sample(pid)
+
+        self.assertEqual(sample, (2048, 16, 2))
+
+    def test_post_guard_pressure_cap_uses_16_mib_margin_below_threshold(self):
+        mib = 1024 * 1024
+        target, cap = scenario._m3_post_guard_pressure_cap(
+            allocated=30 * mib,
+            available_bytes=200 * mib,
+            earlyoom_threshold_bytes=100 * mib,
+        )
+        self.assertEqual(target, 84 * mib)
+        self.assertEqual(cap, 146 * mib)
+
+        target, cap = scenario._m3_post_guard_pressure_cap(
+            allocated=0,
+            available_bytes=mib,
+            earlyoom_threshold_bytes=8 * mib,
+        )
+        self.assertEqual(target, 0)
+        self.assertEqual(cap, 2 * mib)
+
+    def test_earlyoom_parser_uses_reported_user_memory_denominator(self):
+        mib = 1024 * 1024
+        threshold_787 = (787 * mib * 5 + 99) // 100
+        threshold_790 = (790 * mib * 5 + 99) // 100
+        samples = scenario._m3_parse_earlyoom_memory_samples(
+            "\x1b[0mmem avail:   58 of   787 MiB ( 7.39%), swap free: 0 MiB\n"
+            "mem avail: 56 of 790 MiB (7.09%), swap free: 0 MiB\n"
+        )
+        self.assertEqual(
+            samples,
+            [
+                {
+                    "available_mib": 58,
+                    "total_mib": 787,
+                    "threshold_bytes": threshold_787,
+                },
+                {
+                    "available_mib": 56,
+                    "total_mib": 790,
+                    "threshold_bytes": threshold_790,
+                },
+            ],
+        )
+        target, cap = scenario._m3_post_guard_pressure_cap(
+            allocated=32 * mib,
+            available_bytes=58 * mib,
+            earlyoom_threshold_bytes=samples[-1]["threshold_bytes"],
+        )
+        self.assertEqual(target, threshold_790 - 16 * mib)
+        self.assertEqual(cap, 32 * mib + max(2 * mib, 58 * mib - target))
+
+    def test_pressure_ramp_is_bounded_to_four_8_mib_increments(self):
+        mib = 1024 * 1024
+        cap = 66 * mib
+        for steps in range(4):
+            cap, increment = scenario._m3_pressure_ramp_next_cap(cap, steps)
+            self.assertEqual(increment, 8 * mib)
+        self.assertEqual(cap, 98 * mib)
+        self.assertEqual(scenario._m3_pressure_ramp_next_cap(cap, 4), (cap, 0))
+
+    def test_cache_file_is_unique_and_created_in_selected_disk_area(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = scenario._m3_create_cache_file(directory)
+            second = scenario._m3_create_cache_file(directory)
+            self.assertNotEqual(first, second)
+            self.assertEqual(os.path.dirname(first), directory)
+            self.assertEqual(os.path.dirname(second), directory)
+            self.assertTrue(os.path.isfile(first))
+            self.assertTrue(os.path.isfile(second))
+
+    def test_cache_stats_report_inactive_file_and_conservative_reclaimable_bytes(self):
+        with tempfile.TemporaryDirectory() as path:
+            with open(os.path.join(path, "memory.current"), "w") as target:
+                target.write("4096\n")
+            with open(os.path.join(path, "memory.stat"), "w") as target:
+                target.write(
+                    "file 1000\nshmem 200\ninactive_file 800\n"
+                    "anon 300\nworkingset_refault_file 7\n"
+                )
+            stats = scenario._m3_cgroup_stats(path)
+        self.assertEqual(stats["inactive_file_bytes"], 800)
+        self.assertEqual(scenario._m3_reclaimable_file_cache_bytes(stats), 800)
+
+    def test_thaw_uncaps_resumes_and_waits_for_both_cgroups(self):
+        with tempfile.TemporaryDirectory() as root:
+            candidate = os.path.join(root, "candidate")
+            pressure = os.path.join(root, "pressure")
+            os.mkdir(candidate)
+            os.mkdir(pressure)
+            for path in (candidate, pressure):
+                with open(os.path.join(path, "cgroup.freeze"), "w") as target:
+                    target.write("1\n")
+                with open(os.path.join(path, "cgroup.events"), "w") as target:
+                    target.write("populated 1\nfrozen 1\n")
+            high = os.path.join(pressure, "memory.high")
+            with open(high, "w") as target:
+                target.write("2M\n")
+
+            class RunningPressure:
+                def __init__(self):
+                    self.sent_signal = None
+
+                def poll(self):
+                    return None
+
+                def send_signal(self, value):
+                    self.sent_signal = value
+
+            worker = RunningPressure()
+
+            def thaw_events():
+                time.sleep(0.05)
+                for path in (candidate, pressure):
+                    with open(os.path.join(path, "cgroup.events"), "w") as target:
+                        target.write("populated 1\nfrozen 0\n")
+
+            thread = threading.Thread(target=thaw_events)
+            thread.start()
+            try:
+                scenario._m3_thaw_cgroups(
+                    candidate, pressure, pressure_proc=worker, timeout=1, poll=0.01
+                )
+            finally:
+                thread.join(timeout=1)
+
+            self.assertEqual(worker.sent_signal, scenario.signal.SIGUSR2)
+            with open(high) as source:
+                self.assertEqual(source.read(), "max\n")
+            for path in (candidate, pressure):
+                with open(os.path.join(path, "cgroup.freeze")) as source:
+                    self.assertEqual(source.read(), "0\n")
+
+
+class ScenarioM3OomScoreTest(unittest.TestCase):
+    def setUp(self):
+        self.procroot = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.procroot, True)
+        self.pid = 123
+        self.pid_path = os.path.join(self.procroot, str(self.pid))
+        os.makedirs(self.pid_path)
+        self.adj_path = os.path.join(self.pid_path, "oom_score_adj")
+        with open(self.adj_path, "w") as target:
+            target.write("0\n")
+
+    def test_set_oom_score_adj_keeps_direct_proc_write(self):
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            with mock.patch.object(scenario.subprocess, "run") as run:
+                result = scenario._m3_set_oom_score_adj(self.pid, -1000)
+        self.assertEqual(result, -1000)
+        with open(self.adj_path) as source:
+            self.assertEqual(source.read(), "-1000\n")
+        run.assert_not_called()
+
+    def test_set_oom_score_adj_falls_back_to_sudo_tee_on_permission_error(self):
+        real_open = open
+        completed = subprocess.CompletedProcess([], 0, "", "")
+
+        def privileged_write(argv, input, **kwargs):
+            with real_open(self.adj_path, "w") as target:
+                target.write(input)
+            return completed
+
+        def deny_direct_write(path, mode="r", *args, **kwargs):
+            if path == self.adj_path and "w" in mode:
+                raise PermissionError("denied")
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            with mock.patch("builtins.open", side_effect=deny_direct_write):
+                with mock.patch.object(
+                    scenario.subprocess, "run", side_effect=privileged_write
+                ) as run:
+                    self.assertEqual(
+                        scenario._m3_set_oom_score_adj(self.pid, -1000), -1000
+                    )
+        run.assert_called_once_with(
+            ["sudo", "-n", "tee", self.adj_path],
+            input="-1000\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_set_oom_score_adj_reports_privileged_failure(self):
+        denied = subprocess.CompletedProcess([], 1, "", "sudo denied proc write")
+
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            with mock.patch(
+                "builtins.open", side_effect=PermissionError("direct write denied")
+            ):
+                with mock.patch.object(scenario.subprocess, "run", return_value=denied):
+                    with self.assertRaisesRegex(
+                        scenario.ScenarioError, "sudo denied proc write"
+                    ):
+                        scenario._m3_set_oom_score_adj(self.pid, -1000)
+
+    def test_process_oom_metrics_read_kernel_score_and_adjustment(self):
+        with open(os.path.join(self.pid_path, "oom_score"), "w") as target:
+            target.write("968\n")
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            metrics = scenario._m3_process_oom_metrics(self.pid)
+        self.assertEqual(metrics, {"oom_score": 968, "oom_score_adj": 0})
+
+    def test_process_oom_evidence_includes_pid_and_kernel_metrics(self):
+        with open(os.path.join(self.pid_path, "oom_score"), "w") as target:
+            target.write("1048\n")
+        with open(self.adj_path, "w") as target:
+            target.write("500\n")
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            evidence = scenario._m3_process_oom_evidence(self.pid)
+        self.assertEqual(
+            evidence,
+            {"pid": self.pid, "oom_score": 1048, "oom_score_adj": 500},
+        )
+
+
+class ScenarioDaemonProcessTest(unittest.TestCase):
+    def setUp(self):
+        self.procroot = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.procroot, True)
+
+    def _proc(self, pid, argv):
+        root = os.path.join(self.procroot, str(pid))
+        os.makedirs(root)
+        with open(os.path.join(root, "cmdline"), "wb") as target:
+            target.write(b"\0".join(arg.encode() for arg in argv) + b"\0")
+        return root
+
+    def test_daemon_argv_matches_new_entrypoint_and_public_cli(self):
+        for argv in (
+            ["/usr/bin/python3", "-P", "-m", "taema.daemon_entrypoint"],
+            ["/usr/bin/python3", "-P", "-m", "taema", "daemon"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(scenario._is_taema_daemon_argv(argv))
+
+    def test_daemon_argv_rejects_unrelated_processes_with_daemon_text(self):
+        self.assertFalse(scenario._is_taema_daemon_argv(["grep", "taema daemon"]))
+        self.assertFalse(
+            scenario._is_taema_daemon_argv(
+                ["/usr/bin/python3", "-m", "taema.not_daemon"]
+            )
+        )
+
+    def test_m3_pid_finds_the_daemon_only_module_argv(self):
+        self._proc(
+            1234,
+            ["/usr/bin/python3", "-P", "-m", "taema.daemon_entrypoint"],
+        )
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            self.assertEqual(scenario._m3_daemon_pid(), 1234)
 
 
 class ScenarioApiTest(unittest.TestCase):

@@ -37,7 +37,7 @@ install:
 	find src/taema -type f -name '*.py' -print | while read file; do \
 		rel=$${file#src/taema/}; install -m644 "$$file" "$(LIBDIR)/$$rel"; \
 	done
-	install -m755 bin/taema bin/scoperun bin/scopekill bin/scopels $(BINDIR)/
+	install -m755 bin/taema bin/taemad bin/scoperun bin/scopekill bin/scopels $(BINDIR)/
 	install -m755 libexec/taema-attach libexec/taemad-user libexec/taemad-log libexec/taema-svstop libexec/taema-hook $(LIBEXEC)/
 	install -m755 sv/taema/run sv/taema/finish $(SVDIR)/
 	install -m755 sv/taema/log/run $(SVDIR)/log/

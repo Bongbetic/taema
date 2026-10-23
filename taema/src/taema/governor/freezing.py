@@ -173,9 +173,10 @@ def listener_descriptors(members, snapshot, member_socket_inodes=()):
         for row in rows:
             if row.get("state") != "LISTEN":
                 continue
-            if not (row.get("pids", set()) & members) and row.get(
-                "inode"
-            ) not in member_socket_inodes:
+            if (
+                not (row.get("pids", set()) & members)
+                and row.get("inode") not in member_socket_inodes
+            ):
                 continue
             inode = row.get("inode")
             if not isinstance(inode, int) or isinstance(inode, bool) or inode <= 0:

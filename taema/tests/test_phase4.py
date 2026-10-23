@@ -1321,8 +1321,9 @@ class RuntimeGc(AutoCase):
                     mock.patch.object(
                         engine,
                         "stop",
-                        side_effect=lambda *args, **kwargs: order.append("stop")
-                        or report,
+                        side_effect=lambda *args, **kwargs: (
+                            order.append("stop") or report
+                        ),
                     ),
                     mock.patch.object(self.d, "note_stop", return_value=[pid]),
                     mock.patch.object(self.d, "stopped_apps", return_value=[]),

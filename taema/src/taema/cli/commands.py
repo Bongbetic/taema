@@ -3645,15 +3645,12 @@ def cmd_adopt(a):
 
 
 def cmd_daemon(a):
-    from ..daemon import service as daemon
+    from ..daemon_entrypoint import launch_daemon
 
-    cfg = policy.load_config(path=getattr(a, "config", None))
-    socket_override = getattr(a, "socket", None)
-    if socket_override:
-        socket_override = policy.expand(socket_override)
-        cfg["paths"]["socket"] = socket_override
-        cfg["paths"]["socket_fallback"] = socket_override
-    return daemon.run(cfg)
+    return launch_daemon(
+        config_path=getattr(a, "config", None),
+        socket_override=getattr(a, "socket", None),
+    )
 
 
 def main(argv):

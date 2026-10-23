@@ -53,7 +53,7 @@ runsv taema (root)
   runsvdir /run/taema/sv
     runsv <user>
       taemad-user <user> (root)  moves itself to user/<uid>/manager, then setpriv
-        taema daemon (uid)       all decisions, all signals
+        taemad (uid)             starts taema.daemon_entrypoint; all decisions, all signals
           sudo -n taema-attach   the one privileged step, validated on its own
 ```
 

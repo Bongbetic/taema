@@ -11,10 +11,63 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from taema.core import cgroup
 from taema.daemon import service
 from tests.test_phase0 import make_cfg
+
+
+def _move_http_server(pid, scope_path):
+    """Use the delegated write first, with the VM's root helper as a fallback."""
+    try:
+        return cgroup.move(pid, scope_path)
+    except PermissionError:
+        result = subprocess.run(
+            ["sudo", "-n", "tee", os.path.join(scope_path, "cgroup.procs")],
+            input="%d\n" % pid,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip()
+            raise PermissionError(detail or "privileged cgroup move failed")
+        return True
+
+
+class CgroupMoveTests(unittest.TestCase):
+    def test_http_scope_move_falls_back_to_privileged_cgroup_write(self):
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(cgroup, "move", side_effect=PermissionError("denied")):
+            with mock.patch.object(
+                cgroup, "base", return_value="/sys/fs/cgroup/user/1000"
+            ):
+                with mock.patch.object(
+                    subprocess, "run", return_value=completed
+                ) as run:
+                    self.assertTrue(
+                        _move_http_server(123, "/sys/fs/cgroup/user/1000/leftover/test")
+                    )
+
+        run.assert_called_once_with(
+            [
+                "sudo",
+                "-n",
+                "tee",
+                "/sys/fs/cgroup/user/1000/leftover/test/cgroup.procs",
+            ],
+            input="123\n",
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_http_scope_move_keeps_delegated_direct_write(self):
+        with mock.patch.object(cgroup, "move", return_value=True):
+            with mock.patch.object(subprocess, "run") as run:
+                self.assertTrue(_move_http_server(123, "/cgroup/test"))
+        run.assert_not_called()
 
 
 @unittest.skipUnless(
@@ -48,7 +101,9 @@ class LiveListenerWakeTests(unittest.TestCase):
     def tearDown(self):
         if self.scope_path and os.path.exists(self.scope_path):
             try:
-                with open(os.path.join(self.scope_path, "cgroup.freeze"), "w") as target:
+                with open(
+                    os.path.join(self.scope_path, "cgroup.freeze"), "w"
+                ) as target:
                     target.write("0\n")
             except OSError:
                 pass
@@ -139,11 +194,13 @@ class LiveListenerWakeTests(unittest.TestCase):
 
     def test_http_request_thaws_listener_with_p95_under_three_seconds(self):
         directory = self.temporary.name
-        with open(os.path.join(directory, "index.html"), "w", encoding="utf-8") as target:
+        with open(
+            os.path.join(directory, "index.html"), "w", encoding="utf-8"
+        ) as target:
             target.write("wake-on-connect\n")
         port = self._start_http_server(directory)
 
-        if not cgroup.move(self.server.pid, self.scope_path):
+        if not _move_http_server(self.server.pid, self.scope_path):
             self.skipTest("HTTP server exited before cgroup placement")
         self.assertIn(self.server.pid, cgroup.tree_procs(self.scope_path))
 

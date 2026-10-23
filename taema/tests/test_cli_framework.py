@@ -232,6 +232,73 @@ class CliRegistry(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_public_daemon_command_uses_shared_daemon_launcher(self):
+        with mock.patch(
+            "taema.daemon_entrypoint.launch_daemon", return_value=17
+        ) as launch:
+            result = framework.main(
+                [
+                    "daemon",
+                    "--config",
+                    "/tmp/taema-test.toml",
+                    "--socket",
+                    "/tmp/taema-test.sock",
+                ]
+            )
+        self.assertEqual(result, 17)
+        launch.assert_called_once_with(
+            config_path="/tmp/taema-test.toml",
+            socket_override="/tmp/taema-test.sock",
+        )
+
+    def test_daemon_only_entrypoint_does_not_import_cli_commands(self):
+        source = str(ROOT / "src")
+        script = (
+            "import sys; sys.path.insert(0, %r); "
+            "import taema.daemon_entrypoint; "
+            "assert 'taema.cli.framework' not in sys.modules; "
+            "assert 'taema.cli.commands' not in sys.modules"
+        ) % source
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_daemon_entrypoint_loads_config_and_starts_the_shared_service(self):
+        from taema import daemon_entrypoint
+
+        cfg = {"paths": {}}
+        with (
+            mock.patch("taema.config.policy.load_config", return_value=cfg) as load,
+            mock.patch(
+                "taema.config.policy.expand", return_value="/run/taema/test.sock"
+            ) as expand,
+            mock.patch("taema.daemon.service.run", return_value=23) as run,
+        ):
+            result = daemon_entrypoint.launch_daemon(
+                config_path="/tmp/taema-test.toml",
+                socket_override="~/taema-test.sock",
+            )
+        self.assertEqual(result, 23)
+        load.assert_called_once_with(path="/tmp/taema-test.toml")
+        expand.assert_called_once_with("~/taema-test.sock")
+        run.assert_called_once_with(cfg)
+        self.assertEqual(cfg["paths"]["socket"], "/run/taema/test.sock")
+        self.assertEqual(cfg["paths"]["socket_fallback"], "/run/taema/test.sock")
+
+    def test_daemon_only_main_uses_the_shared_default_launcher(self):
+        from taema import daemon_entrypoint
+
+        with mock.patch.object(
+            daemon_entrypoint, "launch_daemon", return_value=29
+        ) as launch:
+            self.assertEqual(daemon_entrypoint.main(), 29)
+        launch.assert_called_once_with()
+
 
 class CliViews(unittest.TestCase):
     def test_status_loader_skips_fast_store_until_needed(self):

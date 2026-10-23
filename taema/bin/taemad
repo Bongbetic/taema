@@ -1,0 +1,10 @@
+#!/bin/sh
+# taemad: start only the per-user daemon, without importing the general CLI dispatcher.
+# Installed copy runs the package from /usr/lib/taema; a checkout runs ../src.
+set -eu
+lib=/usr/lib/taema
+here=$(dirname "$(readlink -f "$0")")
+[ -d "$here/../src/taema" ] && lib=$here/../src
+unset PYTHONPYCACHEPREFIX
+PYTHONPATH="$lib" PYTHONDONTWRITEBYTECODE=1 \
+    exec /usr/bin/python3 -P -m taema.daemon_entrypoint "$@"

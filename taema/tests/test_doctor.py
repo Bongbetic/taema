@@ -53,6 +53,8 @@ class DoctorChecks(unittest.TestCase):
             ("memory.stat", "anon 0\nfile 0\ninactive_file 0\nshmem 0\n"),
             ("memory.peak", "0\n"),
             ("memory.reclaim", ""),
+            ("memory.low", "0\n"),
+            ("memory.oom.group", "0\n"),
             ("memory.high", "max\n"),
             ("memory.max", "max\n"),
             ("memory.events", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"),
@@ -99,6 +101,7 @@ class DoctorChecks(unittest.TestCase):
             self.system_root + "/proc/swaps",
             "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1048576\t0\t-2\n",
         )
+        self.write(self.system_root + "/proc/self/oom_score_adj", "0\n")
         os.makedirs(self.system_root + "/sys/block", exist_ok=True)
 
         self.cfg = make_cfg(self.state_dir, mode="auto")
@@ -247,6 +250,10 @@ class DoctorChecks(unittest.TestCase):
         self.assertEqual(self.check(report, "delegation")["status"], "warn")
         self.assertEqual(self.check(report, "memory reclaim")["status"], "warn")
         self.assertEqual(self.check(report, "memory accounting")["status"], "warn")
+        group_control = self.check(report, "memory OOM group kill")
+        self.assertEqual(group_control["status"], "warn")
+        self.assertIn("memory controller is unavailable", group_control["message"])
+        self.assertIn("per-process OOM score adjustment", group_control["fix"])
 
         shutil.rmtree(self.base)
         report = self.report()
@@ -266,6 +273,8 @@ class DoctorChecks(unittest.TestCase):
                 "memory peak usage",
                 "memory pressure",
                 "memory reclaim",
+                "memory low reservation",
+                "memory OOM group kill",
                 "memory soft cap",
                 "memory hard cap",
                 "swap accounting",
@@ -275,8 +284,12 @@ class DoctorChecks(unittest.TestCase):
             <= names
         )
         self.assertEqual(self.check(report, "memory peak usage")["status"], "ok")
+        self.assertEqual(self.check(report, "memory low reservation")["status"], "ok")
+        self.assertEqual(self.check(report, "memory OOM group kill")["status"], "ok")
 
         os.unlink(self.base + "/memory.peak")
+        os.unlink(self.base + "/memory.low")
+        os.unlink(self.base + "/memory.oom.group")
         os.unlink(self.base + "/memory.pressure")
         os.unlink(self.base + "/memory.reclaim")
         self.write(
@@ -285,6 +298,15 @@ class DoctorChecks(unittest.TestCase):
         )
         report = self.report()
         self.assertIn("samples max", self.check(report, "memory peak usage")["message"])
+        self.assertEqual(self.check(report, "memory low reservation")["status"], "warn")
+        self.assertIn(
+            "memory.low",
+            self.check(report, "memory low reservation")["message"],
+        )
+        group_control = self.check(report, "memory OOM group kill")
+        self.assertEqual(group_control["status"], "warn")
+        self.assertIn("memory.oom.group", group_control["message"])
+        self.assertIn("per-process OOM score adjustment", group_control["fix"])
         self.assertIn(
             "host PSI fallback", self.check(report, "memory pressure")["message"]
         )
@@ -300,6 +322,72 @@ class DoctorChecks(unittest.TestCase):
         report = self.report()
         self.assertIn("swap use", self.check(report, "zswap accounting")["message"])
 
+    def test_process_oom_score_adjustment_is_read_only_and_validated(self):
+        path = self.system_root + "/proc/self/oom_score_adj"
+        original = Path(path).read_text()
+        report = self.report()
+        check = self.check(report, "process OOM score adjustment")
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("readable and valid", check["message"])
+        self.assertEqual(Path(path).read_text(), original)
+
+        for value in ("bad\n", "1001\n", "-1001\n"):
+            with self.subTest(value=value):
+                self.write(path, value)
+                check = self.check(self.report(), "process OOM score adjustment")
+                self.assertEqual(check["status"], "warn")
+                self.assertIn("invalid", check["message"])
+
+    def test_process_oom_score_adjustment_warns_when_absent_or_unreadable(self):
+        path = self.system_root + "/proc/self/oom_score_adj"
+        os.unlink(path)
+        check = self.check(self.report(), "process OOM score adjustment")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("absent or unreadable", check["message"])
+
+        self.write(path, "0\n")
+        original_read = doctor._read
+
+        def read_unless_score_is_unreadable(candidate):
+            if candidate == path:
+                return None
+            return original_read(candidate)
+
+        with mock.patch.object(
+            doctor, "_read", side_effect=read_unless_score_is_unreadable
+        ):
+            check = self.check(self.report(), "process OOM score adjustment")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("absent or unreadable", check["message"])
+
+    def test_memory_oom_group_reports_support_and_optional_fallback(self):
+        name = "memory OOM group kill"
+        control = self.base + "/memory.oom.group"
+        check = self.check(self.report(), name)
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("supported", check["message"])
+
+        os.unlink(control)
+        check = self.check(self.report(), name)
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("memory.oom.group", check["message"])
+        self.assertIn("per-process OOM score adjustment", check["fix"])
+
+        self.write(control, "0\n")
+        original_read = doctor._read
+
+        def read_unless_group_control_is_unreadable(candidate):
+            if candidate == control:
+                return None
+            return original_read(candidate)
+
+        with mock.patch.object(
+            doctor, "_read", side_effect=read_unless_group_control_is_unreadable
+        ):
+            check = self.check(self.report(), name)
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("unreadable", check["message"])
+
     def test_doctor_does_not_probe_memory_when_disabled(self):
         self.cfg["mem"] = {"enabled": False}
         with mock.patch.object(doctor.memory, "_read", side_effect=AssertionError):
@@ -308,6 +396,7 @@ class DoctorChecks(unittest.TestCase):
             "memory accounting",
             "memory peak usage",
             "memory pressure",
+            "memory OOM group kill",
         ):
             self.assertIn("disabled", self.check(report, name)["message"])
         self.assertIn("enabled", self.check(report, "zswap")["message"])

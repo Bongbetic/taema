@@ -6,12 +6,22 @@ import glob
 import hashlib
 import os
 import signal
-import subprocess
 import sys
 import time
 
 from ..core import cgroup, process as inspect, signature as survivor_signature
 from ..config import policy
+
+
+class _LazySubprocess:
+    def __getattr__(self, name):
+        import subprocess as module
+
+        return getattr(module, name)
+
+
+# Preserve the patchable module seam without importing subprocess during startup.
+subprocess = _LazySubprocess()
 
 
 HOOK_TIMEOUT = 30
@@ -1200,7 +1210,9 @@ def gc_candidates(
                 if (value := inspect.environ(p).get(socket_env))
             }
             if socket_paths and all(not os.path.exists(path) for path in socket_paths):
-                runtime_quit_reason = "runtime socket gone: %s" % sorted(socket_paths)[0]
+                runtime_quit_reason = (
+                    "runtime socket gone: %s" % sorted(socket_paths)[0]
+                )
         socket_glob = gc.get("socket_glob")
         if (
             isinstance(socket_glob, str)
@@ -1252,11 +1264,7 @@ def gc_candidates(
                 runtime_quit_reason = "QMP socket gone: %s" % sorted(qmp_paths)[0]
         s = snap.get()
         edge_map = inspect.edges(set(pids), s)
-        busy = (
-            bool(edge_map)
-            or not getattr(s, "ok", True)
-            or runtime_process_live
-        )
+        busy = bool(edge_map) or not getattr(s, "ok", True) or runtime_process_live
         if gc.get("keep_while_children") and u and not has_no_attach_grace:
             root_match = u.get("match") or {}
             busy = busy or any(not _matches(root_match, p) for p in pids)
@@ -1280,10 +1288,7 @@ def gc_candidates(
         if runtime_quit_reason:
             out.append((d, runtime_quit_reason))
             continue
-        if (
-            has_no_attach_grace
-            and now() - first >= no_attach_grace
-        ):
+        if has_no_attach_grace and now() - first >= no_attach_grace:
             out.append((d, "no attachment for %ds" % int(now() - first)))
             continue
         key = policy.app_key(pids[0], units=units)

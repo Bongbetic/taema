@@ -227,7 +227,7 @@ class Parse(unittest.TestCase):
 
     def test_parse_unix_listener_queue_and_socket_inode(self):
         row = inspect.parse_ss_unix(
-            'u_str LISTEN 0 8 /run/user/1000/test.sock 64634660 * 0 '
+            "u_str LISTEN 0 8 /run/user/1000/test.sock 64634660 * 0 "
             'users:(("python3",pid=42,fd=3)) <-> ino:19010946 dev:0/66306 peers:'
         )[0]
         self.assertEqual(
@@ -246,7 +246,7 @@ class Parse(unittest.TestCase):
 
     def test_parse_tcp_extended_inode(self):
         row = inspect.parse_ss_tcp(
-            'ESTAB 0 0 127.0.0.1:80 127.0.0.1:5555 '
+            "ESTAB 0 0 127.0.0.1:80 127.0.0.1:5555 "
             'users:(("browser",pid=55,fd=8)) uid:1000 ino:12345 sk:abc'
         )[0]
         self.assertEqual((row["pids"], row["inode"]), ({55}, 12345))

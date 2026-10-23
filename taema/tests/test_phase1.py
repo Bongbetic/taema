@@ -167,8 +167,7 @@ class LazySs(unittest.TestCase):
         with mock.patch.object(
             inspect,
             "_ss",
-            side_effect=lambda *a: calls.append(a)
-            or (tcp if "-tanpe" in a else ""),
+            side_effect=lambda *a: calls.append(a) or (tcp if "-tanpe" in a else ""),
         ):
             s = inspect.Snapshot()
         self.assertEqual(calls, [("-xapne",), ("-tanpe",), ("-uanpe",)])

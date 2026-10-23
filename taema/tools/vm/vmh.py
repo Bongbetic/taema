@@ -1282,9 +1282,7 @@ def main(argv, out=None, err=None):
         "--scenarios",
         help="comma-separated: smoke,m0,m1,m2,m3,upgrade,remove or all",
     )
-    runp.add_argument(
-        "--memory-mb", type=int, help="guest RAM in MiB (minimum 512)"
-    )
+    runp.add_argument("--memory-mb", type=int, help="guest RAM in MiB (minimum 512)")
     runp.add_argument("--tcg", action="store_true", help="force TCG emulation")
     runp.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     runp.add_argument(

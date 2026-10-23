@@ -62,6 +62,7 @@ def _new_id():
 
     return uuid.uuid4().hex
 
+
 # ---- pair model (Phase 2/4 thresholds; pure, see decide()) ----
 DAY = 86400.0
 PAIR_RETENTION = 30 * DAY

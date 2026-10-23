@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from unittest import mock
 
 CGROOT = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
@@ -1999,7 +2000,9 @@ def _m3_wait_for_footprint_quiet(
         guard = details.get("guard", {}) if isinstance(details, dict) else {}
         latest_guard_active = guard.get("active") if isinstance(guard, dict) else None
         if not isinstance(latest_guard_active, bool):
-            raise ScenarioError("daemon guard status is unavailable during footprint settling")
+            raise ScenarioError(
+                "daemon guard status is unavailable during footprint settling"
+            )
 
         latest_pressure = psi_reader()
         totals = (
@@ -2060,12 +2063,17 @@ def _m3_cgroup_stats(path):
             for line in source:
                 fields = line.split()
                 if len(fields) == 2 and fields[0] in (
-                    "anon", "file", "shmem", "inactive_file",
+                    "anon",
+                    "file",
+                    "shmem",
+                    "inactive_file",
                     "workingset_refault_file",
                 ):
                     values[fields[0] + "_bytes"] = int(fields[1])
     except (OSError, ValueError) as error:
-        raise ScenarioError("cannot read cgroup memory counters at %s: %s" % (path, error))
+        raise ScenarioError(
+            "cannot read cgroup memory counters at %s: %s" % (path, error)
+        )
     return values
 
 
@@ -2123,9 +2131,7 @@ def _m3_pressure_ramp_next_cap(cap_bytes, increments_used):
 
 def _m3_create_cache_file(directory="/var/tmp"):
     """Reserve a unique candidate cache path on the guest's disk-backed temp area."""
-    fd, path = tempfile.mkstemp(
-        prefix="taema-m3-cache-", suffix=".bin", dir=directory
-    )
+    fd, path = tempfile.mkstemp(prefix="taema-m3-cache-", suffix=".bin", dir=directory)
     os.close(fd)
     return path
 
@@ -2257,13 +2263,10 @@ def _m3_set_oom_score_adj(pid, adjustment):
         with open(path, encoding="ascii") as source:
             actual = int(source.read().strip())
     except (OSError, ValueError) as error:
-        raise ScenarioError(
-            "cannot verify oom_score_adj for pid %d: %s" % (pid, error)
-        )
+        raise ScenarioError("cannot verify oom_score_adj for pid %d: %s" % (pid, error))
     if actual != adjustment:
         raise ScenarioError(
-            "oom_score_adj for pid %d is %d, expected %d"
-            % (pid, actual, adjustment)
+            "oom_score_adj for pid %d is %d, expected %d" % (pid, actual, adjustment)
         )
     return actual
 
@@ -2276,9 +2279,7 @@ def _m3_process_oom_metrics(pid):
             with open(os.path.join(path, name), encoding="ascii") as source:
                 values[name] = int(source.read().strip())
         except (OSError, ValueError) as error:
-            raise ScenarioError(
-                "cannot read %s for pid %d: %s" % (name, pid, error)
-            )
+            raise ScenarioError("cannot read %s for pid %d: %s" % (name, pid, error))
     return values
 
 
@@ -2437,15 +2438,67 @@ def _m3_daemon_sample(pid):
     if rss is None or len(fields) < 13:
         raise ScenarioError("daemon RSS/CPU counters unavailable for pid %d" % pid)
     ticks = int(fields[11]) + int(fields[12])
-    psi_fd = False
+    pressure_path = os.path.join(CGROOT, "user", str(os.getuid()), "memory.pressure")
+    psi_fds = 0
     for fd in glob.glob(os.path.join(PROCROOT, str(pid), "fd", "*")):
         try:
-            if os.path.basename(os.readlink(fd)) == "memory.pressure":
-                psi_fd = True
-                break
+            target = os.readlink(fd)
+            if os.path.normpath(target) == os.path.normpath(pressure_path):
+                psi_fds += 1
         except OSError:
             pass
-    return rss, ticks, psi_fd
+    return rss, ticks, psi_fds
+
+
+def _m3_production_guard_configured(contents):
+    """Require the production guard and both production PSI thresholds in the live config."""
+    try:
+        config = tomllib.loads(contents)
+    except (TypeError, tomllib.TOMLDecodeError):
+        return False
+    guard = config.get("guard", {})
+    experimental = config.get("experimental", {})
+    memory = config.get("mem", {})
+    return (
+        config.get("mode") == "auto"
+        and isinstance(memory, dict)
+        and memory.get("enabled") is True
+        and isinstance(guard, dict)
+        and guard.get("enabled") is True
+        and guard.get("psi_some") == "150ms/2s"
+        and guard.get("psi_full") == "50ms/2s"
+        and isinstance(experimental, dict)
+        and experimental.get("guard") is True
+    )
+
+
+def _m3_footprint_guard_inputs(configured, psi_trigger_fds, status):
+    """Confirm the daemon is running with production guard settings and both PSI fds."""
+    daemon_status = status.get("status", {}) if isinstance(status, dict) else {}
+    memory_status = status.get("memory", {}) if isinstance(status, dict) else {}
+    return (
+        _m3_production_guard_configured(configured)
+        and isinstance(psi_trigger_fds, int)
+        and not isinstance(psi_trigger_fds, bool)
+        and psi_trigger_fds == 2
+        and isinstance(daemon_status, dict)
+        and daemon_status.get("daemon") == "running"
+        and daemon_status.get("mode") == "auto"
+        and not daemon_status.get("config_error")
+        and isinstance(memory_status, dict)
+        and memory_status.get("enabled") is True
+    )
+
+
+def _m3_unittest_passed(returncode, output, *, fail_on_skip=False):
+    """Whether a focused unittest command passed, optionally requiring zero skips."""
+    if returncode != 0:
+        return False
+    if fail_on_skip:
+        for match in re.finditer(r"\(skipped=(\d+)\)", output or ""):
+            if int(match.group(1)):
+                return False
+    return True
 
 
 def _m3_memory_sample_bounds(path):
@@ -2454,7 +2507,7 @@ def _m3_memory_sample_bounds(path):
     return int(row[0] or 0), float(row[1] or 0)
 
 
-def _m3_run_tests(rec, args, label, tests, extra_env=None):
+def _m3_run_tests(rec, args, label, tests, extra_env=None, *, fail_on_skip=False):
     log_path = os.path.join(args.artifacts, label + ".log")
     env = dict(os.environ)
     installed = "/usr/lib/taema"
@@ -2473,13 +2526,16 @@ def _m3_run_tests(rec, args, label, tests, extra_env=None):
     )
     with open(log_path, "w", encoding="utf-8") as target:
         target.write(result.stdout or "")
+    passed = _m3_unittest_passed(
+        result.returncode, result.stdout or "", fail_on_skip=fail_on_skip
+    )
     rec.step(
         label,
-        result.returncode == 0,
-        "rc=%d log=%s\n%s"
-        % (result.returncode, log_path, (result.stdout or "")[-2500:]),
+        passed,
+        "rc=%d fail_on_skip=%s log=%s\n%s"
+        % (result.returncode, fail_on_skip, log_path, (result.stdout or "")[-2500:]),
     )
-    return result.returncode == 0
+    return passed
 
 
 def _m3_pressure_probe(rec, args):
@@ -2517,7 +2573,7 @@ def _m3_pressure_probe(rec, args):
     changed_config = False
     failure = None
 
-    candidate_code = r'''import ctypes, os, signal, sys, time
+    candidate_code = r"""import ctypes, os, signal, sys, time
 +ready, gate, cache, anon_mb, file_mb = sys.argv[1:]
 +try: ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b"m3cache"), 0, 0, 0)
 +except Exception: pass
@@ -2533,8 +2589,8 @@ def _m3_pressure_probe(rec, args):
 +    os.fsync(target.fileno())
 +with open(ready, "w") as target: target.write(str(os.getpid()))
 +signal.pause()
-+'''
-    pressure_code = r'''import ctypes, json, os, signal, sys, time
++"""
+    pressure_code = r"""import ctypes, json, os, signal, sys, time
 +gate, capfile, statefile = sys.argv[1:]
 +try: ctypes.CDLL(None).prctl(15, ctypes.c_char_p(b"m3press"), 0, 0, 0)
 +except Exception: pass
@@ -2576,12 +2632,14 @@ def _m3_pressure_probe(rec, args):
 +    tmp = statefile + ".tmp"
 +    with open(tmp, "w") as target: json.dump({"allocated_bytes": allocated, "churns": churns}, target)
 +    os.replace(tmp, statefile)
-+'''
++"""
     try:
         if not os.path.isfile("/usr/bin/earlyoom"):
             raise ScenarioError("earlyoom is not installed in the VM guest")
         if detect_oom_handlers().get("earlyoom"):
-            raise ScenarioError("an earlyoom handler already exists in the disposable guest")
+            raise ScenarioError(
+                "an earlyoom handler already exists in the disposable guest"
+            )
         _m3_write_config(config_path, _m3_guard_config())
         changed_config = True
         master, slave = pty.openpty()
@@ -2629,15 +2687,20 @@ def _m3_pressure_probe(rec, args):
 
         available, total = _m3_memory()
         handler = next(
-            (item for item in detect_oom_handlers().get("earlyoom", ())
-             if item.pid == earlyoom.pid),
+            (
+                item
+                for item in detect_oom_handlers().get("earlyoom", ())
+                if item.pid == earlyoom.pid
+            ),
             None,
         )
         if handler is None:
             raise ScenarioError("daemon handler detector missed synthetic earlyoom")
         memory_percent = earlyoom_memory_percent(handler, total)
         guard_floor = available_floor_bytes(
-            total, "auto", earlyoom_present=True,
+            total,
+            "auto",
+            earlyoom_present=True,
             earlyoom_memory_percent=memory_percent,
         )
         oom_floor = math.ceil(total * 5 / 100)
@@ -2652,9 +2715,7 @@ def _m3_pressure_probe(rec, args):
                 % (available, guard_floor)
             )
         mib = 1024 * 1024
-        reclaim_bytes = max(
-            8 * mib, min(32 * mib, guard_floor - oom_floor - 12 * mib)
-        )
+        reclaim_bytes = max(8 * mib, min(32 * mib, guard_floor - oom_floor - 12 * mib))
         reclaim_mb = reclaim_bytes // mib
         anon_mb = max(32, min(64, total // (16 * mib)))
         file_mb = anon_mb + 128 + reclaim_mb
@@ -2678,10 +2739,20 @@ def _m3_pressure_probe(rec, args):
         pressure_code = pressure_code.replace("\n+", "\n")
         cache_path = _m3_create_cache_file()
         candidate = subprocess.Popen(
-            [sys.executable, "-c", candidate_code, ready_path, candidate_gate,
-             cache_path, str(anon_mb), str(file_mb)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
+            [
+                sys.executable,
+                "-c",
+                candidate_code,
+                ready_path,
+                candidate_gate,
+                cache_path,
+                str(anon_mb),
+                str(file_mb),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         _m3_move(candidate.pid, candidate_path)
         open(candidate_gate, "w").close()
@@ -2745,28 +2816,42 @@ def _m3_pressure_probe(rec, args):
         if pressure_budget < 8 * mib:
             raise ScenarioError("insufficient headroom for bounded PSI pressure")
         rec.step(
-            "pressure-fixture-ready", True,
+            "pressure-fixture-ready",
+            True,
             "candidate=%s pid=%d oom_score_adj=500 stats=%s "
             "reclaimable_file_cache=%d expected=%d earlyoom_pid=%d "
             "threshold=%d guard_floor=%d"
             % (
-                candidate_scope, candidate.pid, stats,
-                reclaimable_file_cache_bytes, expected_cache_bytes,
-                earlyoom.pid, oom_floor, guard_floor,
+                candidate_scope,
+                candidate.pid,
+                stats,
+                reclaimable_file_cache_bytes,
+                expected_cache_bytes,
+                earlyoom.pid,
+                oom_floor,
+                guard_floor,
             ),
         )
 
         pressure = subprocess.Popen(
-            [sys.executable, "-c", pressure_code, pressure_gate, pressure_cap, pressure_state],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
+            [
+                sys.executable,
+                "-c",
+                pressure_code,
+                pressure_gate,
+                pressure_cap,
+                pressure_state,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         _m3_move(pressure.pid, pressure_path)
         pressure_oom_adj = _m3_set_oom_score_adj(pressure.pid, -1000)
         if pressure_oom_adj != -1000:
             raise ScenarioError(
-                "pressure worker oom_score_adj=%d, expected -1000"
-                % pressure_oom_adj
+                "pressure worker oom_score_adj=%d, expected -1000" % pressure_oom_adj
             )
         high_path = os.path.join(pressure_path, "memory.high")
         with open(high_path, "w", encoding="ascii") as target_file:
@@ -2774,7 +2859,9 @@ def _m3_pressure_probe(rec, args):
         with open(high_path, encoding="ascii") as source:
             pressure_high = source.read().strip()
         if pressure_high != str(2 * mib):
-            raise ScenarioError("could not bound PSI pressure cgroup: %s" % pressure_high)
+            raise ScenarioError(
+                "could not bound PSI pressure cgroup: %s" % pressure_high
+            )
         with open(pressure_cap, "w") as target_file:
             target_file.write(str(pressure_budget))
         event_offset = os.path.getsize(state_log) if os.path.isfile(state_log) else 0
@@ -2795,9 +2882,9 @@ def _m3_pressure_probe(rec, args):
                 )
             offset, events = _m3_events(state_log, offset)
             for event in events:
-                if (
-                    event.get("event") == "guard_started"
-                    and event.get("trigger") in ("some", "full")
+                if event.get("event") == "guard_started" and event.get("trigger") in (
+                    "some",
+                    "full",
                 ):
                     guard_started = event
                 if (
@@ -2807,14 +2894,12 @@ def _m3_pressure_probe(rec, args):
                 ):
                     reclaim = event
                 if event.get("event") == "guard_step":
-                    if (
-                        event.get("step") == "page_cache"
-                        and candidate_scope in event.get("scopes", [])
-                    ):
+                    if event.get(
+                        "step"
+                    ) == "page_cache" and candidate_scope in event.get("scopes", []):
                         page_step = event
-                    if (
-                        event.get("step") == "freeze"
-                        and candidate_scope in event.get("scopes", [])
+                    if event.get("step") == "freeze" and candidate_scope in event.get(
+                        "scopes", []
                     ):
                         freeze_step = event
             try:
@@ -2852,8 +2937,16 @@ def _m3_pressure_probe(rec, args):
             "min_pressure_available=%d pressure_high=%s budget=%d "
             "reclaim=%s page_cache_step=%s freeze_step=%s frozen=%s"
             % (
-                oom_floor, guard_floor, guard_start_available, min_pressure_available,
-                pressure_high, pressure_budget, reclaim, page_step, freeze_step, is_frozen,
+                oom_floor,
+                guard_floor,
+                guard_start_available,
+                min_pressure_available,
+                pressure_high,
+                pressure_budget,
+                reclaim,
+                page_step,
+                freeze_step,
+                is_frozen,
             ),
         )
         if not guard_ok:
@@ -2876,7 +2969,9 @@ def _m3_pressure_probe(rec, args):
         # which can differ from the host MemTotal used for the guard floor above.
         initial_samples = _m3_parse_earlyoom_memory_samples("".join(oom_chunks))
         if not initial_samples:
-            raise ScenarioError("earlyoom did not report memory availability before ramp")
+            raise ScenarioError(
+                "earlyoom did not report memory availability before ramp"
+            )
         latest_sample = initial_samples[-1]
         actual_earlyoom_threshold_bytes = latest_sample["threshold_bytes"]
         mib = 1024 * 1024
@@ -2914,9 +3009,7 @@ def _m3_pressure_probe(rec, args):
             }
         ]
         pressure_increments = []
-        earlyoom_available_samples = [
-            dict(latest_sample, elapsed_seconds=0.0)
-        ]
+        earlyoom_available_samples = [dict(latest_sample, elapsed_seconds=0.0)]
         seen_sample_count = len(initial_samples)
         next_ramp_at = ramp_started + _M3_PRESSURE_RAMP_INTERVAL_SECONDS
         deadline = ramp_started + 30
@@ -3009,7 +3102,9 @@ def _m3_pressure_probe(rec, args):
             try:
                 selected_scope = scope_of(selected)
                 selected_leftover = scope_matches(selected_scope, "leftover/")
-                with open(os.path.join(PROCROOT, str(selected), "oom_score_adj")) as source:
+                with open(
+                    os.path.join(PROCROOT, str(selected), "oom_score_adj")
+                ) as source:
                     selected_adj = int(source.read().strip())
             except (OSError, ScenarioError, ValueError):
                 selected_scope = "exited after signal"
@@ -3022,13 +3117,20 @@ def _m3_pressure_probe(rec, args):
             "pid=%s scope=%s oom_score_adj=%s threshold=%d total_mib=%d "
             "available_mib=%d cap=%d increments=%d prior_log=%s"
             % (
-                selected, selected_scope, selected_adj,
-                actual_earlyoom_threshold_bytes, latest_sample["total_mib"],
-                latest_sample["available_mib"], pressure_cap_bytes,
-                len(pressure_increments), oom_log_path,
+                selected,
+                selected_scope,
+                selected_adj,
+                actual_earlyoom_threshold_bytes,
+                latest_sample["total_mib"],
+                latest_sample["available_mib"],
+                pressure_cap_bytes,
+                len(pressure_increments),
+                oom_log_path,
             ),
         )
-        with open(os.path.join(args.artifacts, "m3-pressure-evidence.json"), "w") as target:
+        with open(
+            os.path.join(args.artifacts, "m3-pressure-evidence.json"), "w"
+        ) as target:
             json.dump(
                 {
                     "earlyoom_pid": earlyoom.pid,
@@ -3045,7 +3147,9 @@ def _m3_pressure_probe(rec, args):
                     "pressure_budget_bytes": pressure_budget,
                     "post_guard_pressure_target_bytes": final_target,
                     "post_guard_pressure_initial_target_bytes": initial_pressure_target_bytes,
-                    "post_guard_pressure_initial_cap_bytes": pressure_cap_history[0]["cap_bytes"],
+                    "post_guard_pressure_initial_cap_bytes": pressure_cap_history[0][
+                        "cap_bytes"
+                    ],
                     "post_guard_pressure_cap_bytes": pressure_cap_bytes,
                     "post_guard_pressure_cap_history": pressure_cap_history,
                     "post_guard_pressure_increments": pressure_increments,
@@ -3073,9 +3177,15 @@ def _m3_pressure_probe(rec, args):
                     "earlyoom_selected_prioritized_leftover": selected_ok,
                     "earlyoom_log": oom_log_path,
                 },
-                target, indent=2, sort_keys=True,
+                target,
+                indent=2,
+                sort_keys=True,
             )
-        rec.step("pressure-evidence-artifact", True, "m3-pressure-evidence.json; " + oom_log_path)
+        rec.step(
+            "pressure-evidence-artifact",
+            True,
+            "m3-pressure-evidence.json; " + oom_log_path,
+        )
         if not selected_ok:
             raise ScenarioError(
                 "earlyoom did not select the prioritized leftover after %d bounded "
@@ -3095,7 +3205,9 @@ def _m3_pressure_probe(rec, args):
             errors.append("could not release fixture cgroups: %s" % error)
         for proc in (earlyoom, pressure, candidate):
             if not _m3_stop_process(proc, timeout=3):
-                errors.append("process %s survived SIGKILL" % getattr(proc, "pid", None))
+                errors.append(
+                    "process %s survived SIGKILL" % getattr(proc, "pid", None)
+                )
         if reader is not None:
             reader.join(timeout=3)
         for path, created in (
@@ -3114,7 +3226,14 @@ def _m3_pressure_probe(rec, args):
                 os.rmdir(leftover_parent)
             except OSError as error:
                 errors.append("could not remove leftover parent: %s" % error)
-        for path in (cache_path, ready_path, candidate_gate, pressure_gate, pressure_cap, pressure_state):
+        for path in (
+            cache_path,
+            ready_path,
+            candidate_gate,
+            pressure_gate,
+            pressure_cap,
+            pressure_state,
+        ):
             if path is None:
                 continue
             try:
@@ -3176,25 +3295,27 @@ def _m3_footprint_probe(rec, args):
             "waited=%.2fs stable=%.2fs some_total=%d full_total=%d "
             "some_avg10=%.3f%% full_avg10=%.3f%%"
             % (
-                quiet["waited_seconds"], quiet["stable_seconds"],
-                quiet["some_total"], quiet["full_total"],
-                quiet["some_avg10"], quiet["full_avg10"],
+                quiet["waited_seconds"],
+                quiet["stable_seconds"],
+                quiet["some_total"],
+                quiet["full_total"],
+                quiet["some_avg10"],
+                quiet["full_avg10"],
             ),
         )
         daemon_pid = _m3_daemon_pid()
         db_path = os.path.join(args.state_dir, "state.db")
         db_count_before, db_latest_before = _m3_memory_sample_bounds(db_path)
-        rss, ticks, psi_fd = _m3_daemon_sample(daemon_pid)
+        rss, ticks, psi_fds = _m3_daemon_sample(daemon_pid)
         initial_ticks = ticks
         available, total = _m3_memory()
         fallback = available >= 0 and total > 0
         with open(config_path, encoding="utf-8") as source:
             configured = source.read()
-        guard_configured = "guard = true" in configured and "enabled = true" in configured
-        if not guard_configured or not (psi_fd or fallback):
+        if not _m3_footprint_guard_inputs(configured, psi_fds, before):
             raise ScenarioError(
-                "guard trigger inputs unavailable: config=%s psi_fd=%s floor=%s"
-                % (guard_configured, psi_fd, fallback)
+                "production guard trigger inputs unavailable: psi_trigger_fds=%d floor=%s"
+                % (psi_fds, fallback)
             )
 
         hz = os.sysconf("SC_CLK_TCK")
@@ -3203,29 +3324,38 @@ def _m3_footprint_probe(rec, args):
         prior_ticks = ticks
         max_rss = rss
         max_interval_cpu = 0.0
-        psi_samples = int(psi_fd)
+        psi_samples = int(psi_fds == 2)
+        guard_samples = int(_m3_footprint_guard_inputs(configured, psi_fds, before))
         floor_samples = int(fallback)
         sample_count = 0
         csv_path = os.path.join(args.artifacts, "m3-daemon-footprint.csv")
         with open(csv_path, "w", encoding="utf-8") as output:
-            output.write("elapsed_s,rss_kib,cpu_interval_pct,psi_fd,floor_sampler\n")
-            output.write("0,%d,0,%d,%d\n" % (rss, psi_fd, fallback))
+            output.write(
+                "elapsed_s,rss_kib,cpu_interval_pct,psi_trigger_fds,floor_sampler\n"
+            )
+            output.write("0,%d,0,%d,%d\n" % (rss, psi_fds, fallback))
             output.flush()
             while time.monotonic() - start < 610:
                 time.sleep(min(1.0, max(0.0, 610 - (time.monotonic() - start))))
                 now = time.monotonic()
-                rss, ticks, psi_fd = _m3_daemon_sample(daemon_pid)
+                rss, ticks, psi_fds = _m3_daemon_sample(daemon_pid)
                 interval = max(0.001, now - prior_time)
                 interval_cpu = 100.0 * max(0, ticks - prior_ticks) / (hz * interval)
                 max_rss = max(max_rss, rss)
                 max_interval_cpu = max(max_interval_cpu, interval_cpu)
                 available, total = _m3_memory()
                 fallback = available >= 0 and total > 0
-                psi_samples += int(psi_fd)
+                with open(config_path, encoding="utf-8") as source:
+                    configured = source.read()
+                sample_guard_active = _m3_footprint_guard_inputs(
+                    configured, psi_fds, before
+                )
+                psi_samples += int(psi_fds == 2)
+                guard_samples += int(sample_guard_active)
                 floor_samples += int(fallback)
                 output.write(
                     "%.3f,%d,%.5f,%d,%d\n"
-                    % (now - start, rss, interval_cpu, psi_fd, fallback)
+                    % (now - start, rss, interval_cpu, psi_fds, fallback)
                 )
                 output.flush()
                 prior_time = now
@@ -3236,16 +3366,18 @@ def _m3_footprint_probe(rec, args):
         after = _m3_status()
         final_status = after.get("status", {})
         final_memory = after.get("memory", {})
+        with open(config_path, encoding="utf-8") as source:
+            final_configured = source.read()
+        final_rss, _final_ticks, final_psi_fds = _m3_daemon_sample(daemon_pid)
+        max_rss = max(max_rss, final_rss)
         db_count_after, db_latest_after = _m3_memory_sample_bounds(db_path)
         triggers_active = (
             final_status.get("daemon") == "running"
             and final_status.get("mode") == "auto"
             and not final_status.get("config_error")
             and final_memory.get("enabled") is True
-            and (
-                psi_samples == sample_count + 1
-                or floor_samples == sample_count + 1
-            )
+            and guard_samples == sample_count + 1
+            and _m3_footprint_guard_inputs(final_configured, final_psi_fds, after)
         )
         passed = (
             elapsed >= 600
@@ -3258,12 +3390,25 @@ def _m3_footprint_probe(rec, args):
             "daemon-10-minute-footprint-sampling",
             passed,
             "pid=%d elapsed=%.2fs rss_peak_kib=%d cpu_avg_pct=%.5f "
-            "cpu_max_1s_pct=%.5f observations=%d psi_fd=%d floor_samples=%d "
+            "cpu_max_1s_pct=%.5f observations=%d psi_fd_samples=%d "
+            "guard_samples=%d final_psi_fds=%d floor_samples=%d "
             "db_samples=%d->%d latest=%.3f->%.3f triggers=%s csv=%s"
             % (
-                daemon_pid, elapsed, max_rss, avg_cpu, max_interval_cpu,
-                sample_count + 1, psi_samples, floor_samples, db_count_before,
-                db_count_after, db_latest_before, db_latest_after, triggers_active,
+                daemon_pid,
+                elapsed,
+                max_rss,
+                avg_cpu,
+                max_interval_cpu,
+                sample_count + 1,
+                psi_samples,
+                guard_samples,
+                final_psi_fds,
+                floor_samples,
+                db_count_before,
+                db_count_after,
+                db_latest_before,
+                db_latest_after,
+                triggers_active,
                 csv_path,
             ),
         )
@@ -3292,20 +3437,31 @@ def scenario_m3(rec, args, tree_holder):
         except OSError:
             pass
     inside_qemu = "qemu" in identity.lower()
-    rec.step("disposable-qemu-guest", inside_qemu, identity.strip() or "DMI unavailable")
+    rec.step(
+        "disposable-qemu-guest", inside_qemu, identity.strip() or "DMI unavailable"
+    )
     if not inside_qemu:
-        raise ScenarioError("M3 acceptance must run only inside the disposable QEMU guest")
+        raise ScenarioError(
+            "M3 acceptance must run only inside the disposable QEMU guest"
+        )
 
     test_root = os.path.dirname(os.path.abspath(__file__))
     if not os.path.isdir(os.path.join(test_root, "tests")):
         raise ScenarioError("guest test sources were not bootstrapped")
     wake_ok = _m3_run_tests(
-        rec, args, "m3-live-http-wake", ["tests.test_freeze_live"],
+        rec,
+        args,
+        "m3-live-http-wake",
+        ["tests.test_freeze_live"],
         extra_env={"TAEMA_LIVE_FREEZE_TEST": "1"},
+        fail_on_skip=True,
     )
     qmp_ok = _m3_run_tests(
-        rec, args, "m3-fake-qmp-save-stop",
+        rec,
+        args,
+        "m3-fake-qmp-save-stop",
         [
+            "tests.test_m3_live_qmp.LiveQmpSaveStopTests.test_connected_qmp_client_blocks_save_and_stop_until_disconnect",
             "tests.test_phase0.GcRules.test_runtime_socket_peers_hold_the_scope_past_no_attachment_grace",
             "tests.test_phase0.GcRules.test_missing_qmp_socket_is_a_runtime_quit_signal",
             "tests.test_reclaim.DaemonReclaimTests.test_vm_save_hook_is_blocked_by_management_client_dependency",
@@ -3313,13 +3469,14 @@ def scenario_m3(rec, args, tree_holder):
             "tests.test_phase4.RuntimeGc.test_cleanup_orders_hook_reclaim_stop_and_records_freed_state",
             "tests.test_phase4.RuntimeGc.test_refused_stop_preflight_blocks_preservation_and_cleanup",
         ],
+        extra_env={"TAEMA_LIVE_QMP_TEST": "1"},
+        fail_on_skip=True,
     )
     if not (wake_ok and qmp_ok):
         raise ScenarioError("focused HTTP/QMP guest checks failed")
     _m3_pressure_probe(rec, args)
     _m3_footprint_probe(rec, args)
     return all(step["ok"] for step in rec.steps)
-
 
 
 def scenario_remove(rec, args, tree_holder):

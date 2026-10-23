@@ -110,7 +110,12 @@ def _guard_skipped_candidate_details(results, limit=GUARD_STEP_SKIP_DETAIL_LIMIT
         if isinstance(counters, dict):
             useful = {
                 key: counters[key]
-                for key in ("current_bytes", "file_bytes", "anon_bytes", "reclaimable_bytes")
+                for key in (
+                    "current_bytes",
+                    "file_bytes",
+                    "anon_bytes",
+                    "reclaimable_bytes",
+                )
                 if isinstance(counters.get(key), int)
                 and not isinstance(counters.get(key), bool)
             }
@@ -6016,7 +6021,12 @@ class Daemon:
                 continue
             candidate_counters = {
                 key: counters.get(key)
-                for key in ("current_bytes", "file_bytes", "anon_bytes", "reclaimable_bytes")
+                for key in (
+                    "current_bytes",
+                    "file_bytes",
+                    "anon_bytes",
+                    "reclaimable_bytes",
+                )
             }
             candidates.append(
                 (size, scope, path, resource_class or "leftover", candidate_counters)

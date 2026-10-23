@@ -705,7 +705,7 @@ class GcRules(unittest.TestCase):
         self.assertTrue(candidates[0][1].startswith("runtime socket gone:"))
 
     def test_runtime_quit_scan_fails_closed_for_unreadable_proc_entries(self):
-        path = self.cg.leaf("app-runtime-test", [42], cpu=1)
+        self.cg.leaf("app-runtime-test", [42], cpu=1)
         unit = {
             "unit": {
                 "name": "app-runtime",
@@ -722,7 +722,9 @@ class GcRules(unittest.TestCase):
         for label, uids, names in cases:
             with self.subTest(entry=label):
                 with (
-                    mock.patch.object(engine.inspect, "all_pids", return_value=[42, 43]),
+                    mock.patch.object(
+                        engine.inspect, "all_pids", return_value=[42, 43]
+                    ),
                     mock.patch.object(
                         engine.inspect,
                         "uid_of",
@@ -808,9 +810,12 @@ class GcRules(unittest.TestCase):
         for index, (runtime, name, root_comm, live_comm, gc, socket_rel) in enumerate(
             cases
         ):
-            with self.subTest(runtime=runtime), tempfile.TemporaryDirectory(
-                prefix="runtime-", dir=self.cg.root
-            ) as runtime_dir:
+            with (
+                self.subTest(runtime=runtime),
+                tempfile.TemporaryDirectory(
+                    prefix="runtime-", dir=self.cg.root
+                ) as runtime_dir,
+            ):
                 path = self.cg.leaf("%s-test" % name, [42 + index], cpu=1)
                 socket_path = os.path.join(runtime_dir, socket_rel)
                 os.makedirs(os.path.dirname(socket_path), exist_ok=True)

@@ -40,14 +40,14 @@ class CgroupMoveTests(unittest.TestCase):
     def test_http_scope_move_falls_back_to_privileged_cgroup_write(self):
         completed = subprocess.CompletedProcess([], 0, "", "")
         with mock.patch.object(cgroup, "move", side_effect=PermissionError("denied")):
-            with mock.patch.object(cgroup, "base", return_value="/sys/fs/cgroup/user/1000"):
+            with mock.patch.object(
+                cgroup, "base", return_value="/sys/fs/cgroup/user/1000"
+            ):
                 with mock.patch.object(
                     subprocess, "run", return_value=completed
                 ) as run:
                     self.assertTrue(
-                        _move_http_server(
-                            123, "/sys/fs/cgroup/user/1000/leftover/test"
-                        )
+                        _move_http_server(123, "/sys/fs/cgroup/user/1000/leftover/test")
                     )
 
         run.assert_called_once_with(
@@ -101,7 +101,9 @@ class LiveListenerWakeTests(unittest.TestCase):
     def tearDown(self):
         if self.scope_path and os.path.exists(self.scope_path):
             try:
-                with open(os.path.join(self.scope_path, "cgroup.freeze"), "w") as target:
+                with open(
+                    os.path.join(self.scope_path, "cgroup.freeze"), "w"
+                ) as target:
                     target.write("0\n")
             except OSError:
                 pass
@@ -192,7 +194,9 @@ class LiveListenerWakeTests(unittest.TestCase):
 
     def test_http_request_thaws_listener_with_p95_under_three_seconds(self):
         directory = self.temporary.name
-        with open(os.path.join(directory, "index.html"), "w", encoding="utf-8") as target:
+        with open(
+            os.path.join(directory, "index.html"), "w", encoding="utf-8"
+        ) as target:
             target.write("wake-on-connect\n")
         port = self._start_http_server(directory)
 

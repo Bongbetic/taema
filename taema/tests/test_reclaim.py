@@ -40,8 +40,7 @@ def write_scope(
     write(
         path + "/memory.stat",
         "anon %d\nfile %d\ninactive_file %d\nshmem %d\n"
-        "workingset_refault_file 4\npgmajfault 1\n"
-        % (anon, file, 600 * MIB, 32 * MIB),
+        "workingset_refault_file 4\npgmajfault 1\n" % (anon, file, 600 * MIB, 32 * MIB),
     )
     write(path + "/memory.events", "low 0\nhigh 2\nmax 0\nome 0\n")
     write(
@@ -141,9 +140,7 @@ class ReclaimMemoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as path:
             write(path + "/memory.reclaim", "")
             write(path + "/memory.zswap.writeback", "0\n")
-            self.assertEqual(
-                memory.reclaim_anonymous(path, 32 * MIB), "memory.reclaim"
-            )
+            self.assertEqual(memory.reclaim_anonymous(path, 32 * MIB), "memory.reclaim")
             self.assertEqual(
                 Path(path, "memory.reclaim").read_text(),
                 "%d swappiness=max\n" % (32 * MIB),
@@ -435,9 +432,7 @@ class DaemonReclaimTests(unittest.TestCase):
         write(self.path + "/cgroup.freeze", "1\n")
         self.daemon.store.data["frozen_scopes"] = {self.scope: {"source": "test"}}
         with (
-            mock.patch.object(
-                self.daemon, "_reclaim_idle", side_effect=AssertionError
-            ),
+            mock.patch.object(self.daemon, "_reclaim_idle", side_effect=AssertionError),
             mock.patch.object(service.memory, "swap_available_bytes", return_value=0),
         ):
             result = self.daemon._reclaim_one(
@@ -465,9 +460,7 @@ class DaemonReclaimTests(unittest.TestCase):
         ):
             guarded = self.daemon.reclaim_scope(scope, dry_run=True, now=1000)
             self.daemon.units[0]["mem"] = {"swap_max": "1G"}
-            configured = self.daemon.reclaim_scope(
-                scope, dry_run=True, now=1000
-            )
+            configured = self.daemon.reclaim_scope(scope, dry_run=True, now=1000)
             self.daemon.mark_vm_saved(scope)
             saved = self.daemon.reclaim_scope(scope, dry_run=True, now=1000)
         self.assertEqual(guarded["anonymous_requested_bytes"], 0)
@@ -810,13 +803,21 @@ class DaemonReclaimTests(unittest.TestCase):
             return True, "VM save hook succeeded"
 
         with (
-            mock.patch.object(service.memory, "swap_available_bytes", return_value=2 * 1024 * MIB),
+            mock.patch.object(
+                service.memory, "swap_available_bytes", return_value=2 * 1024 * MIB
+            ),
             mock.patch.object(
                 self.daemon, "_reclaim_idle", return_value=(True, "idle for 300s")
             ),
-            mock.patch.object(self.daemon, "_run_runtime_hook", side_effect=saved) as hook,
-            mock.patch.object(service.memory, "reclaim_page_cache", return_value="memory.reclaim"),
-            mock.patch.object(service.memory, "reclaim_anonymous", return_value="memory.reclaim") as anon,
+            mock.patch.object(
+                self.daemon, "_run_runtime_hook", side_effect=saved
+            ) as hook,
+            mock.patch.object(
+                service.memory, "reclaim_page_cache", return_value="memory.reclaim"
+            ),
+            mock.patch.object(
+                service.memory, "reclaim_anonymous", return_value="memory.reclaim"
+            ) as anon,
         ):
             result = self.daemon.reclaim_scope(scope, now=1000)
         hook.assert_called_once()
@@ -1038,8 +1039,12 @@ class DaemonReclaimTests(unittest.TestCase):
 
         with (
             mock.patch.object(service.engine, "_cpu_usage", return_value=100),
-            mock.patch.object(service.memory, "reclaim_page_cache", side_effect=reclaim),
-            mock.patch.object(self.daemon, "_guard_reclaim_step", side_effect=guard_reclaim),
+            mock.patch.object(
+                service.memory, "reclaim_page_cache", side_effect=reclaim
+            ),
+            mock.patch.object(
+                self.daemon, "_guard_reclaim_step", side_effect=guard_reclaim
+            ),
             mock.patch.object(
                 self.daemon,
                 "_guard_pressure_high",

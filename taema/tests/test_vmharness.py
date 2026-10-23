@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -687,12 +688,8 @@ class HarnessCliParsingTest(VmTestCase):
     def test_m3_release_acceptance_is_a_registered_guest_scenario(self):
         self.assertIn("m3", vmh.SCENARIOS)
         self.assertIn("m3", scenario.SCENARIOS)
-        cfg = vmh.load_config(
-            self.write_config(libcs=["glibc"], scenarios=["m3"])
-        )
-        plan = vmh.build_plan(
-            cfg, libcs=["glibc"], scenarios=["m3"], kvm=False
-        )
+        cfg = vmh.load_config(self.write_config(libcs=["glibc"], scenarios=["m3"]))
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["m3"], kvm=False)
         step = next(
             item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:m3"
         )
@@ -861,9 +858,7 @@ class ScenarioM3MoveTest(unittest.TestCase):
         denied = subprocess.CompletedProcess([], 1, "", "sudo denied cgroup write")
         with mock.patch.object(scenario, "CGROOT", cgroot):
             with mock.patch("builtins.open", side_effect=PermissionError("denied")):
-                with mock.patch.object(
-                    scenario.subprocess, "run", return_value=denied
-                ):
+                with mock.patch.object(scenario.subprocess, "run", return_value=denied):
                     with self.assertRaisesRegex(
                         scenario.ScenarioError, "sudo denied cgroup write"
                     ):
@@ -966,7 +961,8 @@ class ScenarioM3MemoryControllerTest(unittest.TestCase):
         with mock.patch("builtins.open", side_effect=deny_write):
             with mock.patch.object(scenario.subprocess, "run") as run:
                 with self.assertRaisesRegex(
-                    scenario.ScenarioError, "cannot enable memory controller.*controller busy"
+                    scenario.ScenarioError,
+                    "cannot enable memory controller.*controller busy",
                 ):
                     scenario._m3_enable_memory_controllers(base, leftover)
         run.assert_not_called()
@@ -1075,6 +1071,108 @@ class ScenarioM3FixtureHelpersTest(unittest.TestCase):
         self.assertIn('psi_full = "50ms/2s"', idle_config)
         self.assertIn("cooldown = 1", pressure_config)
         self.assertIn('psi_some = "1ms/2s"', pressure_config)
+
+    def test_required_live_unittest_gate_rejects_a_skipped_test(self):
+        self.assertFalse(
+            scenario._m3_unittest_passed(
+                0, "Ran 1 test in 0.001s\n\nOK (skipped=1)\n", fail_on_skip=True
+            )
+        )
+        self.assertTrue(scenario._m3_unittest_passed(0, "Ran 1 test\n\nOK\n"))
+        self.assertFalse(
+            scenario._m3_unittest_passed(1, "Ran 1 test\n\nFAILED (errors=1)\n")
+        )
+
+    def test_required_live_unittest_runner_records_a_skip_as_failure(self):
+        output = "Ran 1 test in 0.001s\n\nOK (skipped=1)\n"
+        result = subprocess.CompletedProcess([], 0, output, None)
+        with tempfile.TemporaryDirectory() as artifacts:
+            rec = scenario.ResultRecorder("m3", artifacts)
+            args = types.SimpleNamespace(artifacts=artifacts)
+            with mock.patch.object(scenario.subprocess, "run", return_value=result):
+                passed = scenario._m3_run_tests(
+                    rec,
+                    args,
+                    "required-live-test",
+                    [
+                        "tests.test_freeze_live.LiveListenerWakeTests.test_http_request_thaws_listener_with_p95_under_three_seconds"
+                    ],
+                    fail_on_skip=True,
+                )
+
+        self.assertFalse(passed)
+        self.assertFalse(rec.steps[0]["ok"])
+        self.assertIn("skipped=1", rec.steps[0]["detail"])
+
+    def test_footprint_gate_requires_enabled_guard_and_two_production_psi_fds(self):
+        status = {
+            "status": {
+                "daemon": "running",
+                "mode": "auto",
+                "config_error": None,
+            },
+            "memory": {"enabled": True},
+        }
+        config = scenario._m3_guard_config(pressure_fixture=False)
+
+        self.assertTrue(scenario._m3_footprint_guard_inputs(config, 2, status))
+        self.assertFalse(scenario._m3_footprint_guard_inputs(config, 1, status))
+        self.assertFalse(scenario._m3_footprint_guard_inputs(config, 3, status))
+        self.assertFalse(
+            scenario._m3_footprint_guard_inputs(
+                scenario._m3_guard_config(pressure_fixture=True), 2, status
+            )
+        )
+        self.assertFalse(
+            scenario._m3_footprint_guard_inputs(
+                config,
+                2,
+                {
+                    "status": dict(status["status"], mode="observe"),
+                    "memory": status["memory"],
+                },
+            )
+        )
+
+    def test_daemon_sample_counts_both_user_memory_pressure_fds(self):
+        with (
+            tempfile.TemporaryDirectory() as proc_root,
+            tempfile.TemporaryDirectory() as cg_root,
+        ):
+            pid = 1234
+            process_root = os.path.join(proc_root, str(pid))
+            fd_root = os.path.join(process_root, "fd")
+            os.makedirs(fd_root)
+            with open(
+                os.path.join(process_root, "status"), "w", encoding="ascii"
+            ) as target:
+                target.write("VmRSS:\t2048 kB\n")
+            stat_fields = ["S"] + ["0"] * 13
+            stat_fields[11] = "7"
+            stat_fields[12] = "9"
+            with open(
+                os.path.join(process_root, "stat"), "w", encoding="ascii"
+            ) as target:
+                target.write("1234 (taemad) " + " ".join(stat_fields))
+            for fd in ("3", "4", "5"):
+                open(os.path.join(fd_root, fd), "w").close()
+            pressure_path = os.path.join(cg_root, "user", "1000", "memory.pressure")
+            links = {
+                os.path.join(fd_root, "3"): pressure_path,
+                os.path.join(fd_root, "4"): pressure_path,
+                os.path.join(fd_root, "5"): os.path.join(cg_root, "memory.pressure"),
+            }
+            with (
+                mock.patch.object(scenario, "PROCROOT", proc_root),
+                mock.patch.object(scenario, "CGROOT", cg_root),
+                mock.patch.object(scenario.os, "getuid", return_value=1000),
+                mock.patch.object(
+                    scenario.os, "readlink", side_effect=links.__getitem__
+                ),
+            ):
+                sample = scenario._m3_daemon_sample(pid)
+
+        self.assertEqual(sample, (2048, 16, 2))
 
     def test_post_guard_pressure_cap_uses_16_mib_margin_below_threshold(self):
         mib = 1024 * 1024
@@ -1264,9 +1362,7 @@ class ScenarioM3OomScoreTest(unittest.TestCase):
             with mock.patch(
                 "builtins.open", side_effect=PermissionError("direct write denied")
             ):
-                with mock.patch.object(
-                    scenario.subprocess, "run", return_value=denied
-                ):
+                with mock.patch.object(scenario.subprocess, "run", return_value=denied):
                     with self.assertRaisesRegex(
                         scenario.ScenarioError, "sudo denied proc write"
                     ):
@@ -1313,9 +1409,7 @@ class ScenarioDaemonProcessTest(unittest.TestCase):
                 self.assertTrue(scenario._is_taema_daemon_argv(argv))
 
     def test_daemon_argv_rejects_unrelated_processes_with_daemon_text(self):
-        self.assertFalse(
-            scenario._is_taema_daemon_argv(["grep", "taema daemon"])
-        )
+        self.assertFalse(scenario._is_taema_daemon_argv(["grep", "taema daemon"]))
         self.assertFalse(
             scenario._is_taema_daemon_argv(
                 ["/usr/bin/python3", "-m", "taema.not_daemon"]

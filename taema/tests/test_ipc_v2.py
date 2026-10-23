@@ -186,9 +186,7 @@ class IpcV2Tests(unittest.TestCase):
             protocol.decode_v2(freeze),
             {"cmd": "freeze", "scope": "leftover/browser"},
         )
-        self.assertEqual(
-            protocol.decode_v2(thaw_all), {"cmd": "thaw", "all": True}
-        )
+        self.assertEqual(protocol.decode_v2(thaw_all), {"cmd": "thaw", "all": True})
         for args in ({}, {"all": True, "scope": "leftover/browser"}, {"all": False}):
             with self.subTest(args=args), self.assertRaises(protocol.ProtocolError):
                 protocol.decode_v2(self.request(4, "thaw", args))
@@ -276,13 +274,21 @@ class IpcV2Tests(unittest.TestCase):
                     operation = mock.patch.object(
                         self.daemon,
                         "freeze_scope",
-                        return_value={"ok": True, "scope": args["scope"], "frozen": True},
+                        return_value={
+                            "ok": True,
+                            "scope": args["scope"],
+                            "frozen": True,
+                        },
                     )
                 elif command == "thaw" and "scope" in args:
                     operation = mock.patch.object(
                         self.daemon,
                         "_thaw_scope",
-                        return_value={"ok": True, "scope": args["scope"], "thawed": True},
+                        return_value={
+                            "ok": True,
+                            "scope": args["scope"],
+                            "thawed": True,
+                        },
                     )
                 elif command == "thaw":
                     operation = mock.patch.object(

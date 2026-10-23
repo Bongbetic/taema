@@ -284,9 +284,7 @@ class DoctorChecks(unittest.TestCase):
             <= names
         )
         self.assertEqual(self.check(report, "memory peak usage")["status"], "ok")
-        self.assertEqual(
-            self.check(report, "memory low reservation")["status"], "ok"
-        )
+        self.assertEqual(self.check(report, "memory low reservation")["status"], "ok")
         self.assertEqual(self.check(report, "memory OOM group kill")["status"], "ok")
 
         os.unlink(self.base + "/memory.peak")
@@ -300,9 +298,7 @@ class DoctorChecks(unittest.TestCase):
         )
         report = self.report()
         self.assertIn("samples max", self.check(report, "memory peak usage")["message"])
-        self.assertEqual(
-            self.check(report, "memory low reservation")["status"], "warn"
-        )
+        self.assertEqual(self.check(report, "memory low reservation")["status"], "warn")
         self.assertIn(
             "memory.low",
             self.check(report, "memory low reservation")["message"],

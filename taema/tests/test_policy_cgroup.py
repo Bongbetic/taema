@@ -305,9 +305,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(virtualbox["unit"]["class"], "vm")
         self.assertEqual(virtualbox["match"]["comm"], "VBoxHeadless")
         self.assertEqual(virtualbox["mem"]["class"], "vm")
-        self.assertEqual(
-            virtualbox["gc"]["socket_glob"], "/tmp/.vbox-*-ipc/ipcd"
-        )
+        self.assertEqual(virtualbox["gc"]["socket_glob"], "/tmp/.vbox-*-ipc/ipcd")
         self.assertEqual(virtualbox["gc"]["quit_process_missing"], "VBoxSVC")
         self.assertEqual(virtualbox["gc"]["no_attach_grace"], 120)
 
@@ -316,9 +314,7 @@ class PolicyTests(unittest.TestCase):
         )
         examples_by_name = {unit["unit"]["name"]: unit for unit in examples}
         self.assertEqual(examples_by_name["scope-emulator"]["mem"]["class"], "vm")
-        self.assertEqual(
-            examples_by_name["app-claude-desktop"]["mem"]["class"], "app"
-        )
+        self.assertEqual(examples_by_name["app-claude-desktop"]["mem"]["class"], "app")
         self.assertEqual(examples_by_name["app-herdr"]["mem"]["class"], "app")
         self.assertTrue(examples_by_name["app-herdr"]["mem"]["background"])
         self.assertFalse(self.cfg()["mem"]["probe"])

@@ -22,9 +22,7 @@ subprocess = _LazySubprocess()
 PROC = os.environ.get("TAEMA_PROCROOT", "/proc")
 MAX_RESTORE_ARGV_BYTES = 16 << 10
 _USERS = re.compile(r'\("([^"]*)",pid=(\d+)')
-_UNIX = re.compile(
-    r"^(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)"
-)
+_UNIX = re.compile(r"^(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)")
 _TCP = re.compile(r"^(\S+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)")
 _INODE = re.compile(r"\bino:(\d+)\b")
 
@@ -426,7 +424,9 @@ class Snapshot:
     """One consistent view of sockets, taken once per decision pass: three ss runs
     (`-xapne`, `-tanpe`, `-uanpe`); listening tcp rows are split out by state."""
 
-    def __init__(self, unix_text=None, tcp_text=None, tcp_listen_text=None, udp_text=None):
+    def __init__(
+        self, unix_text=None, tcp_text=None, tcp_listen_text=None, udp_text=None
+    ):
         self.ok = True  # False when any ss call failed: edges are unknown, not absent
 
         def get(given, args):

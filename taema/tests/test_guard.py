@@ -270,8 +270,7 @@ class GuardDaemonTests(unittest.TestCase):
 
     def test_page_cache_guard_step_logs_bounded_skipped_candidate_details(self):
         paths = {
-            "leftover/cache-%d" % index: "/fake/cache-%d" % index
-            for index in range(6)
+            "leftover/cache-%d" % index: "/fake/cache-%d" % index for index in range(6)
         }
         counters = {
             path: {

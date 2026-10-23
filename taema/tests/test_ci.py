@@ -94,6 +94,14 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn('tags: ["taema-v*"]', text)
         self.assertIn("tools/build-xbps.sh", text)
 
+    def test_release_container_installs_build_runtime_dependencies(self):
+        text = read(RELEASE)
+        install = next(
+            line for line in text.splitlines() if "xbps-install -Sy python3" in line
+        )
+        self.assertIn("findutils", install)
+        self.assertIn("tzdata", install)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1112,11 +1112,9 @@ def scenario_m0(rec, args, tree_holder):
             status.stdout[:300],
         )
         sys.path.insert(0, "/usr/lib/taema")
-        from taema import (
-            daemon as taema_daemon,
-            engine as taema_engine,
-            policy as taema_policy,
-        )
+        from taema.config import policy as taema_policy
+        from taema.daemon import service as taema_daemon
+        from taema.governor import engine as taema_engine
 
         cfg = taema_policy.load_config()
         cfg["mode"] = "observe"

@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import taema.cli.commands as commands
-import taema.cli as cli_package
 from taema.cli import fast, framework, view
 from taema.core import process
 from taema.store import knowledge
@@ -184,12 +183,6 @@ class CliRegistry(unittest.TestCase):
         with redirect_stdout(output):
             self.assertEqual(fast.main(), 0)
         self.assertEqual(output.getvalue(), help_output)
-
-    def test_lazy_package_keeps_legacy_stdlib_exports(self):
-        for name in ("socket", "tempfile", "time", "uuid"):
-            with self.subTest(name=name):
-                self.assertEqual(getattr(cli_package, name).__name__, name)
-        self.assertIs(cli_package.commands, commands)
 
     def test_lazy_module_forwards_mock_assignment_and_deletion(self):
         proxy = commands._LazyModule("_test_process_proxy", "taema.core.process")

@@ -39,8 +39,6 @@ disable_error_code = [
 
 [[tool.mypy.overrides]]
 module = [
-  "taema.authorization",
-  "taema.authorization.*",
   "taema.model",
   "taema.model.*",
   "taema.governor.guard",

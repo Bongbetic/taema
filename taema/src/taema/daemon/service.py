@@ -348,7 +348,7 @@ class Daemon:
 
     # ---- mode gates ----
     # Predicates for code and tests that ask what a mode means; the decision points themselves
-    # ask the authorization ladder via self.authorize() (taema.authorization).
+    # ask the authorization ladder via self.authorize() (taema.model.authorization).
     @property
     def mode(self):
         return self.cfg["mode"]
@@ -400,7 +400,7 @@ class Daemon:
                 self.store.log(event=event, scope=scope, why=why, mode=self.mode)
 
     def authorize(self, trigger, facts=None):
-        """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
+        """Ask the one authorization ladder (taema.model.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
         f = facts if facts is not None else authorization.Facts()
         suppress_stops = bool(self.cfg.get("_profile_suppress_stops"))

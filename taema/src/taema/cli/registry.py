@@ -501,6 +501,31 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "top",
+        "aliases": (),
+        "help": "live process table sorted by CPU, memory, then PID",
+        "handler": "cmd_top",
+        "read": True,
+        "arguments": (
+            (
+                ("count",),
+                {"nargs": "?", "help": "snapshots to show, then exit"},
+            ),
+            (
+                ("--interval",),
+                {"help": "seconds between snapshots (default 1)"},
+            ),
+        ),
+    },
+    {
+        "name": "tree",
+        "aliases": (),
+        "help": "process trees grouped under scope headers",
+        "handler": "cmd_tree",
+        "read": True,
+        "arguments": (),
+    },
+    {
         "name": "unit",
         "aliases": (),
         "help": "unit authoring tools",

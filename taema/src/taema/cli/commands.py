@@ -3381,6 +3381,155 @@ def cmd_history(a):
     return 0
 
 
+def _top_scope(pid, base):
+    try:
+        rel = cgroup.proc_cgroup(pid)
+    except OSError:
+        return "?"
+    if not rel:
+        return "(outside)"
+    if base != "/" and not rel.startswith(base.lstrip("/")):
+        return "(outside)"
+    return os.path.basename(rel.rstrip("/")) or "(outside)"
+
+
+def _top_details(pids):
+    try:
+        base = cgroup.base()
+    except OSError:
+        base = "/"
+    details = {}
+    for pid in pids:
+        try:
+            cmd = inspect.cmdline(pid) or "[%s]" % inspect.comm(pid)
+            details[pid] = {
+                "scope": _top_scope(pid, base),
+                "user": inspect.username(inspect.uid_of(pid)),
+                "mem": inspect.rss_bytes(pid) or 0,
+                "threads": inspect.thread_count(pid) or 0,
+                "cmd": " ".join(cmd.split()),
+            }
+        except OSError:
+            continue
+    details["__total__"] = inspect.mem_total_bytes() or 0
+    return details
+
+
+def _top_tick_hz():
+    try:
+        return os.sysconf("SC_CLK_TCK")
+    except (AttributeError, ValueError, OSError):
+        return 100
+
+
+def _stdin_has_key():
+    import select
+
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+    except (OSError, ValueError):
+        return False
+    return bool(ready)
+
+
+def cmd_top(a):
+    """Live process table sorted by CPU, then memory, then PID."""
+    from . import view
+
+    try:
+        interval = float(getattr(a, "interval", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return die("--interval must be a number of seconds", 2)
+    if interval <= 0:
+        return die("--interval must be positive", 2)
+    count = getattr(a, "count", None)
+    if count is not None:
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return die("top count must be an integer", 2)
+        if count <= 0:
+            return die("top count must be positive", 2)
+    as_json = bool(getattr(a, "json", False) or getattr(a, "jsonl", False))
+    try:
+        live_stdin = bool(sys.stdin.isatty())
+    except (AttributeError, OSError, ValueError):
+        live_stdin = False
+    hz = _top_tick_hz()
+    previous = inspect.ProcTable.scan()
+    time.sleep(interval)
+    frames = 0
+    first = True
+    while True:
+        current = inspect.ProcTable.scan()
+        model = view.top_model(
+            previous.rows,
+            current.rows,
+            interval,
+            hz,
+            _top_details(current.rows),
+        )
+        previous = current
+        frames += 1
+        if as_json:
+            view.emit(view.record("top", {"rows": model}), a, view.render_top(model, a))
+            return 0
+        a._width = view.terminal_width(a)
+        if live_stdin and not first:
+            sys.stdout.write("\033[H\033[J")
+        sys.stdout.write(view.render_top(model, a))
+        sys.stdout.flush()
+        first = False
+        if count is not None:
+            if frames >= count:
+                return 0
+            time.sleep(interval)
+            continue
+        if not live_stdin:
+            return 0
+        time.sleep(interval)
+        if _stdin_has_key():
+            try:
+                sys.stdin.readline()
+            except (OSError, ValueError):
+                pass
+            return 0
+
+
+def _tree_scope(pid, base):
+    try:
+        rel = cgroup.proc_cgroup(pid)
+    except OSError:
+        return "(outside)"
+    if not rel:
+        return "(outside)"
+    if base != "/" and not rel.startswith(base.lstrip("/")):
+        return "(outside)"
+    return rel.rstrip("/") or "(outside)"
+
+
+def cmd_tree(a):
+    """Process trees grouped under scope headers."""
+    from . import view
+
+    try:
+        base = cgroup.base()
+    except OSError:
+        base = "/"
+    table = inspect.ProcTable.scan(include_zombies=True)
+    model = view.tree_model(table, lambda pid: _tree_scope(pid, base))
+    if getattr(a, "json", False) or getattr(a, "jsonl", False):
+        document = view.record(
+            "tree",
+            {"groups": [{"scope": scope, "nodes": nodes} for scope, nodes in model]},
+        )
+        view.emit(document, a, view.render_tree(model, a))
+        return 0
+    a._width = view.terminal_width(a)
+    sys.stdout.write(view.render_tree(model, a))
+    return 0
+
+
 def cmd_unit(a):
     """Unit authoring tools."""
     del a

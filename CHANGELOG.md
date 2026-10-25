@@ -2,6 +2,14 @@
 
 ## Behaviour changes
 
+### Live process top and scope tree
+
+`taema top` shows live CPU/MEM/RSS/threads per scope-grouped process with
+one-shot piped output and `--json` (`taema.top.v1`) plus a looping terminal
+mode (`--count`, `--interval`, keypress to quit). `taema tree` prints a
+scope-grouped process tree with zombie reaper annotations. Both clip to
+terminal width unless `--wide`.
+
 ### Unit authoring tools
 
 `taema unit draft NAME --from PID` generates a unit file from a running

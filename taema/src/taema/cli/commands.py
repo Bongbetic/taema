@@ -1476,6 +1476,21 @@ def _count_scopes(base):
     return count_scopes
 
 
+def _ls_rows(cfg, store):
+    """Scope rows shared by ls and dash; (None, memory) when unavailable."""
+    memory_view = _memory_snapshot(cfg, store)
+    memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
+    deprioritized_scopes = _deprioritized_scopes(store)
+    frozen_scopes = set((store.data.get("frozen_scopes", {}) if store else {}).keys())
+    base = cgroup.base()
+    if not os.path.isdir(base):
+        return None, memory_view
+    rows = []
+    for d in sorted(cgroup.subdirs(base)):
+        _walk(d, 0, rows, memory_scopes, deprioritized_scopes, frozen_scopes)
+    return rows, memory_view
+
+
 def cmd_ls(a):
     from . import view
 
@@ -1483,18 +1498,11 @@ def cmd_ls(a):
         cfg, store, _units = _load(a)
     except (OSError, ValueError):
         cfg, store = None, None
-    memory_view = _memory_snapshot(cfg, store)
-    memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
-    deprioritized_scopes = _deprioritized_scopes(store)
-    frozen_scopes = set((store.data.get("frozen_scopes", {}) if store else {}).keys())
-    base = cgroup.base()
-    if not os.path.isdir(base):
+    rows, memory_view = _ls_rows(cfg, store)
+    if rows is None:
         model = view.snapshot("ls", scopes=(), memory=memory_view)
-        view.emit(model, a, "scope tree unavailable: %s\n" % base)
+        view.emit(model, a, "scope tree unavailable: %s\n" % cgroup.base())
         return 3
-    rows = []
-    for d in sorted(cgroup.subdirs(base)):
-        _walk(d, 0, rows, memory_scopes, deprioritized_scopes, frozen_scopes)
     model = view.snapshot("ls", scopes=rows, memory=memory_view)
     records = [view.record("scope", row) for row in rows]
     if getattr(a, "jsonl", False):
@@ -3156,6 +3164,60 @@ def cmd_watch(a):
     return _follow_events(
         cfg, a, store.events_since(0, limit=1)["latest_seq"], line_only=True
     )
+
+
+def dash_snapshot(a):
+    """View-model snapshot shared by dash --once, --json, and the live screen."""
+    from . import view
+    from .. import events as event_views
+
+    cfg, store, _units = _load(a)
+    rows, memory_view = _ls_rows(cfg, store)
+    budget = ask(cfg, {"cmd": "memory_budget"})
+    if not isinstance(budget, dict) or budget.get("schema") != "taema.memory-budget.v1":
+        budget = None
+    alive = ask(cfg, {"cmd": "status"}) is not None
+    recent = store.events_since(0, limit=1000)["events"][-10:]
+    events = []
+    for event in recent:
+        record = event_views.view_event(event)
+        record["scope"] = event.get("scope", "")
+        record["why"] = event.get("why", "")
+        events.append(record)
+    model = view.snapshot("dash", scopes=rows or [], memory=memory_view)
+    model["learned"] = {
+        "apps": store.apps_summary(limit=10),
+        "pairs": store.pairs_summary(limit=10),
+        "signatures": store.signatures_summary(limit=10),
+    }
+    model["budget"] = budget
+    model["events"] = events
+    model["reviews"] = store.open_reviews()
+    model["daemon"] = "ok" if alive else "unavailable"
+    return model
+
+
+def cmd_dash(a):
+    """Show the terminal dashboard, or its snapshot with --once/--json."""
+    from . import dash as dash_ui
+    from . import view
+
+    if (
+        not getattr(a, "once", False)
+        and not getattr(a, "json", False)
+        and not getattr(a, "jsonl", False)
+    ):
+        try:
+            import curses
+        except ImportError:
+            curses = None
+        return dash_ui.main(a, curses_module=curses)
+    model = dash_snapshot(a)
+    if getattr(a, "once", False):
+        print(view.render_dash(model, a), end="")
+        return 0
+    view.emit(model, a, view.render_dash(model, a))
+    return 0
 
 
 def cmd_prompt(a):

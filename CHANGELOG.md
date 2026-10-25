@@ -2,6 +2,17 @@
 
 ## Behaviour changes
 
+### Terminal dashboard
+
+`taema dash` shows scopes, learned pairs and signatures, memory and budget,
+open reviews, and recent events in one curses screen refreshed every 2 seconds
+over the daemon subscription stream. Movement, why, stop (with a confirmation
+showing veto, edge, and memory facts), veto, undo, review answers, filters,
+and governor keys (reclaim, freeze/thaw, profile, GC dry run) all dispatch
+through the same CLI paths, so refusals match the CLI exactly. `dash --once`
+prints a deterministic snapshot, `dash --json` prints the view model, and
+without curses `dash` falls back to `watch --plain`.
+
 ### Live process top and scope tree
 
 `taema top` shows live CPU/MEM/RSS/threads per scope-grouped process with

@@ -357,6 +357,19 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_watch",
     },
     {
+        "name": "dash",
+        "aliases": (),
+        "help": "show scopes, learning, memory, and events in one screen",
+        "handler": "cmd_dash",
+        "read": True,
+        "arguments": (
+            (
+                ("--once",),
+                {"action": "store_true", "help": "print one snapshot and exit"},
+            ),
+        ),
+    },
+    {
         "name": "events",
         "aliases": (),
         "help": "query or follow the event log",

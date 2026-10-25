@@ -247,6 +247,72 @@ def render_scopes(scopes, args):
     return "\n".join(lines) + "\n"
 
 
+def render_dash(model, args):
+    """Deterministic dashboard text shared by --once and the live screen."""
+    width = getattr(args, "_width", 80)
+    wide = getattr(args, "wide", False)
+    learned = model.get("learned") or {}
+    pairs = learned.get("pairs") or []
+    signatures = learned.get("signatures") or []
+    apps = learned.get("apps") or []
+    host = (model.get("memory") or {}).get("host") or {}
+    budget = model.get("budget")
+    if budget is None:
+        budget_text = "unavailable"
+    elif budget.get("enabled"):
+        budget_text = "ceiling %s" % _format_memory(budget.get("budget_bytes") or 0)
+    else:
+        budget_text = "disabled"
+    lines = ["scopes (%d)" % len(model.get("scopes") or [])]
+    for row in model.get("scopes") or []:
+        memory = row.get("memory_bytes")
+        text = "  %s procs=%s mem=%s" % (
+            row.get("name", "?"),
+            row.get("procs", row.get("processes", 0)),
+            "-" if memory is None else _format_memory(memory),
+        )
+        if row.get("frozen"):
+            text += " frozen"
+        lines.append(text)
+    lines.append(
+        "learned apps=%d pairs=%d signatures=%d"
+        % (len(apps), len(pairs), len(signatures))
+    )
+    for pair in pairs[:5]:
+        lines.append(
+            "  pair %s -> %s %s"
+            % (
+                pair.get("owner", "?"),
+                pair.get("leftover", "?"),
+                pair.get("decision", pair.get("action", "ask")),
+            )
+        )
+    for signature in signatures[:5]:
+        lines.append(
+            "  signature %s %s"
+            % (signature.get("id", "?"), signature.get("decision", "ask"))
+        )
+    lines.append("memory")
+    lines.append(
+        "  host total %s  budget %s"
+        % (_format_memory(host.get("total_bytes") or 0), budget_text)
+    )
+    reviews = model.get("reviews") or []
+    lines.append("reviews (%d)" % len(reviews))
+    for review in reviews[:5]:
+        lines.append(
+            "  #%s owner=%s" % (review.get("id", "?"), review.get("owner", "?"))
+        )
+    lines.append("events")
+    for item in model.get("events") or []:
+        parts = ["#%s" % item.get("seq", "?"), str(item.get("event", "unknown"))]
+        scope = item.get("scope") or (item.get("data") or {}).get("scope", "")
+        if scope:
+            parts.append(str(scope))
+        lines.append("  " + " ".join(parts))
+    return "\n".join(_clip(line, width, wide) for line in lines) + "\n"
+
+
 def _format_memory(value):
     amount = float(value)
     for unit in ("B", "K", "M", "G", "T"):

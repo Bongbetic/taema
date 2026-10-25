@@ -2,6 +2,15 @@
 
 ## Behaviour changes
 
+### History, reports, and recent actions
+
+`taema history APP|SCOPE [--since]` shows a decision-id timeline of launches,
+closes, reviews, freezes, reclaims, stops, and regrets. `taema recent` lists
+the last 50 automatic actions with freed bytes and restore possibility.
+`taema report --day|--week|--month [--json]` aggregates freed memory by
+reclaim and stop, stops, undos, regrets, leftover makers, frozen time,
+guard events, and review outcomes from indexed queries and daily rollups.
+
 ### Backup, learning transfer, and reset
 
 `taema backup` writes a tarball with an online database copy, user config,

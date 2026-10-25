@@ -2,6 +2,20 @@
 
 ## Behaviour changes
 
+### Session agent lifecycle
+
+`taema agent` runs once per session under a lock, joins the protected `agent`
+leaf (asking the daemon to attach it only when a direct move fails),
+registers its capabilities, and beats every 30 seconds with exponential
+reconnect backoff capped at 30 seconds. The daemon accepts `register_agent`
+and `agent_beat` only from the same uid, marks agents down after 3 missed
+beats with `agent_up`/`agent_down` audit events, and refuses stale facts so
+it decides on process data only. The agent exits when the compositor socket
+goes away. The agent leaf is never adopted, frozen, thawed, deprioritized,
+reclaimed, undone, stopped, or removed. `status` and `doctor` show agent
+state, and example niri and XDG autostart entries ship under
+`examples/autostart/`.
+
 ### Terminal dashboard
 
 `taema dash` shows scopes, learned pairs and signatures, memory and budget,

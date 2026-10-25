@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=taema session agent
+Comment=Relay desktop-session facts to the taema daemon (no authority)
+Exec=taema agent
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Phase=EarlyInitialization

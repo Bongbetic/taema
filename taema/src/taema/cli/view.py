@@ -357,6 +357,16 @@ def render_status(model, args, summary=False):
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),
     ]
+    agents = details.get("agents")
+    if isinstance(agents, dict):
+        if not agents:
+            lines.append("agent: none registered")
+        for session in sorted(agents):
+            info = agents[session] or {}
+            lines.append(
+                "agent: %s (session %s, pid %s)"
+                % (info.get("state", "?"), session, info.get("pid", "?"))
+            )
     guard = status.get("guard") or details.get("guard") or {}
     if guard.get("active") is True:
         lines.append(

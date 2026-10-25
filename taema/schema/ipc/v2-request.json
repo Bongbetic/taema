@@ -9,6 +9,8 @@
     {"$ref": "#/$defs/subscribe"},
     {"$ref": "#/$defs/register"},
     {"$ref": "#/$defs/attach"},
+    {"$ref": "#/$defs/register_agent"},
+    {"$ref": "#/$defs/agent_beat"},
     {"$ref": "#/$defs/job_done"},
     {"$ref": "#/$defs/kill_done"},
     {"$ref": "#/$defs/ask"},
@@ -306,6 +308,16 @@
     "attach": {
       "type": "object", "required": ["v", "id", "cmd", "args"],
       "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "attach"}, "args": {"type": "object", "required": ["scope", "pids"], "properties": {"scope": {"type": "string", "minLength": 1}, "pids": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "integer", "minimum": 2}}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "register_agent": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "register_agent"}, "args": {"type": "object", "required": ["session", "pid"], "properties": {"session": {"type": "string", "minLength": 1, "maxLength": 64}, "pid": {"type": "integer", "minimum": 2}, "capabilities": {"type": "array", "maxItems": 16, "items": {"type": "string", "minLength": 1, "maxLength": 32}}, "compositor": {"type": "string", "maxLength": 256}}, "additionalProperties": false}},
+      "additionalProperties": false
+    },
+    "agent_beat": {
+      "type": "object", "required": ["v", "id", "cmd", "args"],
+      "properties": {"v": {"const": 2}, "id": {"$ref": "#/$defs/id"}, "cmd": {"const": "agent_beat"}, "args": {"type": "object", "required": ["session", "pid"], "properties": {"session": {"type": "string", "minLength": 1, "maxLength": 64}, "pid": {"type": "integer", "minimum": 2}, "facts": {"type": "object"}}, "additionalProperties": false}},
       "additionalProperties": false
     },
     "job_done": {

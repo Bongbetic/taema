@@ -94,6 +94,36 @@ def _agent_check(agents):
     )
 
 
+def _notify_check(cfg, notify):
+    """Active notification backend and the server's capabilities."""
+    if notify is None:
+        from . import notify as notify_mod
+
+        try:
+            configured = (cfg.get("notify") or {}).get("backend", "auto")
+            backend = notify_mod.select_backend(configured)
+            notify = {
+                "backend": backend.name,
+                "capabilities": backend.server_capabilities(),
+            }
+        except Exception:
+            notify = {"backend": "unknown", "capabilities": []}
+    backend = notify.get("backend", "unknown")
+    if backend in ("null", "unknown"):
+        return _check(
+            "notifications",
+            "warn",
+            "no notification backend is available; reviews wait for the shell",
+            "Install libnotify (notify-send) for desktop notifications.",
+        )
+    caps = ", ".join(notify.get("capabilities", ())) or "capabilities unknown"
+    return _check(
+        "notifications",
+        "ok",
+        "backend %s; server capabilities: %s" % (backend, caps),
+    )
+
+
 def _rooted(root, path):
     return os.path.join(root, path.lstrip("/")) if root != "/" else path
 
@@ -1189,6 +1219,7 @@ def diagnose(
     uid=None,
     group_ids=None,
     agents=None,
+    notify=None,
 ):
     """Build a stable, read-only diagnostic result shared by the CLI and daemon."""
     uid = os.getuid() if uid is None else uid
@@ -1278,6 +1309,7 @@ def diagnose(
     )
     if agents is not None:
         checks.append(_agent_check(agents))
+    checks.append(_notify_check(cfg, notify))
     statuses = {item["status"] for item in checks}
     overall = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "ok"
     return {"schema": "taema.doctor.v1", "status": overall, "checks": checks}

@@ -2,6 +2,18 @@
 
 ## Behaviour changes
 
+### Notification backends
+
+One `Notifier` contract (`taema.notify`) with three backends and no new
+mandatory dependencies: `notify-send` stays the default (actions via
+`--action=NAME=Text` with `--wait`), an opt-in jeepney D-Bus backend sends,
+closes, and listens for action/close signals while accepting signals only
+from the bus name that owns the notification service, and a `gdbus` backend
+sends one-way toasts when libnotify is missing. `notify.backend = auto`
+prefers notify-send, falls back to gdbus, and degrades to a null backend
+that keeps CLI reviews working; `doctor` reports the active backend and the
+server's capabilities.
+
 ### Disposable graphical test session
 
 The VM harness gains a `graphical` scenario: a disposable headless session

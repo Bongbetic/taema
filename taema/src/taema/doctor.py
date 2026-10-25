@@ -28,6 +28,7 @@ _PATH_KEYS = {
     "helper",
     "hooks_dir",
     "units_dir",
+    "power_supply",
 }
 _TIMER_KEYS = {
     "adopt_interval",
@@ -130,7 +131,7 @@ def _unknown_config(cfg):
                         unknown.extend(
                             path + "." + item
                             for item in child
-                            if item not in {"on_battery", "when_running"}
+                            if item not in {"on_battery", "when_running", "time"}
                         )
                         if "when_running" in child and not isinstance(
                             child["when_running"], dict

@@ -2,6 +2,13 @@
 
 ## Behaviour changes
 
+### Automatic profile switching
+
+`[profile.auto]` rules switch profiles on battery power, running processes,
+and time windows while `profile.active` is `auto`. A manual `taema profile`
+choice wins until `taema profile auto`. Selections reuse the config-reload
+path, log `profile_changed`, and show in status.
+
 ### History, reports, and recent actions
 
 `taema history APP|SCOPE [--since]` shows a decision-id timeline of launches,

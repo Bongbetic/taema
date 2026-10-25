@@ -1,3 +1,16 @@
+# Unreleased
+
+## Behaviour changes
+
+### Legacy module paths removed
+
+The one-release compatibility shims are gone. Import the new package paths:
+`taema.model.authorization`, `taema.core.cgroup`, `taema.governor.engine`,
+`taema.core.process`, `taema.store.knowledge`, `taema.core.lineage`,
+`taema.config.policy`, `taema.cli.commands`, and `taema.daemon.service`.
+The `taema.cli` and `taema.daemon` packages no longer re-export implementation
+names.
+
 # 0.5.0
 
 ## Resource governor

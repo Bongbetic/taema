@@ -2806,7 +2806,7 @@ def cmd_reload(a):
 
 
 def _capability_changes(old_mode, new_mode):
-    from .. import authorization
+    from ..model import authorization
 
     changes = []
     for trigger in authorization.TRIGGER_ACTIONS:

@@ -14,35 +14,33 @@ PACKAGE = Path(__file__).resolve().parents[1]
 
 
 class PackageLayoutTests(unittest.TestCase):
-    def test_legacy_module_paths_alias_the_new_modules(self):
-        module_pairs = (
-            ("taema.authorization", "taema.model.authorization"),
-            ("taema.cgroup", "taema.core.cgroup"),
-            ("taema.engine", "taema.governor.engine"),
-            ("taema.inspect", "taema.core.process"),
-            ("taema.knowledge", "taema.store.knowledge"),
-            ("taema.lineage", "taema.core.lineage"),
-            ("taema.policy", "taema.config.policy"),
-        )
-        for legacy_name, package_name in module_pairs:
-            with self.subTest(legacy=legacy_name):
-                self.assertIs(
-                    importlib.import_module(legacy_name),
-                    importlib.import_module(package_name),
-                )
+    OLD_MODULE_PATHS = (
+        "taema.authorization",
+        "taema.cgroup",
+        "taema.engine",
+        "taema.inspect",
+        "taema.knowledge",
+        "taema.lineage",
+        "taema.policy",
+    )
 
-    def test_legacy_cli_and_daemon_exports_are_preserved(self):
-        package_pairs = (
-            ("taema.cli", "taema.cli.commands"),
-            ("taema.daemon", "taema.daemon.service"),
-        )
-        for package_name, implementation_name in package_pairs:
-            with self.subTest(package=package_name):
-                package = importlib.import_module(package_name)
-                implementation = importlib.import_module(implementation_name)
-                for name, value in vars(implementation).items():
-                    if not name.startswith("_"):
-                        self.assertIs(getattr(package, name), value)
+    def test_old_module_paths_are_removed(self):
+        for old_name in self.OLD_MODULE_PATHS:
+            with self.subTest(module=old_name):
+                leaf = old_name.split(".")[-1]
+                self.assertFalse((PACKAGE / "src" / "taema" / (leaf + ".py")).exists())
+                with self.assertRaises(ImportError):
+                    importlib.import_module(old_name)
+
+    def test_cli_and_daemon_packages_export_no_legacy_names(self):
+        cli_package = importlib.import_module("taema.cli")
+        daemon_package = importlib.import_module("taema.daemon")
+        for name in ("cmd_ls", "cmd_kill", "main", "ask", "die", "socket"):
+            with self.subTest(package="taema.cli", name=name):
+                self.assertFalse(hasattr(cli_package, name))
+        for name in ("Daemon", "main"):
+            with self.subTest(package="taema.daemon", name=name):
+                self.assertFalse(hasattr(daemon_package, name))
 
     def test_authorization_model_has_no_io_dependencies_or_calls(self):
         source = PACKAGE / "src" / "taema" / "model" / "authorization.py"
@@ -99,6 +97,17 @@ class PackageLayoutTests(unittest.TestCase):
             ):
                 with self.subTest(module=relative):
                     self.assertTrue((installed / relative).is_file())
+            for leaf in (
+                "authorization.py",
+                "cgroup.py",
+                "engine.py",
+                "inspect.py",
+                "knowledge.py",
+                "lineage.py",
+                "policy.py",
+            ):
+                with self.subTest(removed=leaf):
+                    self.assertFalse((installed / leaf).exists())
 
             env = os.environ.copy()
             env["PYTHONPATH"] = str(package_root)

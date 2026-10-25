@@ -33,6 +33,8 @@ import tempfile
 import threading
 import time
 import tomllib
+import struct
+import zlib
 from unittest import mock
 
 CGROOT = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
@@ -3515,6 +3517,313 @@ def scenario_remove(rec, args, tree_holder):
     return all(s["ok"] for s in rec.steps)
 
 
+# ---- disposable graphical session -------------------------------------------
+#
+# A scripted Wayland stack for desktop-path tests: weston on the headless
+# backend (pixman software rendering, no seat or GPU), mako as the
+# notification server, notify-send as the test client, and grim screenshots
+# diffed with the stdlib PNG reader below. Later desktop scenarios reuse
+# start/stop_graphical_session; only scenario_graphical asserts the stack.
+
+GRAPHICAL_TOOLS = ("weston", "mako", "grim", "notify-send", "dbus-daemon")
+
+
+def weston_ini(width, height):
+    """Deterministic kiosk-free config: solid background, no panel clock."""
+    return (
+        "[core]\n"
+        "backend=headless\n"
+        "[shell]\n"
+        "panel-location=none\n"
+        "background-color=0xff1a1a1a\n"
+        "[output]\n"
+        "name=headless\n"
+        "mode=%dx%d\n" % (width, height)
+    )
+
+
+def wait_for_path(path, procs, timeout=60, poll=0.1):
+    """Wait for a socket file; refuse when a watched process dies first."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if os.path.exists(path):
+            return True
+        dead = [p for p in procs if p.poll() is not None]
+        if dead:
+            raise ScenarioError(
+                "%s never appeared; process exited rc=%s" % (path, dead[0].poll())
+            )
+        if time.monotonic() >= deadline:
+            raise ScenarioError("%s never appeared within %ss" % (path, timeout))
+        time.sleep(poll)
+
+
+def start_graphical_session(
+    workdir, display="taema-test", width=800, height=600, timeout=60
+):
+    """Start dbus-daemon, weston, and mako; return the live session dict."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not runtime_dir or not os.path.isdir(runtime_dir):
+        raise ScenarioError("XDG_RUNTIME_DIR is not a directory: %r" % runtime_dir)
+    os.makedirs(workdir, exist_ok=True)
+    ini_path = os.path.join(workdir, "weston.ini")
+    with open(ini_path, "w") as f:
+        f.write(weston_ini(width, height))
+    weston_log = open(os.path.join(workdir, "weston.log"), "w")
+    bus_log = open(os.path.join(workdir, "dbus.log"), "w")
+    bus = subprocess.Popen(
+        ["dbus-daemon", "--session", "--print-address=1", "--nofork"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=bus_log,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        address = bus.stdout.readline().strip()
+    except OSError as e:
+        bus.kill()
+        raise ScenarioError("dbus-daemon produced no address: %s" % e)
+    if not address or bus.poll() is not None:
+        raise ScenarioError("dbus-daemon failed during startup")
+    base_env = dict(
+        os.environ,
+        XDG_RUNTIME_DIR=runtime_dir,
+        WAYLAND_DISPLAY=display,
+        DBUS_SESSION_BUS_ADDRESS=address,
+        LIBGL_ALWAYS_SOFTWARE="1",
+    )
+    weston = subprocess.Popen(
+        [
+            "weston",
+            "--backend=headless",
+            "--socket=" + display,
+            "--config=" + ini_path,
+        ],
+        env=base_env,
+        stdin=subprocess.DEVNULL,
+        stdout=weston_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    socket_path = os.path.join(runtime_dir, display)
+    try:
+        wait_for_path(socket_path, [weston], timeout=timeout)
+    except ScenarioError:
+        weston.terminate()
+        raise
+    mako_log = open(os.path.join(workdir, "mako.log"), "w")
+    mako = subprocess.Popen(
+        ["mako"],
+        env=base_env,
+        stdin=subprocess.DEVNULL,
+        stdout=mako_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    time.sleep(1)
+    if mako.poll() is not None:
+        stop_graphical_session(
+            {
+                "weston": weston,
+                "mako": mako,
+                "bus": bus,
+                "logs": [weston_log, mako_log, bus_log, bus.stdout],
+            }
+        )
+        raise ScenarioError("mako exited during startup")
+    return {
+        "weston": weston,
+        "mako": mako,
+        "bus": bus,
+        "display": display,
+        "runtime_dir": runtime_dir,
+        "socket": socket_path,
+        "env": base_env,
+        "logs": [weston_log, mako_log, bus_log, bus.stdout],
+    }
+
+
+def stop_graphical_session(session, timeout=10):
+    """Terminate the session processes; tolerate the already-dead."""
+    for key in ("mako", "weston", "bus"):
+        proc = session.get(key)
+        if proc is None or proc.poll() is not None:
+            continue
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout)
+    for handle in session.get("logs", []):
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def notify_send(env, summary, body="", timeout=15):
+    """Deliver one notification through the session bus; return CompletedProcess."""
+    argv = ["notify-send", summary] + ([body] if body else [])
+    return subprocess.run(
+        argv, env=env, capture_output=True, text=True, timeout=timeout
+    )
+
+
+def take_screenshot(env, path, timeout=30):
+    """Capture the headless output with grim; return CompletedProcess."""
+    return subprocess.run(
+        ["grim", path], env=env, capture_output=True, text=True, timeout=timeout
+    )
+
+
+def _paeth(a, b, c):
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def scenario_graphical(rec, args, tree_holder):
+    """Headless weston + mako session: notify, capture, verify the PNG."""
+    missing = [tool for tool in GRAPHICAL_TOOLS if shutil.which(tool) is None]
+    rec.step(
+        "graphical-tools",
+        not missing,
+        "missing: %s" % ",".join(missing) if missing else "all present",
+    )
+    if missing:
+        return False
+    with tempfile.TemporaryDirectory(prefix="taema-graphical-") as workdir:
+        session = None
+        try:
+            session = start_graphical_session(workdir)
+            rec.step(
+                "session-up",
+                True,
+                "display=%s socket=%s" % (session["display"], session["socket"]),
+            )
+            notify_send(session["env"], "taema", "graphical session is up")
+            rec.step("notify", True, "notify-send accepted")
+            shot = os.path.join(args.artifacts, "graphical.png")
+            png = take_screenshot(session, shot)
+            img = read_png(png)
+            rec.step(
+                "screenshot",
+                img["width"] > 0 and img["height"] > 0,
+                "%dx%d RGB" % (img["width"], img["height"]),
+            )
+        except ScenarioError as e:
+            rec.step("graphical", False, str(e))
+            return False
+        finally:
+            if session is not None:
+                stop_graphical_session(session)
+    return all(s["ok"] for s in rec.steps)
+
+
+def read_png(path):
+    """Decode 8-bit RGB/RGBA PNGs to {"width","height","pixels"} (RGB bytes)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise ScenarioError("cannot read %s: %s" % (path, e))
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ScenarioError("%s is not a PNG" % path)
+    pos, width, height, color = 8, None, None, None
+    raw = b""
+    try:
+        while pos + 8 <= len(data):
+            (length,) = struct.unpack(">I", data[pos : pos + 4])
+            ctype = data[pos + 4 : pos + 8]
+            payload = data[pos + 8 : pos + 8 + length]
+            if len(payload) != length or pos + 12 + length > len(data):
+                raise ScenarioError("%s is truncated" % path)
+            if ctype == b"IHDR":
+                width, height, depth, color, comp, filt, inter = struct.unpack(
+                    ">IIBBBBB", payload
+                )
+                if depth != 8 or color not in (2, 6) or comp != 0 or filt != 0:
+                    raise ScenarioError(
+                        "%s: need 8-bit RGB/RGBA, got depth=%s color=%s"
+                        % (path, depth, color)
+                    )
+                if inter != 0:
+                    raise ScenarioError("%s is interlaced" % path)
+            elif ctype == b"IDAT":
+                raw += payload
+            elif ctype == b"IEND":
+                break
+            pos += 12 + length
+    except struct.error as e:
+        raise ScenarioError("%s has a bad chunk: %s" % (path, e))
+    if width is None:
+        raise ScenarioError("%s has no IHDR" % path)
+    try:
+        pixels = zlib.decompress(raw)
+    except zlib.error as e:
+        raise ScenarioError("%s has bad image data: %s" % (path, e))
+    channels = 3 if color == 2 else 4
+    stride = width * channels
+    want = height * (stride + 1)
+    if len(pixels) != want:
+        raise ScenarioError(
+            "%s: want %d image bytes, got %d" % (path, want, len(pixels))
+        )
+    out = bytearray()
+    prior = bytearray(stride)
+    for row in range(height):
+        line = pixels[row * (stride + 1) : (row + 1) * (stride + 1)]
+        kind, filt = line[0], line[1:]
+        if kind > 4:
+            raise ScenarioError("%s: bad filter %d" % (path, kind))
+        recon = bytearray(stride)
+        for i in range(stride):
+            a = recon[i - channels] if i >= channels else 0
+            b = prior[i]
+            c = prior[i - channels] if i >= channels else 0
+            if kind == 1:
+                pred = a
+            elif kind == 2:
+                pred = b
+            elif kind == 3:
+                pred = (a + b) // 2
+            elif kind == 4:
+                pred = _paeth(a, b, c)
+            else:
+                pred = 0
+            recon[i] = (filt[i] + pred) % 256
+        if channels == 4:
+            out += b"".join(bytes(recon[i : i + 3]) for i in range(0, stride, 4))
+        else:
+            out += recon
+        prior = recon
+    return {"width": width, "height": height, "pixels": bytes(out)}
+
+
+def image_diff_fraction(first, second):
+    """Fraction of differing bytes between two read_png images."""
+    if (
+        first["width"] != second["width"]
+        or first["height"] != second["height"]
+        or len(first["pixels"]) != len(second["pixels"])
+    ):
+        raise ScenarioError(
+            "screenshot size mismatch: %dx%d vs %dx%d"
+            % (first["width"], first["height"], second["width"], second["height"])
+        )
+    total = len(first["pixels"])
+    if total == 0:
+        return 0.0
+    differing = sum(1 for a, b in zip(first["pixels"], second["pixels"]) if a != b)
+    return differing / total
+
+
 SCENARIOS = {
     "smoke": scenario_smoke,
     "m0": scenario_m0,
@@ -3523,6 +3832,7 @@ SCENARIOS = {
     "m3": scenario_m3,
     "upgrade": scenario_upgrade,
     "remove": scenario_remove,
+    "graphical": scenario_graphical,
 }
 
 

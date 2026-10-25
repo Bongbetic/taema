@@ -129,6 +129,13 @@ Built-in scenarios:
   earlyoom floor. Verify a leftover has `oom_score_adj=500`, record earlyoom's selected
   process when it fires, then measure daemon RSS, CPU, sampling, and pressure triggers for
   610 seconds. The two-libc run therefore takes at least 20 minutes plus guest setup.
+- **graphical** — start a disposable headless graphical session (private
+  dbus-daemon, `weston --backend=headless`, mako) under a test-owned
+  `XDG_RUNTIME_DIR`, assert the Wayland socket appears, send a `notify-send`
+  notification, capture the headless output with `grim`, and verify the PNG
+  decodes to an RGB image with the stdlib-only `read_png` (no new
+  dependencies). The capture lands in the artifacts directory as
+  `graphical.png`; `image_diff_fraction` compares two captures.
 
 ## Artifacts
 

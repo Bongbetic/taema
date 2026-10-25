@@ -2,6 +2,17 @@
 
 ## Behaviour changes
 
+### Disposable graphical test session
+
+The VM harness gains a `graphical` scenario: a disposable headless session
+(private dbus-daemon, `weston --backend=headless` with a deterministic
+weston.ini, mako) under a test-owned `XDG_RUNTIME_DIR`. The scenario asserts
+the Wayland socket appears, sends a `notify-send` notification, captures the
+headless output with `grim` into the artifacts directory, and verifies the
+PNG with a stdlib-only reader plus a capture-diff helper (`read_png`,
+`image_diff_fraction`). Guest images install `weston mako grim libnotify
+mesa-dri`.
+
 ### Rust root helper with differential parity
 
 The privileged `taema-attach` helper is rewritten in Rust (`rust/attach`,

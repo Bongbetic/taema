@@ -325,8 +325,9 @@ user has to accept the new fingerprint.
 The `ci` workflow runs on every push and pull request: the unit and packaging test
 suites and package build, as an unprivileged user, in the Void glibc and Void musl
 containers with the distribution Python. Its Python 3.11 job also runs Ruff lint and
-format checks, mypy, and the coverage report and gate. Reproduce that quality job from
-the repository root with:
+format checks, mypy, and the coverage report and gate. Its Rust job runs fmt, clippy,
+tests, audit, and deny for the helper workspace from `taema/rust`. Reproduce that
+quality job from the repository root with:
 
 ```sh
 python3 -m venv /tmp/taema-quality-venv
@@ -349,10 +350,21 @@ make -C taema test        # the test suites (unit and packaging)
 taema/tools/build-xbps.sh # the package build; runs the suites first, needs xbps-create/xbps-rindex
 ```
 
-The test suites need only Python 3.11+ and `make`; the package build also needs
-`xbps-create` and `xbps-rindex`. A failing step fails the workflow run, which marks the
-commit and the pull request as failed. The tag-triggered `release` workflow is separate
-and unchanged.
+The test suites need Python 3.11+, `make`, and Cargo (or `WITHOUT_RUST=1` to skip
+the helper build and its parity corpus); the package build also needs `xbps-create`
+and `xbps-rindex`. Reproduce the Rust job from the repository root with:
+
+```sh
+cd taema/rust
+cargo fmt --check
+cargo clippy --locked --offline -- -D warnings
+cargo test --locked --offline
+cargo audit --file Cargo.lock
+cargo deny check
+```
+
+A failing step fails the workflow run, which marks the commit and the pull request as
+failed. The tag-triggered `release` workflow is separate and unchanged.
 
 ## Layout
 

@@ -5,6 +5,7 @@ revision=1
 build_wrksrc=taema
 build_style=gnu-makefile
 make_check_target=test
+hostmakedepends="cargo"
 depends="python3>=3.11 iproute2 util-linux sudo runit shadow"
 checkdepends="python3 iproute2"
 short_desc="Dependency-aware, self-managing cgroup v2 process scopes"

@@ -2,6 +2,20 @@
 
 ## Behaviour changes
 
+### Rust root helper with differential parity
+
+The privileged `taema-attach` helper is rewritten in Rust (`rust/attach`,
+only libc/serde/serde_json/toml per ADR-3, vendored for offline builds) with
+an identical command line and validation. A differential corpus
+(`tests/test_attach_parity.py`, ~90 cases plus a refusal catalog) sends the
+same requests to both helpers and compares exit codes, output, and produced
+files byte for byte; the only intentional differences are inputs where Python
+crashes with a traceback, which Rust refuses cleanly with the same exit code.
+The install ships a `taema-attach` wrapper preferring the Rust binary with
+the Python helper as fallback (same sudoers rule, unchanged service), and CI
+gates the workspace on fmt, clippy, tests, audit, and deny. `WITHOUT_RUST=1`
+skips the Rust build, the corpus, and the Rust install.
+
 ### Session agent lifecycle
 
 `taema agent` runs once per session under a lock, joins the protected `agent`

@@ -11,6 +11,7 @@ import fnmatch
 import math
 import os
 import re
+import time as _time
 import tomllib
 import glob
 
@@ -586,6 +587,164 @@ def _validate_config(cfg, sources):
         raise ValueError(
             "%s:1:1: profile.runtime_mode must be one of %s" % (source, MODES)
         )
+    auto = profiles.get("auto", {})
+    auto_source = sources.get("profile.auto", profile_source)
+    if not isinstance(auto, dict):
+        raise ValueError("%s:1:1: profile.auto must be a table" % auto_source)
+    if "on_battery" in auto:
+        battery = auto["on_battery"]
+        if not isinstance(battery, str) or not isinstance(profiles.get(battery), dict):
+            raise ValueError(
+                "%s:1:1: profile.auto.on_battery must name a profile" % auto_source
+            )
+    running = auto.get("when_running", {})
+    if not isinstance(running, dict) or any(
+        not isinstance(comm, str) or not isinstance(profiles.get(name), dict)
+        for comm, name in running.items()
+    ):
+        raise ValueError(
+            "%s:1:1: profile.auto.when_running must map commands to profiles"
+            % auto_source
+        )
+    windows = auto.get("time", [])
+    if not isinstance(windows, list) or any(
+        not isinstance(window, dict)
+        or not isinstance(profiles.get(window.get("profile")), dict)
+        or _parse_day_time(window.get("start")) is None
+        or _parse_day_time(window.get("end")) is None
+        or (
+            window.get("days") is not None
+            and (
+                not isinstance(window.get("days"), list)
+                or not window["days"]
+                or any(
+                    not isinstance(day, str)
+                    or day.strip().lower()
+                    not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+                    for day in window["days"]
+                )
+            )
+        )
+        for window in windows
+    ):
+        raise ValueError(
+            "%s:1:1: profile.auto.time must list profile/start/end windows"
+            % auto_source
+        )
+
+
+def read_power_supply(power_dir):
+    """True when the machine runs on battery. Missing facts mean False."""
+    try:
+        entries = sorted(os.listdir(power_dir))
+    except OSError:
+        return False
+    seen_ac = False
+    for entry in entries:
+        kind_path = os.path.join(power_dir, entry, "type")
+        try:
+            with open(kind_path, encoding="utf-8") as stream:
+                kind = stream.read().strip()
+        except OSError:
+            continue
+        if kind == "Mains":
+            seen_ac = True
+            try:
+                with open(
+                    os.path.join(power_dir, entry, "online"), encoding="utf-8"
+                ) as stream:
+                    if stream.read().strip() == "1":
+                        return False
+            except OSError:
+                continue
+    if seen_ac:
+        return True
+    for entry in entries:
+        status_path = os.path.join(power_dir, entry, "status")
+        try:
+            with open(status_path, encoding="utf-8") as stream:
+                if stream.read().strip() == "Discharging":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _parse_day_time(value):
+    match = re.fullmatch(r"(\d{2}):(\d{2})", str(value or ""))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _window_matches(window, now):
+    local = _time.localtime(now)
+    days = window.get("days")
+    if days is not None:
+        names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        wanted = {str(day).strip().lower() for day in days if isinstance(day, str)}
+        if names[local.tm_wday] not in wanted:
+            return False
+    start = _parse_day_time(window.get("start"))
+    end = _parse_day_time(window.get("end"))
+    if start is None or end is None:
+        return False
+    current = local.tm_hour * 60 + local.tm_min
+    if start <= end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def select_auto_profile(cfg, *, on_battery, comms, now):
+    """Pick the automatic profile, or None when a manual profile is active.
+
+    Precedence: a running match, then a time window, then battery, then the
+    default profile. Returns (name, reason).
+    """
+    profiles = cfg.get("profile", {})
+    if profiles.get("active", "auto") != "auto":
+        return None
+    auto = profiles.get("auto", {})
+    if not isinstance(auto, dict):
+        auto = {}
+    for comm, name in sorted((auto.get("when_running") or {}).items()):
+        if comm in (comms or set()) and isinstance(profiles.get(name), dict):
+            return name, "process %s is running" % comm
+    for window in auto.get("time") or []:
+        if not isinstance(window, dict):
+            continue
+        name = window.get("profile")
+        if isinstance(profiles.get(name), dict) and _window_matches(window, now):
+            return name, "time window %s-%s" % (window.get("start"), window.get("end"))
+    if on_battery:
+        name = auto.get("on_battery")
+        if isinstance(name, str) and isinstance(profiles.get(name), dict):
+            return name, "running on battery power"
+    if isinstance(profiles.get("default"), dict):
+        return "default", "no automatic rule matched"
+    return None
+
+
+def with_profile(cfg, name, reason):
+    """Return cfg with the named profile overlay applied. The input is unchanged."""
+    overlay = cfg["profile"][name]
+    merged = merge(copy.deepcopy(cfg), copy.deepcopy(overlay))
+    source_map = merged.setdefault("_source_map", {})
+    source_map.update(_flatten_sources(overlay, "profile %s" % name))
+    runtime_mode = merged.get("profile", {}).get("runtime_mode", "")
+    if runtime_mode:
+        merged["mode"] = runtime_mode
+        source_map["mode"] = source_map.get(
+            "profile.runtime_mode", "runtime mode override"
+        )
+    merged["_profile_name"] = name
+    merged["_profile_reason"] = reason
+    merged["_profile_suppress_stops"] = name == "quiet"
+    merged["_source_map"] = source_map
+    return merged
 
 
 def effective_authority(cfg):
@@ -621,23 +780,19 @@ def _load_files(files, required=()):
     _validate_config(cfg, source_map)
     active_profile = cfg["profile"].get("active", "auto")
     if active_profile != "auto":
-        overlay = cfg["profile"][active_profile]
-        cfg = merge(copy.deepcopy(cfg), copy.deepcopy(overlay))
-        source_map.update(_flatten_sources(overlay, "profile %s" % active_profile))
-    runtime_mode = cfg.get("profile", {}).get("runtime_mode", "")
-    if runtime_mode:
-        cfg["mode"] = runtime_mode
-        source_map["mode"] = source_map.get(
-            "profile.runtime_mode", "runtime mode override"
-        )
-    cfg["_profile_name"] = active_profile
-    cfg["_profile_reason"] = (
-        "automatic profile selection"
-        if active_profile == "auto"
-        else "manual profile selection"
-    )
-    cfg["_profile_suppress_stops"] = active_profile == "quiet"
-    cfg["_source_map"] = source_map
+        cfg = with_profile(cfg, active_profile, "manual profile selection")
+        source_map = cfg["_source_map"]
+    else:
+        runtime_mode = cfg.get("profile", {}).get("runtime_mode", "")
+        if runtime_mode:
+            cfg["mode"] = runtime_mode
+            source_map["mode"] = source_map.get(
+                "profile.runtime_mode", "runtime mode override"
+            )
+        cfg["_profile_name"] = active_profile
+        cfg["_profile_reason"] = "automatic profile selection"
+        cfg["_profile_suppress_stops"] = False
+        cfg["_source_map"] = source_map
     _validate_config(cfg, source_map)
     p = cfg["paths"]
     p.setdefault("session_cgroup", "auto")
@@ -646,6 +801,7 @@ def _load_files(files, required=()):
     p.setdefault("socket_fallback", os.path.join(expand(p["state_dir"]), "taema.sock"))
     p.setdefault("helper", HELPER)
     p.setdefault("hooks_dir", os.path.join(user_config_dir(), "hooks"))
+    p.setdefault("power_supply", "/sys/class/power_supply")
     source_map = cfg["_source_map"]
     for key in (
         "session_cgroup",
@@ -654,6 +810,7 @@ def _load_files(files, required=()):
         "socket_fallback",
         "helper",
         "hooks_dir",
+        "power_supply",
     ):
         source_map.setdefault("paths." + key, "built-in defaults")
     return cfg

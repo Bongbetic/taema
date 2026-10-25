@@ -5689,12 +5689,15 @@ class Daemon:
         else:
             self.stopping = True
 
-    def reload_config(self, reason="configuration reload"):
+    def reload_config(self, reason="configuration reload", _preloaded=None):
         """Install a validated config and units snapshot, retaining the current one on error."""
         old_cfg, old_units, old_store = self.cfg, self.units, self.store
         try:
-            cfg = policy.load_config()
-            units = policy.load_units(cfg)
+            if _preloaded is not None:
+                cfg, units = _preloaded
+            else:
+                cfg = policy.load_config()
+                units = policy.load_units(cfg)
             old_state_dir = old_cfg.get("paths", {}).get("state_dir")
             new_state_dir = cfg.get("paths", {}).get("state_dir")
             if policy.expand(old_state_dir) != policy.expand(new_state_dir):
@@ -5805,6 +5808,44 @@ class Daemon:
             self.store.log(event="memory_budget_failed", reason=str(error))
         self._save_if_idle()
         return {"reloaded": True, "sources": list(cfg.get("_sources", []))}
+
+    def _running_comms(self):
+        """Comms of all visible processes, best effort."""
+        try:
+            return {
+                comm
+                for pid in inspect.all_pids()
+                for comm in [inspect.comm(pid)]
+                if comm
+            }
+        except OSError:
+            return set()
+
+    def auto_profile_pass(self, now=None):
+        """Apply the selected automatic profile; None when manual or failed."""
+        if self.cfg.get("profile", {}).get("active", "auto") != "auto":
+            return None
+        now = time.time() if now is None else now
+        power_dir = policy.expand(
+            self.cfg.get("paths", {}).get("power_supply", "/sys/class/power_supply")
+        )
+        selected = policy.select_auto_profile(
+            self.cfg,
+            on_battery=policy.read_power_supply(power_dir),
+            comms=self._running_comms(),
+            now=now,
+        )
+        if selected is None:
+            return None
+        name, why = selected
+        if self.cfg.get("_profile_name", "auto") == name:
+            return name
+        reason = "automatic: " + why
+        cfg = policy.with_profile(policy.load_config(), name, reason)
+        result = self.reload_config(reason, _preloaded=(cfg, policy.load_units(cfg)))
+        if not isinstance(result, dict) or not result.get("reloaded"):
+            return None
+        return name
 
     def poll_config_reload(self):
         """Reload on SIGHUP or a changed config, drop-in, unit, or watched directory mtime."""
@@ -6460,6 +6501,10 @@ class Daemon:
         try:
             self._expire_subscribers()
             self.guarded(self.poll_config_reload)
+            profile_now = time.time()
+            if profile_now - self.last.get("profile", 0.0) >= 15.0:
+                self.last["profile"] = profile_now
+                self.guarded(self.auto_profile_pass)
             if not self.store.db.write_available():
                 skip_pass = True
                 self.guarded(self.thaw_held_scopes)

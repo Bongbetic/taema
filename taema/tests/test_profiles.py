@@ -178,6 +178,145 @@ class ModeProfileCliTests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["profile", "quiet"])._command, "profile")
 
 
+class AutoProfileSelectionTests(unittest.TestCase):
+    def config(self, auto, active="auto"):
+        cfg = {"profile": {"active": active, "auto": auto}}
+        for name in ("default", "battery", "game", "quiet"):
+            cfg["profile"][name] = {}
+        return cfg
+
+    def test_manual_active_disables_selection(self):
+        cfg = self.config({"on_battery": "battery"}, active="quiet")
+        self.assertIsNone(
+            policy.select_auto_profile(cfg, on_battery=True, comms=set(), now=0)
+        )
+
+    def test_battery_selects_profile(self):
+        cfg = self.config({"on_battery": "battery"})
+        name, reason = policy.select_auto_profile(
+            cfg, on_battery=True, comms=set(), now=0
+        )
+        self.assertEqual(name, "battery")
+        self.assertIn("battery", reason)
+
+    def test_running_match_wins_over_battery(self):
+        cfg = self.config(
+            {"on_battery": "battery", "when_running": {"gamescope": "game"}}
+        )
+        name, reason = policy.select_auto_profile(
+            cfg, on_battery=True, comms={"gamescope"}, now=0
+        )
+        self.assertEqual(name, "game")
+        self.assertIn("gamescope", reason)
+
+    def test_time_window_matches_overnight(self):
+        cfg = self.config(
+            {
+                "time": [
+                    {"profile": "quiet", "start": "22:00", "end": "07:00"},
+                ]
+            }
+        )
+        import time as _time
+
+        night = _time.mktime((2026, 9, 15, 23, 30, 0, 0, 0, -1))
+        name, _reason = policy.select_auto_profile(
+            cfg, on_battery=False, comms=set(), now=night
+        )
+        self.assertEqual(name, "quiet")
+        noon = _time.mktime((2026, 9, 15, 12, 0, 0, 0, 0, -1))
+        name, _reason = policy.select_auto_profile(
+            cfg, on_battery=False, comms=set(), now=noon
+        )
+        self.assertEqual(name, "default")
+
+    def test_time_window_respects_days(self):
+        cfg = self.config(
+            {
+                "time": [
+                    {
+                        "profile": "quiet",
+                        "start": "00:00",
+                        "end": "23:59",
+                        "days": ["sat", "sun"],
+                    },
+                ]
+            }
+        )
+        import time as _time
+
+        saturday = _time.mktime((2026, 9, 19, 12, 0, 0, 0, 0, -1))
+        name, _reason = policy.select_auto_profile(
+            cfg, on_battery=False, comms=set(), now=saturday
+        )
+        self.assertEqual(name, "quiet")
+        monday = _time.mktime((2026, 9, 21, 12, 0, 0, 0, 0, -1))
+        name, _reason = policy.select_auto_profile(
+            cfg, on_battery=False, comms=set(), now=monday
+        )
+        self.assertEqual(name, "default")
+
+    def test_no_match_falls_back_to_default(self):
+        cfg = self.config({})
+        name, _reason = policy.select_auto_profile(
+            cfg, on_battery=False, comms=set(), now=0
+        )
+        self.assertEqual(name, "default")
+
+    def test_power_supply_tree(self):
+        with tempfile.TemporaryDirectory() as root:
+            ac = Path(root, "AC0")
+            ac.mkdir()
+            (ac / "type").write_text("Mains\n")
+            (ac / "online").write_text("1\n")
+            self.assertFalse(policy.read_power_supply(root))
+            (ac / "online").write_text("0\n")
+            self.assertTrue(policy.read_power_supply(root))
+        with tempfile.TemporaryDirectory() as root:
+            bat = Path(root, "BAT0")
+            bat.mkdir()
+            (bat / "type").write_text("Battery\n")
+            (bat / "status").write_text("Discharging\n")
+            self.assertTrue(policy.read_power_supply(root))
+            (bat / "status").write_text("Charging\n")
+            self.assertFalse(policy.read_power_supply(root))
+        self.assertFalse(policy.read_power_supply("/nonexistent-power-tree"))
+
+
+class AutoProfileConfigTests(unittest.TestCase):
+    def test_with_profile_applies_overlay_and_reason(self):
+        cfg = policy.load_config()
+        overlaid = policy.with_profile(cfg, "quiet", "automatic test")
+        self.assertEqual(overlaid["_profile_name"], "quiet")
+        self.assertEqual(overlaid["_profile_reason"], "automatic test")
+        self.assertTrue(overlaid["_profile_suppress_stops"])
+        self.assertFalse(overlaid["notify"]["enabled"])
+        self.assertEqual(cfg["_profile_name"], "auto")
+
+    def test_rejects_unknown_auto_profile_names(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "taema.toml")
+            source.write_text('[profile.auto]\non_battery = "nope"\n', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"TAEMA_CONFIG": str(source)}):
+                with self.assertRaises(ValueError):
+                    policy.load_config()
+
+    def test_rejects_bad_time_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root, "taema.toml")
+            source.write_text(
+                '[[profile.auto.time]]\nprofile = "quiet"\nstart = "25:00"\nend = "07:00"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"TAEMA_CONFIG": str(source)}):
+                with self.assertRaises(ValueError):
+                    policy.load_config()
+
+    def test_power_supply_path_defaults(self):
+        cfg = policy.load_config()
+        self.assertEqual(cfg["paths"]["power_supply"], "/sys/class/power_supply")
+
+
 class ProfileDaemonTests(unittest.TestCase):
     def test_reload_logs_changes_and_status_reports_active_profile_reason(self):
         with tempfile.TemporaryDirectory() as root:
@@ -236,6 +375,114 @@ class ProfileDaemonTests(unittest.TestCase):
                 self.assertEqual(logged["profile_changed"]["old"], "auto")
                 self.assertEqual(logged["profile_changed"]["new"], "quiet")
             daemon.sel.close()
+
+    def make_daemon(self, root, extra=""):
+        source = Path(root, "taema.toml")
+        state = Path(root, "state")
+        units = Path(root, "units")
+        power = Path(root, "power")
+        units.mkdir()
+        power.mkdir()
+        source.write_text(
+            "[paths]\nstate_dir = %s\nunits_dir = %s\npower_supply = %s\n%s"
+            % (
+                json.dumps(str(state)),
+                json.dumps(str(units)),
+                json.dumps(str(power)),
+                extra,
+            ),
+            encoding="utf-8",
+        )
+        return source, power
+
+    def test_auto_pass_switches_on_battery(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, power = self.make_daemon(root)
+            ac = power / "AC0"
+            ac.mkdir()
+            (ac / "type").write_text("Mains\n")
+            (ac / "online").write_text("0\n")
+            with mock.patch.dict(os.environ, {"TAEMA_CONFIG": str(source)}):
+                daemon = service.Daemon(policy.load_config())
+                try:
+                    with mock.patch.object(
+                        service.Daemon, "_running_comms", return_value=set()
+                    ):
+                        self.assertEqual(daemon.auto_profile_pass(), "battery")
+                    status = daemon.handle({"cmd": "status"})
+                    self.assertEqual(status["profile"], "battery")
+                    self.assertIn("battery", status["profile_reason"])
+                    daemon.store.save()
+                    with daemon.store.db.connection() as connection:
+                        rows = connection.execute(
+                            "SELECT data FROM events WHERE event = 'profile_changed'"
+                        ).fetchall()
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(json.loads(rows[0][0])["new"], "battery")
+                finally:
+                    daemon.sel.close()
+
+    def test_auto_pass_matches_running_process(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, _power = self.make_daemon(root)
+            with mock.patch.dict(os.environ, {"TAEMA_CONFIG": str(source)}):
+                daemon = service.Daemon(policy.load_config())
+                try:
+                    with mock.patch.object(
+                        service.Daemon,
+                        "_running_comms",
+                        return_value={"gamescope"},
+                    ):
+                        self.assertEqual(daemon.auto_profile_pass(), "game")
+                    self.assertEqual(
+                        daemon.handle({"cmd": "status"})["profile"], "game"
+                    )
+                finally:
+                    daemon.sel.close()
+
+    def test_manual_profile_blocks_auto_pass(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, power = self.make_daemon(root, '[profile]\nactive = "quiet"\n')
+            ac = power / "AC0"
+            ac.mkdir()
+            (ac / "type").write_text("Mains\n")
+            (ac / "online").write_text("0\n")
+            with mock.patch.dict(os.environ, {"TAEMA_CONFIG": str(source)}):
+                daemon = service.Daemon(policy.load_config())
+                try:
+                    self.assertIsNone(daemon.auto_profile_pass())
+                    self.assertEqual(
+                        daemon.handle({"cmd": "status"})["profile"], "quiet"
+                    )
+                finally:
+                    daemon.sel.close()
+
+    def test_auto_pass_does_not_reload_when_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            source, _power = self.make_daemon(root)
+            with mock.patch.dict(os.environ, {"TAEMA_CONFIG": str(source)}):
+                daemon = service.Daemon(policy.load_config())
+                try:
+                    with mock.patch.object(
+                        service.Daemon, "_running_comms", return_value=set()
+                    ):
+                        first = daemon.auto_profile_pass()
+                        daemon.store.save()
+                        with daemon.store.db.connection() as connection:
+                            before = connection.execute(
+                                "SELECT COUNT(*) FROM events WHERE event = ?",
+                                ("profile_changed",),
+                            ).fetchone()[0]
+                        second = daemon.auto_profile_pass()
+                    self.assertEqual((first, second), ("default", "default"))
+                    with daemon.store.db.connection() as connection:
+                        after = connection.execute(
+                            "SELECT COUNT(*) FROM events WHERE event = ?",
+                            ("profile_changed",),
+                        ).fetchone()[0]
+                    self.assertEqual(before, after)
+                finally:
+                    daemon.sel.close()
 
 
 if __name__ == "__main__":

@@ -665,6 +665,8 @@ def stop(
     leftover=None,
 ):
     """Trace a stop attempt unless its caller already established the decision context."""
+    if policy.is_agent_scope(cgroup.rel(path)):
+        raise Refused("agent leaf is never stopped")
     if not dry_run:
         thaw_managed_scope_before_stop(path, store)
     context = getattr(store, "decision_context", None)
@@ -1392,7 +1394,11 @@ def _leftover_verdict(
 
 def remove_empty(path):
     """rmdir an empty leaf tree. False when a process is (or became) present or rmdir fails."""
-    if os.path.basename(path) == "manager" or cgroup.tree_procs(path):
+    if (
+        os.path.basename(path) == "manager"
+        or policy.is_agent_scope(cgroup.rel(path))
+        or cgroup.tree_procs(path)
+    ):
         return False
     try:
         cgroup.rmdir_tree(path)

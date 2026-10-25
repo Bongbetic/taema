@@ -201,6 +201,16 @@ class IpcV2Tests(unittest.TestCase):
             ("register", {"scope": "scope-ipc", "owner": pid}),
             ("attach", {"scope": "scope-ipc", "pids": [pid]}),
             (
+                "register_agent",
+                {
+                    "session": "ipc-agent",
+                    "pid": pid,
+                    "capabilities": ["heartbeat"],
+                    "compositor": "",
+                },
+            ),
+            ("agent_beat", {"session": "ipc-agent", "pid": pid}),
+            (
                 "job_done",
                 {"shell_pid": pid, "tag": "%d.1" % pid, "status": 0, "word": "cmd"},
             ),

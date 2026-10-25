@@ -112,6 +112,8 @@
     },
     "register": {"type": "object", "required": ["watching"], "properties": {"watching": {"type": "boolean"}}, "additionalProperties": true},
     "attach": {"type": "object", "required": ["ok", "attached"], "properties": {"ok": {"const": true}, "attached": {"type": "array", "items": {"type": "integer"}}}, "additionalProperties": true},
+    "register_agent": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true},
+    "agent_beat": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true},
     "job_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}, "ignored": {"type": "string"}}, "additionalProperties": true},
     "kill_done": {"type": "object", "required": ["ok"], "properties": {"ok": {"const": true}}, "additionalProperties": true},
     "ask": {"type": "object", "required": ["question"], "properties": {"question": {"type": ["object", "null"]}, "reason": {"type": "string"}}, "additionalProperties": true},

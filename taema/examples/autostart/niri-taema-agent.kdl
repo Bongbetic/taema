@@ -1,0 +1,4 @@
+// Example: start the tæma session agent with niri.
+// Copy into your niri config.h / config.kdl `spawn-at-startup` section.
+// The agent relays desktop facts to the daemon and decides nothing.
+spawn-at-startup "taema" "agent"

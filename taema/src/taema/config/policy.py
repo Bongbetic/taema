@@ -19,7 +19,17 @@ SYSTEM_CONFIG = os.environ.get("TAEMA_SYSTEM_CONFIG", "/etc/taema/taema.toml")
 SYSTEM_UNITS = "/etc/taema/units"
 USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
+AGENT_LEAF = "agent"
 MODES = ("observe", "adopt", "enforce", "auto")
+
+
+def is_agent_scope(rel):
+    """True for the protected session-agent leaf and anything below it."""
+    return rel == AGENT_LEAF or (
+        isinstance(rel, str) and rel.startswith(AGENT_LEAF + "/")
+    )
+
+
 LEARN_AUTHORITIES = ("answered", "learned", "aggressive")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
 
@@ -1167,6 +1177,9 @@ def protected_reason(pid, cfg, pp=None):
         return "protected comm %s" % c
     cg = cgroup.proc_cgroup(pid) or ""
     full = cgroup.CG + cg
+    leaf = cgroup.base() + "/" + AGENT_LEAF
+    if full == leaf or full.startswith(leaf + "/"):
+        return "agent leaf"
     for pre in prot.get("cgroup_prefix", []):
         if full == pre or full.startswith(pre.rstrip("/") + "/"):
             return "protected cgroup %s" % pre

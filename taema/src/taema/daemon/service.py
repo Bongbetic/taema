@@ -197,6 +197,7 @@ class Daemon:
         self._config_watch_paths = policy.config_watch_paths(cfg)
         self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
         self.sel = selectors.DefaultSelector()
+        self.agents = {}  # session -> {pid, capabilities, compositor, last_beat, state, facts}
         self.owners = {}  # pidfd -> (scope leaf name, owner pid, owner starttime)
         self.idle_since = {}
         self.gc_usage = {}  # rel -> cpu usage_usec when the idle window started
@@ -3902,7 +3903,7 @@ class Daemon:
                 d for d in top if os.path.basename(d) != engine.LEFTOVER
             ] + cgroup.subdirs(cgroup.base() + "/" + engine.LEFTOVER)
         for d in top:
-            if os.path.basename(d) == "manager":
+            if os.path.basename(d) == "manager" or policy.is_agent_scope(cgroup.rel(d)):
                 continue
             unit = engine.unit_for_leaf(self.units, os.path.basename(d))
             scope = cgroup.rel(d)
@@ -3998,7 +3999,11 @@ class Daemon:
         scope = payload.get("scope") or decision.get("scope")
         if not isinstance(scope, str) or not cgroup.valid_rel(scope):
             return {"ok": False, "error": "undo scope is invalid"}
-        if scope == "manager" or scope.startswith("manager/"):
+        if (
+            scope == "manager"
+            or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
+        ):
             return {"ok": False, "error": "managed service scope cannot be undone"}
         path = os.path.join(cgroup.base(), scope)
 
@@ -4327,14 +4332,17 @@ class Daemon:
         if c == "doctor":
             from ..doctor import diagnose
 
+            agent_state = self.agent_report()
+            agent_kwarg = {"agents": agent_state} if agent_state else {}
             if self.config_error:
                 return diagnose(
                     self.cfg,
                     self.store,
                     self.units,
                     config_error=self.config_error,
+                    **agent_kwarg,
                 )
-            return diagnose(self.cfg, self.store, self.units)
+            return diagnose(self.cfg, self.store, self.units, **agent_kwarg)
         if c == "reload":
             reason = msg.get("reason", "reload command")
             if not isinstance(reason, str) or len(reason) > 256:
@@ -4350,6 +4358,7 @@ class Daemon:
                 or not cgroup.valid_rel(scope)
                 or scope == "manager"
                 or scope.startswith("manager/")
+                or policy.is_agent_scope(scope)
             ):
                 return {"error": "invalid freeze scope", "code": "invalid_request"}
             result = self.freeze_scope(scope, manual=True, reason="manual freeze")
@@ -4373,6 +4382,7 @@ class Daemon:
                 or not cgroup.valid_rel(scope)
                 or scope == "manager"
                 or scope.startswith("manager/")
+                or policy.is_agent_scope(scope)
             ):
                 return {"error": "invalid thaw scope", "code": "invalid_request"}
             result = self._thaw_scope(
@@ -4426,6 +4436,7 @@ class Daemon:
                 "unit_errors": list(self.cfg.get("_unit_errors", [])),
                 "auto": self.auto_status(),
                 "guard": self.guard_status(),
+                "agents": self.agent_report(),
             }
         if c == "review":
             self.store.expire_reviews()
@@ -4445,6 +4456,10 @@ class Daemon:
             return {"watching": self.watch_owner(leaf, owner)}
         if c == "attach":
             return self.attach(msg)
+        if c == "register_agent":
+            return self.register_agent(msg)
+        if c == "agent_beat":
+            return self.agent_beat(msg)
         if c == "job_done":
             return self.job_done(msg)
         if c == "kill_done":
@@ -4589,6 +4604,8 @@ class Daemon:
         me = os.getuid()
         if any(inspect.uid_of(p) != me for p in pids):
             return {"error": "pid gone or not yours"}
+        if scope == policy.AGENT_LEAF:
+            return self.attach_agent(pids)
         done = []
         with self.store.decision_context(
             "containment",
@@ -4607,6 +4624,123 @@ class Daemon:
                 done.append(p)
             self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
         return {"ok": True, "attached": done}
+
+    def attach_agent(self, pids):
+        """Move same-uid pids into the agent leaf with a direct write, no helper."""
+        try:
+            dest = cgroup.mkleaf(policy.AGENT_LEAF)
+        except OSError as error:
+            return {"error": "agent leaf unavailable: %s" % error}
+        done = []
+        for p in dict.fromkeys(pids):
+            try:
+                cgroup.move(p, dest)
+            except OSError as error:
+                return {"error": "attach failed: %s" % error, "attached": done}
+            done.append(p)
+        self.store.log(event="attach", scope=policy.AGENT_LEAF, pids=done[:8])
+        return {"ok": True, "attached": done}
+
+    def register_agent(self, msg):
+        """Record one session's agent; same uid only, capabilities announced."""
+        session, pid = msg.get("session"), msg.get("pid")
+        capabilities, compositor = (
+            msg.get("capabilities", []),
+            msg.get("compositor", ""),
+        )
+        if (
+            not isinstance(session, str)
+            or not session
+            or len(session) > 64
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+            or not isinstance(capabilities, list)
+            or any(not isinstance(cap, str) for cap in capabilities)
+            or not isinstance(compositor, str)
+        ):
+            return {"error": "bad request"}
+        if inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        previous = self.agents.get(session)
+        self.agents[session] = {
+            "pid": pid,
+            "capabilities": capabilities,
+            "compositor": compositor,
+            "last_beat": time.time(),
+            "state": "up",
+            "facts": {},
+        }
+        if previous is None or previous.get("state") != "up":
+            self.store.log(event="agent_up", scope=session, target=str(pid))
+        return {"ok": True}
+
+    def agent_beat(self, msg):
+        """Accept one heartbeat; revive a down agent, store bounded facts."""
+        session, pid = msg.get("session"), msg.get("pid")
+        if (
+            not isinstance(session, str)
+            or not session
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+        ):
+            return {"error": "bad request"}
+        record = self.agents.get(session)
+        if record is None:
+            return {"error": "unknown agent session; register first"}
+        if pid != record["pid"] or inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        if "facts" in msg:
+            facts = msg["facts"]
+            if not isinstance(facts, dict):
+                return {"error": "bad request"}
+            if len(json.dumps(facts, sort_keys=True, default=str)) > 8192:
+                return {"error": "agent facts are too large"}
+            record["facts"] = facts
+        record["last_beat"] = time.time()
+        if record["state"] != "up":
+            record["state"] = "up"
+            self.store.log(event="agent_up", scope=session, target=str(pid))
+        return {"ok": True}
+
+    def agent_watch_pass(self, now=None):
+        """Mark agents down after 3 missed beats; stale facts stay refused."""
+        from .. import agent as agent_mod
+
+        now = time.time() if now is None else now
+        limit = agent_mod.BEAT_S * agent_mod.MAX_MISSED
+        for session, record in self.agents.items():
+            if record["state"] == "up" and now - record["last_beat"] > limit:
+                record["state"] = "down"
+                record["facts"] = {}
+                self.store.log(event="agent_down", scope=session)
+
+    def agent_live(self, session):
+        """True only while the session's agent beats; gate for window facts."""
+        record = self.agents.get(session)
+        return record is not None and record["state"] == "up"
+
+    def agent_facts(self, session):
+        """Desktop facts, or {} once the agent is down: decide on process data."""
+        record = self.agents.get(session)
+        if record is None or record["state"] != "up":
+            return {}
+        return dict(record["facts"])
+
+    def agent_report(self):
+        """JSON-safe agent state for status and doctor."""
+        now = time.time()
+        return {
+            session: {
+                "state": record["state"],
+                "pid": record["pid"],
+                "capabilities": list(record["capabilities"]),
+                "compositor": record["compositor"],
+                "last_beat_age_s": max(0, int(now - record["last_beat"])),
+            }
+            for session, record in sorted(self.agents.items())
+        }
 
     def _summary_text(self):
         state = self.store.hold_status()
@@ -5056,6 +5190,7 @@ class Daemon:
             not cgroup.valid_rel(scope)
             or scope == "manager"
             or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
             or scope.count("/") != 1
             or not scope.startswith("leftover/")
         ):
@@ -5155,6 +5290,7 @@ class Daemon:
             or not cgroup.valid_rel(scope)
             or scope == "manager"
             or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
         ):
             return {"ok": False, "error": "invalid or managed scope"}
         record = self.store.data.get("frozen_scopes", {}).get(scope)
@@ -6549,6 +6685,7 @@ class Daemon:
                 self.guarded(self.freeze_pass)
             self._run_listener_wake_if_due(now)
             self.drain_collector_events()
+            self.guarded(self.agent_watch_pass)
             self.guarded(self.qos_pass)
         finally:
             self._in_tick = False
@@ -7530,7 +7667,11 @@ class Daemon:
 
     def _reclaim_class(self, scope, path):
         """Resolve the deliberately small set of scope classes eligible for idle reclaim."""
-        if scope == "manager" or scope.startswith("manager/"):
+        if (
+            scope == "manager"
+            or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
+        ):
             return None
         if scope.startswith("leftover/"):
             return "leftover"
@@ -7564,6 +7705,8 @@ class Daemon:
     def _reclaim_safety_reason(self, scope, path, pids):
         if scope == "manager" or scope.startswith("manager/"):
             return "manager scope is never reclaimed"
+        if policy.is_agent_scope(scope):
+            return "agent leaf is never reclaimed"
         if os.getpid() in pids or cgroup.is_prefix(path, cgroup.own_cgroup()):
             return "scope contains the daemon"
         if not pids:

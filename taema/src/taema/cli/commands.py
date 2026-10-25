@@ -4289,6 +4289,45 @@ def cmd_daemon(a):
     )
 
 
+def cmd_agent(a):
+    """Run this session's relay: lock, join the agent leaf, register, beat."""
+    import time
+
+    from .. import agent as agent_mod
+
+    cfg = policy.load_config(path=getattr(a, "config", None))
+    socket_override = getattr(a, "socket", None)
+    if socket_override:
+        socket_override = policy.expand(socket_override)
+        cfg["paths"]["socket"] = socket_override
+        cfg["paths"]["socket_fallback"] = socket_override
+    session = agent_mod.session_key()
+    lock = agent_mod.hold_lock(agent_mod.lock_path(policy.state_dir(cfg), session))
+    if lock is None:
+        print("taema: agent already running for session %s" % session)
+        return 0
+    try:
+        compositor = agent_mod.compositor_socket()
+        if not agent_mod.compositor_live(compositor):
+            return die("no compositor socket; the agent needs a graphical session")
+        if not agent_mod.ensure_leaf(os.getpid(), lambda message: ask(cfg, message)):
+            return die("could not join the agent leaf")
+        agent = agent_mod.Agent(cfg, session)
+        attempt = 0
+        while not agent.connect():
+            time.sleep(agent_mod.backoff(attempt))
+            attempt += 1
+        try:
+            result = agent.run()
+        except KeyboardInterrupt:
+            return 0
+        if result == "compositor-gone":
+            print("taema: compositor socket went away; agent exiting")
+        return 0
+    finally:
+        agent_mod.release_lock(lock)
+
+
 def main(argv):
     from .framework import main as framework_main
 

@@ -357,6 +357,12 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_watch",
     },
     {
+        "name": "agent",
+        "aliases": (),
+        "help": "relay this session's desktop facts to the daemon",
+        "handler": "cmd_agent",
+    },
+    {
         "name": "dash",
         "aliases": (),
         "help": "show scopes, learning, memory, and events in one screen",

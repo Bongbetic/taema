@@ -67,6 +67,33 @@ def _check(name, status, message, fix="No action required."):
     return {"name": name, "status": status, "message": str(message), "fix": str(fix)}
 
 
+def _agent_check(agents):
+    """Session-agent liveness from the daemon's live report."""
+    if not agents:
+        return _check(
+            "session agent",
+            "warn",
+            "no session agent is registered; desktop facts are unavailable",
+            "Start taema agent from the graphical session autostart.",
+        )
+    down = sorted(
+        session for session, info in agents.items() if info.get("state") != "up"
+    )
+    if down:
+        return _check(
+            "session agent",
+            "warn",
+            "session agent down for %s; the daemon decides on process data only"
+            % ", ".join(down),
+            "Restart taema agent in the affected session.",
+        )
+    return _check(
+        "session agent",
+        "ok",
+        "session agent up for %s" % ", ".join(sorted(agents)),
+    )
+
+
 def _rooted(root, path):
     return os.path.join(root, path.lstrip("/")) if root != "/" else path
 
@@ -1161,6 +1188,7 @@ def diagnose(
     system_root="/",
     uid=None,
     group_ids=None,
+    agents=None,
 ):
     """Build a stable, read-only diagnostic result shared by the CLI and daemon."""
     uid = os.getuid() if uid is None else uid
@@ -1248,6 +1276,8 @@ def diagnose(
             "taema 0.3.0 adopts eligible apps and reviews unknown leftovers before stopping them",
         )
     )
+    if agents is not None:
+        checks.append(_agent_check(agents))
     statuses = {item["status"] for item in checks}
     overall = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "ok"
     return {"schema": "taema.doctor.v1", "status": overall, "checks": checks}

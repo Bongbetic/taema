@@ -13,6 +13,19 @@ _COMMANDS = {
     "subscribe": ({"topics": "array", "since_seq": "integer"}, ("topics", "since_seq")),
     "register": ({"scope": "string", "owner": "integer"}, ("scope", "owner")),
     "attach": ({"scope": "string", "pids": "array"}, ("scope", "pids")),
+    "register_agent": (
+        {
+            "session": "string",
+            "pid": "integer",
+            "capabilities": "array",
+            "compositor": "string",
+        },
+        ("session", "pid"),
+    ),
+    "agent_beat": (
+        {"session": "string", "pid": "integer", "facts": "object"},
+        ("session", "pid"),
+    ),
     "job_done": (
         {
             "shell_pid": "integer",
@@ -84,6 +97,8 @@ def _is_type(value, kind):
         return isinstance(value, int) and not isinstance(value, bool)
     if kind == "array":
         return isinstance(value, list)
+    if kind == "object":
+        return isinstance(value, dict)
     if kind == "boolean":
         return isinstance(value, bool)
     if kind == "string":
@@ -399,6 +414,25 @@ def _validate_args(command, args):
         pid = args.get("owner") if command == "register" else args.get("shell_pid")
         if pid is not None and pid <= 1:
             _fail("process id must be greater than one")
+    if command in ("register_agent", "agent_beat"):
+        if not args["session"] or len(args["session"]) > 64:
+            _fail("agent session is empty or too long")
+        if args["pid"] <= 1:
+            _fail("process id must be greater than one")
+    if command == "register_agent":
+        capabilities = args.get("capabilities", [])
+        if len(capabilities) > 16 or any(
+            not _is_type(cap, "string") or not cap or len(cap) > 32
+            for cap in capabilities
+        ):
+            _fail("agent capabilities must be up to 16 short names")
+        if len(args.get("compositor", "")) > 256:
+            _fail("agent compositor path is too long")
+    if command == "agent_beat" and "facts" in args:
+        import json as _json
+
+        if len(_json.dumps(args["facts"], sort_keys=True, default=str)) > 8192:
+            _fail("agent facts are too large")
     if command == "attach":
         if not 0 < len(args["pids"]) <= 64 or any(
             not _is_type(pid, "integer") or pid <= 1 for pid in args["pids"]

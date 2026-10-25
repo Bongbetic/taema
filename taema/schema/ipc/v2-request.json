@@ -258,6 +258,18 @@
             "staging": {"type": "string", "minLength": 1, "maxLength": 4096}
           },
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["v", "id", "op", "unit", "pids"],
+          "properties": {
+            "v": {"const": 2},
+            "id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "op": {"const": "unit_test"},
+            "unit": {"type": "object"},
+            "pids": {"type": "array", "maxItems": 4096}
+          },
+          "additionalProperties": false
         }
       ]
     },

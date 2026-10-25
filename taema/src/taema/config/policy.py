@@ -747,6 +747,191 @@ def with_profile(cfg, name, reason):
     return merged
 
 
+_UNIT_TABLES = {
+    "unit": {
+        "name",
+        "kind",
+        "stop_when_unneeded",
+        "group_by_env",
+        "group_by_qmp",
+    },
+    "match": {"exe", "comm", "cmdline_contains", "env_exclude"},
+    "mem": {"class", "background", "save_state", "pause", "swap_max"},
+    "kill": {"graceful", "keep", "hook", "never_stop", "survive_logout"},
+    "gc": {
+        "keep_while_children",
+        "no_attach_grace",
+        "env_dir_missing",
+        "socket_path",
+        "socket_glob",
+        "socket_env",
+        "quit_process_missing",
+        "qmp_socket",
+    },
+}
+_CHILDREN_KEYS = {"name", "comm", "ancestor_comm", "binds_to", "same_env"}
+
+
+def validate_unit(unit):
+    """Lint one parsed unit file. Returns a list of error strings."""
+    errors = []
+    if not isinstance(unit, dict):
+        return ["unit must be a table"]
+    for table in sorted(unit):
+        if table in ("_file", "children"):
+            continue
+        if table not in _UNIT_TABLES:
+            errors.append("unknown table [%s]" % table)
+    for table, allowed in _UNIT_TABLES.items():
+        section = unit.get(table)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            errors.append("[%s] must be a table" % table)
+            continue
+        for key in sorted(section):
+            if key not in allowed:
+                errors.append("unknown key [%s] %s" % (table, key))
+    head = unit.get("unit")
+    if not isinstance(head, dict):
+        errors.append("[unit] table is required")
+        return errors
+    name = head.get("name")
+    if not isinstance(name, str) or not name:
+        errors.append("[unit] name must be a non-empty string")
+    kind = head.get("kind")
+    if kind not in ("app", "scope"):
+        errors.append('[unit] kind must be "app" or "scope"')
+    for key in ("stop_when_unneeded", "group_by_qmp"):
+        if key in head and not isinstance(head[key], bool):
+            errors.append("[unit] %s must be true or false" % key)
+    if "group_by_env" in head and not isinstance(head["group_by_env"], str):
+        errors.append("[unit] group_by_env must be a string")
+    match = unit.get("match", {})
+    if kind == "app" and not any(
+        key in match for key in ("exe", "comm", "cmdline_contains")
+    ):
+        errors.append("[match] needs one of exe, comm, cmdline_contains")
+    for key in ("exe", "comm", "cmdline_contains"):
+        if key in match and not isinstance(match[key], str):
+            errors.append("[match] %s must be a string" % key)
+    if "env_exclude" in match and not isinstance(match["env_exclude"], dict):
+        errors.append("[match] env_exclude must be a table")
+    kill = unit.get("kill", {})
+    graceful = kill.get("graceful")
+    if graceful is not None and (
+        not isinstance(graceful, (int, float))
+        or isinstance(graceful, bool)
+        or graceful < 0
+    ):
+        errors.append("[kill] graceful must be a non-negative number of seconds")
+    if "keep" in kill and (
+        not isinstance(kill["keep"], list)
+        or any(not isinstance(item, str) for item in kill["keep"])
+    ):
+        errors.append("[kill] keep must be a list of strings")
+    if "hook" in kill and not isinstance(kill["hook"], str):
+        errors.append("[kill] hook must be a string")
+    for key in ("never_stop", "survive_logout"):
+        if key in kill and not isinstance(kill[key], bool):
+            errors.append("[kill] %s must be true or false" % key)
+    if (
+        kill.get("survive_logout") is True
+        and head.get("stop_when_unneeded") is not True
+    ):
+        errors.append(
+            "[kill] survive_logout without stop_when_unneeded never stops; "
+            "set [unit] stop_when_unneeded"
+        )
+    mem = unit.get("mem", {})
+    if "background" in mem and not isinstance(mem["background"], bool):
+        errors.append("[mem] background must be true or false")
+    if "class" in mem and (not isinstance(mem["class"], str) or not mem["class"]):
+        errors.append("[mem] class must be a non-empty string")
+    if "swap_max" in mem and (
+        not isinstance(mem["swap_max"], int)
+        or isinstance(mem["swap_max"], bool)
+        or mem["swap_max"] < 0
+    ):
+        errors.append("[mem] swap_max must be a non-negative integer")
+    for key in ("save_state", "pause"):
+        if key in mem and not isinstance(mem[key], str):
+            errors.append("[mem] %s must be a string" % key)
+    gc = unit.get("gc", {})
+    grace = gc.get("no_attach_grace")
+    if grace is not None and (
+        not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace < 0
+    ):
+        errors.append("[gc] no_attach_grace must be a non-negative number of seconds")
+    for key in ("keep_while_children", "quit_process_missing", "qmp_socket"):
+        if key in gc and not isinstance(gc[key], bool):
+            errors.append("[gc] %s must be true or false" % key)
+    for key in ("env_dir_missing", "socket_path", "socket_glob", "socket_env"):
+        if key in gc and not isinstance(gc[key], str):
+            errors.append("[gc] %s must be a string" % key)
+    children = unit.get("children", [])
+    if not isinstance(children, list) or any(
+        not isinstance(child, dict) for child in children
+    ):
+        errors.append("[[children]] must be a list of tables")
+    else:
+        for child in children:
+            for key in sorted(child):
+                if key not in _CHILDREN_KEYS:
+                    errors.append("unknown key [[children]] %s" % key)
+            if not isinstance(child.get("name"), str) or not child.get("name"):
+                errors.append("[[children]] name must be a non-empty string")
+            if "comm" not in child and "ancestor_comm" not in child:
+                errors.append("[[children]] needs comm or ancestor_comm")
+    return errors
+
+
+def draft_unit(name, *, comm, exe, cmdline, cgroup):
+    """Generate a unit file body from one running process's identity."""
+    import json as _json
+
+    lines = [
+        "# Drafted from pid identity; adjust [match] before installing.",
+        "# cmdline: %s" % " ".join(str(cmdline).split()),
+        "# cgroup: %s" % cgroup,
+        "[unit]",
+        "name = %s" % _json.dumps(name),
+        'kind = "app"',
+        "",
+        "[match]",
+    ]
+    if comm:
+        lines.append("comm = %s" % _json.dumps(comm))
+    if exe and os.path.isabs(exe):
+        lines.append("exe = %s" % _json.dumps(exe))
+    lines.extend(
+        [
+            "",
+            "[mem]",
+            'class = "app"',
+            "",
+            "[kill]",
+            "graceful = 10",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def read_unit_file(path):
+    """Parse one unit file. Returns (unit, error)."""
+    try:
+        with open(path, "rb") as stream:
+            unit = tomllib.load(stream)
+    except FileNotFoundError:
+        return None, "no such unit file: %s" % path
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        return None, "could not parse %s: %s" % (path, error)
+    if not isinstance(unit, dict):
+        return None, "could not parse %s: not a table" % path
+    return unit, None
+
+
 def effective_authority(cfg):
     """Return the authority used by this mode and where that choice came from."""
     mode = cfg.get("mode", "observe")

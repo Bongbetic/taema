@@ -181,6 +181,8 @@ def _validate_feedback(args):
         "document",
         "scope",
         "staging",
+        "unit",
+        "pids",
     }
     if "v" not in args:
         if set(args) != legacy_fields:
@@ -228,6 +230,7 @@ def _validate_feedback(args):
             "import_learning": common | {"mode", "document"},
             "reset_scope": common | {"scope"},
             "restore_backup": common | {"staging"},
+            "unit_test": common | {"unit", "pids"},
         }
     )
     if op not in operation_fields:
@@ -268,6 +271,19 @@ def _validate_feedback(args):
         staging = args.get("staging")
         if not _is_type(staging, "string") or not staging or len(staging) > 4096:
             _fail("restore staging must be a path string")
+    if op == "unit_test":
+        if not isinstance(args.get("unit"), dict):
+            _fail("unit test needs a unit object")
+        pids = args.get("pids")
+        if (
+            not isinstance(pids, list)
+            or len(pids) > 4096
+            or any(
+                not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                for pid in pids
+            )
+        ):
+            _fail("unit test pids must be a list of at most 4096 positive pids")
     if op in ("answer", "teach"):
         owner, leftovers, choice = (
             args.get("owner"),

@@ -77,6 +77,129 @@ def _clip(value, width, wide=False):
     return value[: width - 1] + "…"
 
 
+def top_model(previous, current, interval_s, hz, details):
+    """CPU-sorted rows from two snapshots. details maps pid to scope/user/mem."""
+    rows = []
+    span = max(interval_s * hz, 1)
+    total = details.get("__total__", 0) or 0
+    for pid, proc in current.items():
+        old = previous.get(pid)
+        before = old.cpu if old is not None else proc.cpu
+        cpu = max(0.0, (proc.cpu - before)) * 100.0 / span
+        info = details.get(pid, {})
+        mem = info.get("mem", 0)
+        rows.append(
+            {
+                "pid": pid,
+                "scope": info.get("scope", "?"),
+                "user": info.get("user", "?"),
+                "cpu": cpu,
+                "mem_pct": (100.0 * mem / total) if total else 0.0,
+                "mem": mem,
+                "threads": info.get("threads", 0),
+                "state": proc.state,
+                "cmd": info.get("cmd", ""),
+            }
+        )
+    rows.sort(key=lambda row: (-row["cpu"], -row["mem"], -row["pid"]))
+    return rows
+
+
+def render_top(model, args):
+    """Fixed-column top table that fits the terminal width."""
+    width = getattr(args, "_width", 80)
+    wide = getattr(args, "wide", False)
+    lines = [_clip("PID SCOPE   USER %CPU %MEM RSS  THR S CMD", width, wide)]
+    for row in model:
+        cmd_width = 0 if wide or width <= 0 else max(1, width - 40)
+        lines.append(
+            "%-3d %-7s %-4s %5.1f %4.1f %-4s %-3d %s %s"
+            % (
+                row["pid"],
+                _clip(row["scope"], 7, wide),
+                _clip(row["user"], 4, wide),
+                row["cpu"],
+                row["mem_pct"],
+                _clip(_format_memory(row["mem"]), 4, wide),
+                row["threads"],
+                row["state"],
+                _clip(row["cmd"], cmd_width, wide),
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def tree_model(table, scope_of):
+    """Process trees grouped by scope. Returns [(scope, [(pid, depth, node)])]."""
+    kids = {}
+    for pid, proc in table.rows.items():
+        kids.setdefault(proc.ppid, []).append(pid)
+    for pids in kids.values():
+        pids.sort()
+    zombies = {pid for pid, proc in table.rows.items() if proc.state == "Z"}
+    reaped = {}
+    for pid in table.rows:
+        count = sum(1 for kid in kids.get(pid, []) if kid in zombies)
+        if count:
+            reaped[pid] = count
+    groups = {}
+    for pid in table.rows:
+        groups.setdefault(scope_of(pid), []).append(pid)
+    model = []
+    for scope in sorted(groups):
+        members = set(groups[scope])
+        roots = sorted(pid for pid in members if table.rows[pid].ppid not in members)
+        nodes = []
+        stack = [(pid, 0, True) for pid in reversed(roots)]
+        while stack:
+            pid, depth, _last = stack.pop()
+            nodes.append(
+                {
+                    "pid": pid,
+                    "depth": depth,
+                    "state": table.rows[pid].state,
+                    "zombies": reaped.get(pid, 0),
+                }
+            )
+            young = [kid for kid in kids.get(pid, []) if kid in members]
+            for kid in reversed(young):
+                stack.append((kid, depth + 1, True))
+        model.append((scope, nodes))
+    return model
+
+
+def render_tree(model, args):
+    """Scope-grouped process trees with zombie reapers marked."""
+    width = getattr(args, "_width", 80)
+    wide = getattr(args, "wide", False)
+    limit = 0 if wide or width <= 0 else width
+    lines = []
+    for scope, nodes in model:
+        lines.append(_clip(scope, limit, wide))
+        for index, node in enumerate(nodes):
+            depth = node["depth"]
+            if depth == 0:
+                prefix = "└─ "
+            else:
+                siblings_after = any(
+                    other["depth"] == depth
+                    for other in nodes[index + 1 :]
+                    if other["depth"] <= depth
+                )
+                branch = "├─ " if siblings_after else "└─ "
+                prefix = "   " * depth + branch
+            text = "%s%d" % (prefix, node["pid"])
+            if depth > 0:
+                text += " %s" % node["state"]
+            if node["zombies"]:
+                text += " (reaps %d zombie%s)" % (
+                    node["zombies"],
+                    "s" if node["zombies"] != 1 else "",
+                )
+            lines.append(_clip(text, limit, wide))
+    return "\n".join(lines) + "\n"
+
+
 def render_scopes(scopes, args):
     if not scopes:
         return "no scopes\n"

@@ -1996,6 +1996,54 @@ class StateDB:
                 raise
         return identifiers
 
+    def reset_counts(self):
+        """Row counts for the reset plan display."""
+        if not self.available:
+            return {"signatures": 0, "decisions": 0, "events": 0}
+        with self.connection() as connection:
+            return {
+                table: connection.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[
+                    0
+                ]
+                for table in ("signatures", "decisions", "events")
+            }
+
+    def clear_decisions_events(self):
+        """Delete all decision and event rows. Returns (decisions, events)."""
+        if self.read_only or not self.available:
+            return (0, 0)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                decisions = connection.execute(
+                    "SELECT COUNT(*) FROM decisions"
+                ).fetchone()[0]
+                events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                connection.execute("DELETE FROM events")
+                connection.execute("DELETE FROM decisions")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return (decisions, events)
+
+    def clear_signatures(self):
+        """Delete all signature rows. Returns the removed count."""
+        if self.read_only or not self.available:
+            return 0
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM signatures"
+                ).fetchone()[0]
+                connection.execute("DELETE FROM signatures")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return count
+
     def answer_signature(self, identifier, choice, weight, now=None):
         """Add no-decay explicit answer weight to a signature."""
         if self.read_only or not self.available or choice not in ("stop", "keep"):

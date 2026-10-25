@@ -52,6 +52,7 @@ lineage = _LazyModule("lineage", "taema.core.lineage")
 engine = _LazyModule("engine", "taema.governor.engine")
 knowledge = _LazyModule("knowledge", "taema.store.knowledge")
 policy = _LazyModule("policy", "taema.config.policy")
+transfer = _LazyModule("transfer", "taema.store.transfer")
 _pressure_guard = _LazyModule("_pressure_guard", "taema.governor.guard")
 
 _REQUEST_IDS = count(1)
@@ -3165,11 +3166,23 @@ def cmd_prompt(a):
 
 
 def cmd_learn_export(a):
-    """Write the current store in the JSON format understood by the 0.2 release."""
+    """Write learned answers in the versioned format, or legacy 0.2 JSON."""
     import tempfile
 
     _cfg, store, _units = _load(a)
-    payload = json.dumps(store.export_legacy(), indent=2, sort_keys=True) + "\n"
+    if getattr(a, "format", "learn-v1") == "v2":
+        if getattr(a, "redact", False):
+            return die("--redact needs --format learn-v1", 2)
+        payload = json.dumps(store.export_legacy(), indent=2, sort_keys=True) + "\n"
+    else:
+        payload = (
+            json.dumps(
+                transfer.export_learn(store, redacted=getattr(a, "redact", False)),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
     if not a.output:
         sys.stdout.write(payload)
         return 0
@@ -3192,6 +3205,154 @@ def cmd_learn_export(a):
             except OSError:
                 pass
         return die("could not write export: %s" % error)
+    return 0
+
+
+def _read_learn_document(path):
+    """Read and validate a learn export file. Returns (document, error)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as error:
+        return None, "could not read import: %s" % error
+    if size > transfer.MAX_IMPORT_BYTES:
+        return None, "import is larger than 4 MiB; move state with backup instead"
+    try:
+        with open(path, encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, ValueError) as error:
+        return None, "could not parse import: %s" % error
+    problem = transfer.validate_learn_document(document)
+    if problem is not None:
+        return None, "invalid import: %s" % problem
+    return document, None
+
+
+def _writable_store(cfg):
+    return knowledge.Store(
+        policy.state_dir(cfg),
+        cfg.get("seeds"),
+        read_only=False,
+        deny=policy.owner_deny(cfg),
+        mode=cfg.get("mode", "observe"),
+        learn=cfg.get("learn"),
+    )
+
+
+def cmd_learn_import(a):
+    """Import learned answers from a versioned export file."""
+    if getattr(a, "merge", False) and getattr(a, "replace", False):
+        return die("--merge cannot be combined with --replace", 2)
+    mode = "replace" if getattr(a, "replace", False) else "merge"
+    document, error = _read_learn_document(os.path.abspath(os.path.expanduser(a.file)))
+    if error is not None:
+        return die(error, 2)
+    cfg, store, _units = _load(a)
+    rows = transfer.import_diff(store, document, mode=mode)
+    if not rows:
+        print("import: nothing to change")
+        return 0
+    if not _confirm_bulk("import learning", rows, a):
+        return 1
+    how, reply = feedback_action(
+        cfg, store, "import_learning", queue_if_down=False, mode=mode, document=document
+    )
+    if how == "offline":
+        writer = _writable_store(cfg)
+        summary = writer.import_learning_document(document, mode=mode)
+        writer.save()
+        how = "direct"
+        reply = {"ok": True, **(summary or {})}
+    if not reply or not reply.get("ok"):
+        return die((reply or {}).get("error", "could not import learning"))
+    print(
+        "imported learning via %s: %d pairs added, %d updated, %d skipped"
+        % (
+            how,
+            reply.get("pairs_added", 0),
+            reply.get("pairs_updated", 0),
+            reply.get("pairs_skipped", 0),
+        )
+    )
+    return 0
+
+
+def cmd_restore_backup(a):
+    """Restore state, config, and units from a backup tarball."""
+    import tempfile
+
+    tarball = os.path.abspath(os.path.expanduser(a.file))
+    rows, error = transfer.restore_plan(tarball)
+    if error is not None:
+        return die(error, 2)
+    if not rows:
+        print("restore: backup holds nothing to restore")
+        return 0
+    if not _confirm_bulk("restore backup", rows, a):
+        return 1
+    cfg, store, _units = _load(a)
+    with tempfile.TemporaryDirectory(prefix="taema-restore-") as staging:
+        problem = transfer.stage_backup(tarball, staging)
+        if problem is not None:
+            return die(problem, 2)
+        how, reply = feedback_action(
+            cfg, store, "restore_backup", queue_if_down=False, staging=staging
+        )
+        if how == "offline":
+            summary, apply_error = transfer.apply_staged_backup(
+                staging, policy.state_dir(cfg)
+            )
+            if apply_error is not None:
+                return die(apply_error, 1)
+            how = "direct"
+            reply = {"ok": True, **summary}
+    if not reply or not reply.get("ok"):
+        return die((reply or {}).get("error", "could not restore backup"))
+    print("restored backup via %s" % how)
+    return 0
+
+
+def cmd_reset(a):
+    """Clear learning, vetoes, history, or all state after a backup."""
+    scopes = [
+        name
+        for name in ("learning", "vetoes", "history", "all")
+        if getattr(a, name, False)
+    ]
+    if len(scopes) != 1:
+        return die("reset needs exactly one of --learning --vetoes --history --all", 2)
+    scope = scopes[0]
+    cfg, store, _units = _load(a)
+    rows = transfer.reset_plan(store, scope)
+    if not _confirm_bulk("reset " + scope, rows, a):
+        return 1
+    try:
+        backup_path = transfer.create_backup(cfg)
+    except OSError as error:
+        return die("could not write pre-reset backup: %s" % error)
+    print("backup: %s" % backup_path)
+    how, reply = feedback_action(
+        cfg, store, "reset_scope", queue_if_down=False, scope=scope
+    )
+    if how == "offline":
+        writer = _writable_store(cfg)
+        summary = writer.reset_scope(scope)
+        writer.save()
+        how = "direct"
+        reply = {"ok": True, **(summary or {})}
+    if not reply or not reply.get("ok"):
+        return die((reply or {}).get("error", "could not reset " + scope))
+    print("reset %s via %s" % (scope, how))
+    return 0
+
+
+def cmd_backup(a):
+    """Write a tarball with the database, user config, and user units."""
+    cfg, _store, _units = _load(a)
+    try:
+        path = transfer.create_backup(cfg, target=getattr(a, "to", None))
+    except OSError as error:
+        return die("could not write backup: %s" % error)
+    print(path)
     return 0
 
 

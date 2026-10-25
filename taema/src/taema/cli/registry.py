@@ -452,16 +452,72 @@ COMMANDS: tuple[dict[str, Any], ...] = (
             },
             {
                 "name": "export",
-                "help": "export state for a 0.2 downgrade",
+                "help": "export learned answers",
                 "handler": "cmd_learn_export",
                 "arguments": (
-                    (("--format",), {"choices": ("v2",), "required": True}),
+                    (
+                        ("--format",),
+                        {
+                            "choices": ("learn-v1", "v2"),
+                            "default": "learn-v1",
+                            "help": "learn-v1 (default) or v2 for a 0.2 downgrade",
+                        },
+                    ),
                     (
                         ("--output",),
                         {"help": "write atomically to PATH instead of stdout"},
                     ),
+                    (
+                        ("--redact",),
+                        {
+                            "action": "store_true",
+                            "help": "strip argv, cwd, titles, and environment values",
+                        },
+                    ),
                 ),
             },
+            {
+                "name": "import",
+                "help": "import learned answers from an export file",
+                "handler": "cmd_learn_import",
+                "arguments": (
+                    (("file",), {}),
+                    (("--merge",), {"action": "store_true"}),
+                    (("--replace",), {"action": "store_true"}),
+                ),
+            },
+        ),
+    },
+    {
+        "name": "restore-backup",
+        "aliases": (),
+        "help": "restore state, config, and units from a backup tarball",
+        "handler": "cmd_restore_backup",
+        "arguments": ((("file",), {}),),
+    },
+    {
+        "name": "reset",
+        "aliases": (),
+        "help": "clear learning, vetoes, history, or all state after a backup",
+        "handler": "cmd_reset",
+        "arguments": (
+            (("--learning",), {"action": "store_true"}),
+            (("--vetoes",), {"action": "store_true"}),
+            (("--history",), {"action": "store_true"}),
+            (("--all",), {"action": "store_true"}),
+        ),
+    },
+    {
+        "name": "backup",
+        "aliases": (),
+        "help": "write a tarball with the database, user config, and user units",
+        "handler": "cmd_backup",
+        "read": True,
+        "arguments": (
+            (
+                ("--to",),
+                {"help": "write to PATH instead of the state backups directory"},
+            ),
         ),
     },
     {

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taema-learn-v1",
+  "title": "taema learning export, version 1",
+  "type": "object",
+  "required": ["format", "version", "pairs", "standalone", "signatures"],
+  "properties": {
+    "format": {"const": "taema-learn"},
+    "version": {"const": 1},
+    "exported": {"type": "string"},
+    "taema": {"type": "string"},
+    "redacted": {"type": "boolean"},
+    "pairs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["owner", "leftover", "ex_last"],
+        "properties": {
+          "owner": {"type": "string", "minLength": 1, "maxLength": 256},
+          "leftover": {"type": "string", "minLength": 1, "maxLength": 256},
+          "sig": {"type": ["string", "null"]},
+          "ex_stop": {"type": "number", "minimum": 0},
+          "ex_keep": {"type": "number", "minimum": 0},
+          "ex_last": {"enum": ["stop", "keep", "standalone"]},
+          "from_source": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "standalone": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key"],
+        "properties": {
+          "key": {"type": "string", "minLength": 1, "maxLength": 256},
+          "n": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    },
+    "signatures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "owner", "members", "ex_last"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 256},
+          "owner": {"type": "string", "minLength": 1, "maxLength": 256},
+          "members": {"type": "array"},
+          "runtime": {"type": ["string", "null"]},
+          "ex_stop": {"type": "number", "minimum": 0},
+          "ex_keep": {"type": "number", "minimum": 0},
+          "ex_last": {"enum": ["stop", "keep"]}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}

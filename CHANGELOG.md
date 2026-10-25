@@ -2,6 +2,16 @@
 
 ## Behaviour changes
 
+### Backup, learning transfer, and reset
+
+`taema backup` writes a tarball with an online database copy, user config,
+drop-ins, and user units; `taema restore-backup` restores it after
+confirmation. `taema learn export` defaults to the versioned `learn-v1`
+format with `--redact`, and `taema learn import` merges or replaces answers
+after showing a diff. Imported answers start probationary and never allow
+SIGKILL. `taema reset --learning|--vetoes|--history|--all` always backs up
+first.
+
 ### Legacy module paths removed
 
 The one-release compatibility shims are gone. Import the new package paths:

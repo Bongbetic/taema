@@ -3276,6 +3276,185 @@ def cmd_learn_import(a):
     return 0
 
 
+def _parse_since(value):
+    """Epoch float or relative Nd/Nh/Nm/Ns. Returns (timestamp, error)."""
+    import re
+
+    if value is None:
+        return 0, None
+    try:
+        return float(value), None
+    except (TypeError, ValueError):
+        pass
+    match = re.fullmatch(r"(\d+)([smhd])", str(value).strip())
+    if not match:
+        return None, "--since takes an epoch timestamp or a relative Ns/Nm/Nh/Nd"
+    amount, unit = int(match.group(1)), match.group(2)
+    span = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return time.time() - amount * span, None
+
+
+def _history_entries(timeline):
+    entries = []
+    for decision in timeline["decisions"]:
+        entries.append(
+            {
+                "ts": decision.get("ts") or 0,
+                "kind": decision.get("kind") or "unknown",
+                "decision_id": decision.get("id"),
+                "scope": decision.get("scope"),
+                "owner": decision.get("owner"),
+                "detail": (decision.get("why") or "").splitlines()[0]
+                if decision.get("why")
+                else "",
+            }
+        )
+    for event in timeline["events"]:
+        try:
+            data = json.loads(event.get("data") or "{}")
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        entries.append(
+            {
+                "ts": event.get("ts") or 0,
+                "kind": event.get("event") or "unknown",
+                "decision_id": event.get("decision_id"),
+                "scope": data.get("scope"),
+                "owner": data.get("owner"),
+                "detail": str(data.get("why") or data.get("reason") or ""),
+            }
+        )
+    for launch in timeline["launches"]:
+        entries.append(
+            {
+                "ts": launch.get("born") or 0,
+                "kind": "launch",
+                "decision_id": None,
+                "scope": launch.get("scope"),
+                "owner": launch.get("app"),
+                "detail": "pid %s" % launch.get("pid"),
+            }
+        )
+    entries.sort(key=lambda entry: (entry["ts"], str(entry["kind"])))
+    return entries
+
+
+def cmd_history(a):
+    """Show the timeline of one app or scope."""
+    target = a.target
+    if target.startswith("scope:"):
+        owner, scope = None, target[len("scope:") :]
+    elif target.startswith("app:"):
+        owner, scope = target[len("app:") :], None
+    elif not target:
+        return die("history needs an APP or SCOPE target", 2)
+    else:
+        owner, scope = target, target
+    since, error = _parse_since(getattr(a, "since", None))
+    if error is not None:
+        return die(error, 2)
+    cfg, store = _load_events(a)
+    del cfg
+    entries = _history_entries(
+        store.db.history_timeline(owner=owner, scope=scope, since=since)
+    )
+    if getattr(a, "json", False):
+        print(
+            json.dumps({"target": target, "entries": entries}, indent=2, sort_keys=True)
+        )
+        return 0
+    for entry in entries:
+        line = "%s %s" % (
+            _datetime.fromtimestamp(entry["ts"]).strftime("%Y-%m-%d %H:%M:%S"),
+            entry["kind"],
+        )
+        if entry["decision_id"] is not None:
+            line += " #%s" % entry["decision_id"]
+        for key in ("scope", "owner"):
+            if entry[key]:
+                line += " %s=%s" % (key, entry[key])
+        if entry["detail"]:
+            line += " %s" % " ".join(entry["detail"].split())
+        print(line)
+    return 0
+
+
+def cmd_report(a):
+    """Summarize a day, week, or month of cleanup activity."""
+    windows = [
+        (name, span)
+        for name, span in (("day", 86400), ("week", 7 * 86400), ("month", 30 * 86400))
+        if getattr(a, name, False)
+    ]
+    if len(windows) != 1:
+        return die("report needs exactly one of --day --week --month", 2)
+    name, span = windows[0]
+    end = time.time()
+    cfg, store = _load_events(a)
+    del cfg
+    report = store.report_window(end - span, end)
+    report["window"] = name
+    if getattr(a, "json", False):
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    memory = report["memory_freed_bytes"]
+    print(
+        "memory freed: %d bytes by stop, %d bytes by reclaim"
+        % (memory["stop"], memory["reclaim"])
+    )
+    print(
+        "stops: %d automatic, %d answered"
+        % (report["stops"]["automatic"], report["stops"]["answered"])
+    )
+    print("undos: %d, regrets: %d" % (report["undos"], report["regrets"]))
+    print(
+        "reviews: %d answered, %d expired"
+        % (report["reviews"]["answered"], report["reviews"]["expired"])
+    )
+    print("guard events: %d" % report["guard_events"]["total"])
+    frozen = report["frozen"]
+    print(
+        "frozen: %d seconds, %d thaws (%d on connection), %d frozen now"
+        % (
+            frozen["frozen_seconds"],
+            frozen["thaws"],
+            frozen["connection_thaws"],
+            frozen["frozen_now"],
+        )
+    )
+    print("top leftover makers:")
+    for row in report["top_leftovers"][:10]:
+        print(
+            "  %s launches=%d closes=%d kills=%d"
+            % (row["leftover"], row["launches"], row["closes"], row["kills"])
+        )
+    return 0
+
+
+def cmd_recent(a):
+    """List the latest automatic actions."""
+    cfg, store = _load_events(a)
+    del cfg
+    actions = store.db.recent_auto_actions(limit=50)
+    if getattr(a, "json", False):
+        print(json.dumps({"actions": actions}, indent=2, sort_keys=True))
+        return 0
+    for action in actions:
+        line = "%s %s #%s freed=%d restore=%s" % (
+            _datetime.fromtimestamp(action["ts"] or 0).strftime("%Y-%m-%d %H:%M:%S"),
+            action["scope"],
+            action["decision_id"],
+            action["freed_bytes"],
+            "yes" if action["restore_possible"] else "no",
+        )
+        if action["why"]:
+            line += " %s" % " ".join(str(action["why"]).split())
+        print(line)
+    return 0
+
+
 def cmd_restore_backup(a):
     """Restore state, config, and units from a backup tarball."""
     import tempfile

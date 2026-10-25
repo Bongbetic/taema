@@ -489,6 +489,40 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "report",
+        "aliases": (),
+        "help": "summarize a day, week, or month of cleanup activity",
+        "handler": "cmd_report",
+        "read": True,
+        "arguments": (
+            (("--day",), {"action": "store_true"}),
+            (("--week",), {"action": "store_true"}),
+            (("--month",), {"action": "store_true"}),
+        ),
+    },
+    {
+        "name": "recent",
+        "aliases": (),
+        "help": "list the latest automatic actions",
+        "handler": "cmd_recent",
+        "read": True,
+        "arguments": (),
+    },
+    {
+        "name": "history",
+        "aliases": (),
+        "help": "show the timeline of one app or scope",
+        "handler": "cmd_history",
+        "read": True,
+        "arguments": (
+            (("target",), {"help": "APP, SCOPE, app:APP, or scope:SCOPE"}),
+            (
+                ("--since",),
+                {"help": "epoch timestamp or relative Ns/Nm/Nh/Nd"},
+            ),
+        ),
+    },
+    {
         "name": "restore-backup",
         "aliases": (),
         "help": "restore state, config, and units from a backup tarball",

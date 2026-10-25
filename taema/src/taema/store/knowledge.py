@@ -3202,6 +3202,12 @@ class Store:
             self.dirty = True
         return summary
 
+    def report_window(self, start, end):
+        """Aggregate one report window. Guard vocabulary comes from events.py."""
+        from .. import events as event_views
+
+        return self.db.report_window(start, end, event_views.guard_event_names())
+
     def refresh_persisted(self):
         """Reload persisted collections from the database, dropping memory drift.
 

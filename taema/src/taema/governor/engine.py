@@ -797,11 +797,26 @@ def _matches(m, pid, env=None):
                 file=sys.stderr,
             )
         return False
-    if "exe" in m and inspect.exe(pid) != m["exe"]:
+    return unit_matches(m, pid)
+
+
+def unit_matches(match, pid, *, exe=None, comm=None, cmdline=None):
+    """Pure [match] evaluation. Overrides stand in for live process reads."""
+    if not isinstance(match, dict) or not any(k in match for k in _MATCH_KEYS):
         return False
-    if "comm" in m and not fnmatch.fnmatchcase(inspect.comm(pid), m["comm"]):
+    if (
+        "exe" in match
+        and (exe if exe is not None else inspect.exe(pid)) != match["exe"]
+    ):
         return False
-    if "cmdline_contains" in m and m["cmdline_contains"] not in inspect.cmdline(pid):
+    if "comm" in match and not fnmatch.fnmatchcase(
+        comm if comm is not None else inspect.comm(pid), match["comm"]
+    ):
+        return False
+    needle = match.get("cmdline_contains")
+    if needle is not None and needle not in (
+        cmdline if cmdline is not None else inspect.cmdline(pid)
+    ):
         return False
     return True
 

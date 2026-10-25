@@ -3381,6 +3381,91 @@ def cmd_history(a):
     return 0
 
 
+def cmd_unit(a):
+    """Unit authoring tools."""
+    del a
+    print("usage: taema unit <draft|dry-run|lint>")
+    return 2
+
+
+def _process_identity(pid):
+    try:
+        number = int(pid)
+    except (TypeError, ValueError):
+        return None, "pid must be an integer"
+    if number <= 0 or not os.path.isdir("/proc/%d" % number):
+        return None, "no such process: %s" % pid
+    return (
+        {
+            "comm": inspect.comm(number),
+            "exe": inspect.exe(number),
+            "cmdline": inspect.cmdline(number),
+            "cgroup": cgroup.proc_cgroup(number),
+        },
+        None,
+    )
+
+
+def cmd_unit_draft(a):
+    """Generate a unit file from a running process."""
+    identity, error = _process_identity(a.from_pid)
+    if error is not None:
+        return die(error, 2)
+    if not identity["comm"]:
+        return die("process has no comm; refusing to draft", 2)
+    units_dir = os.path.join(policy.user_config_dir(), "units")
+    os.makedirs(units_dir, exist_ok=True)
+    target = os.path.join(units_dir, a.name + ".toml")
+    if os.path.exists(target) and not getattr(a, "force", False):
+        return die("unit file exists: %s (use --force to overwrite)" % target, 1)
+    body = policy.draft_unit(
+        a.name,
+        comm=identity["comm"],
+        exe=identity["exe"],
+        cmdline=identity["cmdline"],
+        cgroup=identity["cgroup"],
+    )
+    with open(target, "w", encoding="utf-8") as stream:
+        stream.write(body)
+    os.chmod(target, 0o600)
+    print(target)
+    return 0
+
+
+def cmd_unit_lint(a):
+    """Lint one unit file."""
+    unit, error = policy.read_unit_file(os.path.abspath(os.path.expanduser(a.file)))
+    if error is not None:
+        print(error)
+        return 2
+    problems = policy.validate_unit(unit)
+    for problem in problems:
+        print("%s: %s" % (a.file, problem))
+    return 2 if problems else 0
+
+
+def cmd_unit_dry_run(a):
+    """Show what a unit file would match, changing nothing."""
+    unit, error = policy.read_unit_file(os.path.abspath(os.path.expanduser(a.file)))
+    if error is not None:
+        print(error)
+        return 2
+    problems = policy.validate_unit(unit)
+    if problems:
+        for problem in problems:
+            print("%s: %s" % (a.file, problem))
+        return 2
+    match = unit.get("match", {})
+    matched = []
+    for pid in sorted(inspect.all_pids()):
+        if engine.unit_matches(match, pid):
+            matched.append((pid, inspect.comm(pid)))
+    for pid, comm in matched:
+        print("%d %s" % (pid, comm))
+    print("%d processes" % len(matched))
+    return 0
+
+
 def cmd_report(a):
     """Summarize a day, week, or month of cleanup activity."""
     windows = [

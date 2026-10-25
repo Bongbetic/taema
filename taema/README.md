@@ -581,6 +581,13 @@ Project scopes (`kind = "scope"`) are created with `taema run NAME`. Their unit 
 `keep = ["adb"]` and a stop `hook`. An executable `~/.config/taema/hooks/NAME.stop` runs
 before `scope-NAME` is signalled, for example to let an emulator save its state.
 
+Author new units with `taema unit draft NAME --from PID`, which writes
+`~/.config/taema/units/NAME.toml` from the process's comm, exe, cmdline, and cgroup.
+`taema unit lint FILE` checks keys, durations, and dangerous combinations such as
+`survive_logout` without `stop_when_unneeded`. `taema unit dry-run FILE` shows which
+running processes would match, changing nothing. The daemon picks up new and changed
+unit files without a restart; `taema reload` applies them immediately.
+
 ## Configuration
 
 Configuration layers apply in this order: built-in defaults, `/etc/taema/taema.toml`,

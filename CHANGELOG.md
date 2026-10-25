@@ -2,6 +2,13 @@
 
 ## Behaviour changes
 
+### Unit authoring tools
+
+`taema unit draft NAME --from PID` generates a unit file from a running
+process. `taema unit lint` and `taema unit dry-run` validate units and show
+matches without consequences. The `unit_test` socket command evaluates match
+logic remotely. New and changed units reload without a restart.
+
 ### Automatic profile switching
 
 `[profile.auto]` rules switch profiles on battery power, running processes,

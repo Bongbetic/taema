@@ -16,7 +16,9 @@ import time
 
 from ..config import policy
 from .. import protocol
+from ..core import process as _inspect
 from ..core import signature as survivor_signature
+from ..governor import engine as _engine
 from ..model import learning as pair_learning
 from . import db
 from . import transfer
@@ -2004,6 +2006,15 @@ class Store:
             if error is not None:
                 return {"ok": False, "error": error}
             result = dict(summary)
+        elif msg["v"] == 2 and op == "unit_test":
+            problems = policy.validate_unit(msg["unit"])
+            matched = []
+            if not problems:
+                match = msg["unit"].get("match", {})
+                for pid in msg["pids"]:
+                    if _engine.unit_matches(match, pid):
+                        matched.append({"pid": pid, "comm": _inspect.comm(pid)})
+            result = {"matched": matched, "lint": problems}
         else:
             return None
         ids.append(op_id)

@@ -501,6 +501,48 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "unit",
+        "aliases": (),
+        "help": "unit authoring tools",
+        "handler": "cmd_unit",
+        "children": (
+            {
+                "name": "draft",
+                "help": "generate a unit file from a running process",
+                "handler": "cmd_unit_draft",
+                "arguments": (
+                    (("name",), {}),
+                    (
+                        ("--from",),
+                        {
+                            "dest": "from_pid",
+                            "required": True,
+                            "help": "draft from PID",
+                        },
+                    ),
+                    (
+                        ("--force",),
+                        {"action": "store_true", "help": "overwrite an existing file"},
+                    ),
+                ),
+            },
+            {
+                "name": "dry-run",
+                "help": "show what a unit file would match, changing nothing",
+                "handler": "cmd_unit_dry_run",
+                "read": True,
+                "arguments": ((("file",), {}),),
+            },
+            {
+                "name": "lint",
+                "help": "lint one unit file",
+                "handler": "cmd_unit_lint",
+                "read": True,
+                "arguments": ((("file",), {}),),
+            },
+        ),
+    },
+    {
         "name": "recent",
         "aliases": (),
         "help": "list the latest automatic actions",

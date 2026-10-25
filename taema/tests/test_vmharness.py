@@ -675,7 +675,7 @@ class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
         self.assertEqual(
             vmh.parse_scenarios("all"),
-            ["smoke", "m0", "m1", "m2", "m3", "upgrade", "remove"],
+            ["smoke", "m0", "m1", "m2", "m3", "upgrade", "remove", "graphical"],
         )
 
     def test_m0_acceptance_is_a_registered_guest_scenario(self):
@@ -694,6 +694,20 @@ class HarnessCliParsingTest(VmTestCase):
             item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:m3"
         )
         self.assertIn("scenario.py m3", step["argv"][-1])
+
+    def test_graphical_is_a_registered_guest_scenario(self):
+        self.assertIn("graphical", vmh.SCENARIOS)
+        self.assertIn("graphical", scenario.SCENARIOS)
+        cfg = vmh.load_config(
+            self.write_config(libcs=["glibc"], scenarios=["graphical"])
+        )
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["graphical"], kvm=False)
+        step = next(
+            item
+            for item in plan["vms"][0]["steps"]
+            if item["name"] == "scenario:graphical"
+        )
+        self.assertIn("scenario.py graphical", step["argv"][-1])
 
     def test_m3_can_boot_a_low_memory_guest(self):
         config = self.write_config(libcs=["glibc"], scenarios=["m3"])
@@ -1902,6 +1916,179 @@ class StopAuditEventTest(unittest.TestCase):
                 42,
             )
         )
+
+
+def encode_png(width, height, rows, color_type=2):
+    """Minimal PNG writer for tests: rows are (filter, bytes) pairs."""
+    import struct
+    import zlib
+
+    raw = b"".join(bytes([kind]) + data for kind, data in rows)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+
+    def chunk(ctype, data):
+        return (
+            struct.pack(">I", len(data))
+            + ctype
+            + data
+            + struct.pack(">I", zlib.crc32(ctype + data))
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+class GraphicalPngTest(unittest.TestCase):
+    def write_png(self, data):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "shot.png")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_reads_plain_rgb(self):
+        path = self.write_png(encode_png(2, 1, [(0, bytes([1, 2, 3, 4, 5, 6]))]))
+        image = scenario.read_png(path)
+        self.assertEqual((image["width"], image["height"]), (2, 1))
+        self.assertEqual(image["pixels"], bytes([1, 2, 3, 4, 5, 6]))
+
+    def test_unfilters_all_types(self):
+        # Two pixels per row so sub/average/paeth use left and upper-left.
+        rows = [
+            (0, bytes([10, 20, 30, 40, 50, 60])),
+            (1, bytes([1, 2, 3, 4, 5, 6])),
+            (2, bytes([5, 5, 5, 5, 5, 5])),
+            (3, bytes([2, 2, 2, 2, 2, 2])),
+            (4, bytes([3, 3, 3, 3, 3, 3])),
+        ]
+        path = self.write_png(encode_png(2, 5, rows))
+        image = scenario.read_png(path)
+        self.assertEqual(
+            list(image["pixels"]),
+            [10, 20, 30, 40, 50, 60]
+            + [1, 2, 3, 5, 7, 9]
+            + [6, 7, 8, 10, 12, 14]
+            + [5, 5, 6, 9, 10, 12]
+            + [8, 8, 9, 12, 13, 15],
+        )
+
+    def test_strips_alpha(self):
+        path = self.write_png(
+            encode_png(1, 1, [(0, bytes([9, 8, 7, 255]))], color_type=6)
+        )
+        image = scenario.read_png(path)
+        self.assertEqual(image["pixels"], bytes([9, 8, 7]))
+
+    def test_rejects_non_png(self):
+        path = self.write_png(b"not a png")
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.read_png(path)
+
+    def test_rejects_interlaced(self):
+        import struct
+        import zlib
+
+        ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 1)
+        data = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", 13)
+            + b"IHDR"
+            + ihdr
+            + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr))
+        )
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.read_png(self.write_png(data))
+
+    def test_diff_fractions(self):
+        make = lambda px: {"width": 2, "height": 1, "pixels": bytes(px)}
+        self.assertEqual(
+            scenario.image_diff_fraction(
+                make([1, 2, 3, 4, 5, 6]), make([1, 2, 3, 4, 5, 6])
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            scenario.image_diff_fraction(
+                make([1, 2, 3, 4, 5, 6]), make([1, 2, 3, 4, 5, 7])
+            ),
+            1 / 6,
+        )
+
+    def test_diff_rejects_size_mismatch(self):
+        make = lambda w, px: {"width": w, "height": 1, "pixels": bytes(px)}
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.image_diff_fraction(make(2, [1] * 6), make(1, [1] * 3))
+
+
+class GraphicalSessionTest(unittest.TestCase):
+    def test_weston_ini_is_deterministic(self):
+        first = scenario.weston_ini(800, 600)
+        self.assertEqual(first, scenario.weston_ini(800, 600))
+        self.assertIn("backend=headless", first)
+        self.assertIn("800", first)
+        self.assertIn("600", first)
+        self.assertIn("panel-location=none", first)
+
+    def test_notify_argv(self):
+        with mock.patch.object(scenario.subprocess, "run") as run:
+            scenario.notify_send(
+                {"WAYLAND_DISPLAY": "t", "DBUS_SESSION_BUS_ADDRESS": "u"},
+                "hello",
+                "body",
+            )
+        run.assert_called_once()
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:2], ["notify-send", "hello"])
+        self.assertIn("body", argv)
+        env = run.call_args[1]["env"]
+        self.assertEqual(env["WAYLAND_DISPLAY"], "t")
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], "u")
+
+    def test_screenshot_argv(self):
+        with mock.patch.object(scenario.subprocess, "run") as run:
+            scenario.take_screenshot({"WAYLAND_DISPLAY": "t"}, "/tmp/x.png")
+        argv = run.call_args[0][0]
+        self.assertEqual(argv, ["grim", "/tmp/x.png"])
+
+    def test_wait_for_path_ready(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "sock")
+        open(path, "w").close()
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        self.assertTrue(scenario.wait_for_path(path, [proc], timeout=1))
+
+    def test_wait_for_path_dead_process(self):
+        proc = mock.Mock()
+        proc.poll.return_value = 1
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.wait_for_path("/nonexistent-xyz/sock", [proc], timeout=1)
+
+    def test_wait_for_path_timeout(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        with self.assertRaises(scenario.ScenarioError):
+            scenario.wait_for_path("/nonexistent-xyz/sock", [proc], timeout=0.1)
+
+    def test_stop_terminates_processes(self):
+        first = subprocess.Popen(["sleep", "30"])
+        second = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(first.kill)
+        self.addCleanup(second.kill)
+        scenario.stop_graphical_session({"weston": first, "mako": second})
+        self.assertIsNotNone(first.poll())
+        self.assertIsNotNone(second.poll())
+
+    def test_image_build_installs_graphics(self):
+        script = read_text(os.path.join(VM_DIR, "mkimage.sh"))
+        for package in ("weston", "mako", "grim", "libnotify", "mesa-dri"):
+            self.assertIn(package, script)
 
 
 if __name__ == "__main__":

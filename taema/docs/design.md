@@ -57,7 +57,8 @@ runsv taema (root)
           sudo -n taema-attach   the one privileged step, validated on its own
 ```
 
-`taema-attach` is self-contained (standard library only, `python3 -I`) and reads only
+`taema-attach` is a small wrapper preferring the Rust helper with the Python
+helper as fallback (standard library only, `python3 -I`). It reads only
 `/etc/taema/taema.toml`, which must be root owned. It refuses:
 
 - callers that are not using sudo, and uid 0

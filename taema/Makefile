@@ -1,6 +1,11 @@
 # taema: install layout for Void Linux. Paths are fixed to /usr and /etc; use DESTDIR to stage.
 DESTDIR ?=
 PYTHON  ?= python3
+CARGO   ?= cargo
+# Hermetic offline builds from rust/vendor in rust/target. Override on the
+# make command line (not via the environment) to reuse a shared cache.
+CARGO_TARGET_DIR = $(CURDIR)/rust/target
+export CARGO_TARGET_DIR
 
 LIBDIR    = $(DESTDIR)/usr/lib/taema/taema
 BINDIR    = $(DESTDIR)/usr/bin
@@ -18,10 +23,23 @@ BASHCOMP  = $(DESTDIR)/usr/share/bash-completion/completions
 ZSHCOMP   = $(DESTDIR)/usr/share/zsh/site-functions
 FISHCOMP  = $(DESTDIR)/usr/share/fish/vendor_completions.d
 
-.PHONY: all test check install vm-test vm-dry-run vm-doctor
+.PHONY: all test check install vm-test vm-dry-run vm-doctor rust-helper rust-helper-release
 
 all:
 	@:
+
+# The Rust helper builds offline from the vendored crates. WITHOUT_RUST=1
+# skips it: tests skip the parity corpus and install ships Python only.
+rust-helper:
+	$(CARGO) build --locked --offline --manifest-path rust/Cargo.toml
+
+rust-helper-release:
+	$(CARGO) build --locked --offline --release --manifest-path rust/Cargo.toml
+
+ifndef WITHOUT_RUST
+test check: rust-helper
+install: rust-helper-release
+endif
 
 test check:
 	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests -t .
@@ -38,7 +56,14 @@ install:
 		rel=$${file#src/taema/}; install -m644 "$$file" "$(LIBDIR)/$$rel"; \
 	done
 	install -m755 bin/taema bin/taemad bin/scoperun bin/scopekill bin/scopels $(BINDIR)/
-	install -m755 libexec/taema-attach libexec/taemad-user libexec/taemad-log libexec/taema-svstop libexec/taema-hook $(LIBEXEC)/
+	install -m755 libexec/taemad-user libexec/taemad-log libexec/taema-svstop libexec/taema-hook $(LIBEXEC)/
+ifdef WITHOUT_RUST
+	install -m755 libexec/taema-attach.py $(LIBEXEC)/taema-attach
+else
+	install -m755 libexec/taema-attach $(LIBEXEC)/taema-attach
+	install -m755 libexec/taema-attach.py $(LIBEXEC)/taema-attach.py
+	install -m755 rust/target/release/taema-attach $(LIBEXEC)/taema-attach.rs
+endif
 	install -m755 sv/taema/run sv/taema/finish $(SVDIR)/
 	install -m755 sv/taema/log/run $(SVDIR)/log/
 	install -m644 etc/taema.toml $(CONFDIR)/

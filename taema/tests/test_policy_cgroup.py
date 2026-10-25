@@ -14,7 +14,7 @@ SYSTEM_TOML = os.path.join(ROOT, "etc", "taema.toml")
 
 
 def load_helper():
-    path = os.path.join(ROOT, "libexec", "taema-attach")
+    path = os.path.join(ROOT, "libexec", "taema-attach.py")
     loader = importlib.machinery.SourceFileLoader("taema_attach", path)
     spec = importlib.util.spec_from_loader("taema_attach", loader)
     mod = importlib.util.module_from_spec(spec)

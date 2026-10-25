@@ -2,6 +2,7 @@
 notes/
 # build output
 taema/build/
+taema/rust/target/
 *.xbps
 *-repodata
 __pycache__/

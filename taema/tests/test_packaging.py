@@ -31,6 +31,7 @@ class SyntaxTest(unittest.TestCase):
             "srcpkgs/taema/REMOVE",
             "sv/taema/run",
             "sv/taema/finish",
+            "libexec/taema-attach",
             "libexec/taemad-user",
             "bin/taemad",
             "tools/build-xbps.sh",

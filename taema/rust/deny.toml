@@ -1,0 +1,29 @@
+# cargo-deny policy for the taema Rust workspace (ADR-3, D12).
+# Crates stay minimal (libc, serde, serde_json, toml) and vendored.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = [
+    # The workspace's own crate carries the project's license.
+    { allow = ["PolyForm-Noncommercial-1.0.0"], crate = "taema-attach" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

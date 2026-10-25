@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_helper():
-    path = os.path.join(ROOT, "libexec", "taema-attach")
+    path = os.path.join(ROOT, "libexec", "taema-attach.py")
     loader = importlib.machinery.SourceFileLoader("taema_attach_t", path)
     spec = importlib.util.spec_from_loader("taema_attach_t", loader)
     mod = importlib.util.module_from_spec(spec)

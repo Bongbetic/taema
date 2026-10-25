@@ -4526,6 +4526,15 @@ class Daemon:
                         )
                 if msg.get("op") in ("veto", "undo") and not result.get("duplicate"):
                     self.thaw_held_scopes()
+                if (
+                    msg.get("op") == "restore_backup"
+                    and result.get("ok")
+                    and not result.get("duplicate")
+                ):
+                    reloaded = self.reload_config("backup restore")
+                    result["config_reloaded"] = bool(
+                        isinstance(reloaded, dict) and reloaded.get("reloaded")
+                    )
                 return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):
                 return {"error": "bad request"}

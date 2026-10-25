@@ -177,6 +177,10 @@ def _validate_feedback(args):
         "until",
         "reason",
         "expires",
+        "mode",
+        "document",
+        "scope",
+        "staging",
     }
     if "v" not in args:
         if set(args) != legacy_fields:
@@ -221,6 +225,9 @@ def _validate_feedback(args):
             "mute": common | {"app", "muted"},
             "hold": common | {"scope", "held", "reason"},
             "snooze": common | {"until", "reason"},
+            "import_learning": common | {"mode", "document"},
+            "reset_scope": common | {"scope"},
+            "restore_backup": common | {"staging"},
         }
     )
     if op not in operation_fields:
@@ -249,6 +256,18 @@ def _validate_feedback(args):
             _fail("feedback key must be a non-empty string")
     if op == "forget" and "all" in args and not _is_type(args["all"], "boolean"):
         _fail("forget all must be a boolean")
+    if op == "import_learning":
+        if args.get("mode") not in ("merge", "replace"):
+            _fail("import mode must be merge or replace")
+        if not isinstance(args.get("document"), dict):
+            _fail("import document must be an object")
+    if op == "reset_scope":
+        if args.get("scope") not in ("learning", "vetoes", "history", "all"):
+            _fail("reset scope must be learning, vetoes, history, or all")
+    if op == "restore_backup":
+        staging = args.get("staging")
+        if not _is_type(staging, "string") or not staging or len(staging) > 4096:
+            _fail("restore staging must be a path string")
     if op in ("answer", "teach"):
         owner, leftovers, choice = (
             args.get("owner"),

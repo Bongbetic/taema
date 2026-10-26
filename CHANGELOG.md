@@ -2,6 +2,22 @@
 
 ## Behaviour changes
 
+### Review fixes: windowless lifecycle, unit authoring, top/tree
+
+The last-window lifecycle is complete: a scope whose last window
+closed past its per-app grace now follows its `on_last_window` policy
+(ask, quit, keep) from unit `[desktop]` or learned answers, behind
+`[experimental] window_close`. Asking queues a review with a toast;
+answers are recorded per app, reopening logs keep evidence, and the
+grace widens per app. `taema unit new --from PID|scope:REL|APP` drafts
+units with child/GC/memory suggestions and validates after `$EDITOR`;
+`taema unit test FILE|NAME` dry-runs matches, scopes, and ladder
+effects; lint flags over-broad matches, missing hook executables,
+`never_stop` conflicts, and a `[mem] max` below the observed peak.
+`taema top` gains Δmem/min, PSI, and decision columns plus `--sort`
+and `--once`; `taema tree [TARGET]` shows provenance arrows and
+socket dependency edges.
+
 ### M4 release gate: 0.6.0 readiness
 
 `taema status` answers in 43 ms p50 over 100 runs (gate: under 50 ms):

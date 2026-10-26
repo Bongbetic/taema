@@ -1,7 +1,7 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
  "$id": "https://taema.dev/schema/cli/read-v1.json",
- "title": "t\u00e6ma CLI read output v1",
+ "title": "tæma CLI read output v1",
  "oneOf": [
   {
    "$ref": "#/$defs/view"
@@ -53,6 +53,27 @@
   },
   {
    "$ref": "#/$defs/memory-budget"
+  },
+  {
+   "$ref": "#/$defs/bar"
+  },
+  {
+   "$ref": "#/$defs/history"
+  },
+  {
+   "$ref": "#/$defs/report"
+  },
+  {
+   "$ref": "#/$defs/recent"
+  },
+  {
+   "$ref": "#/$defs/backup"
+  },
+  {
+   "$ref": "#/$defs/top"
+  },
+  {
+   "$ref": "#/$defs/tree"
   }
  ],
  "$defs": {
@@ -72,7 +93,8 @@
     "kind": {
      "enum": [
       "status",
-      "ls"
+      "ls",
+      "dash"
      ]
     },
     "status": {
@@ -97,6 +119,51 @@
     },
     "memory": {
      "$ref": "#/$defs/memory-view"
+    },
+    "learned": {
+     "type": "object",
+     "required": [
+      "apps",
+      "pairs",
+      "signatures"
+     ],
+     "properties": {
+      "apps": {
+       "type": "array"
+      },
+      "pairs": {
+       "type": "array"
+      },
+      "signatures": {
+       "type": "array"
+      }
+     },
+     "additionalProperties": false
+    },
+    "budget": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/memory-budget"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "events": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/dash-event"
+     }
+    },
+    "reviews": {
+     "type": "array"
+    },
+    "daemon": {
+     "enum": [
+      "ok",
+      "unavailable"
+     ]
     }
    },
    "additionalProperties": false
@@ -1960,6 +2027,612 @@
     },
     "focused": {
      "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "bar": {
+   "type": "object",
+   "required": [
+    "schema",
+    "mode",
+    "profile",
+    "reviews",
+    "frozen",
+    "deprioritized",
+    "freed_today_bytes",
+    "hold",
+    "pressure",
+    "agent_running",
+    "class",
+    "text",
+    "tooltip"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.bar.v1"
+    },
+    "mode": {
+     "type": "string"
+    },
+    "profile": {
+     "type": "string"
+    },
+    "reviews": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "frozen": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "deprioritized": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "freed_today_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "hold": {
+     "type": "string"
+    },
+    "pressure": {
+     "type": "boolean"
+    },
+    "agent_running": {
+     "type": "boolean"
+    },
+    "class": {
+     "enum": [
+      "ok",
+      "review",
+      "pressure",
+      "hold",
+      "error"
+     ]
+    },
+    "text": {
+     "type": "string"
+    },
+    "tooltip": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "history": {
+   "type": "object",
+   "required": [
+    "schema",
+    "target",
+    "entries"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.history.v1"
+    },
+    "target": {
+     "type": "string"
+    },
+    "entries": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/history-entry"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "history-entry": {
+   "type": "object",
+   "required": [
+    "ts",
+    "kind",
+    "decision_id",
+    "scope",
+    "owner",
+    "detail"
+   ],
+   "properties": {
+    "ts": {
+     "type": "number",
+     "minimum": 0
+    },
+    "kind": {
+     "type": "string"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "scope": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "owner": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "detail": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "report": {
+   "type": "object",
+   "required": [
+    "schema",
+    "window",
+    "stops",
+    "memory_freed_bytes",
+    "undos",
+    "regrets",
+    "reviews",
+    "guard_events",
+    "top_leftovers",
+    "frozen",
+    "rollups"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.report.v1"
+    },
+    "window": {
+     "enum": [
+      "day",
+      "week",
+      "month"
+     ]
+    },
+    "stops": {
+     "type": "object",
+     "required": [
+      "automatic",
+      "answered"
+     ],
+     "properties": {
+      "automatic": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "answered": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "memory_freed_bytes": {
+     "type": "object",
+     "required": [
+      "stop",
+      "reclaim"
+     ],
+     "properties": {
+      "stop": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "reclaim": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "undos": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "regrets": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "reviews": {
+     "type": "object",
+     "required": [
+      "answered",
+      "expired"
+     ],
+     "properties": {
+      "answered": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "expired": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "guard_events": {
+     "type": "object",
+     "required": [
+      "total",
+      "by_event"
+     ],
+     "properties": {
+      "total": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "by_event": {
+       "type": "object"
+      }
+     },
+     "additionalProperties": false
+    },
+    "top_leftovers": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "leftover",
+       "launches",
+       "closes",
+       "kills"
+      ],
+      "properties": {
+       "leftover": {
+        "type": "string"
+       },
+       "launches": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "closes": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "kills": {
+        "type": "integer",
+        "minimum": 0
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "frozen": {
+     "type": "object",
+     "required": [
+      "frozen_seconds",
+      "thaws",
+      "connection_thaws",
+      "frozen_now"
+     ],
+     "properties": {
+      "frozen_seconds": {
+       "type": "number",
+       "minimum": 0
+      },
+      "thaws": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "connection_thaws": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "frozen_now": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "rollups": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "app",
+       "peak",
+       "current_p50"
+      ],
+      "properties": {
+       "app": {
+        "type": "string"
+       },
+       "peak": {
+        "type": "number",
+        "minimum": 0
+       },
+       "current_p50": {
+        "type": "number",
+        "minimum": 0
+       }
+      },
+      "additionalProperties": false
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "recent": {
+   "type": "object",
+   "required": [
+    "schema",
+    "actions"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.recent.v1"
+    },
+    "actions": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/recent-action"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "recent-action": {
+   "type": "object",
+   "required": [
+    "id",
+    "ts",
+    "scope",
+    "why",
+    "pairs",
+    "decision_id",
+    "freed_bytes",
+    "restore_possible"
+   ],
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "ts": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "scope": {
+     "type": "string"
+    },
+    "why": {
+     "type": "string"
+    },
+    "pairs": {
+     "type": "array"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "freed_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "restore_possible": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "backup": {
+   "type": "object",
+   "required": [
+    "schema",
+    "path"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.backup.v1"
+    },
+    "path": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "additionalProperties": false
+  },
+  "top": {
+   "type": "object",
+   "required": [
+    "schema",
+    "rows"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.top.v1"
+    },
+    "rows": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/top-row"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "top-row": {
+   "type": "object",
+   "required": [
+    "pid",
+    "scope",
+    "user",
+    "cpu",
+    "mem_pct",
+    "mem",
+    "threads",
+    "state",
+    "window",
+    "cmd"
+   ],
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "scope": {
+     "type": "string"
+    },
+    "user": {
+     "type": "string"
+    },
+    "cpu": {
+     "type": "number",
+     "minimum": 0
+    },
+    "mem_pct": {
+     "type": "number",
+     "minimum": 0
+    },
+    "mem": {
+     "type": "number",
+     "minimum": 0
+    },
+    "threads": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "state": {
+     "type": "string"
+    },
+    "window": {
+     "type": "string"
+    },
+    "cmd": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree": {
+   "type": "object",
+   "required": [
+    "schema",
+    "groups"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.tree.v1"
+    },
+    "groups": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree-group"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree-group": {
+   "type": "object",
+   "required": [
+    "scope",
+    "nodes"
+   ],
+   "properties": {
+    "scope": {
+     "type": "string"
+    },
+    "nodes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree-node"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree-node": {
+   "type": "object",
+   "required": [
+    "pid",
+    "depth",
+    "state",
+    "zombies",
+    "window"
+   ],
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "depth": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "state": {
+     "type": "string"
+    },
+    "zombies": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "window": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "dash-event": {
+   "type": "object",
+   "required": [
+    "seq",
+    "ts",
+    "event",
+    "decision_id",
+    "topics",
+    "data",
+    "scope",
+    "why"
+   ],
+   "properties": {
+    "seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "ts": {
+     "type": "number",
+     "minimum": 0
+    },
+    "event": {
+     "type": "string"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "topics": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "status",
+       "scope",
+       "review",
+       "decision",
+       "memory",
+       "guard",
+       "profile"
+      ]
+     }
+    },
+    "data": {
+     "type": "object"
+    },
+    "scope": {
+     "type": "string"
+    },
+    "why": {
+     "type": "string"
     }
    },
    "additionalProperties": false

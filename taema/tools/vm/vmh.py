@@ -48,7 +48,7 @@ LEARNING_REPLAY_FIXTURE = os.path.join(
 GUEST_TMP = "/tmp/taema-vm"
 
 LIBCS = ("glibc", "musl")
-SCENARIOS = ("smoke", "m0", "m1", "m2", "m3", "upgrade", "remove", "graphical")
+SCENARIOS = ("smoke", "m0", "m1", "m2", "m3", "m4", "upgrade", "remove", "graphical")
 ACCELS = ("auto", "kvm", "tcg")
 IMAGE_KEYS = ("dir", "tarball", "rootfs", "base", "kernel", "initrd")
 
@@ -1280,7 +1280,7 @@ def main(argv, out=None, err=None):
     )
     runp.add_argument(
         "--scenarios",
-        help="comma-separated: smoke,m0,m1,m2,m3,upgrade,remove or all",
+        help="comma-separated: smoke,m0,m1,m2,m3,m4,upgrade,remove or all",
     )
     runp.add_argument("--memory-mb", type=int, help="guest RAM in MiB (minimum 512)")
     runp.add_argument("--tcg", action="store_true", help="force TCG emulation")

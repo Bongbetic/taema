@@ -1,7 +1,5 @@
 """Single source for public command names, aliases, help, and arguments."""
 
-from typing import Any
-
 GLOBAL_OPTIONS = (
     (("--plain",), {"action": "store_true", "help": "use plain, accessible output"}),
     (("--wide",), {"action": "store_true", "help": "do not truncate terminal output"}),
@@ -14,7 +12,9 @@ GLOBAL_OPTIONS = (
     (("--verbose",), {"action": "store_true", "help": "show additional details"}),
 )
 
-COMMANDS: tuple[dict[str, Any], ...] = (
+# String annotation: keeps the type visible to checkers without importing typing
+# on the latency-sensitive CLI path.
+COMMANDS: "tuple[dict[str, Any], ...]" = (
     {
         "name": "run",
         "aliases": (),

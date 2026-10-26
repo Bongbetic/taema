@@ -150,15 +150,20 @@ class MemorySample:
         )
 
 
-def enabled(cfg=None):
-    """Whether memory collection is enabled by config and the process environment."""
-    if os.environ.get("TAEMA_MEM") == "0":
-        return False
+def config_enabled(cfg=None):
+    """Whether memory collection is enabled by config alone, ignoring TAEMA_MEM."""
     if isinstance(cfg, dict):
         section = cfg.get("mem", {})
         if isinstance(section, dict) and section.get("enabled") is False:
             return False
     return True
+
+
+def enabled(cfg=None):
+    """Whether memory collection is enabled by config and the process environment."""
+    if os.environ.get("TAEMA_MEM") == "0":
+        return False
+    return config_enabled(cfg)
 
 
 def _read(path):
@@ -684,9 +689,20 @@ def scope_class(key):
 
 
 def snapshot(
-    base=None, cfg=None, peak_cache=None, proc_root=None, system_root=None, now=None
+    base=None,
+    cfg=None,
+    peak_cache=None,
+    proc_root=None,
+    system_root=None,
+    now=None,
+    include_scopes=True,
 ):
-    """Collect a bounded snapshot, tolerating cgroups that exit during the scan."""
+    """Collect a bounded snapshot, tolerating cgroups that exit during the scan.
+
+    include_scopes=False skips the per-scope walk and reports host memory
+    only; the human status line uses it because it never shows per-scope
+    rows.
+    """
     sampled_at = time.time() if now is None else float(now)
     if not enabled(cfg):
         return {
@@ -705,7 +721,7 @@ def snapshot(
     host = _host(proc_root, system_root, base)
     scopes = []
     alive = set()
-    pending = list(reversed(cgroup.subdirs(base)))
+    pending = list(reversed(cgroup.subdirs(base))) if include_scopes else []
     while pending:
         path = pending.pop()
         if not os.path.isdir(path):
@@ -722,9 +738,10 @@ def snapshot(
             pending.extend(reversed(cgroup.subdirs(path)))
         except OSError:
             continue
-    for key in tuple(peak_cache):
-        if key not in alive:
-            peak_cache.pop(key, None)
+    if include_scopes:
+        for key in tuple(peak_cache):
+            if key not in alive:
+                peak_cache.pop(key, None)
 
     features = {
         "accounting": "supported"

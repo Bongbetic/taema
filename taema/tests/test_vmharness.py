@@ -675,7 +675,7 @@ class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
         self.assertEqual(
             vmh.parse_scenarios("all"),
-            ["smoke", "m0", "m1", "m2", "m3", "upgrade", "remove", "graphical"],
+            ["smoke", "m0", "m1", "m2", "m3", "m4", "upgrade", "remove", "graphical"],
         )
 
     def test_m0_acceptance_is_a_registered_guest_scenario(self):
@@ -758,7 +758,7 @@ class HarnessSurfacesTest(unittest.TestCase):
 
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
-        self.assertEqual(vmh.read_version(ROOT), "0.5.0")
+        self.assertEqual(vmh.read_version(ROOT), "0.6.0")
 
     def test_release_notes_document_0_5_0_resource_governor(self):
         notes = read_text(os.path.join(REPO, "CHANGELOG.md"))

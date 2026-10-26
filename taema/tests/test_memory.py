@@ -40,6 +40,25 @@ def write_scope(
     )
 
 
+class MemoryConfigFlag(unittest.TestCase):
+    def test_config_enabled_ignores_environment(self):
+        self.assertTrue(memory.config_enabled(None))
+        self.assertTrue(memory.config_enabled({}))
+        self.assertTrue(memory.config_enabled({"mem": {"enabled": True}}))
+        self.assertFalse(memory.config_enabled({"mem": {"enabled": False}}))
+        with mock.patch.dict(os.environ, {"TAEMA_MEM": "0"}):
+            self.assertTrue(memory.config_enabled({"mem": {"enabled": True}}))
+            self.assertFalse(memory.enabled({"mem": {"enabled": True}}))
+
+    def test_daemon_status_reports_config_side_mem_flag(self):
+        cfg = make_cfg(tempfile.mkdtemp())
+        self.assertTrue(service.Daemon(cfg).handle({"cmd": "status"})["mem_enabled"])
+        cfg["mem"] = {"enabled": False}
+        self.assertFalse(
+            service.Daemon(cfg).handle({"cmd": "status"})["mem_enabled"]
+        )
+
+
 class MemoryAccounting(unittest.TestCase):
     def test_host_and_scope_metrics_include_peak_fallback_and_feature_sources(self):
         with FakeCg() as cg, tempfile.TemporaryDirectory() as temporary:

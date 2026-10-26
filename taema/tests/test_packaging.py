@@ -68,6 +68,8 @@ class InstalledDocumentationTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             for path in (
                 "usr/share/man/man7/taema-learning.7",
+                "usr/share/man/man1/taema.1",
+                "usr/share/man/man5/taema.toml.5",
                 "usr/share/doc/taema/state-schema.md",
                 "usr/share/doc/taema/legacy-state-migration.md",
                 "usr/bin/taemad",

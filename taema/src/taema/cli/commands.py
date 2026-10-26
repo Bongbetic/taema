@@ -151,12 +151,22 @@ def sock_path(cfg):
     return primary if os.path.isdir(os.path.dirname(primary)) else fallback
 
 
-def ask(cfg, msg, timeout=3.0):
-    """One JSON request to the daemon. Returns the reply dict, or None when it is not running."""
+def _default_sock_paths():
+    """[primary, fallback] socket paths from built-in defaults, without loading config."""
+    primary = "/run/user/%d/taema.sock" % os.getuid()
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state"
+    )
+    return [primary, os.path.join(state_home, "taema", "taema.sock")]
+
+
+def _ask_paths(paths, msg, timeout=3.0):
+    """One JSON request to the daemon over explicit socket paths.
+
+    Returns the reply dict, or None when it is not running.
+    """
     import socket
 
-    if not isinstance(msg, dict) or not isinstance(msg.get("cmd"), str):
-        return {"error": "invalid request", "code": "invalid_request"}
     identifier = next(_REQUEST_IDS)
     envelope = {
         "v": 2,
@@ -164,7 +174,7 @@ def ask(cfg, msg, timeout=3.0):
         "cmd": msg["cmd"],
         "args": {key: value for key, value in msg.items() if key != "cmd"},
     }
-    for path in sock_paths(cfg):
+    for path in paths:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
@@ -200,6 +210,49 @@ def ask(cfg, msg, timeout=3.0):
         finally:
             s.close()
     return None
+
+
+def ask(cfg, msg, timeout=3.0):
+    """One JSON request to the daemon. Returns the reply dict, or None when it is not running."""
+    if not isinstance(msg, dict) or not isinstance(msg.get("cmd"), str):
+        return {"error": "invalid request", "code": "invalid_request"}
+    return _ask_paths(sock_paths(cfg), msg, timeout=timeout)
+
+
+#: Reply keys bare `status` needs so it can skip the config load entirely.
+_FAST_STATUS_KEYS = frozenset(
+    {
+        "mode",
+        "authority",
+        "authority_source",
+        "profile",
+        "profile_reason",
+        "feedback_invalid",
+        "hold",
+        "hold_state",
+        "guard",
+        "config",
+        "mem_enabled",
+    }
+)
+
+
+def _fast_status_probe(a):
+    """Return a complete status reply without loading config, or None for slow path."""
+    if not getattr(a, "_fast", False):
+        return None
+    if getattr(a, "socket", None) or getattr(a, "config", None):
+        return None
+    if os.environ.get("TAEMA_CONFIG"):
+        return None
+    reply = _ask_paths(_default_sock_paths(), {"cmd": "status"})
+    if not isinstance(reply, dict) or "error" in reply:
+        return None
+    if not _FAST_STATUS_KEYS.issubset(reply):
+        return None
+    if not isinstance(reply.get("mem_enabled"), bool):
+        return None
+    return reply
 
 
 def subscribe(cfg, topics, since_seq):
@@ -1114,6 +1167,8 @@ def cmd_bar(a):
 
     cfg, _store, _units = _load(a)
     format_name = getattr(a, "format", None) or "plain"
+    if getattr(a, "json", False) or getattr(a, "jsonl", False):
+        format_name = "json"
     if format_name not in bar.FORMATS:
         return die(
             "unknown bar format %r (use %s)" % (format_name, ", ".join(bar.FORMATS)),
@@ -1312,12 +1367,17 @@ def _memory_peak_cache(store=None):
     return peak_cache
 
 
-def _memory_snapshot(cfg=None, store=None, peak_cache=None):
+def _memory_snapshot(cfg=None, store=None, peak_cache=None, include_scopes=True):
     if not memory.enabled(cfg):
         return memory.snapshot(base=cgroup.base(), cfg=cfg)
-    if peak_cache is None:
+    if peak_cache is None and include_scopes:
         peak_cache = _memory_peak_cache(store)
-    return memory.snapshot(base=cgroup.base(), cfg=cfg, peak_cache=peak_cache)
+    return memory.snapshot(
+        base=cgroup.base(),
+        cfg=cfg,
+        peak_cache=peak_cache,
+        include_scopes=include_scopes,
+    )
 
 
 def _memory_config(args):
@@ -2823,20 +2883,27 @@ def print_auto(auto):
 def cmd_status(a):
     from . import view
 
-    client_config_error = None
-    try:
-        cfg, store = _load_status(a)
-    except (ValueError, OSError) as error:
-        from .. import doctor
-
-        client_config_error = str(error)
-        cfg = doctor.fallback_config()
-        socket_override = getattr(a, "socket", None)
-        if socket_override:
-            cfg["paths"]["socket"] = policy.expand(socket_override)
-            cfg["paths"]["socket_fallback"] = cfg["paths"]["socket"]
+    probed = _fast_status_probe(a)
+    if probed is not None:
+        cfg = {"mem": {"enabled": probed["mem_enabled"]}}
         store = None
-    reply = ask(cfg, {"cmd": "status"})
+        reply = probed
+        client_config_error = None
+    else:
+        client_config_error = None
+        try:
+            cfg, store = _load_status(a)
+        except (ValueError, OSError) as error:
+            from .. import doctor
+
+            client_config_error = str(error)
+            cfg = doctor.fallback_config()
+            socket_override = getattr(a, "socket", None)
+            if socket_override:
+                cfg["paths"]["socket"] = policy.expand(socket_override)
+                cfg["paths"]["socket_fallback"] = cfg["paths"]["socket"]
+            store = None
+        reply = ask(cfg, {"cmd": "status"})
     empty_hold_state = {
         "global": False,
         "scopes": [],
@@ -2844,8 +2911,7 @@ def cmd_status(a):
         "snooze_remaining_s": 0,
         "reason": "",
     }
-    empty_guard_state = _pressure_guard.empty_status()
-    if store is None:
+    if store is None and probed is None:
         store = _status_store(cfg, pending_only=reply is not None)
     if reply is None:
         effective_authority = policy.effective_authority(cfg)
@@ -2863,7 +2929,7 @@ def cmd_status(a):
             + (store.pending_feedback_invalid() if store else 0),
             "hold": hold or "",
             "hold_state": hold_state,
-            "guard": empty_guard_state,
+            "guard": _pressure_guard.empty_status(),
             "config": list(cfg["_sources"]),
             "config_error": client_config_error,
             "details": {
@@ -2885,13 +2951,13 @@ def cmd_status(a):
         )
         status = {
             "daemon": "running",
-            "mode": reply.get("mode", cfg["mode"]),
-            "authority": reply.get(
-                "authority", policy.effective_authority(cfg)["value"]
-            ),
-            "authority_source": reply.get(
-                "authority_source", policy.effective_authority(cfg)["source"]
-            ),
+            "mode": reply["mode"] if "mode" in reply else cfg["mode"],
+            "authority": reply["authority"]
+            if "authority" in reply
+            else policy.effective_authority(cfg)["value"],
+            "authority_source": reply["authority_source"]
+            if "authority_source" in reply
+            else policy.effective_authority(cfg)["source"],
             "profile": reply.get("profile", cfg.get("_profile_name", "auto")),
             "profile_reason": reply.get(
                 "profile_reason",
@@ -2900,13 +2966,18 @@ def cmd_status(a):
             "feedback_invalid": int(reply["feedback_invalid"]),
             "hold": reply["hold"] or "",
             "hold_state": reply["hold_state"],
-            "guard": reply.get("guard", empty_guard_state),
-            "config": list(reply.get("config", cfg["_sources"])),
+            "guard": reply["guard"]
+            if "guard" in reply
+            else _pressure_guard.empty_status(),
+            "config": list(
+                reply["config"] if "config" in reply else cfg["_sources"]
+            ),
             "config_error": reply.get("config_error") or client_config_error,
             "details": reply,
         }
         result = 0
-    memory_view = _memory_snapshot(cfg, store)
+    want_json = bool(getattr(a, "json", False) or getattr(a, "jsonl", False))
+    memory_view = _memory_snapshot(cfg, store, include_scopes=want_json)
     memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
     deprioritized_scopes = _deprioritized_scopes(store)
     frozen_scopes = set((store.data.get("frozen_scopes", {}) if store else {}).keys())
@@ -3718,8 +3789,14 @@ def cmd_history(a):
         store.db.history_timeline(owner=owner, scope=scope, since=since)
     )
     if getattr(a, "json", False):
+        from . import view
+
         print(
-            json.dumps({"target": target, "entries": entries}, indent=2, sort_keys=True)
+            json.dumps(
+                view.record("history", {"target": target, "entries": entries}),
+                indent=2,
+                sort_keys=True,
+            )
         )
         return 0
     for entry in entries:
@@ -4003,7 +4080,9 @@ def cmd_report(a):
     report = store.report_window(end - span, end)
     report["window"] = name
     if getattr(a, "json", False):
-        print(json.dumps(report, indent=2, sort_keys=True))
+        from . import view
+
+        print(json.dumps(view.record("report", report), indent=2, sort_keys=True))
         return 0
     memory = report["memory_freed_bytes"]
     print(
@@ -4045,7 +4124,15 @@ def cmd_recent(a):
     del cfg
     actions = store.db.recent_auto_actions(limit=50)
     if getattr(a, "json", False):
-        print(json.dumps({"actions": actions}, indent=2, sort_keys=True))
+        from . import view
+
+        print(
+            json.dumps(
+                view.record("recent", {"actions": actions}),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
     for action in actions:
         line = "%s %s #%s freed=%d restore=%s" % (
@@ -4137,6 +4224,13 @@ def cmd_backup(a):
         path = transfer.create_backup(cfg, target=getattr(a, "to", None))
     except OSError as error:
         return die("could not write backup: %s" % error)
+    if getattr(a, "json", False):
+        from . import view
+
+        print(
+            json.dumps(view.record("backup", {"path": path}), indent=2, sort_keys=True)
+        )
+        return 0
     print(path)
     return 0
 

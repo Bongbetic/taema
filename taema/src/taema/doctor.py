@@ -124,6 +124,37 @@ def _notify_check(cfg, notify):
     )
 
 
+def _desktop_check(cfg):
+    """Wrapped launcher entries, and whether their sources drifted behind them."""
+    from . import desktop as desktop_mod
+
+    try:
+        items = desktop_mod.list_wraps()
+    except Exception:
+        return _check(
+            "desktop entries",
+            "warn",
+            "wrapped launcher entries could not be listed",
+            "Check %s for overrides taema cannot read." % desktop_mod.user_dir(),
+        )
+    drifted = [item for item in items if item["drifted"]]
+    if drifted:
+        names = ", ".join(sorted(os.path.basename(item["file"]) for item in drifted))
+        return _check(
+            "desktop entries",
+            "warn",
+            "package update changed the source behind: %s" % names,
+            "Run taema desktop wrap NAME.desktop again to rewrap.",
+        )
+    if not items:
+        return _check("desktop entries", "ok", "no wrapped launcher entries")
+    return _check(
+        "desktop entries",
+        "ok",
+        "%d wrapped launcher entries match their sources" % len(items),
+    )
+
+
 def _rooted(root, path):
     return os.path.join(root, path.lstrip("/")) if root != "/" else path
 
@@ -1310,6 +1341,7 @@ def diagnose(
     if agents is not None:
         checks.append(_agent_check(agents))
     checks.append(_notify_check(cfg, notify))
+    checks.append(_desktop_check(cfg))
     statuses = {item["status"] for item in checks}
     overall = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "ok"
     return {"schema": "taema.doctor.v1", "status": overall, "checks": checks}

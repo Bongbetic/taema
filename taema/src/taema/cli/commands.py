@@ -53,6 +53,7 @@ engine = _LazyModule("engine", "taema.governor.engine")
 knowledge = _LazyModule("knowledge", "taema.store.knowledge")
 policy = _LazyModule("policy", "taema.config.policy")
 transfer = _LazyModule("transfer", "taema.store.transfer")
+desktop = _LazyModule("desktop", "taema.desktop")
 _pressure_guard = _LazyModule("_pressure_guard", "taema.governor.guard")
 
 _REQUEST_IDS = count(1)
@@ -948,6 +949,8 @@ def cmd_launch(a):
 
     cfg, _store, _units = _load(a)
     cmd = list(getattr(a, "cmd", None) or [])
+    if cmd[:1] == ["--"]:
+        cmd = cmd[1:]
     if not cmd:
         return die("launch needs a command to run", 2)
     app = getattr(a, "app", None) or os.path.basename(cmd[0])
@@ -1025,6 +1028,81 @@ def _launch_offline(cfg, app, cmd):
         file=sys.stderr,
     )
     os.execvp(cmd[0], cmd)
+
+
+# ---- desktop ------------------------------------------------------------------------------
+
+
+def cmd_desktop(a):
+    """Desktop entry wrapping tools."""
+    del a
+    print("usage: taema desktop <wrap|unwrap|list>")
+    return 2
+
+
+def cmd_desktop_wrap(a):
+    cfg, _store, _units = _load(a)
+    if cfg.get("experimental", {}).get("launch_wrap") is not True:
+        return die(
+            "desktop wrapping needs [experimental] launch_wrap = true",
+            hint="set launch_wrap in taema.toml to wrap launcher entries",
+        )
+    try:
+        record = desktop.wrap(getattr(a, "name", None) or "")
+    except desktop.DesktopError as e:
+        return die(str(e))
+    verb = "rewrapped" if record["updated"] else "wrapped"
+    print(
+        "%s %s -> %s (app %s)"
+        % (
+            verb,
+            os.path.basename(record["file"]),
+            record["source"],
+            record["app"],
+        )
+    )
+    return 0
+
+
+def cmd_desktop_unwrap(a):
+    _cfg, _store, _units = _load(a)
+    if getattr(a, "all", False):
+        removed = desktop.unwrap_all()
+        for record in removed:
+            print("removed %s" % record["file"])
+        if not removed:
+            print("no wrapped desktop entries")
+            return 0
+        print("removed %d wrappers" % len(removed))
+        return 0
+    name = getattr(a, "name", None)
+    if not name:
+        return die("unwrap needs NAME or --all", 2)
+    try:
+        record = desktop.unwrap(name)
+    except desktop.DesktopError as e:
+        return die(str(e))
+    print("removed %s" % record["file"])
+    return 0
+
+
+def cmd_desktop_list(a):
+    _cfg, _store, _units = _load(a)
+    items = desktop.list_wraps()
+    if not items:
+        print("no wrapped desktop entries")
+        return 0
+    for item in items:
+        print(
+            "%s app=%s source=%s%s"
+            % (
+                os.path.basename(item["file"]),
+                item["app"],
+                item["source"],
+                " DRIFTED" if item["drifted"] else "",
+            )
+        )
+    return 0
 
 
 # ---- kill ---------------------------------------------------------------------------------

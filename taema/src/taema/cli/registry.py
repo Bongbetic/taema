@@ -55,6 +55,36 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "desktop",
+        "aliases": (),
+        "help": "wrap launcher entries with taema launch",
+        "handler": "cmd_desktop",
+        "children": (
+            {
+                "name": "wrap",
+                "help": "wrap NAME.desktop with taema launch",
+                "handler": "cmd_desktop_wrap",
+                "arguments": ((("name",), {}),),
+            },
+            {
+                "name": "unwrap",
+                "help": "remove the wrapper for NAME",
+                "handler": "cmd_desktop_unwrap",
+                "arguments": (
+                    (("name",), {"nargs": "?"}),
+                    (("--all",), {"action": "store_true"}),
+                ),
+            },
+            {
+                "name": "list",
+                "help": "list wrapped launcher entries",
+                "handler": "cmd_desktop_list",
+                "read": True,
+                "arguments": (),
+            },
+        ),
+    },
+    {
         "name": "kill",
         "aliases": ("stop",),
         "help": "stop a scope; shared members are moved aside, not killed",

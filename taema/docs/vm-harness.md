@@ -130,12 +130,15 @@ Built-in scenarios:
   process when it fires, then measure daemon RSS, CPU, sampling, and pressure triggers for
   610 seconds. The two-libc run therefore takes at least 20 minutes plus guest setup.
 - **graphical** — start a disposable headless graphical session (private
-  dbus-daemon, `weston --backend=headless`, mako) under a test-owned
-  `XDG_RUNTIME_DIR`, assert the Wayland socket appears, send a `notify-send`
-  notification, capture the headless output with `grim`, and verify the PNG
-  decodes to an RGB image with the stdlib-only `read_png` (no new
-  dependencies). The capture lands in the artifacts directory as
-  `graphical.png`; `image_diff_fraction` compares two captures.
+  dbus-daemon, `weston --backend=headless` as the outer root, niri nested
+  inside it) under a test-owned `XDG_RUNTIME_DIR`, run a scripted
+  `org.freedesktop.Notifications` server (`tools/vm/notify_server.py`) that
+  records notifications and closes them or invokes actions on cue, open and
+  close test windows and move focus through `niri msg`, read the window
+  list back, and capture the headless output with `grim`, verifying the PNG
+  decodes with the stdlib-only `read_png` (no new dependencies). The
+  capture lands in the artifacts directory as `graphical.png`;
+  `image_diff_fraction` compares two captures.
 
 ## Artifacts
 

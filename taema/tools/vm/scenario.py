@@ -27,6 +27,7 @@ import select
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3530,12 +3531,22 @@ def scenario_remove(rec, args, tree_holder):
 # ---- disposable graphical session -------------------------------------------
 #
 # A scripted Wayland stack for desktop-path tests: weston on the headless
-# backend (pixman software rendering, no seat or GPU), mako as the
-# notification server, notify-send as the test client, and grim screenshots
-# diffed with the stdlib PNG reader below. Later desktop scenarios reuse
-# start/stop_graphical_session; only scenario_graphical asserts the stack.
+# backend (pixman software rendering, no seat or GPU) as the outer root,
+# niri nested inside it as the compositor under test, a scripted
+# org.freedesktop.Notifications server that records notifications and can
+# close them or invoke actions on cue, test windows opened/closed/focused
+# through niri's IPC, and grim screenshots diffed with the stdlib PNG reader
+# below. Later desktop scenarios reuse start/stop_graphical_session; only
+# scenario_graphical asserts the stack.
 
-GRAPHICAL_TOOLS = ("weston", "mako", "grim", "notify-send", "dbus-daemon")
+GRAPHICAL_TOOLS = (
+    "weston",
+    "niri",
+    "foot",
+    "grim",
+    "notify-send",
+    "dbus-daemon",
+)
 
 
 def weston_ini(width, height):
@@ -3568,10 +3579,56 @@ def wait_for_path(path, procs, timeout=60, poll=0.1):
         time.sleep(poll)
 
 
+def _socket_entries(runtime_dir):
+    """Socket filenames currently present in the runtime directory."""
+    found = set()
+    for entry in os.listdir(runtime_dir):
+        try:
+            mode = os.stat(os.path.join(runtime_dir, entry)).st_mode
+        except OSError:
+            continue
+        if stat.S_ISSOCK(mode):
+            found.add(entry)
+    return found
+
+
+def _wait_for_sockets(runtime_dir, before, procs, display, timeout=60):
+    """Wait until niri's wayland and IPC sockets appear; classify them."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        dead = [p for p in procs if p.poll() is not None]
+        if dead:
+            raise ScenarioError(
+                "compositor exited rc=%s during startup" % dead[0].poll()
+            )
+        new = _socket_entries(runtime_dir) - before - {display}
+        wayland = sorted(name for name in new if name.startswith("wayland-"))
+        ipc = sorted(name for name in new if not name.startswith("wayland-"))
+        if wayland and ipc:
+            return wayland[0], [os.path.join(runtime_dir, name) for name in ipc]
+        time.sleep(0.1)
+    raise ScenarioError("niri sockets never appeared within %ss" % timeout)
+
+
+def _niri_probe(env, timeout=10):
+    """True when `niri msg` answers over env's NIRI_SOCKET."""
+    try:
+        reply = subprocess.run(
+            ["niri", "msg", "--json", "version"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return reply.returncode == 0
+
+
 def start_graphical_session(
     workdir, display="taema-test", width=800, height=600, timeout=60
 ):
-    """Start dbus-daemon, weston, and mako; return the live session dict."""
+    """Start dbus-daemon, weston, the scripted notify server, and niri."""
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
     if not runtime_dir or not os.path.isdir(runtime_dir):
         raise ScenarioError("XDG_RUNTIME_DIR is not a directory: %r" % runtime_dir)
@@ -3622,41 +3679,88 @@ def start_graphical_session(
     except ScenarioError:
         weston.terminate()
         raise
-    mako_log = open(os.path.join(workdir, "mako.log"), "w")
-    mako = subprocess.Popen(
-        ["mako"],
+    notify_log_path = os.path.join(workdir, "notify.jsonl")
+    notify_control_path = os.path.join(workdir, "notify.control")
+    notify_log = open(os.path.join(workdir, "notify-server.log"), "w")
+    server_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "notify_server.py"
+    )
+    notify = subprocess.Popen(
+        ["python3", server_script, notify_log_path, notify_control_path],
         env=base_env,
         stdin=subprocess.DEVNULL,
-        stdout=mako_log,
+        stdout=notify_log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
-    time.sleep(1)
-    if mako.poll() is not None:
+    try:
+        wait_for_path(notify_log_path, [notify], timeout=timeout)
+    except ScenarioError:
         stop_graphical_session(
             {
+                "notify": notify,
                 "weston": weston,
-                "mako": mako,
                 "bus": bus,
-                "logs": [weston_log, mako_log, bus_log, bus.stdout],
+                "logs": [weston_log, notify_log, bus_log, bus.stdout],
             }
         )
-        raise ScenarioError("mako exited during startup")
+        raise
+    niri_config = os.path.join(workdir, "niri-config.kdl")
+    with open(niri_config, "w") as handle:
+        handle.write("// taema graphical test session\n")
+    before = _socket_entries(runtime_dir)
+    niri_log = open(os.path.join(workdir, "niri.log"), "w")
+    niri = subprocess.Popen(
+        ["niri", "--config", niri_config],
+        env=base_env,
+        stdin=subprocess.DEVNULL,
+        stdout=niri_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        niri_display, ipc_candidates = _wait_for_sockets(
+            runtime_dir, before, [niri], display, timeout=timeout
+        )
+        niri_socket = None
+        for candidate in ipc_candidates:
+            if _niri_probe(dict(base_env, NIRI_SOCKET=candidate)):
+                niri_socket = candidate
+                break
+        if niri_socket is None:
+            raise ScenarioError("no niri IPC socket answered `niri msg`")
+    except ScenarioError:
+        stop_graphical_session(
+            {
+                "notify": notify,
+                "niri": niri,
+                "weston": weston,
+                "bus": bus,
+                "logs": [weston_log, notify_log, niri_log, bus_log, bus.stdout],
+            }
+        )
+        raise
+    niri_env = dict(base_env, WAYLAND_DISPLAY=niri_display, NIRI_SOCKET=niri_socket)
     return {
         "weston": weston,
-        "mako": mako,
+        "niri": niri,
+        "notify": notify,
         "bus": bus,
         "display": display,
+        "niri_display": niri_display,
         "runtime_dir": runtime_dir,
         "socket": socket_path,
         "env": base_env,
-        "logs": [weston_log, mako_log, bus_log, bus.stdout],
+        "niri_env": niri_env,
+        "notify_log": notify_log_path,
+        "notify_control": notify_control_path,
+        "logs": [weston_log, notify_log, niri_log, bus_log, bus.stdout],
     }
 
 
 def stop_graphical_session(session, timeout=10):
     """Terminate the session processes; tolerate the already-dead."""
-    for key in ("mako", "weston", "bus"):
+    for key in ("notify", "niri", "mako", "weston", "bus"):
         proc = session.get(key)
         if proc is None or proc.poll() is not None:
             continue
@@ -3681,11 +3785,116 @@ def notify_send(env, summary, body="", timeout=15):
     )
 
 
+def notify_records(session):
+    """Parsed notification-server records so far (oldest first)."""
+    records = []
+    try:
+        with open(session["notify_log"], encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    records.append(json.loads(line))
+    except OSError:
+        pass
+    return records
+
+
+def wait_notify_record(session, event, timeout=15, **match):
+    """Wait for a server record of `event` whose fields match; return it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for record in notify_records(session):
+            if record.get("event") != event:
+                continue
+            if all(record.get(key) == value for key, value in match.items()):
+                return record
+        time.sleep(0.1)
+    raise ScenarioError("no %s record matching %s within %ss" % (event, match, timeout))
+
+
+def notify_cue(session, line):
+    """Append one command line to the notify server's control file."""
+    with open(session["notify_control"], "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+_WINDOW_CLIENTS = (
+    ("foot", ["foot"]),
+    ("weston-terminal", ["weston-terminal"]),
+    ("weston-simple-shm", ["weston-simple-shm"]),
+)
+
+
+def open_test_window(env):
+    """Open one test window on env's compositor; return the Popen."""
+    for _name, argv in _WINDOW_CLIENTS:
+        if shutil.which(argv[0]) is not None:
+            return subprocess.Popen(
+                argv,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    raise ScenarioError("no test-window client available")
+
+
+def niri_windows(env, timeout=15):
+    """The compositor's window list, parsed from `niri msg --json windows`."""
+    reply = subprocess.run(
+        ["niri", "msg", "--json", "windows"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if reply.returncode != 0:
+        raise ScenarioError("niri msg windows failed: %s" % reply.stderr[:200])
+    try:
+        windows = json.loads(reply.stdout or "[]")
+    except ValueError as e:
+        raise ScenarioError("niri msg windows gave bad JSON: %s" % e)
+    return windows if isinstance(windows, list) else []
+
+
+def wait_window_count(env, count, timeout=30):
+    """Wait until the window list has exactly `count` entries; return it."""
+    deadline = time.monotonic() + timeout
+    windows = []
+    while time.monotonic() < deadline:
+        windows = niri_windows(env)
+        if len(windows) == count:
+            return windows
+        time.sleep(0.2)
+    raise ScenarioError(
+        "window count never reached %d (last saw %d)" % (count, len(windows))
+    )
+
+
+def niri_focus_window(env, window_id, timeout=15):
+    """Focus one window through niri's IPC action interface."""
+    reply = subprocess.run(
+        ["niri", "msg", "action", "focus-window", "--id", str(window_id)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if reply.returncode != 0:
+        raise ScenarioError("focus-window failed: %s" % reply.stderr[:200])
+
+
 def take_screenshot(env, path, timeout=30):
-    """Capture the headless output with grim; return CompletedProcess."""
-    return subprocess.run(
+    """Capture one output with grim; raise ScenarioError when it fails."""
+    reply = subprocess.run(
         ["grim", path], env=env, capture_output=True, text=True, timeout=timeout
     )
+    if reply.returncode != 0 or not os.path.isfile(path):
+        raise ScenarioError(
+            "grim failed rc=%s: %s"
+            % (reply.returncode, (reply.stderr or reply.stdout)[:200])
+        )
+    return reply
 
 
 def _paeth(a, b, c):
@@ -3699,7 +3908,8 @@ def _paeth(a, b, c):
 
 
 def scenario_graphical(rec, args, tree_holder):
-    """Headless weston + mako session: notify, capture, verify the PNG."""
+    """Nested niri session: windows, scripted notifications, screenshot."""
+    del tree_holder
     missing = [tool for tool in GRAPHICAL_TOOLS if shutil.which(tool) is None]
     rec.step(
         "graphical-tools",
@@ -3710,27 +3920,115 @@ def scenario_graphical(rec, args, tree_holder):
         return False
     with tempfile.TemporaryDirectory(prefix="taema-graphical-") as workdir:
         session = None
+        clients = []
         try:
             session = start_graphical_session(workdir)
             rec.step(
                 "session-up",
                 True,
-                "display=%s socket=%s" % (session["display"], session["socket"]),
+                "weston=%s niri=%s" % (session["display"], session["niri_display"]),
             )
-            notify_send(session["env"], "taema", "graphical session is up")
-            rec.step("notify", True, "notify-send accepted")
+            niri_env = session["niri_env"]
+            baseline = wait_window_count(niri_env, 0)
+            rec.step("window-list-baseline", baseline == [], "no windows yet")
+
+            first = open_test_window(niri_env)
+            clients.append(first)
+            opened = wait_window_count(niri_env, 1)
+            first_id = opened[0].get("id")
+            rec.step("window-open", first_id is not None, "id=%s" % first_id)
+
+            second = open_test_window(niri_env)
+            clients.append(second)
+            wait_window_count(niri_env, 2)
+            rec.step("window-open-second", True, "two windows listed")
+
+            niri_focus_window(niri_env, first_id)
+            deadline = time.monotonic() + 15
+            focused_id = None
+            while time.monotonic() < deadline:
+                for window in niri_windows(niri_env):
+                    if window.get("is_focused"):
+                        focused_id = window.get("id")
+                if focused_id == first_id:
+                    break
+                time.sleep(0.2)
+            rec.step(
+                "window-focus",
+                focused_id == first_id,
+                "focused=%s want=%s" % (focused_id, first_id),
+            )
+
+            first.terminate()
+            remaining = wait_window_count(niri_env, 1)
+            rec.step(
+                "window-close",
+                len(remaining) == 1 and remaining[0].get("id") != first_id,
+                "remaining=%s" % [w.get("id") for w in remaining],
+            )
+
+            wait_notify_record(session, "ready")
+            client = subprocess.Popen(
+                [
+                    "notify-send",
+                    "--wait",
+                    "--action=default=Open",
+                    "taema-graphical",
+                    "session is up",
+                ],
+                env=session["env"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            clients.append(client)
+            seen = wait_notify_record(session, "notify", summary="taema-graphical")
+            rec.step(
+                "notify-recorded",
+                seen.get("summary") == "taema-graphical",
+                "id=%s" % seen.get("id"),
+            )
+            notify_cue(session, "invoke %d default" % seen["id"])
+            out, _err = client.communicate(timeout=15)
+            rec.step(
+                "notify-action-invoked",
+                out.strip() == "default",
+                "client heard action %r" % out.strip(),
+            )
+
+            sent = notify_send(session["env"], "taema-close-cue")
+            closed_seen = wait_notify_record(
+                session, "notify", summary="taema-close-cue"
+            )
+            notify_cue(session, "close %d" % closed_seen["id"])
+            wait_notify_record(session, "closed", id=closed_seen["id"])
+            rec.step(
+                "notify-close-on-cue",
+                sent.returncode == 0,
+                "closed id=%s on cue" % closed_seen["id"],
+            )
+
             shot = os.path.join(args.artifacts, "graphical.png")
-            png = take_screenshot(session, shot)
-            img = read_png(png)
+            take_screenshot(session["niri_env"], shot)
+            shutil.copy2(
+                session["notify_log"],
+                os.path.join(args.artifacts, "graphical-notify.jsonl"),
+            )
+            img = read_png(shot)
+            distinct = len(set(img["pixels"]))
             rec.step(
                 "screenshot",
-                img["width"] > 0 and img["height"] > 0,
-                "%dx%d RGB" % (img["width"], img["height"]),
+                img["width"] > 0 and img["height"] > 0 and distinct > 1,
+                "%dx%d distinct=%d" % (img["width"], img["height"], distinct),
             )
         except ScenarioError as e:
             rec.step("graphical", False, str(e))
             return False
         finally:
+            for client in clients:
+                if client.poll() is None:
+                    client.terminate()
             if session is not None:
                 stop_graphical_session(session)
     return all(s["ok"] for s in rec.steps)

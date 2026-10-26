@@ -279,6 +279,7 @@ def bootstrap_sources(pub, package_repo, previous, scenarios):
     sources = [
         os.path.join(VM_DIR, "provision.sh"),
         os.path.join(VM_DIR, "scenario.py"),
+        os.path.join(VM_DIR, "notify_server.py"),
         pub,
         package_repo,
     ]

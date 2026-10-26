@@ -50,7 +50,8 @@ chroot "$R" env -u TMPDIR -u XBPS_ROOT -u XBPS_ARCH -u XBPS_TARGET_ARCH \
     /usr/bin/xbps-install -Syu
 chroot "$R" env -u TMPDIR -u XBPS_ROOT -u XBPS_ARCH -u XBPS_TARGET_ARCH \
     /usr/bin/xbps-install -S -y linux openssh dhcpcd python3 iproute2 sudo dbus elogind earlyoom \
-    weston mako grim libnotify mesa-dri zsh fish-shell
+    weston niri foot grim libnotify mesa-dri python3-dbus python3-gobject \
+    dejavu-fonts-ttf zsh fish-shell
 
 # Void's kernel packages build the initramfs with dracut, whose host-only
 # detection inside this chroot sees the builder's hardware (and previously

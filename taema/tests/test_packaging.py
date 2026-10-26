@@ -24,6 +24,36 @@ nobody:x:65534:65534::/:/bin/bash
 """
 
 
+class VendoredCargoTest(unittest.TestCase):
+    def test_offline_build_resolves_vendored_crates_from_package_root(self):
+        # The Makefile and release build invoke cargo from the package root
+        # with --manifest-path; with an empty CARGO_HOME that only resolves
+        # when the vendored-sources config is discoverable from there.
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust build")
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            raise unittest.SkipTest("cargo not available")
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ, CARGO_HOME=home)
+            built = subprocess.run(
+                [
+                    cargo,
+                    "build",
+                    "--locked",
+                    "--offline",
+                    "--manifest-path",
+                    os.path.join(ROOT, "rust", "Cargo.toml"),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=600,
+            )
+        self.assertEqual(built.returncode, 0, built.stderr)
+
+
 class SyntaxTest(unittest.TestCase):
     def test_sh_n(self):
         for rel in (

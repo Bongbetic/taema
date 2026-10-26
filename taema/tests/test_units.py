@@ -15,6 +15,18 @@ from taema.governor import engine
 from taema.store import knowledge
 
 
+def _self_comm():
+    from taema.core import process as inspect
+
+    return inspect.comm(os.getpid())
+
+
+def _self_exe():
+    from taema.core import process as inspect
+
+    return inspect.exe(os.getpid())
+
+
 def run_cli(root, *argv):
     override = Path(root) / "taema.toml"
     override.write_text(
@@ -126,6 +138,42 @@ class UnitLintTests(unittest.TestCase):
                 with open(path, "rb") as stream:
                     self.assertEqual(policy.validate_unit(tomllib.load(stream)), [])
 
+    def test_generic_comm_alone_is_overbroad(self):
+        unit = good_unit()
+        unit["match"] = {"comm": "node"}
+        errors = policy.validate_unit(unit)
+        self.assertTrue(any("over-broad" in error for error in errors))
+        unit["match"] = {"comm": "node", "cmdline_contains": "server.js"}
+        self.assertEqual(policy.validate_unit(unit), [])
+        unit["match"] = {"comm": "demo"}
+        self.assertEqual(policy.validate_unit(unit), [])
+
+    def test_never_stop_with_stop_when_unneeded_is_flagged(self):
+        unit = good_unit()
+        unit["kill"]["never_stop"] = True
+        unit["unit"]["stop_when_unneeded"] = True
+        errors = policy.validate_unit(unit)
+        self.assertTrue(any("never_stop" in error for error in errors))
+
+    def test_hook_must_be_executable_when_a_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            hook = Path(root) / "hook.sh"
+            hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            unit = good_unit()
+            unit["kill"]["hook"] = str(hook)
+            errors = policy.validate_unit(unit)
+            self.assertTrue(any("executable" in error for error in errors))
+            hook.chmod(0o755)
+            self.assertEqual(policy.validate_unit(unit), [])
+
+    def test_mem_max_below_observed_peak_is_flagged(self):
+        unit = good_unit()
+        unit["mem"]["max"] = 1000
+        self.assertEqual(policy.validate_unit(unit), [])
+        errors = policy.validate_unit(unit, peaks={"app-demo": 2000})
+        self.assertTrue(any("peak" in error for error in errors))
+        self.assertEqual(policy.validate_unit(unit, peaks={"app-demo": 500}), [])
+
 
 class UnitCliTests(unittest.TestCase):
     def isolated(self, root):
@@ -169,6 +217,95 @@ class UnitCliTests(unittest.TestCase):
             code, _output = run_cli(root, "unit", "draft", "nope", "--from", "99999999")
             self.assertEqual(code, 2)
 
+    def test_new_from_pid_names_and_suggests_sections(self):
+        with tempfile.TemporaryDirectory() as root, self.isolated(root):
+            code, output = run_cli(
+                root,
+                "unit",
+                "new",
+                "--from",
+                str(os.getpid()),
+                "--name",
+                "self-new",
+            )
+            self.assertEqual(code, 0, output)
+            path = Path(root) / "config" / "taema" / "units" / "self-new.toml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('name = "self-new"', text)
+            for section in (
+                "[match]",
+                "[children]",
+                "[gc]",
+                "[mem]",
+                "[qos]",
+                "[kill]",
+            ):
+                self.assertIn(section, text)
+            import tomllib
+
+            with open(path, "rb") as stream:
+                self.assertEqual(policy.validate_unit(tomllib.load(stream)), [])
+
+    def test_new_from_app_comm(self):
+        with tempfile.TemporaryDirectory() as root, self.isolated(root):
+            import taema.core.process as inspect
+
+            code, output = run_cli(
+                root, "unit", "new", "--from", inspect.comm(os.getpid())
+            )
+            self.assertEqual(code, 0, output)
+            units = list((Path(root) / "config" / "taema" / "units").glob("*.toml"))
+            self.assertEqual(len(units), 1)
+
+    def test_new_bad_target_dies(self):
+        with tempfile.TemporaryDirectory() as root, self.isolated(root):
+            code, _output = run_cli(
+                root, "unit", "new", "--from", "zzz-no-such-app-name"
+            )
+            self.assertEqual(code, 2)
+
+    def test_new_validates_after_editor_save(self):
+        with tempfile.TemporaryDirectory() as root, self.isolated(root):
+            editor = Path(root) / "editor.sh"
+            editor.write_text(
+                "#!/bin/sh\nprintf '\\n[nope]\\nx = 1\\n' >> \"$1\"\n",
+                encoding="utf-8",
+            )
+            editor.chmod(0o755)
+            env = {"EDITOR": str(editor)}
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(commands, "_stdin_is_tty", return_value=True),
+            ):
+                code, output = run_cli(
+                    root, "unit", "new", "--from", str(os.getpid()), "--name", "edited"
+                )
+            self.assertEqual(code, 2, output)
+            self.assertIn("nope", output)
+
+    def test_unit_test_by_file_and_name_shows_scope_and_ladder(self):
+        with tempfile.TemporaryDirectory() as root, self.isolated(root):
+            path = Path(root) / "unit.toml"
+            path.write_text(
+                '[unit]\nname = "app-selftest"\nkind = "app"\n'
+                '[match]\ncomm = "%s"\nexe = "%s"\n' % (_self_comm(), _self_exe()),
+                encoding="utf-8",
+            )
+            code, output = run_cli(root, "unit", "test", str(path))
+            self.assertEqual(code, 0, output)
+            self.assertIn("scope app-", output)
+            self.assertIn("gc:", output)
+            self.assertIn("mem:", output)
+            self.assertIn("qos:", output)
+            units_dir = Path(root) / "config" / "taema" / "units"
+            units_dir.mkdir(parents=True)
+            (units_dir / "app-selftest.toml").write_text(
+                path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            code, output = run_cli(root, "unit", "test", "app-selftest")
+            self.assertEqual(code, 0, output)
+            self.assertIn("scope app-", output)
+
     def test_lint_clean_and_bad(self):
         with tempfile.TemporaryDirectory() as root, self.isolated(root):
             good = Path(root) / "good.toml"
@@ -211,6 +348,47 @@ class UnitCliTests(unittest.TestCase):
 
 
 class UnitTestOpTests(unittest.TestCase):
+    def test_unit_test_fuzz_rejected_without_state_change(self):
+        from taema import protocol
+
+        bad = [
+            {"v": 2, "id": "f1", "op": "unit_test", "unit": "nope", "pids": [1]},
+            {"v": 2, "id": "f2", "op": "unit_test", "unit": {}, "pids": "x"},
+            {"v": 2, "id": "f3", "op": "unit_test", "unit": {}, "pids": [0]},
+            {"v": 2, "id": "f4", "op": "unit_test", "unit": {}, "pids": [True]},
+            {
+                "v": 2,
+                "id": "f5",
+                "op": "unit_test",
+                "unit": {},
+                "pids": list(range(5000)),
+            },
+            {"v": 2, "id": "f6", "op": "unit_test", "unit": [], "pids": [1]},
+        ]
+        for message in bad:
+            with self.subTest(message=message["id"]):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_feedback(message)
+        with tempfile.TemporaryDirectory() as root:
+            store = knowledge.Store(str(Path(root) / "state"))
+            before = store.export_legacy()
+            reply = store.apply_feedback_command(
+                {
+                    "v": 2,
+                    "id": "f7",
+                    "op": "unit_test",
+                    "unit": {"unit": {"name": "x", "kind": "bogus"}},
+                    "pids": [99999999],
+                }
+            )
+            self.assertTrue(reply["ok"])
+            self.assertEqual(reply["matched"], [])
+            after = store.export_legacy()
+            # Applying a command records its id for dedup; nothing else moves.
+            after.pop("feedback_ids", None)
+            before.pop("feedback_ids", None)
+            self.assertEqual(after, before)
+
     def test_op_matches_live_pid(self):
         from taema.core import process as inspect
 
@@ -224,7 +402,10 @@ class UnitTestOpTests(unittest.TestCase):
                     "op": "unit_test",
                     "unit": {
                         "unit": {"name": "app-self", "kind": "app"},
-                        "match": {"comm": inspect.comm(own)},
+                        "match": {
+                            "comm": inspect.comm(own),
+                            "exe": inspect.exe(own),
+                        },
                     },
                     "pids": [own, 99999999],
                 }

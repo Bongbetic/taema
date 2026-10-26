@@ -767,7 +767,7 @@ _UNIT_TABLES = {
     },
     "match": {"exe", "comm", "cmdline_contains", "env_exclude"},
     "window": {"backend", "requires_window"},
-    "mem": {"class", "background", "save_state", "pause", "swap_max"},
+    "mem": {"class", "background", "save_state", "pause", "swap_max", "max"},
     "kill": {"graceful", "keep", "hook", "never_stop", "survive_logout"},
     "gc": {
         "keep_while_children",
@@ -783,8 +783,37 @@ _UNIT_TABLES = {
 _CHILDREN_KEYS = {"name", "comm", "ancestor_comm", "binds_to", "same_env"}
 
 
-def validate_unit(unit):
-    """Lint one parsed unit file. Returns a list of error strings."""
+#: Interpreter and shell comms that match far more than one app when used alone.
+_GENERIC_COMMS = frozenset(
+    {
+        "node",
+        "nodejs",
+        "python",
+        "python2",
+        "python3",
+        "java",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "electron",
+        "ruby",
+        "perl",
+        "php",
+        "deno",
+        "bun",
+    }
+)
+
+
+def validate_unit(unit, peaks=None):
+    """Lint one parsed unit file. Returns a list of error strings.
+
+    peaks optionally maps a unit name to its observed peak memory in
+    bytes, letting the lint flag a [mem] max below what the app has
+    already used.
+    """
     errors = []
     if not isinstance(unit, dict):
         return ["unit must be a table"]
@@ -828,6 +857,13 @@ def validate_unit(unit):
             errors.append("[match] %s must be a string" % key)
     if "env_exclude" in match and not isinstance(match["env_exclude"], dict):
         errors.append("[match] env_exclude must be a table")
+    if set(match) == {"comm"} and isinstance(match.get("comm"), str):
+        comm = match["comm"].strip("*?[]").lower()
+        if comm in _GENERIC_COMMS:
+            errors.append(
+                "[match] over-broad: comm %r alone matches every %s process; "
+                "add exe or cmdline_contains" % (match["comm"], comm)
+            )
     window = unit.get("window", {})
     if "backend" in window and (
         not isinstance(window["backend"], str) or not window["backend"]
@@ -850,9 +886,19 @@ def validate_unit(unit):
         errors.append("[kill] keep must be a list of strings")
     if "hook" in kill and not isinstance(kill["hook"], str):
         errors.append("[kill] hook must be a string")
+    hook = kill.get("hook")
+    if isinstance(hook, str) and "/" in hook:
+        hook_path = os.path.expanduser(hook)
+        if not (os.path.isfile(hook_path) and os.access(hook_path, os.X_OK)):
+            errors.append("[kill] hook %s is not executable" % hook)
     for key in ("never_stop", "survive_logout"):
         if key in kill and not isinstance(kill[key], bool):
             errors.append("[kill] %s must be true or false" % key)
+    if kill.get("never_stop") is True and head.get("stop_when_unneeded") is True:
+        errors.append(
+            "[kill] never_stop contradicts [unit] stop_when_unneeded; "
+            "the unit can never be stopped"
+        )
     if (
         kill.get("survive_logout") is True
         and head.get("stop_when_unneeded") is not True
@@ -872,6 +918,19 @@ def validate_unit(unit):
         or mem["swap_max"] < 0
     ):
         errors.append("[mem] swap_max must be a non-negative integer")
+    if "max" in mem and (
+        not isinstance(mem["max"], int)
+        or isinstance(mem["max"], bool)
+        or mem["max"] < 0
+    ):
+        errors.append("[mem] max must be a non-negative integer")
+    if peaks and isinstance(mem.get("max"), int) and not isinstance(mem["max"], bool):
+        peak = peaks.get(name)
+        if isinstance(peak, (int, float)) and mem["max"] < peak:
+            errors.append(
+                "[mem] max %d is below the observed peak %d for %s"
+                % (mem["max"], int(peak), name)
+            )
     for key in ("save_state", "pause"):
         if key in mem and not isinstance(mem[key], str):
             errors.append("[mem] %s must be a string" % key)
@@ -904,8 +963,15 @@ def validate_unit(unit):
     return errors
 
 
-def draft_unit(name, *, comm, exe, cmdline, cgroup):
-    """Generate a unit file body from one running process's identity."""
+def draft_unit(
+    name, *, comm, exe, cmdline, cgroup, children=(), peak_bytes=None, app_id=None
+):
+    """Generate a unit file body from one running process's identity.
+
+    children lists observed child comms, peak_bytes the scope's observed
+    memory peak, and app_id the window app id when known; each becomes a
+    suggestion in the drafted sections.
+    """
     import json as _json
 
     lines = [
@@ -929,9 +995,42 @@ def draft_unit(name, *, comm, exe, cmdline, cgroup):
             "[window]",
             "backend = %s" % _json.dumps(backend),
             "requires_window = true",
+        ]
+    )
+    if app_id:
+        lines.append("# window app id: %s" % app_id)
+    kids = sorted({str(kid) for kid in children if kid})
+    if kids:
+        lines.append("")
+        for kid in kids:
+            lines.extend(
+                [
+                    "[[children]]",
+                    "name = %s" % _json.dumps(kid),
+                    "comm = %s" % _json.dumps(kid),
+                    "",
+                ]
+            )
+    else:
+        lines.extend(
+            [
+                "",
+                "# [[children]]",
+                '# name = "helper"',
+                '# comm = "helper"',
+            ]
+        )
+    lines.extend(
+        ["", "[gc]", "keep_while_children = %s" % ("true" if kids else "false")]
+    )
+    lines.extend(["", "[mem]", 'class = "app"'])
+    if peak_bytes:
+        lines.append("# observed peak %d bytes; set max above it" % int(peak_bytes))
+        lines.append("max = %d" % int(peak_bytes * 1.25))
+    lines.extend(
+        [
             "",
-            "[mem]",
-            'class = "app"',
+            "# [qos] is profile-level; set the app's profile for QoS classes.",
             "",
             "[kill]",
             "graceful = 10",

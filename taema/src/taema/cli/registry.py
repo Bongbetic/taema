@@ -658,6 +658,36 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         "handler": "cmd_unit",
         "children": (
             {
+                "name": "new",
+                "help": "draft a unit from a running process, scope, or app",
+                "handler": "cmd_unit_new",
+                "arguments": (
+                    (
+                        ("--from",),
+                        {
+                            "dest": "from_target",
+                            "required": True,
+                            "help": "PID, scope:REL, or app comm",
+                        },
+                    ),
+                    (
+                        ("--name",),
+                        {"help": "unit name (default: from the process)"},
+                    ),
+                    (
+                        ("--force",),
+                        {"action": "store_true", "help": "overwrite an existing file"},
+                    ),
+                ),
+            },
+            {
+                "name": "test",
+                "help": "dry-run a unit file or name through the ladder",
+                "handler": "cmd_unit_test",
+                "read": True,
+                "arguments": ((("target",), {}),),
+            },
+            {
                 "name": "draft",
                 "help": "generate a unit file from a running process",
                 "handler": "cmd_unit_draft",

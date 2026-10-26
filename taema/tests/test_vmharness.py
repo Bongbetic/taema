@@ -2050,10 +2050,22 @@ class GraphicalSessionTest(unittest.TestCase):
         self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], "u")
 
     def test_screenshot_argv(self):
-        with mock.patch.object(scenario.subprocess, "run") as run:
+        with (
+            mock.patch.object(scenario.subprocess, "run") as run,
+            mock.patch("os.path.isfile", return_value=True),
+        ):
+            run.return_value = mock.Mock(returncode=0, stderr="", stdout="")
             scenario.take_screenshot({"WAYLAND_DISPLAY": "t"}, "/tmp/x.png")
         argv = run.call_args[0][0]
         self.assertEqual(argv, ["grim", "/tmp/x.png"])
+
+    def test_screenshot_failure_raises(self):
+        with mock.patch.object(scenario.subprocess, "run") as run:
+            run.return_value = mock.Mock(
+                returncode=1, stderr="no screencopy", stdout=""
+            )
+            with self.assertRaises(scenario.ScenarioError):
+                scenario.take_screenshot({"WAYLAND_DISPLAY": "t"}, "/tmp/x.png")
 
     def test_wait_for_path_ready(self):
         tmp = tempfile.mkdtemp()

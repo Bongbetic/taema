@@ -3885,10 +3885,16 @@ def niri_focus_window(env, window_id, timeout=15):
 
 
 def take_screenshot(env, path, timeout=30):
-    """Capture the headless output with grim; return CompletedProcess."""
-    return subprocess.run(
+    """Capture one output with grim; raise ScenarioError when it fails."""
+    reply = subprocess.run(
         ["grim", path], env=env, capture_output=True, text=True, timeout=timeout
     )
+    if reply.returncode != 0 or not os.path.isfile(path):
+        raise ScenarioError(
+            "grim failed rc=%s: %s"
+            % (reply.returncode, (reply.stderr or reply.stdout)[:200])
+        )
+    return reply
 
 
 def _paeth(a, b, c):
@@ -4004,7 +4010,11 @@ def scenario_graphical(rec, args, tree_holder):
             )
 
             shot = os.path.join(args.artifacts, "graphical.png")
-            take_screenshot(session["env"], shot)
+            take_screenshot(session["niri_env"], shot)
+            shutil.copy2(
+                session["notify_log"],
+                os.path.join(args.artifacts, "graphical-notify.jsonl"),
+            )
             img = read_png(shot)
             distinct = len(set(img["pixels"]))
             rec.step(

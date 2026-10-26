@@ -198,6 +198,12 @@ class Daemon:
         self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
         self.sel = selectors.DefaultSelector()
         self.agents = {}  # session -> {pid, capabilities, compositor, last_beat, state, facts}
+        self.notify_queues = {}  # session -> [jobs]; drained by notify_poll
+        self.notify_seq = 0
+        self.countdowns = {}  # nonce -> learned-stop countdown awaiting objection
+        self._recovery_notified = set()  # sessions told about store recovery
+        self._digest_at = {}  # session -> last digest job timestamp
+        self._close_history = {}  # app -> [close timestamps, last hour]
         self.owners = {}  # pidfd -> (scope leaf name, owner pid, owner starttime)
         self.idle_since = {}
         self.gc_usage = {}  # rel -> cpu usage_usec when the idle window started
@@ -617,6 +623,7 @@ class Daemon:
             # observed in observe mode when a unit's binds_to=root is only a projected carve.
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
+        pre_stop_bytes = self._scope_bytes(path)
         try:
             with self.store.decision_context(
                 "stop",
@@ -646,6 +653,18 @@ class Daemon:
                         apps=stopped,
                         decision=decision,
                         restore=rep.get("restore"),
+                        freed_bytes=pre_stop_bytes,
+                    )
+                else:
+                    app = os.path.basename(leaf.rstrip("/")) or leaf
+                    self.notify_agents(
+                        {
+                            "kind": "close",
+                            "app": app,
+                            "scope": leaf,
+                            "mem_bytes": pre_stop_bytes,
+                            "sig_repeats": self._note_close(app),
+                        }
                     )
                 self.store.log(event="stopped", scope=leaf, why=why)
         except engine.Refused as e:
@@ -1005,6 +1024,7 @@ class Daemon:
         owner=None,
         signature_id=None,
         restore=None,
+        freed_bytes=0,
     ):
         """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
@@ -1039,6 +1059,17 @@ class Daemon:
             restore=restore,
         )
         self._save_if_idle()
+        if (decision or {}).get("id") is not None:
+            self.notify_agents(
+                {
+                    "kind": "undo",
+                    "action": "stop",
+                    "decision_id": decision["id"],
+                    "scope": scope,
+                    "apps": sorted(set(apps)),
+                    "freed_bytes": freed_bytes,
+                }
+            )
         self.auto_stops.append(
             {
                 "ts": int(now),
@@ -1416,6 +1447,7 @@ class Daemon:
         require_pair,
         authority=None,
         trigger=authorization.GC_STOP,
+        _countdown_approved=False,
     ):
         """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
         decided stop); otherwise only the idle checks (known CPU, no edges, no pty host, not protected) apply.
@@ -1521,7 +1553,17 @@ class Daemon:
         probationary = require_pair and any(
             self.store.stop_in_probation(o, k) for o, k in pairs
         )
+        if (
+            require_pair
+            and not explicit
+            and not _countdown_approved
+            and self._countdown_wait(
+                leaf, path, pairs, stop_owner, signature_id, why, authority, trigger
+            )
+        ):
+            return False
         grace = engine.auto_grace(self.store, {i["key"] for i in infos})
+        pre_stop_bytes = self._scope_bytes(path)
         with self.store.decision_context(
             "stop",
             scope=leaf,
@@ -1561,6 +1603,7 @@ class Daemon:
                     decision=decision,
                     owner=decision["owner"],
                     restore=rep.get("restore"),
+                    freed_bytes=pre_stop_bytes,
                 )
             return rep["removed"]
 
@@ -1793,6 +1836,8 @@ class Daemon:
                 self.guarded(lambda: self.decide_kill(arg))
             elif kind == "expire":
                 self.guarded(lambda: self.expire_question(arg))
+            elif kind == "countdown":
+                self.guarded(lambda: self._countdown_expired(arg))
 
     def job_done(self, msg):
         shell, tag, status, word = (
@@ -4418,6 +4463,7 @@ class Daemon:
                     "jobs": len(self.lineage.jobs),
                 },
                 "pending_questions": len(self.pending),
+                "muted": sorted(self.store.data.get("muted_apps", [])),
                 "reviews": self.store.review_count,
                 "recovery": self.store.recovery,
                 "latest_decision": self.store.latest_decision(),
@@ -4460,6 +4506,10 @@ class Daemon:
             return self.register_agent(msg)
         if c == "agent_beat":
             return self.agent_beat(msg)
+        if c == "notify_poll":
+            return self.notify_poll(msg)
+        if c == "notify_result":
+            return self.notify_result(msg)
         if c == "job_done":
             return self.job_done(msg)
         if c == "kill_done":
@@ -4541,6 +4591,8 @@ class Daemon:
                         )
                 if msg.get("op") in ("veto", "undo") and not result.get("duplicate"):
                     self.thaw_held_scopes()
+                if msg.get("op") == "veto" and not result.get("duplicate"):
+                    self._cancel_countdowns_for_target(result.get("target"))
                 if (
                     msg.get("op") == "restore_backup"
                     and result.get("ok")
@@ -4673,7 +4725,322 @@ class Daemon:
         }
         if previous is None or previous.get("state") != "up":
             self.store.log(event="agent_up", scope=session, target=str(pid))
+        if self.store.recovery and session not in self._recovery_notified:
+            self._recovery_notified.add(session)
+            recovery = self.store.recovery
+            source = (
+                recovery.get("source", "backup")
+                if isinstance(recovery, dict)
+                else "backup"
+            )
+            self.notify_agents(
+                {
+                    "kind": "error",
+                    "error_kind": "store-recovery",
+                    "detail": "state was rebuilt from %s at startup" % source,
+                }
+            )
         return {"ok": True}
+
+    def _agent_session(self, msg):
+        """Validate a message on a registered agent connection.
+
+        Returns (session, record) or (None, error reply): the session must
+        be registered and the pid must be the registered agent, alive and
+        same-uid.
+        """
+        session, pid = msg.get("session"), msg.get("pid")
+        if (
+            not isinstance(session, str)
+            or not session
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+        ):
+            return None, {"error": "bad request"}
+        record = self.agents.get(session)
+        if record is None:
+            return None, {"error": "unknown agent session; register first"}
+        if pid != record["pid"] or inspect.uid_of(pid) != os.getuid():
+            return None, {"error": "pid gone or not yours"}
+        return session, record
+
+    def notify_agents(self, job):
+        """Queue one notification job for every up session agent."""
+        self.notify_seq += 1
+        body = dict(job)
+        envelope = {
+            "seq": self.notify_seq,
+            "created": time.time(),
+            "ttl": body.pop("ttl", None) or self.cfg.get("notify", {}).get("ttl", 600),
+            **body,
+        }
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            self._queue_job(session, envelope)
+        return envelope["seq"]
+
+    def _queue_job(self, session, envelope):
+        queue = self.notify_queues.setdefault(session, [])
+        queue.append(dict(envelope))
+        while len(queue) > 64:
+            del queue[0]
+
+    def _scope_bytes(self, path):
+        """Last-known current bytes for a scope; 0 when unreadable."""
+        try:
+            counters = memory.scope_counters(path)
+        except OSError:
+            return 0
+        if not isinstance(counters, dict):
+            return 0
+        current = counters.get("current_bytes")
+        return current if isinstance(current, int) and current > 0 else 0
+
+    def _note_close(self, app):
+        """Count an app's closes in the last hour for the repeat override."""
+        now = time.time()
+        history = [ts for ts in self._close_history.get(app, []) if now - ts < 3600]
+        history.append(now)
+        self._close_history[app] = history[-16:]
+        return len(history)
+
+    def _maybe_digest(self, session, now):
+        """Queue one digest a day per session while digests are enabled."""
+        if self.cfg.get("notify", {}).get("digest", "off") in ("off", "", None):
+            return
+        if now - self._digest_at.get(session, 0) < 86400:
+            return
+        self._digest_at[session] = now
+        self.notify_seq += 1
+        stops_24h = sum(
+            1 for item in self.auto_stops if now - item.get("ts", 0) < 86400
+        )
+        self._queue_job(
+            session,
+            {
+                "seq": self.notify_seq,
+                "created": now,
+                "ttl": 86400,
+                "kind": "digest",
+                "stops_24h": stops_24h,
+                "frozen": len(self.store.data.get("frozen_scopes", {})),
+                "guard_bytes": int(self.guard_state.get("last_bytes_freed", 0)),
+                "reviews": self.store.review_count,
+            },
+        )
+
+    def _notify_capable_agents(self):
+        """Up sessions whose agent can show actions."""
+        return [
+            session
+            for session, record in self.agents.items()
+            if record.get("state") == "up"
+            and "notify-actions" in (record.get("capabilities") or [])
+        ]
+
+    def notify_poll(self, msg):
+        """Drain one session's notification jobs, with profile and mutes."""
+        session, record = self._agent_session(msg)
+        if session is None:
+            return record
+        since = msg.get("since_seq", 0)
+        if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+            return {"error": "bad request"}
+        now = time.time()
+        self._maybe_digest(session, now)
+        queue = self.notify_queues.get(session, [])
+        live = [job for job in queue if job["created"] + job["ttl"] > now]
+        self.notify_queues[session] = live
+        return {
+            "jobs": [job for job in live if job["seq"] > since],
+            "profile": self.cfg.get("_profile_name", "auto"),
+            "mutes": sorted(self.store.data.get("muted_apps", [])),
+        }
+
+    def notify_result(self, msg):
+        """Apply one agent-reported notification outcome."""
+        session, record = self._agent_session(msg)
+        if session is None:
+            return record
+        kind = msg.get("kind")
+        if kind == "countdown":
+            return self._countdown_answer(msg)
+        if kind == "undo":
+            return self._toast_undo(msg)
+        return {"error": "unknown notification result kind"}
+
+    def _countdown_answer(self, msg):
+        nonce, choice = msg.get("nonce"), msg.get("choice")
+        if not isinstance(nonce, str) or not nonce or choice not in ("keep", "stop"):
+            return {"error": "bad request"}
+        record = self.countdowns.get(nonce)
+        if record is None or time.time() >= record["deadline"]:
+            self.countdowns.pop(nonce, None)
+            return {"error": "unknown or expired countdown"}
+        del self.countdowns[nonce]
+        if choice == "keep":
+            now = time.time()
+            for pair in record["pairs"]:
+                owner, leftover = pair
+                self.store.answer(owner, leftover, "keep", source="countdown")
+                entry = self.store._pair(owner, leftover)
+                entry["suspended_until"] = now + self.store.regret_suspend
+                self.store.dirty = True
+            if record.get("signature"):
+                self.store.db.suspend_signature(
+                    record["signature"],
+                    now + self.store.regret_suspend,
+                    now=now,
+                    outcome="countdown-keep",
+                )
+            self.store.log(
+                event="countdown_answered",
+                scope=record["scope"],
+                choice="keep",
+            )
+            self.store.save()
+            return {"ok": True, "choice": "keep"}
+        self.store.log(event="countdown_answered", scope=record["scope"], choice="stop")
+        stopped = self.auto_stop_path(
+            record["path"],
+            record["why"],
+            record["require_pair"],
+            authority=record["authority"],
+            trigger=record["trigger"],
+            _countdown_approved=True,
+        )
+        return {"ok": True, "choice": "stop", "stopped": bool(stopped)}
+
+    def _toast_undo(self, msg):
+        decision_id = msg.get("decision_id")
+        if (
+            not isinstance(decision_id, int)
+            or isinstance(decision_id, bool)
+            or decision_id <= 0
+        ):
+            return {"error": "bad request"}
+        candidate = self.store.undo_candidate(decision_id)
+        if candidate is None or candidate.get("undone") is not None:
+            return {"error": "nothing retained to undo"}
+        action = self.store._action_for_decision(
+            candidate,
+            [a for a in self.store.data.get("auto_actions", []) if isinstance(a, dict)],
+        )
+        pairs = [
+            pair
+            for pair in (action or {}).get("pairs", [])
+            if isinstance(pair, list) and len(pair) == 2
+        ]
+        for owner, leftover in pairs:
+            self.store.regret(owner, leftover)
+        reply = self.handle(
+            {
+                "cmd": "feedback",
+                "v": 2,
+                "id": "toast-undo-%d" % decision_id,
+                "op": "undo",
+                "action_id": str(decision_id),
+            }
+        )
+        if (
+            not isinstance(reply, dict)
+            or reply.get("error")
+            or not reply.get("ok", True)
+        ):
+            return {"error": (reply or {}).get("error", "undo failed")}
+        return {"ok": True, "undone": decision_id}
+
+    def _countdown_wait(
+        self, leaf, path, pairs, owner, signature_id, why, authority, trigger
+    ):
+        """Hold a learned stop for objection; True when the stop must wait.
+
+        No wait without an action-capable agent and enabled notifications:
+        headless and quiet installs keep stopping immediately.
+        """
+        now = time.time()
+        for nonce, record in list(self.countdowns.items()):
+            if record.get("scope") != leaf:
+                continue
+            if record.get("deadline", 0) > now:
+                return True
+            # Expired but the deadline has not fired yet: this pass proceeds
+            # and the pending firing finds no record and does nothing.
+            del self.countdowns[nonce]
+        if not self.cfg.get("notify", {}).get("enabled", True):
+            return False
+        if not self._notify_capable_agents():
+            return False
+        while len(self.countdowns) >= 32:
+            oldest = min(self.countdowns, key=lambda n: self.countdowns[n]["created"])
+            del self.countdowns[oldest]
+        seconds = int(self.cfg.get("notify", {}).get("countdown_seconds", 30))
+        nonce = _secure_token_hex(8)
+        self.countdowns[nonce] = {
+            "nonce": nonce,
+            "scope": leaf,
+            "path": path,
+            "app": owner,
+            "pairs": [list(pair) for pair in pairs],
+            "signature": signature_id,
+            "why": why,
+            "require_pair": True,
+            "authority": authority,
+            "trigger": trigger,
+            "deadline": now + seconds,
+            "created": now,
+        }
+        self.add_deadline(now + seconds, "countdown", nonce)
+        self.notify_agents(
+            {
+                "kind": "countdown",
+                "nonce": nonce,
+                "scope": leaf,
+                "app": owner or leaf,
+                "seconds": seconds,
+                "ttl": seconds + 60,
+            }
+        )
+        self.store.log(event="countdown_started", scope=leaf)
+        return True
+
+    def _countdown_expired(self, nonce):
+        """A countdown nobody objected to: run the approved stop."""
+        record = self.countdowns.pop(nonce, None)
+        if record is None:
+            return False
+        self.store.log(event="countdown_expired", scope=record.get("scope"))
+        return bool(
+            self.auto_stop_path(
+                record["path"],
+                record["why"],
+                record["require_pair"],
+                authority=record["authority"],
+                trigger=record["trigger"],
+                _countdown_approved=True,
+            )
+        )
+
+    def _cancel_countdowns_for_target(self, target):
+        """A veto cancels pending countdowns on the same app, scope, or signature."""
+        if not isinstance(target, dict):
+            return 0
+        values = {target.get("value"), target.get("owner"), target.get("leftover")}
+        values = {value for value in values if value}
+        if not values:
+            return 0
+        cancelled = 0
+        for nonce, record in list(self.countdowns.items()):
+            known = {record.get("scope"), record.get("app"), record.get("signature")}
+            for pair in record.get("pairs", []):
+                known.update(pair)
+            if known & values:
+                del self.countdowns[nonce]
+                self.store.log(event="countdown_cancelled", scope=record.get("scope"))
+                cancelled += 1
+        return cancelled
 
     def agent_beat(self, msg):
         """Accept one heartbeat; revive a down agent, store bounded facts."""
@@ -5603,6 +5970,7 @@ class Daemon:
             return {"ok": False, "error": "managed freeze limit reached"}
         source = "manual" if manual else "auto"
         why = reason or "eligible idle leftover"
+        audit_id = None
         try:
             with self.store.decision_context(
                 "freeze",
@@ -5610,7 +5978,9 @@ class Daemon:
                 authority=decision.authority or ("manual" if manual else "mode"),
                 mode=self.mode,
                 why=why,
+                undo={"operation": "thaw", "scope": scope},
             ) as audit:
+                audit_id = audit["id"]
                 self.store.set_frozen_scope(
                     scope,
                     time.time(),
@@ -5662,6 +6032,17 @@ class Daemon:
         # thaw path, including one initiated by the stop engine, must begin afresh.
         self._clear_freeze_samples(scope)
         self._save_if_idle()
+        if not manual and audit_id is not None:
+            self.notify_agents(
+                {
+                    "kind": "undo",
+                    "action": "freeze",
+                    "decision_id": audit_id,
+                    "scope": scope,
+                    "apps": [],
+                    "freed_bytes": 0,
+                }
+            )
         return {"ok": True, "scope": scope, "frozen": True}
 
     def freeze_pass(self, now=None, guard=False):
@@ -6438,6 +6819,14 @@ class Daemon:
             duration_ms=duration_ms,
             outcome=outcome,
         )
+        if bytes_freed > 0:
+            self.notify_agents(
+                {
+                    "kind": "guard",
+                    "trigger": trigger_name,
+                    "bytes_freed": bytes_freed,
+                }
+            )
         return state
 
     def guard_pass(self, trigger="retry"):

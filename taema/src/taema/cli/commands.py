@@ -2065,6 +2065,35 @@ def cmd_keep(a):
     return 0
 
 
+def cmd_mute(a):
+    cfg, store, _units = _load(a)
+    app = getattr(a, "app", None)
+    if not app:
+        muted = sorted(store.data.get("muted_apps", []))
+        if not muted:
+            print("no muted apps")
+        else:
+            print("muted: %s" % ", ".join(muted))
+        return 0
+    how, reply = feedback_action(cfg, store, "mute", app=app, muted=True)
+    if not reply or reply.get("error") or not reply.get("ok", True):
+        return die((reply or {}).get("error", "could not mute %s" % app))
+    print("%s: muted (%s)" % (app, how))
+    return 0
+
+
+def cmd_unmute(a):
+    cfg, store, _units = _load(a)
+    app = getattr(a, "app", None)
+    if not app:
+        return die("unmute requires an app", 2)
+    how, reply = feedback_action(cfg, store, "mute", app=app, muted=False)
+    if not reply or reply.get("error") or not reply.get("ok", True):
+        return die((reply or {}).get("error", "could not unmute %s" % app))
+    print("%s: unmuted (%s)" % (app, how))
+    return 0
+
+
 def cmd_do_not_kill(a):
     cfg, store, units = _load(a)
     if (

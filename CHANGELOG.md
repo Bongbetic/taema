@@ -2,6 +2,22 @@
 
 ## Behaviour changes
 
+### Notification policy, toasts, and countdowns
+
+The agent polls a per-session notification queue (`notify_poll`) and shows
+jobs through the configured backend subject to policy: closes batch over 60
+seconds and cap at 6 per hour, closes under 200 MB are skipped unless their
+pattern repeats 3 times, quiet hours (22:00–08:00), the game and quiet
+profiles, and `taema mute APP`/`unmute` suppress per-app noise. Automatic
+stops and freezes queue undo toasts ("Freed 812 MB · Undo"); a toast undo
+also records a full regret. Learned stops that were not explicitly answered
+wait out a 30-second countdown with Keep and Stop now while an
+action-capable agent is up — Keep records keep evidence with a 7-day
+suspension, a veto cancels the countdown, and silence stops when the
+deadline fires. Guard runs that reclaim memory, error notices (at most once
+a day per kind, including store recovery), and an optional daily digest
+round out the set. Text stays plain unless the server advertises markup.
+
 ### Notification backends
 
 One `Notifier` contract (`taema.notify`) with three backends and no new

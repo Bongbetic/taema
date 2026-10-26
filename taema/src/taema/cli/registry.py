@@ -159,6 +159,20 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "mute",
+        "aliases": (),
+        "help": "mute an app's notifications, or list muted apps",
+        "handler": "cmd_mute",
+        "arguments": ((("app",), {"nargs": "?", "metavar": "APP"}),),
+    },
+    {
+        "name": "unmute",
+        "aliases": (),
+        "help": "unmute an app's notifications",
+        "handler": "cmd_unmute",
+        "arguments": ((("app",), {"metavar": "APP"}),),
+    },
+    {
         "name": "undo",
         "aliases": (),
         "help": "undo the latest automatic action or a decision by id",

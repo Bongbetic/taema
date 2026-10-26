@@ -2,6 +2,16 @@
 
 ## Behaviour changes
 
+### Desktop entry wrapping
+
+`taema desktop wrap NAME.desktop` writes a user-level override whose
+Exec runs the original command under `taema launch`, recording the
+source hash in the override marker; `unwrap NAME|--all` and `list`
+reverse and inspect. System entries are only read, never edited.
+`doctor` warns when a package update changes a source behind its
+wrapper (rewrap to fix). Wrapping is gated behind
+`[experimental] launch_wrap`.
+
 ### Launch-time scoping
 
 `taema launch [--app NAME] [--unit UNIT] [--bind] -- CMD…` reserves an

@@ -4102,8 +4102,183 @@ def cmd_tree(a):
 def cmd_unit(a):
     """Unit authoring tools."""
     del a
-    print("usage: taema unit <draft|dry-run|lint>")
+    print("usage: taema unit <new|draft|test|dry-run|lint>")
     return 2
+
+
+def _stdin_is_tty():
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _unit_target_pid(target):
+    """Resolve a unit --from target (PID, scope:REL, or app comm) to a pid."""
+    try:
+        number = int(target)
+    except (TypeError, ValueError):
+        number = None
+    if number is not None:
+        return number
+    if target.startswith("scope:") or "/" in target:
+        rel = target[6:] if target.startswith("scope:") else target
+        matches = []
+        for pid in inspect.all_pids():
+            try:
+                pid_rel = cgroup.proc_cgroup(pid)
+            except OSError:
+                continue
+            if pid_rel and (pid_rel == rel or pid_rel.endswith("/" + rel)):
+                matches.append(pid)
+        return min(matches) if matches else None
+    for pid in sorted(inspect.all_pids()):
+        try:
+            if inspect.comm(pid) == target:
+                return pid
+        except OSError:
+            continue
+    return None
+
+
+def _unit_name_for(identity, requested):
+    if requested:
+        return requested
+    comm = (identity or {}).get("comm") or "app"
+    slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in comm)
+    return "app-" + slug.strip("-").lower() if slug.strip("-") else "app"
+
+
+def cmd_unit_new(a):
+    """Draft a unit from a running process, scope, or app; edit in a terminal."""
+    pid = _unit_target_pid(a.from_target)
+    if pid is None:
+        return die("no such process, scope, or app: %s" % a.from_target, 2)
+    identity, error = _process_identity(pid)
+    if error is not None:
+        return die(error, 2)
+    if not identity["comm"]:
+        return die("process has no comm; refusing to draft", 2)
+    name = _unit_name_for(identity, getattr(a, "name", None))
+    children = []
+    try:
+        table = inspect.ProcTable.scan()
+        children = [
+            inspect.comm(kid) or ""
+            for kid, proc in table.rows.items()
+            if proc.ppid == pid
+        ]
+    except OSError:
+        children = []
+    peak = None
+    try:
+        root = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
+        with open(
+            os.path.join(root, identity["cgroup"].lstrip("/"), "memory.peak"),
+            encoding="ascii",
+        ) as source:
+            peak = int(source.read().strip())
+    except (OSError, ValueError):
+        peak = None
+    units_dir = os.path.join(policy.user_config_dir(), "units")
+    os.makedirs(units_dir, exist_ok=True)
+    target = os.path.join(units_dir, name + ".toml")
+    if os.path.exists(target) and not getattr(a, "force", False):
+        return die("unit file exists: %s (use --force to overwrite)" % target, 1)
+    body = policy.draft_unit(
+        name,
+        comm=identity["comm"],
+        exe=identity["exe"],
+        cmdline=identity["cmdline"],
+        cgroup=identity["cgroup"],
+        children=children,
+        peak_bytes=peak,
+    )
+    with open(target, "w", encoding="utf-8") as stream:
+        stream.write(body)
+    os.chmod(target, 0o600)
+    print(target)
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    if editor and _stdin_is_tty():
+        import shlex
+        import subprocess
+
+        try:
+            edited = subprocess.run(shlex.split(editor) + [target], check=False)
+        except OSError as error:
+            return die("could not run editor: %s" % error, 2)
+        if edited.returncode != 0:
+            return die("editor exited with %d" % edited.returncode, 2)
+        unit, read_error = policy.read_unit_file(target)
+        if read_error is not None:
+            print(read_error)
+            return 2
+        problems = policy.validate_unit(unit)
+        for problem in problems:
+            print("%s: %s" % (target, problem))
+        if problems:
+            return 2
+    return 0
+
+
+def _resolve_unit_file(target):
+    """Resolve a unit test target: a file path, or a unit name."""
+    expanded = os.path.abspath(os.path.expanduser(target))
+    if os.path.isfile(expanded):
+        return expanded
+    filename = target if target.endswith(".toml") else target + ".toml"
+    for directory in (os.path.join(policy.user_config_dir(), "units"),):
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def cmd_unit_test(a):
+    """Dry-run a unit file or name: matches, scopes, and ladder effects."""
+    path = _resolve_unit_file(a.target)
+    if path is None:
+        return die("no such unit file or name: %s" % a.target, 2)
+    unit, error = policy.read_unit_file(path)
+    if error is not None:
+        print(error)
+        return 2
+    problems = policy.validate_unit(unit)
+    if problems:
+        for problem in problems:
+            print("%s: %s" % (path, problem))
+        return 2
+    match = unit.get("match", {})
+    matched = []
+    for pid in sorted(inspect.all_pids()):
+        if engine.unit_matches(match, pid):
+            matched.append(pid)
+    for pid in matched:
+        try:
+            key = policy.app_key(pid, units=[unit])
+            scope = engine.auto_scope_name(key, pid, inspect.starttime(pid))
+        except (OSError, ValueError):
+            scope = "?"
+        print("%d %s scope %s" % (pid, inspect.comm(pid) or "?", scope))
+    window = unit.get("window", {}) if isinstance(unit.get("window"), dict) else {}
+    gc = unit.get("gc", {}) if isinstance(unit.get("gc"), dict) else {}
+    mem = unit.get("mem", {}) if isinstance(unit.get("mem"), dict) else {}
+    head = unit.get("unit", {}) if isinstance(unit.get("unit"), dict) else {}
+    print(
+        "gc: requires_window=%s stop_when_unneeded=%s keep_while_children=%s"
+        % (
+            window.get("requires_window", True),
+            head.get("stop_when_unneeded", False),
+            gc.get("keep_while_children", False),
+        )
+    )
+    print(
+        "mem: class=%s max=%s background=%s"
+        % (mem.get("class", "app"), mem.get("max", "-"), mem.get("background", False))
+    )
+    print("qos: profile classes apply; no per-unit qos table")
+    print("%d processes" % len(matched))
+    return 0
 
 
 def _process_identity(pid):
@@ -4150,13 +4325,34 @@ def cmd_unit_draft(a):
     return 0
 
 
+def _unit_peaks(a, unit):
+    """Observed peak bytes for the unit's name from retained samples."""
+    name = (unit.get("unit") or {}).get("name")
+    if not isinstance(name, str) or not name:
+        return {}
+    try:
+        _cfg, store, _units = _load(a)
+        samples = store.latest_memory_samples() if store is not None else {}
+    except Exception:
+        return {}
+    peaks = {}
+    for scope_key, sample in (samples or {}).items():
+        peak = sample.get("peak") if isinstance(sample, dict) else None
+        if not isinstance(peak, (int, float)):
+            continue
+        leaf = os.path.basename(str(scope_key).rstrip("/"))
+        if leaf == name or leaf.startswith(name + "-"):
+            peaks[name] = max(peaks.get(name, 0), peak)
+    return peaks
+
+
 def cmd_unit_lint(a):
     """Lint one unit file."""
     unit, error = policy.read_unit_file(os.path.abspath(os.path.expanduser(a.file)))
     if error is not None:
         print(error)
         return 2
-    problems = policy.validate_unit(unit)
+    problems = policy.validate_unit(unit, peaks=_unit_peaks(a, unit))
     for problem in problems:
         print("%s: %s" % (a.file, problem))
     return 2 if problems else 0

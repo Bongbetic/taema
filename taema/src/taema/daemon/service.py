@@ -202,6 +202,8 @@ class Daemon:
         self.notify_seq = 0
         self.countdowns = {}  # nonce -> learned-stop countdown awaiting objection
         self.review_nonces = {}  # nonce -> review awaiting a toast answer
+        self.window_state = {}  # session -> {windows, focused, pids, updated}
+        self._window_rates = {}  # session -> [recent window event timestamps]
         self._recovery_notified = set()  # sessions told about store recovery
         self._digest_at = {}  # session -> last digest job timestamp
         self._close_history = {}  # app -> [close timestamps, last hour]
@@ -3504,7 +3506,7 @@ class Daemon:
             return False
         observing = decision.verdict == authorization.WOULD_ACT
         if observing:
-            plan = qos.plan(path, resource_class)
+            plan = qos.plan(path, resource_class, self._focus_weight())
             oom_candidates = self._qos_oom_candidates(
                 path, resource_class, previous.get("oom_score_adj", [])
             )
@@ -3549,7 +3551,7 @@ class Daemon:
                 self.store.log(event="qos_refused", scope=scope, reason=decision.reason)
             return False
         controllers_ready = self._enable_qos_controllers(scope, path)
-        plan = qos.plan(path, resource_class)
+        plan = qos.plan(path, resource_class, self._focus_weight())
         if only_controls is not None:
             previously_available = set(previous.get("available", []))
             # Controller enablement can expose controls between the preflight plan
@@ -3751,6 +3753,7 @@ class Daemon:
 
         config = self.cfg.get("qos", policy._DEFAULTS["qos"])
         enabled = isinstance(config, dict) and config.get("enabled", True) is True
+        window_scopes = self.live_window_scopes()
         background_scopes = [
             (scope, path, cgroup.tree_procs(path))
             for scope, path in paths.items()
@@ -3799,6 +3802,11 @@ class Daemon:
                 if unit_class == "normal"
                 else unit_class or qos.classify(scope, idle_times, now)
             )
+            window_class = self._window_qos_class(scope, window_scopes)
+            if window_class == "foreground" and self._focus_boost_on():
+                resource_class = "foreground"
+            elif window_class is not None:
+                resource_class = None
             if record and record.get("active"):
                 decision = self._qos_authorization(scope, path)
                 if decision.verdict == authorization.KEEP:
@@ -3831,7 +3839,7 @@ class Daemon:
                 and record.get("class") == resource_class
                 and record.get("active") is (self.mode != "observe")
             ):
-                plan = qos.plan(path, resource_class)
+                plan = qos.plan(path, resource_class, self._focus_weight())
                 if self.mode == "observe":
                     self.qos_pending.pop(scope, None)
                     oom_candidates = self._qos_oom_candidates(
@@ -4486,6 +4494,7 @@ class Daemon:
                 "auto": self.auto_status(),
                 "guard": self.guard_status(),
                 "agents": self.agent_report(),
+                "windows": self.window_summary(),
             }
         if c == "review":
             self.store.expire_reviews()
@@ -4513,6 +4522,8 @@ class Daemon:
             return self.notify_poll(msg)
         if c == "notify_result":
             return self.notify_result(msg)
+        if c == "window_event":
+            return self.window_event(msg)
         if c == "job_done":
             return self.job_done(msg)
         if c == "kill_done":
@@ -4839,6 +4850,276 @@ class Daemon:
                 "reviews": self.store.review_count,
             },
         )
+
+    def window_event(self, msg):
+        """Ingest one agent-forwarded window event, at most 50 per second."""
+        session, record = self._agent_session(msg)
+        if session is None:
+            return record
+        kind = msg.get("kind")
+        if kind not in ("snapshot", "opened", "changed", "closed", "focus"):
+            return {"error": "bad request"}
+        now = time.time()
+        recent = [ts for ts in self._window_rates.get(session, []) if now - ts < 1.0]
+        if len(recent) >= 50:
+            self._window_rates[session] = recent
+            return {"ok": True, "dropped": True}
+        recent.append(now)
+        self._window_rates[session] = recent
+        state = self.window_state.setdefault(
+            session, {"windows": {}, "focused": None, "pids": {}, "updated": 0}
+        )
+        if kind == "snapshot":
+            return self._window_snapshot(state, msg)
+        parsed = self._parse_window_fields(msg)
+        if parsed is None:
+            return {"error": "bad request"}
+        window_id, app_id, pid, focus, title = parsed
+        if kind == "closed":
+            state["windows"].pop(window_id, None)
+            if state["focused"] == window_id:
+                state["focused"] = None
+        elif kind == "focus":
+            state["focused"] = window_id
+            for known_id, known in state["windows"].items():
+                known["focus"] = known_id == window_id
+            if window_id is not None:
+                self._window_note_pid(state, window_id, app_id, pid, title)
+                state["windows"][window_id]["focus"] = True
+                noted = state["windows"][window_id]
+                self._note_window_instance(
+                    noted.get("app_id"), noted.get("pid"), noted.get("start")
+                )
+                self._window_maybe_thaw(noted)
+        else:
+            self._window_note_pid(state, window_id, app_id, pid, title)
+            noted = state["windows"][window_id]
+            noted["focus"] = focus
+            self._note_window_instance(
+                noted.get("app_id"), noted.get("pid"), noted.get("start")
+            )
+            if focus:
+                state["focused"] = window_id
+                for known_id, known in state["windows"].items():
+                    known["focus"] = known_id == window_id
+                self._window_maybe_thaw(noted)
+        state["updated"] = now
+        if len(state["windows"]) > 512:
+            oldest = sorted(state["windows"])[: len(state["windows"]) - 512]
+            for gone in oldest:
+                del state["windows"][gone]
+        return {"ok": True}
+
+    def _parse_window_fields(self, msg):
+        """Validate one window event's fields; None when malformed."""
+        window_id = msg.get("window_id")
+        if msg.get("kind") == "focus" and window_id is None:
+            pass
+        elif (
+            not isinstance(window_id, int)
+            or isinstance(window_id, bool)
+            or window_id < 0
+        ):
+            return None
+        app_id = msg.get("app_id")
+        if app_id is not None and (
+            not isinstance(app_id, str) or not app_id or len(app_id) > 256
+        ):
+            return None
+        pid = msg.get("window_pid")
+        if pid is not None and (
+            not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+        ):
+            return None
+        focus = msg.get("focus", False)
+        if not isinstance(focus, bool):
+            return None
+        title = msg.get("title")
+        if title is not None and (not isinstance(title, str) or len(title) > 512):
+            return None
+        if title is not None and not self.cfg.get("agent", {}).get(
+            "store_titles", False
+        ):
+            title = None
+        return (window_id, app_id, pid, focus, title)
+
+    def _window_snapshot(self, state, msg):
+        entries = msg.get("windows")
+        if not isinstance(entries, list) or len(entries) > 512:
+            return {"error": "bad request"}
+        fresh = {}
+        focused = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return {"error": "bad request"}
+            parsed = self._parse_window_fields({**entry, "kind": "opened"})
+            if parsed is None or parsed[0] is None:
+                return {"error": "bad request"}
+            window_id, app_id, pid, focus, title = parsed
+            fresh[window_id] = self._window_record(state, window_id, app_id, pid, title)
+            fresh[window_id]["focus"] = focus
+            self._note_window_instance(
+                fresh[window_id].get("app_id"),
+                fresh[window_id].get("pid"),
+                fresh[window_id].get("start"),
+            )
+            if focus:
+                focused = window_id
+        state["windows"] = fresh
+        state["focused"] = focused
+        state["updated"] = time.time()
+        return {"ok": True}
+
+    def _window_pid_start(self, state, pid):
+        """Validate a window pid is alive and same-uid; cache its start time."""
+        if pid is None:
+            return None
+        start = inspect.starttime(pid)
+        if start is None:
+            state["pids"].pop(pid, None)
+            return None
+        if state["pids"].get(pid) != start:
+            if inspect.uid_of(pid) != os.getuid():
+                state["pids"].pop(pid, None)
+                return None
+            state["pids"][pid] = start
+        return start
+
+    def _window_record(self, state, window_id, app_id, pid, title):
+        start = self._window_pid_start(state, pid)
+        record = {
+            "app_id": app_id,
+            "pid": pid if start is not None else None,
+            "start": start,
+            "focus": False,
+        }
+        if title is not None:
+            record["title"] = title
+        return record
+
+    def _window_note_pid(self, state, window_id, app_id, pid, title):
+        record = self._window_record(state, window_id, app_id, pid, title)
+        previous = state["windows"].get(window_id, {})
+        if record["pid"] is None and previous.get("pid") is not None:
+            rechecked = self._window_pid_start(state, previous["pid"])
+            if rechecked == previous.get("start"):
+                record["pid"] = previous["pid"]
+                record["start"] = rechecked
+        if record["app_id"] is None:
+            record["app_id"] = previous.get("app_id")
+        state["windows"][window_id] = record
+
+    def _window_scope(self, pid):
+        """The daemon scope holding a pid, or None outside the tree."""
+        line = cgroup.proc_cgroup(pid)
+        if not line:
+            return None
+        prefix = cgroup.base()[len(cgroup.CG) :]
+        if line == prefix:
+            return ""
+        if not line.startswith(prefix + "/"):
+            return None
+        return line[len(prefix) + 1 :]
+
+    def _note_window_instance(self, app_id, pid, start):
+        """Point the pid's app row at its window app id (desktop evidence)."""
+        if not app_id or pid is None or start != inspect.starttime(pid):
+            return False
+        try:
+            key = policy.app_key(pid, units=self.units)
+        except (OSError, ValueError):
+            return False
+        if not key:
+            return False
+        row = self.store.db.app_identity(key)
+        if row is None:
+            return False
+        if row.get("desktop_id") == app_id and row.get("display") == app_id:
+            return True
+        return bool(self.store.db.set_app_desktop(key, app_id, app_id))
+
+    def _window_maybe_thaw(self, record):
+        """A window opening or focusing in a frozen scope thaws it at once."""
+        pid = record.get("pid")
+        if pid is None or record.get("start") != inspect.starttime(pid):
+            return False
+        scope = self._window_scope(pid)
+        if not scope or scope not in self.store.data.get("frozen_scopes", {}):
+            return False
+        result = self._thaw_scope(scope, "window opened or focused")
+        if result.get("ok"):
+            self.store.log(event="focus_thaw", scope=scope)
+            return True
+        return False
+
+    def window_summary(self):
+        """Window facts for views: per-scope counts plus per-pid markers."""
+        pids = {}
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            state = self.window_state.get(session)
+            if not state:
+                continue
+            for window_id, known in state["windows"].items():
+                pid = known.get("pid")
+                if pid is None or known.get("start") != inspect.starttime(pid):
+                    continue
+                marker = pids.setdefault(
+                    str(pid), {"focused": False, "app_id": known.get("app_id")}
+                )
+                if state.get("focused") == window_id:
+                    marker["focused"] = True
+                if known.get("app_id"):
+                    marker["app_id"] = known["app_id"]
+        scopes = self.live_window_scopes()
+        return {
+            "connected": bool(pids),
+            "scopes": scopes,
+            "pids": pids,
+        }
+
+    def _window_qos_class(self, scope, live=None):
+        """Foreground for the focused scope, interactive for windowed ones."""
+        entry = (live if live is not None else self.live_window_scopes()).get(scope)
+        if entry is None:
+            return None
+        return "foreground" if entry.get("focused") else "interactive"
+
+    def _focus_boost_on(self):
+        """Focus boost applies only in the focus profile (D18)."""
+        config = self.cfg.get("qos", {})
+        if not isinstance(config, dict) or config.get("focus_boost") is not True:
+            return False
+        return self.cfg.get("_profile_name", "auto") == "focus"
+
+    def _focus_weight(self):
+        weight = self.cfg.get("qos", {}).get("focus_cpu_weight", 300)
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            return 300
+        return min(10000, max(1, weight))
+
+    def live_window_scopes(self):
+        """Scope -> {count, focused} from up agents with revalidated pids."""
+        scopes = {}
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            state = self.window_state.get(session)
+            if not state:
+                continue
+            for window_id, known in state["windows"].items():
+                pid = known.get("pid")
+                if pid is None or known.get("start") != inspect.starttime(pid):
+                    continue
+                scope = self._window_scope(pid)
+                if not scope:
+                    continue
+                entry = scopes.setdefault(scope, {"count": 0, "focused": False})
+                entry["count"] += 1
+                if state.get("focused") == window_id:
+                    entry["focused"] = True
+        return scopes
 
     def _notify_capable_agents(self):
         """Up sessions whose agent can show actions."""
@@ -6000,6 +6281,12 @@ class Daemon:
         )
         if decision.verdict != authorization.ACT:
             return {"ok": False, "error": decision.reason}
+        windowed = self.live_window_scopes().get(scope)
+        if windowed:
+            return {
+                "ok": False,
+                "error": "scope has %d open window(s)" % windowed["count"],
+            }
         path = os.path.join(cgroup.base(), scope)
         members = tuple(sorted(cgroup.tree_procs(path)))
         self.lineage.observe(inspect.ProcTable.scan())
@@ -6631,6 +6918,8 @@ class Daemon:
     def _guard_reclaim_step(self, stage):
         managed = self.store.data.get("frozen_scopes", {})
         managed = managed if isinstance(managed, dict) else {}
+        live = self.live_window_scopes()
+        focused = {scope for scope, entry in live.items() if entry.get("focused")}
         candidates = []
         for scope, path in self._memory_paths().items():
             resource_class = self._reclaim_class(scope, path)
@@ -6643,7 +6932,7 @@ class Daemon:
                 ):
                     continue
             elif stage == "anonymous":
-                if not frozen:
+                if not frozen or scope in focused:
                     continue
             else:
                 continue

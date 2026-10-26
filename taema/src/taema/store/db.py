@@ -1420,6 +1420,25 @@ class StateDB:
         """Persist one identity and pid/start instance."""
         return self.record_app_identities(((identity, instance),), now=now)
 
+    def set_app_desktop(self, key, desktop_id, display, now=None):
+        """Point one app row at its window app id; 0 rows when unknown."""
+        if self.read_only or not self.available or not isinstance(key, str) or not key:
+            return 0
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE apps SET desktop_id = ?, display = ?, last_seen = ? "
+                "WHERE key = ?",
+                (
+                    (desktop_id or "")[:256] or None,
+                    (display or key)[:256],
+                    now,
+                    key,
+                ),
+            )
+            connection.commit()
+        return cursor.rowcount
+
     def app_identity(self, key):
         """Read the bounded presentation and executable evidence for one app key."""
         if not self.available or not isinstance(key, str) or not key:

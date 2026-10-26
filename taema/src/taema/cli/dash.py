@@ -286,12 +286,18 @@ def _draw(screen, args, state, live_events):
     for index, row in enumerate(rows[: max(0, height - 8)]):
         marker = ">" if index == state["selected"] else " "
         memory = row.get("memory_bytes")
-        text = "%s %s procs=%s mem=%s%s" % (
+        windows = row.get("windows") or {}
+        if windows.get("count"):
+            win = " win=%s" % ("F" if windows.get("focused") else windows["count"])
+        else:
+            win = ""
+        text = "%s %s procs=%s mem=%s%s%s" % (
             marker,
             row.get("name", "?"),
             row.get("procs", row.get("processes", 0)),
             "-" if memory is None else _mem(memory),
             " frozen" if row.get("frozen") else "",
+            win,
         )
         screen.addstr(line, 0, text[:width])
         line += 1

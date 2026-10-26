@@ -54,9 +54,7 @@ class MemoryConfigFlag(unittest.TestCase):
         cfg = make_cfg(tempfile.mkdtemp())
         self.assertTrue(service.Daemon(cfg).handle({"cmd": "status"})["mem_enabled"])
         cfg["mem"] = {"enabled": False}
-        self.assertFalse(
-            service.Daemon(cfg).handle({"cmd": "status"})["mem_enabled"]
-        )
+        self.assertFalse(service.Daemon(cfg).handle({"cmd": "status"})["mem_enabled"])
 
 
 class MemoryAccounting(unittest.TestCase):

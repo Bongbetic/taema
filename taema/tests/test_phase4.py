@@ -2368,9 +2368,7 @@ class StatusAndModes(ProcCase):
         self.assertIn("guard", reply)
         saved_module = sys.modules.pop("taema.governor.guard", None)
         saved_global = cli._pressure_guard
-        cli._pressure_guard = cli._LazyModule(
-            "_pressure_guard", "taema.governor.guard"
-        )
+        cli._pressure_guard = cli._LazyModule("_pressure_guard", "taema.governor.guard")
         try:
             out = io.StringIO()
             with (
@@ -2419,9 +2417,7 @@ class StatusAndModes(ProcCase):
             saved_modules[name] = sys.modules.pop(name, None)
             global_name = global_names[name]
             saved_globals[name] = getattr(cli, global_name)
-            setattr(
-                cli, global_name, cli._LazyModule(global_name, name)
-            )
+            setattr(cli, global_name, cli._LazyModule(global_name, name))
         return saved_modules, saved_globals
 
     def _restore_cli_modules(self, saved_modules, saved_globals):
@@ -2469,9 +2465,7 @@ class StatusAndModes(ProcCase):
         out = io.StringIO()
         with (
             mock.patch.object(cli, "_ask_paths", return_value=None),
-            mock.patch.object(
-                cli, "_load_status", return_value=(cfg, None)
-            ) as loader,
+            mock.patch.object(cli, "_load_status", return_value=(cfg, None)) as loader,
             mock.patch.object(cli, "ask", return_value=reply),
             redirect_stdout(out),
         ):
@@ -2485,7 +2479,10 @@ class StatusAndModes(ProcCase):
 
         reply = self._complete_status_reply()
         cfg = make_cfg(tmp(), mode="auto")
-        for argv in (["status", "--socket", "/tmp/x.sock"], ["status", "--config", "/tmp/y.toml"]):
+        for argv in (
+            ["status", "--socket", "/tmp/x.sock"],
+            ["status", "--config", "/tmp/y.toml"],
+        ):
             out = io.StringIO()
             with (
                 mock.patch.object(cli, "_ask_paths") as probe,
@@ -2517,9 +2514,7 @@ class StatusAndModes(ProcCase):
         out = io.StringIO()
         with (
             mock.patch.object(cli, "_ask_paths", return_value=reply),
-            mock.patch.object(
-                cli, "_load_status", return_value=(cfg, None)
-            ) as loader,
+            mock.patch.object(cli, "_load_status", return_value=(cfg, None)) as loader,
             mock.patch.object(cli, "ask", return_value=reply),
             redirect_stdout(out),
         ):
@@ -2544,9 +2539,7 @@ class StatusAndModes(ProcCase):
         slow_out = io.StringIO()
         with (
             mock.patch.object(cli, "_ask_paths", return_value=None),
-            mock.patch.object(
-                cli, "_load_status", return_value=(cfg, None)
-            ),
+            mock.patch.object(cli, "_load_status", return_value=(cfg, None)),
             mock.patch.object(cli, "ask", return_value=copy.deepcopy(reply)),
             redirect_stdout(slow_out),
         ):
@@ -2569,9 +2562,7 @@ class StatusAndModes(ProcCase):
             rc = cli.cmd_status(framework._fast_status_args(["status"]))
         self.assertEqual(rc, 0)
         snapshot.assert_called_once()
-        self.assertEqual(
-            snapshot.call_args[0][0], {"mem": {"enabled": False}}
-        )
+        self.assertEqual(snapshot.call_args[0][0], {"mem": {"enabled": False}})
 
     def test_mode_gates(self):
         want = {

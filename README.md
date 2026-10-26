@@ -84,7 +84,7 @@ fa:d1:00:32:ce:b1:b9:fd:73:05:05:76:75:54:37:25
 and answer `y`. Updates arrive with the rest of your system: `sudo xbps-install -Su`. The
 repository serves glibc and musl builds for x86_64, i686, aarch64, armv7l and armv6l.
 
-**2. From a release file.** Download `taema-0.5.0_1.noarch.xbps` from the
+**2. From a release file.** Download `taema-0.6.0_1.noarch.xbps` from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty directory:
 
 ```sh

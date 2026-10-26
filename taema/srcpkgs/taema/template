@@ -1,6 +1,6 @@
 # Template file for 'taema'
 pkgname=taema
-version=0.5.0
+version=0.6.0
 revision=1
 build_wrksrc=taema
 build_style=gnu-makefile
@@ -12,7 +12,7 @@ maintainer="soubarnak <soubarna@live.in>"
 license="custom:PolyForm-Noncommercial-1.0.0"
 homepage="https://github.com/Bongbetic/taema"
 distfiles="https://github.com/Bongbetic/taema/archive/refs/tags/taema-v${version}.tar.gz"
-checksum=cd972e64098cfd00ae69060c35ef9eed6cca3f85e12ced4233ffb49ab2c87212
+checksum=5914930d7822e13c6a9cc1dbff83f024b537e98c94cbcb1f31c57e3d67251989
 system_groups="taema"
 conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 

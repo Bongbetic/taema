@@ -26,6 +26,21 @@ _COMMANDS = {
         {"session": "string", "pid": "integer", "facts": "object"},
         ("session", "pid"),
     ),
+    "notify_poll": (
+        {"session": "string", "pid": "integer", "since_seq": "integer"},
+        ("session", "pid"),
+    ),
+    "notify_result": (
+        {
+            "session": "string",
+            "pid": "integer",
+            "kind": "string",
+            "nonce": "string",
+            "choice": "string",
+            "decision_id": "integer",
+        },
+        ("session", "pid", "kind"),
+    ),
     "job_done": (
         {
             "shell_pid": "integer",
@@ -414,7 +429,7 @@ def _validate_args(command, args):
         pid = args.get("owner") if command == "register" else args.get("shell_pid")
         if pid is not None and pid <= 1:
             _fail("process id must be greater than one")
-    if command in ("register_agent", "agent_beat"):
+    if command in ("register_agent", "agent_beat", "notify_poll", "notify_result"):
         if not args["session"] or len(args["session"]) > 64:
             _fail("agent session is empty or too long")
         if args["pid"] <= 1:

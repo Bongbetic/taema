@@ -357,6 +357,9 @@ def render_status(model, args, summary=False):
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),
     ]
+    muted = details.get("muted")
+    if muted:
+        lines.append("muted: %s" % ", ".join(sorted(muted)))
     agents = details.get("agents")
     if isinstance(agents, dict):
         if not agents:

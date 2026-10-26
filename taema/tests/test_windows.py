@@ -1117,6 +1117,117 @@ class UnitWindowTableTest(unittest.TestCase):
         self.assertTrue(daemon._unit_wants_windowless(None))
 
 
+class WindowlessPolicyTests(unittest.TestCase):
+    def _daemon(self, grace=30, mode="enforce"):
+        from taema.daemon import service
+        from tests.test_phase0 import FakeCg, make_cfg
+
+        cg = FakeCg().__enter__()
+        self.addCleanup(cg.__exit__)
+        cg.leaf("app-x", [4242], cpu=0)
+        cfg = make_cfg(
+            os.path.join(cg.root, "state"),
+            mode=mode,
+            agent={"windowless_grace": grace},
+        )
+        daemon = service.Daemon(cfg)
+        register(daemon)
+        daemon.handle(
+            {
+                "cmd": "window_event",
+                "session": "s1",
+                "pid": os.getpid(),
+                "kind": "snapshot",
+                "backend": "niri",
+                "windows": [],
+            }
+        )
+        return cg, daemon
+
+    def test_experimental_gate_blocks_the_pass(self):
+        _cg, daemon = self._daemon()
+        daemon.cfg.setdefault("experimental", {})["window_close"] = False
+        with mock.patch.object(daemon, "auto_stop_path") as stopper:
+            daemon.windowless_pass(now=1000.0 + 3600)
+        stopper.assert_not_called()
+
+    def test_keep_policy_never_stops(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        with (
+            mock.patch.object(daemon, "_last_window_policy", return_value="keep"),
+            mock.patch.object(daemon, "auto_stop_path") as stopper,
+        ):
+            daemon.windowless_pass(now=1000.0 + 3600)
+        stopper.assert_not_called()
+
+    def test_quit_policy_stops_without_pair_answers(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        with (
+            mock.patch.object(daemon, "_last_window_policy", return_value="quit"),
+            mock.patch.object(daemon, "authorize") as authorize,
+            mock.patch.object(daemon, "auto_stop_path", return_value=True) as stopper,
+        ):
+            authorize.return_value = mock.Mock(verdict="keep")
+            daemon.windowless_pass(now=1000.0 + 3600)
+        stopper.assert_called_once()
+
+    def test_ask_queues_review_and_holds(self):
+        from taema.model import authorization
+
+        _cg, daemon = self._daemon(mode="adopt")
+        daemon._windowless_since = {"app-x": 1000.0}
+        with (
+            mock.patch.object(
+                daemon,
+                "_pair_scope_facts",
+                return_value=authorization.Facts(scope="app-x", pair_action="ask"),
+            ),
+            mock.patch.object(daemon, "auto_stop_path") as stopper,
+        ):
+            daemon.windowless_pass(now=1000.0 + 3600)
+        stopper.assert_not_called()
+        open_reviews = [
+            review
+            for review in daemon.store.data.get("reviews", [])
+            if review.get("state") == "open"
+        ]
+        self.assertEqual(len(open_reviews), 1)
+        self.assertIn(open_reviews[0]["id"], daemon._windowless_ask)
+
+    def test_reopen_records_keep_evidence(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        daemon._windowless_ask = {7: ("app-x", "x")}
+        daemon.window_state["s1"]["windows"] = {
+            1: {"app_id": "x", "pid": None, "start": None, "focus": False}
+        }
+        with mock.patch.object(
+            daemon, "live_window_scopes", return_value={"app-x": {"count": 1}}
+        ):
+            daemon.windowless_pass(now=1000.0 + 5)
+        daemon.store.save()
+        timeline = daemon.store.db.history_timeline(scope="app-x", limit=50)
+        self.assertTrue(
+            any(event.get("event") == "windowless_keep" for event in timeline["events"])
+        )
+        self.assertNotIn(7, daemon._windowless_ask)
+
+    def test_unit_desktop_policy_is_validated(self):
+        from taema.config import policy as cfg_policy
+
+        unit = {
+            "unit": {"name": "app-x", "kind": "app"},
+            "match": {"comm": "x"},
+            "desktop": {"app_id": "org.x", "on_last_window": "quit"},
+        }
+        self.assertEqual(cfg_policy.validate_unit(unit), [])
+        unit["desktop"]["on_last_window"] = "explode"
+        errors = cfg_policy.validate_unit(unit)
+        self.assertTrue(any("on_last_window" in error for error in errors))
+
+
 class WindowlessPassTest(unittest.TestCase):
     def _daemon(self, grace=30):
         from taema.daemon import service

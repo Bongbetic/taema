@@ -767,6 +767,7 @@ _UNIT_TABLES = {
     },
     "match": {"exe", "comm", "cmdline_contains", "env_exclude"},
     "window": {"backend", "requires_window"},
+    "desktop": {"app_id", "on_last_window"},
     "mem": {"class", "background", "save_state", "pause", "swap_max", "max"},
     "kill": {"graceful", "keep", "hook", "never_stop", "survive_logout"},
     "gc": {
@@ -871,6 +872,18 @@ def validate_unit(unit, peaks=None):
         errors.append("[window] backend must be a non-empty string")
     if "requires_window" in window and not isinstance(window["requires_window"], bool):
         errors.append("[window] requires_window must be true or false")
+    desk = unit.get("desktop", {})
+    if not isinstance(desk, dict):
+        errors.append("[desktop] must be a table")
+        desk = {}
+    if "app_id" in desk and not isinstance(desk["app_id"], str):
+        errors.append("[desktop] app_id must be a string")
+    if "on_last_window" in desk and desk["on_last_window"] not in (
+        "ask",
+        "quit",
+        "keep",
+    ):
+        errors.append("[desktop] on_last_window must be ask, quit, or keep")
     kill = unit.get("kill", {})
     graceful = kill.get("graceful")
     if graceful is not None and (

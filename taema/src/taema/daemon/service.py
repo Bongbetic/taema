@@ -206,6 +206,7 @@ class Daemon:
         self.window_state = {}  # session -> {windows, focused, pids, updated}
         self._window_rates = {}  # session -> [recent window event timestamps]
         self._windowless_since = {}  # scope -> when it was last seen windowed
+        self._windowless_ask = {}  # review id -> (scope, app key) awaiting an answer
         self.launch_reservations = {}  # scope -> {app, unit, pid, expires, owner}
         self._state_gen = 0  # bumped by every state-changing command
         self._status_cache = None  # (gen, monotonic ts, reply); 1s TTL backstop
@@ -5360,18 +5361,142 @@ class Daemon:
             return 300
         return min(10000, max(1, weight))
 
-    def windowless_pass(self, now=None):
-        """Stop app scopes windowless past grace under learned authority.
+    def _window_close_enabled(self):
+        """Window-close lifecycle is on unless [experimental] turns it off."""
+        experimental = self.cfg.get("experimental", {})
+        return not (
+            isinstance(experimental, dict) and experimental.get("window_close") is False
+        )
 
-        Windowed scopes reset their clock; opted-out units, frozen
-        scopes, and anything the ladder refuses are left alone. Undo
-        never resets the clock: only windows do.
+    def _windowless_app_key(self, scope, unit, path):
+        """App identity key for a windowless scope.
+
+        The identity key of a member process when one is known, else
+        the unit name with its app- prefix stripped, else the scope.
         """
+        try:
+            members = cgroup.tree_procs(path)
+        except OSError:
+            members = []
+        for pid in members:
+            try:
+                key = policy.app_key(pid, units=self.units)
+            except (OSError, ValueError):
+                continue
+            if key:
+                return key
+        if isinstance(unit, dict):
+            name = (unit.get("unit") or {}).get("name")
+            if isinstance(name, str) and name:
+                return name[4:] if name.startswith("app-") else name
+        return os.path.basename(scope.rstrip("/")) or scope
+
+    def _last_window_policy(self, scope, unit, path):
+        """ask, quit, or keep for a scope whose last window closed.
+
+        A unit's [desktop] on_last_window wins, then the learned app
+        identity, then the default: ask.
+        """
+        if isinstance(unit, dict):
+            chosen = (unit.get("desktop") or {}).get("on_last_window")
+            if chosen in ("ask", "quit", "keep"):
+                return chosen
+        key = self._windowless_app_key(scope, unit, path)
+        identity = self.store.db.app_identity(key)
+        if isinstance(identity, dict) and identity.get("on_last_window") in (
+            "ask",
+            "quit",
+            "keep",
+        ):
+            return identity["on_last_window"]
+        return "ask"
+
+    def _windowless_grace_for(self, app_key):
+        """Per-app windowless grace: base grace, widened by keep evidence."""
+        base = self.cfg.get("agent", {}).get("windowless_grace", 30)
+        if isinstance(base, bool) or not isinstance(base, (int, float)):
+            base = 30
+        learned = self.store.data.get("windowless_grace", {})
+        if isinstance(learned, dict) and isinstance(learned.get(app_key), (int, float)):
+            return max(0.0, float(learned[app_key]))
+        return max(0.0, float(base))
+
+    def _widen_windowless_grace(self, app_key):
+        learned = self.store.data.setdefault("windowless_grace", {})
+        if not isinstance(learned, dict):
+            learned = {}
+            self.store.data["windowless_grace"] = learned
+        current = learned.get(app_key)
+        if not isinstance(current, (int, float)):
+            current = self._windowless_grace_for(app_key)
+        learned[app_key] = min(600.0, max(30.0, float(current) * 2))
+        self.store.dirty = True
+
+    def _queue_windowless_review(self, scope, path, app_key):
+        """Ask what to do with a windowless scope: review plus notification."""
+        pids = cgroup.tree_procs(path)
+        infos = self._infos(pids)
+        owners = {}
+        for info in infos:
+            owner = info.get("origin") or info.get("key")
+            if owner:
+                owners.setdefault(owner, []).append(
+                    {"pid": info["pid"], "key": info["key"]}
+                )
+        before = self.store.data.get("review_seq", 0)
+        review = None
+        if owners:
+            for owner, members in owners.items():
+                candidate = self.store.add_review(
+                    owner,
+                    members,
+                    scope,
+                    memory=self._review_memory(scope),
+                    provenance=self._review_provenance(owner, members),
+                )
+                if candidate and candidate["id"] > before:
+                    review = candidate
+        if review is None:
+            candidate = self.store.add_scope_review(scope, "last window closed")
+            if candidate and candidate["id"] > before:
+                review = candidate
+        if review is None:
+            return None
+        self._windowless_ask[review["id"]] = (scope, app_key)
+        if owners and review.get("kind") != "scope":
+            self.store.log(
+                event="review_created",
+                id=review["id"],
+                owner=review.get("owner"),
+                scope=scope,
+                survivors=review["survivors"],
+                pids=review["pids"],
+                source="windowless",
+            )
+            self._emit_review_job(review)
+        else:
+            self.store.log(
+                event="gc_review_created",
+                id=review["id"],
+                scope=scope,
+                why="last window closed",
+            )
+        self._save_if_idle()
+        return review
+
+    def windowless_pass(self, now=None):
+        """Run the last-window lifecycle for app scopes without windows.
+
+        Windowed scopes reset their clock (and record keep evidence
+        when a question was pending); frozen scopes and units that do
+        not require windows are left alone. Past the per-app grace,
+        the scope's on_last_window policy decides: ask queues a review
+        and holds, quit stops as if the root had exited, keep leaves
+        the app running. Behind [experimental] window_close.
+        """
+        if not self._window_close_enabled():
+            return
         now = time.time() if now is None else now
-        grace = self.cfg.get("agent", {}).get("windowless_grace", 30)
-        if isinstance(grace, bool) or not isinstance(grace, (int, float)):
-            grace = 30
-        grace = max(0.0, float(grace))
         live = self.live_window_scopes()
         try:
             base = cgroup.base()
@@ -5389,6 +5514,22 @@ class Daemon:
             if not first.startswith(("app-", "scope-")):
                 continue
             if scope in live:
+                asked = [
+                    review_id
+                    for review_id, (asked_scope, _key) in list(
+                        self._windowless_ask.items()
+                    )
+                    if asked_scope == scope
+                ]
+                for review_id in asked:
+                    _scope, app_key = self._windowless_ask.pop(review_id)
+                    self.store.log(
+                        event="windowless_keep",
+                        scope=scope,
+                        app=app_key,
+                        why="window reopened while a close was pending",
+                    )
+                    self._widen_windowless_grace(app_key)
                 self._windowless_since.pop(scope, None)
                 continue
             try:
@@ -5405,28 +5546,95 @@ class Daemon:
                     key=lambda name: self._windowless_since[name],
                 )
                 del self._windowless_since[oldest]
-            if now - since < grace or scope in frozen:
+            if scope in frozen:
                 continue
             unit = engine.unit_for_leaf(self.units, os.path.basename(path))
             if not self._unit_wants_windowless(unit):
                 continue
-            decision = self.authorize(
-                authorization.GC_STOP, self._pair_scope_facts(path)
-            )
+            app_key = self._windowless_app_key(scope, unit, path)
+            if now - since < self._windowless_grace_for(app_key):
+                continue
+            chosen = self._last_window_policy(scope, unit, path)
+            if chosen == "keep":
+                continue
+            if chosen == "quit":
+                # A recorded quit needs no pair answers: stop as if
+                # the root had exited.
+                stopped = self.guarded(
+                    lambda: self.auto_stop_path(
+                        path,
+                        "windowless last-window close",
+                        False,
+                        authority=self.effective_authority["value"],
+                        trigger=authorization.GC_STOP,
+                    )
+                )
+                if stopped:
+                    self.store.log(
+                        event="windowless_close",
+                        scope=scope,
+                        app=app_key,
+                        why="last window closed; policy quit",
+                    )
+                continue
+            asked_ids = [
+                review_id
+                for review_id, (asked_scope, _key) in self._windowless_ask.items()
+                if asked_scope == scope
+            ]
+            if asked_ids:
+                reviews = {
+                    review.get("id"): review
+                    for review in self.store.data.get("reviews", [])
+                    if isinstance(review, dict)
+                }
+                if any(
+                    (reviews.get(review_id) or {}).get("state") == "open"
+                    for review_id in asked_ids
+                ):
+                    continue
+                # The question lapsed unanswered: remember the keep
+                # evidence, widen this app's grace, and restart it.
+                for review_id in asked_ids:
+                    self._windowless_ask.pop(review_id, None)
+                self._widen_windowless_grace(app_key)
+                self._windowless_since[scope] = now
+                continue
+            facts = self._pair_scope_facts(path)
+            decision = self.authorize(authorization.GC_STOP, facts)
             if decision.verdict == authorization.WOULD_ACT:
-                self.log_would_stop("windowless_would_stop", scope, "past grace")
+                if self.mode == "observe":
+                    self.log_would_stop("windowless_would_stop", scope, "past grace")
+                else:
+                    self._queue_windowless_review(scope, path, app_key)
                 continue
             if decision.verdict != authorization.ACT:
+                # A pair that still needs an answer is the ask case:
+                # queue the windowless review. Vetoes, holds, and
+                # non-explicit stops stay silent.
+                if (
+                    decision.slot == authorization.AUTHORITY
+                    and facts.pair_action != "stop"
+                    and self.mode != "observe"
+                ):
+                    self._queue_windowless_review(scope, path, app_key)
                 continue
-            self.guarded(
+            stopped = self.guarded(
                 lambda: self.auto_stop_path(
                     path,
-                    "windowless past grace",
+                    "windowless last-window close",
                     True,
                     authority=self.effective_authority["value"],
                     trigger=authorization.GC_STOP,
                 )
             )
+            if stopped:
+                self.store.log(
+                    event="windowless_close",
+                    scope=scope,
+                    app=app_key,
+                    why="last window closed",
+                )
         for scope in list(self._windowless_since):
             if scope in live:
                 del self._windowless_since[scope]
@@ -5593,6 +5801,39 @@ class Daemon:
             or not reply.get("ok", True)
         ):
             return {"error": "review is missing, expired, or not answerable"}
+        asked = self._windowless_ask.pop(mapping["review_id"], None)
+        if asked is not None:
+            scope, app_key = asked
+            if choice == "stop":
+                self.store.db.set_app_last_window(app_key, "quit")
+                try:
+                    base = cgroup.base()
+                    path = os.path.join(base, scope)
+                except OSError:
+                    path = None
+                if path is not None:
+                    stopped = self.guarded(
+                        lambda: self.auto_stop_path(
+                            path,
+                            "windowless last-window close",
+                            False,
+                            authority=self.effective_authority["value"],
+                            trigger=authorization.GC_STOP,
+                        )
+                    )
+                    if stopped:
+                        self.store.log(
+                            event="windowless_close",
+                            scope=scope,
+                            app=app_key,
+                            why="last window closed; answered quit now",
+                        )
+                self._windowless_since.pop(scope, None)
+            elif choice == "never":
+                self.store.db.set_app_last_window(app_key, "keep")
+                self._widen_windowless_grace(app_key)
+            elif choice == "keep":
+                self._widen_windowless_grace(app_key)
         return {"ok": True, "review_id": mapping["review_id"], "choice": choice}
 
     def _countdown_answer(self, msg):

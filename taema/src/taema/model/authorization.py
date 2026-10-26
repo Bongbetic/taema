@@ -193,6 +193,8 @@ class Facts:
     pair_reason: str = ""
     pair_explicit: bool = False
     learn_authority: str = "learned"
+    require_window: bool = False
+    windowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -506,6 +508,8 @@ def _authority(trigger: str, mode: str, facts: Facts) -> tuple[Vote, str]:
     pair authority is still re-checked at actuation after an `act` verdict."""
     if trigger == SESSION_END and facts.unit_survive_logout:
         return "deny", "unit authority: unit sets kill.survive_logout"
+    if trigger in (GC_STOP, SESSION_END) and facts.require_window and facts.windowed:
+        return "deny", "window authority: scope still has windows"
     if (
         mode in ("adopt", "auto")
         and trigger in (GC_STOP, JOB_SURVIVORS, SESSION_END)

@@ -204,6 +204,7 @@ class Daemon:
         self.review_nonces = {}  # nonce -> review awaiting a toast answer
         self.window_state = {}  # session -> {windows, focused, pids, updated}
         self._window_rates = {}  # session -> [recent window event timestamps]
+        self._windowless_since = {}  # scope -> when it was last seen windowed
         self._recovery_notified = set()  # sessions told about store recovery
         self._digest_at = {}  # session -> last digest job timestamp
         self._close_history = {}  # app -> [close timestamps, last hour]
@@ -1436,12 +1437,18 @@ class Daemon:
             denied = next(item for item in decisions if item[0] != "stop")
             action, reason, explicit = denied[0], denied[2], False
         scope = cgroup.rel(path)
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        table = (unit or {}).get("window", {})
+        if not isinstance(table, dict):
+            table = {}
         return authorization.Facts(
             scope=scope,
             leftover=scope.startswith(engine.LEFTOVER + "/"),
             pair_action=action,
             pair_reason=reason,
             pair_explicit=explicit,
+            require_window=table.get("requires_window", True) is True,
+            windowed=scope in self.live_window_scopes(),
         )
 
     def auto_stop_path(
@@ -4861,14 +4868,18 @@ class Daemon:
             return {"error": "bad request"}
         now = time.time()
         recent = [ts for ts in self._window_rates.get(session, []) if now - ts < 1.0]
-        if len(recent) >= 50:
+        if len(recent) >= self._max_window_events():
             self._window_rates[session] = recent
             return {"ok": True, "dropped": True}
         recent.append(now)
         self._window_rates[session] = recent
         state = self.window_state.setdefault(
-            session, {"windows": {}, "focused": None, "pids": {}, "updated": 0}
+            session,
+            {"windows": {}, "focused": None, "pids": {}, "updated": 0, "backend": None},
         )
+        backend = msg.get("backend")
+        if isinstance(backend, str) and backend and len(backend) <= 32:
+            state["backend"] = backend
         if kind == "snapshot":
             return self._window_snapshot(state, msg)
         parsed = self._parse_window_fields(msg)
@@ -5099,6 +5110,86 @@ class Daemon:
             return 300
         return min(10000, max(1, weight))
 
+    def windowless_pass(self, now=None):
+        """Stop app scopes windowless past grace under learned authority.
+
+        Windowed scopes reset their clock; opted-out units, frozen
+        scopes, and anything the ladder refuses are left alone. Undo
+        never resets the clock: only windows do.
+        """
+        now = time.time() if now is None else now
+        grace = self.cfg.get("agent", {}).get("windowless_grace", 30)
+        if isinstance(grace, bool) or not isinstance(grace, (int, float)):
+            grace = 30
+        grace = max(0.0, float(grace))
+        live = self.live_window_scopes()
+        try:
+            base = cgroup.base()
+            top = sorted(cgroup.subdirs(base)) if os.path.isdir(base) else []
+        except OSError:
+            top = []
+        frozen = self.store.data.get("frozen_scopes", {})
+        if not isinstance(frozen, dict):
+            frozen = {}
+        visited = set()
+        for path in top:
+            scope = cgroup.rel(path)
+            visited.add(scope)
+            first = scope.split("/", 1)[0]
+            if not first.startswith(("app-", "scope-")):
+                continue
+            if scope in live:
+                self._windowless_since.pop(scope, None)
+                continue
+            try:
+                members = cgroup.tree_procs(path)
+            except OSError:
+                members = []
+            if not members:
+                self._windowless_since.pop(scope, None)
+                continue
+            since = self._windowless_since.setdefault(scope, now)
+            if len(self._windowless_since) > 512:
+                oldest = min(
+                    self._windowless_since,
+                    key=lambda name: self._windowless_since[name],
+                )
+                del self._windowless_since[oldest]
+            if now - since < grace or scope in frozen:
+                continue
+            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            if not self._unit_wants_windowless(unit):
+                continue
+            decision = self.authorize(
+                authorization.GC_STOP, self._pair_scope_facts(path)
+            )
+            if decision.verdict == authorization.WOULD_ACT:
+                self.log_would_stop("windowless_would_stop", scope, "past grace")
+                continue
+            if decision.verdict != authorization.ACT:
+                continue
+            self.guarded(
+                lambda: self.auto_stop_path(
+                    path,
+                    "windowless past grace",
+                    True,
+                    authority=self.effective_authority["value"],
+                    trigger=authorization.GC_STOP,
+                )
+            )
+        for scope in list(self._windowless_since):
+            if scope in live:
+                del self._windowless_since[scope]
+                continue
+            if scope in visited:
+                continue
+            try:
+                members = cgroup.tree_procs(os.path.join(base, scope))
+            except OSError:
+                members = []
+            if not members:
+                del self._windowless_since[scope]
+
     def live_window_scopes(self):
         """Scope -> {count, focused} from up agents with revalidated pids."""
         scopes = {}
@@ -5120,6 +5211,37 @@ class Daemon:
                 if state.get("focused") == window_id:
                     entry["focused"] = True
         return scopes
+
+    def _unit_wants_windowless(self, unit):
+        """Whether a unit joins the windowless lifecycle.
+
+        The unit must require a window (the default), and its backend
+        must be feeding data: without evidence, windowlessness is
+        unprovable and the scope is left alone.
+        """
+        unit = unit or {}
+        table = unit.get("window", {})
+        if not isinstance(table, dict):
+            table = {}
+        if table.get("requires_window", True) is not True:
+            return False
+        want = table.get("backend", "auto")
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            if session not in self.window_state:
+                continue
+            if want in ("auto", None, ""):
+                return True
+            if self.window_state[session].get("backend") == want:
+                return True
+        return False
+
+    def _max_window_events(self):
+        limit = self.cfg.get("agent", {}).get("max_events_per_s", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            return 50
+        return min(1000, max(1, limit))
 
     def _notify_capable_agents(self):
         """Up sessions whose agent can show actions."""
@@ -7432,6 +7554,9 @@ class Daemon:
             if now - self.last.get("freeze", 0.0) >= 60.0:
                 self.last["freeze"] = now
                 self.guarded(self.freeze_pass)
+            if now - self.last.get("windowless", 0.0) >= 30.0:
+                self.last["windowless"] = now
+                self.guarded(lambda: self.windowless_pass(now=now))
             self._run_listener_wake_if_due(now)
             self.drain_collector_events()
             self.guarded(self.agent_watch_pass)

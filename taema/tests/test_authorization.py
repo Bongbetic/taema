@@ -649,5 +649,37 @@ class ManualKillRouting(unittest.TestCase):
         self.assertEqual(out.getvalue(), "scope scope-x stopped\n")
 
 
+class RequireWindow(unittest.TestCase):
+    """AC 3 (#61): require_window units keep their windowed scopes on stop triggers."""
+
+    def _decide(self, trigger, windowed, require_window=True):
+        facts = authorization.Facts(
+            scope="app-x", require_window=require_window, windowed=windowed
+        )
+        return authorization.authorize(trigger, "auto", facts)
+
+    def test_windowed_gc_stop_is_kept(self):
+        d = self._decide(authorization.GC_STOP, windowed=True)
+        self.assertEqual(d.verdict, authorization.KEEP)
+        self.assertEqual(d.slot, authorization.AUTHORITY)
+
+    def test_windowed_session_end_is_kept(self):
+        d = self._decide(authorization.SESSION_END, windowed=True)
+        self.assertEqual(d.verdict, authorization.KEEP)
+        self.assertEqual(d.slot, authorization.AUTHORITY)
+
+    def test_windowless_gc_stop_still_acts(self):
+        d = self._decide(authorization.GC_STOP, windowed=False)
+        self.assertEqual(d.verdict, authorization.ACT)
+
+    def test_opted_out_unit_stops_windowed(self):
+        d = self._decide(authorization.GC_STOP, windowed=True, require_window=False)
+        self.assertEqual(d.verdict, authorization.ACT)
+
+    def test_manual_kill_ignores_windows(self):
+        d = self._decide(authorization.MANUAL_STOP, windowed=True)
+        self.assertEqual(d.verdict, authorization.ACT)
+
+
 if __name__ == "__main__":
     unittest.main()

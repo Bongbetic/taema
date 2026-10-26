@@ -222,6 +222,10 @@ class Agent:
         backend = self.window_backend
         if backend is None:
             return
+        limit = (self.cfg.get("agent", {}) or {}).get("max_events_per_s", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            limit = 50
+        limit = min(1000, max(1, limit))
         now = int((clock or time.time)())
         if self._window_stream is None:
             try:
@@ -252,8 +256,8 @@ class Agent:
         except (windows_mod.WindowError, OSError):
             self._close_window_stream()
         batch, self._window_pending = (
-            self._window_pending[:50],
-            self._window_pending[50:],
+            self._window_pending[:limit],
+            self._window_pending[limit:],
         )
         for event in batch:
             self._send_window(
@@ -287,6 +291,7 @@ class Agent:
             "session": self.session,
             "pid": self.pid,
             "time": now,
+            "backend": self.window_backend.name,
             **fields,
         }
         if message.get("window_id") is None:

@@ -53,6 +53,7 @@ _COMMANDS = {
             "title": "string",
             "windows": "array",
             "time": "integer",
+            "backend": "string",
         },
         ("session", "pid", "kind"),
     ),

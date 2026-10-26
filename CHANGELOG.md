@@ -2,6 +2,18 @@
 
 ## Behaviour changes
 
+### Windowless lifecycle
+
+App scopes that lose their last window are tracked, and once they stay
+windowless past `agent.windowless_grace` (30 seconds) the daemon stops
+them under the same pair authority as GC, every 30 seconds. Only windows
+reset the clock — undo never does — and opted-out units, frozen scopes,
+and anything the ladder refuses are left alone. Without a feeding window
+backend nothing is tracked or stopped: windowlessness is unprovable and
+fail-closed. GC stops and session end now carry the unit's
+`requires_window` flag (default true) and the scope's live window state,
+so the ladder keeps scopes that still have windows.
+
 ### Niri window feed
 
 The session agent streams window state from niri over `$NIRI_SOCKET`

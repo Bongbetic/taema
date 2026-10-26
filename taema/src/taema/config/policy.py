@@ -766,6 +766,7 @@ _UNIT_TABLES = {
         "group_by_qmp",
     },
     "match": {"exe", "comm", "cmdline_contains", "env_exclude"},
+    "window": {"backend", "requires_window"},
     "mem": {"class", "background", "save_state", "pause", "swap_max"},
     "kill": {"graceful", "keep", "hook", "never_stop", "survive_logout"},
     "gc": {
@@ -827,6 +828,13 @@ def validate_unit(unit):
             errors.append("[match] %s must be a string" % key)
     if "env_exclude" in match and not isinstance(match["env_exclude"], dict):
         errors.append("[match] env_exclude must be a table")
+    window = unit.get("window", {})
+    if "backend" in window and (
+        not isinstance(window["backend"], str) or not window["backend"]
+    ):
+        errors.append("[window] backend must be a non-empty string")
+    if "requires_window" in window and not isinstance(window["requires_window"], bool):
+        errors.append("[window] requires_window must be true or false")
     kill = unit.get("kill", {})
     graceful = kill.get("graceful")
     if graceful is not None and (
@@ -914,8 +922,13 @@ def draft_unit(name, *, comm, exe, cmdline, cgroup):
         lines.append("comm = %s" % _json.dumps(comm))
     if exe and os.path.isabs(exe):
         lines.append("exe = %s" % _json.dumps(exe))
+    backend = "niri" if os.environ.get("NIRI_SOCKET") else "auto"
     lines.extend(
         [
+            "",
+            "[window]",
+            "backend = %s" % _json.dumps(backend),
+            "requires_window = true",
             "",
             "[mem]",
             'class = "app"',

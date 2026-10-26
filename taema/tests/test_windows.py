@@ -218,6 +218,17 @@ def register(daemon, session="s1"):
 
 
 class WindowEventTest(unittest.TestCase):
+    def test_rate_limit_reads_config(self):
+        daemon = make_daemon(agent={"max_events_per_s": 2})
+        register(daemon)
+        first = self._event(daemon, "opened", window_id=1, app_id="a")
+        second = self._event(daemon, "opened", window_id=2, app_id="b")
+        third = self._event(daemon, "opened", window_id=3, app_id="c")
+        self.assertTrue(first.get("ok") and not first.get("dropped"))
+        self.assertTrue(second.get("ok") and not second.get("dropped"))
+        self.assertTrue(third.get("ok") and third.get("dropped"))
+        self.assertEqual(len(daemon.window_state["s1"]["windows"]), 2)
+
     def _event(self, daemon, kind, window_id=1, **fields):
         message = {
             "cmd": "window_event",
@@ -781,6 +792,21 @@ class AgentWindowTest(unittest.TestCase):
             agent.drain_windows()
         self.assertEqual(seen, [])
 
+    def test_drain_cap_reads_config(self):
+        from taema import agent as agent_mod
+        from tests.test_phase0 import make_cfg, tmp
+
+        cfg = make_cfg(tmp(), mode="auto", agent={"max_events_per_s": 3})
+        lines = [niri_line({"WindowClosed": {"id": id}}) for id in range(1, 6)]
+        agent = agent_mod.Agent(
+            cfg, "s1", backend=None, window_backend=FakeWindowBackend(lines=lines)
+        )
+        seen = []
+        with mock.patch.object(agent, "_ask", side_effect=lambda m: seen.append(m)):
+            agent.drain_windows()
+        events = [m for m in seen if m["cmd"] == "window_event"]
+        self.assertEqual(len(events), 4)
+
     def test_connected_ticks_drain_windows(self):
         from tests.test_phase0 import tmp
 
@@ -1001,6 +1027,282 @@ class WindowColumnsTest(unittest.TestCase):
             rows, _memory = commands._ls_rows(cfg, store)
         row = next(row for row in rows if row["name"] == "app-a")
         self.assertIsNone(row["windows"])
+
+
+class UnitWindowTableTest(unittest.TestCase):
+    def test_valid_window_table(self):
+        from taema.config import policy
+
+        unit = {
+            "unit": {"name": "x", "kind": "app"},
+            "match": {"comm": "x"},
+            "window": {"backend": "niri", "requires_window": True},
+        }
+        self.assertEqual(policy.validate_unit(unit), [])
+
+    def test_window_table_types(self):
+        from taema.config import policy
+
+        unit = {
+            "unit": {"name": "x", "kind": "app"},
+            "match": {"comm": "x"},
+            "window": {"backend": "niri", "requires_window": "yes"},
+        }
+        self.assertTrue(
+            any("requires_window" in error for error in policy.validate_unit(unit))
+        )
+        unit["window"] = {"backend": "", "requires_window": True}
+        self.assertTrue(any("backend" in error for error in policy.validate_unit(unit)))
+
+    def test_draft_carries_backend_and_requirement(self):
+        from taema.config import policy
+
+        with mock.patch.dict(os.environ, {"NIRI_SOCKET": "/fake/niri.sock"}):
+            body = policy.draft_unit(
+                "x", comm="x", exe="/usr/bin/x", cmdline="x", cgroup="/x"
+            )
+        self.assertIn("[window]", body)
+        self.assertIn('backend = "niri"', body)
+        self.assertIn("requires_window = true", body)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("NIRI_SOCKET", None)
+            body = policy.draft_unit(
+                "x", comm="x", exe="/usr/bin/x", cmdline="x", cgroup="/x"
+            )
+        self.assertIn('backend = "auto"', body)
+
+    def test_daemon_honors_unit_requirement(self):
+        daemon = make_daemon()
+        register(daemon)
+        daemon.units = [
+            {"unit": {"name": "plain", "kind": "app"}},
+            {
+                "unit": {"name": "nowin", "kind": "app"},
+                "window": {"backend": "auto", "requires_window": False},
+            },
+            {
+                "unit": {"name": "other", "kind": "app"},
+                "window": {"backend": "hypothetical", "requires_window": True},
+            },
+        ]
+        daemon.handle(
+            {
+                "cmd": "window_event",
+                "session": "s1",
+                "pid": os.getpid(),
+                "kind": "snapshot",
+                "backend": "niri",
+                "windows": [],
+            }
+        )
+        self.assertTrue(daemon._unit_wants_windowless(daemon.units[0]))
+        self.assertFalse(daemon._unit_wants_windowless(daemon.units[1]))
+        self.assertFalse(daemon._unit_wants_windowless(daemon.units[2]))
+        self.assertEqual(daemon.window_state["s1"]["backend"], "niri")
+
+    def test_unknown_unit_defaults_to_required(self):
+        daemon = make_daemon()
+        register(daemon)
+        self.assertFalse(daemon._unit_wants_windowless(None))
+        daemon.handle(
+            {
+                "cmd": "window_event",
+                "session": "s1",
+                "pid": os.getpid(),
+                "kind": "snapshot",
+                "backend": "niri",
+                "windows": [],
+            }
+        )
+        self.assertTrue(daemon._unit_wants_windowless(None))
+
+
+class WindowlessPassTest(unittest.TestCase):
+    def _daemon(self, grace=30):
+        from taema.daemon import service
+        from tests.test_phase0 import FakeCg, make_cfg
+
+        cg = FakeCg().__enter__()
+        self.addCleanup(cg.__exit__)
+        cg.leaf("app-x", [4242], cpu=0)
+        cfg = make_cfg(
+            os.path.join(cg.root, "state"),
+            mode="enforce",
+            agent={"windowless_grace": grace},
+        )
+        daemon = service.Daemon(cfg)
+        register(daemon)
+        daemon.handle(
+            {
+                "cmd": "window_event",
+                "session": "s1",
+                "pid": os.getpid(),
+                "kind": "snapshot",
+                "backend": "niri",
+                "windows": [],
+            }
+        )
+        return cg, daemon
+
+    def test_windowless_past_grace_stops(self):
+        from taema.model import authorization
+
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        with (
+            mock.patch.object(daemon, "auto_stop_path", return_value=True) as stopper,
+            mock.patch.object(daemon, "_pair_scope_facts") as facts,
+        ):
+            facts.return_value = authorization.Facts(scope="app-x", pair_action="stop")
+            daemon.windowless_pass(now=1000.0 + 31)
+        stopper.assert_called_once()
+        args, kwargs = stopper.call_args
+        self.assertTrue(args[2])
+
+    def test_within_grace_stays_quiet(self):
+        _cg, daemon = self._daemon()
+        with mock.patch.object(daemon, "auto_stop_path") as stopper:
+            daemon.windowless_pass(now=1000.0)
+            daemon.windowless_pass(now=1000.0 + 29)
+        stopper.assert_not_called()
+        self.assertIn("app-x", daemon._windowless_since)
+
+    def test_windows_reset_tracking(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        daemon.window_state["s1"]["windows"] = {
+            1: {"app_id": "x", "pid": None, "start": None, "focus": False}
+        }
+        with (
+            mock.patch.object(
+                daemon, "live_window_scopes", return_value={"app-x": {"count": 1}}
+            ),
+            mock.patch.object(daemon, "auto_stop_path") as stopper,
+        ):
+            daemon.windowless_pass(now=2000.0)
+        stopper.assert_not_called()
+        self.assertNotIn("app-x", daemon._windowless_since)
+
+    def test_opted_out_unit_is_skipped(self):
+        _cg, daemon = self._daemon()
+        daemon.units = [
+            {
+                "unit": {"name": "app-x", "kind": "app"},
+                "window": {"backend": "auto", "requires_window": False},
+            }
+        ]
+        daemon._windowless_since = {"app-x": 1000.0}
+        with mock.patch.object(daemon, "auto_stop_path") as stopper:
+            daemon.windowless_pass(now=2000.0)
+        stopper.assert_not_called()
+
+    def test_observe_mode_does_not_stop(self):
+        from taema.daemon import service
+        from tests.test_phase0 import FakeCg, make_cfg
+
+        cg = FakeCg().__enter__()
+        self.addCleanup(cg.__exit__)
+        cg.leaf("app-x", [4242], cpu=0)
+        cfg = make_cfg(os.path.join(cg.root, "state"), mode="observe")
+        daemon = service.Daemon(cfg)
+        register(daemon)
+        daemon.handle(
+            {
+                "cmd": "window_event",
+                "session": "s1",
+                "pid": os.getpid(),
+                "kind": "snapshot",
+                "backend": "niri",
+                "windows": [],
+            }
+        )
+        daemon._windowless_since = {"app-x": 1000.0}
+        with mock.patch.object(daemon, "auto_stop_path") as stopper:
+            daemon.windowless_pass(now=2000.0)
+        stopper.assert_not_called()
+
+    def test_frozen_scopes_are_skipped(self):
+        _cg, daemon = self._daemon()
+        daemon.store.data["frozen_scopes"] = {"app-x": {}}
+        daemon._windowless_since = {"app-x": 1000.0}
+        with mock.patch.object(daemon, "auto_stop_path") as stopper:
+            daemon.windowless_pass(now=2000.0)
+        stopper.assert_not_called()
+
+    def test_dead_scopes_prune_tracking(self):
+        from taema.core import cgroup
+
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-gone": 1000.0}
+        with mock.patch.object(cgroup, "tree_procs", return_value=[]):
+            daemon.windowless_pass(now=2000.0)
+        self.assertNotIn("app-gone", daemon._windowless_since)
+
+    def test_undo_does_not_reset_tracking(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        action = daemon.store.record_auto_action("app-x", "stop", [], ["x"])
+        daemon.store.undo_decision(action["decision_id"])
+        self.assertEqual(daemon._windowless_since, {"app-x": 1000.0})
+
+    def test_probation_increments_without_learning(self):
+        daemon = make_daemon()
+        for _ in range(3):
+            daemon.store.auto_stopped("firefox", "helper")
+        pair = daemon.store._pair("firefox", "helper")
+        self.assertEqual(pair["probation"], 3)
+
+    def test_tick_schedules_the_pass(self):
+        _cg, daemon = self._daemon()
+        daemon.last["windowless"] = 0.0
+        with (
+            mock.patch.object(daemon, "windowless_pass") as passer,
+            mock.patch("time.time", return_value=1000.0),
+        ):
+            daemon.tick()
+        passer.assert_called_once_with(now=1000.0)
+
+
+class PairScopeWindowFactsTest(unittest.TestCase):
+    """AC 4 (#61): stop-trigger facts carry the unit window requirement."""
+
+    def _facts(self, daemon, path, live):
+        with mock.patch.object(daemon, "live_window_scopes", return_value=live):
+            return daemon._pair_scope_facts(path)
+
+    def _leaf(self):
+        from taema.core import cgroup
+
+        case = WindowlessPassTest("test_windowless_past_grace_stops")
+        cg, daemon = WindowlessPassTest._daemon(case, grace=30)
+        self.addCleanup(cg.__exit__)
+        return daemon, os.path.join(cgroup.base(), "app-x")
+
+    def test_defaults_require_window(self):
+        daemon, path = self._leaf()
+        facts = self._facts(daemon, path, {})
+        self.assertTrue(facts.require_window)
+        self.assertFalse(facts.windowed)
+
+    def test_windowed_scope_marks_windowed(self):
+        daemon, path = self._leaf()
+        facts = self._facts(daemon, path, {"app-x": {"count": 1, "focused": False}})
+        self.assertTrue(facts.windowed)
+
+    def test_opted_out_unit_clears_requirement(self):
+        from taema.governor import engine
+
+        daemon, path = self._leaf()
+        opt_out = {
+            "unit": {"name": "nowin", "kind": "app"},
+            "window": {"backend": "auto", "requires_window": False},
+        }
+        with (
+            mock.patch.object(daemon, "live_window_scopes", return_value={}),
+            mock.patch.object(engine, "unit_for_leaf", return_value=opt_out),
+        ):
+            facts = daemon._pair_scope_facts(path)
+        self.assertFalse(facts.require_window)
 
 
 class FocusThawTest(unittest.TestCase):

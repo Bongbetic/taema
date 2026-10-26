@@ -565,6 +565,10 @@ graceful = 10                 # seconds between SIGTERM and SIGKILL
 
 [gc]
 keep_while_children = true    # needed while it has child processes
+
+[window]
+backend = "niri"              # auto, or the backend that must feed evidence
+requires_window = true        # stop the scope once windowless past grace
 ```
 
 App units can carve child scopes out of an adopted tree. Each child is bound to its own

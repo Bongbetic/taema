@@ -2,6 +2,18 @@
 
 ## Behaviour changes
 
+### Status bar feed and quickshell widget
+
+`taema bar --format waybar|i3bar|json|plain [--follow]` writes one
+line per state change from subscriptions without polling:
+`tæma ⟲2 ❄1 ↓3 9.3G` with a tooltip and a class of ok, review,
+pressure, hold, or error. Status now also reports deprioritized scope
+count and bytes freed today. `widgets/taema-bar/` holds a quickshell
+widget consuming the json stream: mode, profile, reviews, frozen
+count, freed today, and pressure, with a popup for answering reviews,
+hold/snooze, profile switching, starting the agent, and opening the
+dashboard, all through the existing CLI.
+
 ### Desktop entry wrapping
 
 `taema desktop wrap NAME.desktop` writes a user-level override whose

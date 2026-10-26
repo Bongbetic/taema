@@ -2087,8 +2087,64 @@ class GraphicalSessionTest(unittest.TestCase):
 
     def test_image_build_installs_graphics(self):
         script = read_text(os.path.join(VM_DIR, "mkimage.sh"))
-        for package in ("weston", "mako", "grim", "libnotify", "mesa-dri"):
+        for package in (
+            "weston",
+            "niri",
+            "foot",
+            "grim",
+            "libnotify",
+            "mesa-dri",
+            "python3-dbus",
+            "python3-gobject",
+        ):
             self.assertIn(package, script)
+
+    def test_bootstrap_copies_the_notify_server(self):
+        sources = vmh.bootstrap_sources(
+            "/tmp/key.pub", "/tmp/repo", "/tmp/prev.xbps", ["graphical"]
+        )
+        names = [os.path.basename(source) for source in sources]
+        self.assertIn("notify_server.py", names)
+
+    def test_notify_server_records_and_parses_control(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "notify_server", os.path.join(VM_DIR, "notify_server.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "notify.jsonl")
+            module.record(log, {"event": "notify", "id": 1, "summary": "hi"})
+            module.record(log, {"event": "action", "id": 1, "action": "default"})
+            records = module.read_records(log)
+            self.assertEqual([r["event"] for r in records], ["notify", "action"])
+            self.assertEqual(records[0]["summary"], "hi")
+        self.assertEqual(
+            module.parse_control_line("invoke 3 default\n"), ("invoke", 3, "default")
+        )
+        self.assertEqual(module.parse_control_line("close 2"), ("close", 2, ""))
+        self.assertIsNone(module.parse_control_line("bogus"))
+        self.assertIn("actions", module.CAPABILITIES)
+
+    def test_niri_windows_argv(self):
+        with mock.patch.object(scenario.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout="[]", returncode=0)
+            scenario.niri_windows({"NIRI_SOCKET": "/run/niri.sock"})
+        argv = run.call_args[0][0]
+        self.assertEqual(argv, ["niri", "msg", "--json", "windows"])
+
+    def test_open_test_window_prefers_foot(self):
+        with (
+            mock.patch.object(
+                scenario.shutil, "which", side_effect=lambda name: "/usr/bin/" + name
+            ),
+            mock.patch.object(scenario.subprocess, "Popen") as popen,
+        ):
+            scenario.open_test_window({"WAYLAND_DISPLAY": "wayland-9"})
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[0], "foot")
 
 
 if __name__ == "__main__":

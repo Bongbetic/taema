@@ -622,6 +622,20 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
                 ("--interval",),
                 {"help": "seconds between snapshots (default 1)"},
             ),
+            (
+                ("--once",),
+                {
+                    "action": "store_true",
+                    "help": "print one snapshot and exit",
+                },
+            ),
+            (
+                ("--sort",),
+                {
+                    "metavar": "COLUMN",
+                    "help": "sort by cpu, mem, delta, psi, scope, or pid",
+                },
+            ),
         ),
     },
     {
@@ -630,7 +644,12 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         "help": "process trees grouped under scope headers",
         "handler": "cmd_tree",
         "read": True,
-        "arguments": (),
+        "arguments": (
+            (
+                ("target",),
+                {"nargs": "?", "help": "only scopes whose name contains TARGET"},
+            ),
+        ),
     },
     {
         "name": "unit",

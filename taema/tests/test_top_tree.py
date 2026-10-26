@@ -81,9 +81,9 @@ class TopRenderTests(unittest.TestCase):
         ]
         self.assertEqual(
             view.render_top(model, args()),
-            "PID SCOPE   USER %CPU %MEM RSS  THR S W CMD\n"
-            "10  scope-a ada  100.0 12.5 1.5K 4   R  cc1 foo.c\n"
-            "9   scope-a ada    2.5  4.2 512  1   S  sh\n",
+            "PID SCOPE   USER %CPU %MEM RSS  D/MIN PSI S W DEC CMD\n"
+            "10  scope-a ada  100.0 12.5 1.5K     +0     - R       cc1 foo.c\n"
+            "9   scope-a ada    2.5  4.2 512      +0     - S       sh\n",
         )
         # Narrow windows still fit: the whole row clips, not just the command.
         for line in view.render_top(model, args(width=40)).splitlines():
@@ -144,6 +144,100 @@ class TreeModelTests(unittest.TestCase):
             view.render_tree(model, args()),
             "scope-x\n└─ 50\n",
         )
+
+
+class TopColumnsTests(unittest.TestCase):
+    def test_delta_per_min_psi_and_decision(self):
+        prev = rows((10, 1, "S", 0))
+        curr = rows((10, 1, "S", 0))
+        details = {
+            10: {
+                "scope": "s",
+                "user": "u",
+                "mem": 1300,
+                "threads": 1,
+                "cmd": "a",
+                "psi": 2.5,
+                "decision": "keep",
+            }
+        }
+        previous_details = {10: {"mem": 1000}}
+        model = view.top_model(prev, curr, 30.0, 100, details, previous_details)
+        row = model[0]
+        self.assertAlmostEqual(row["delta_per_min"], 600.0)
+        self.assertAlmostEqual(row["psi"], 2.5)
+        self.assertEqual(row["decision"], "keep")
+
+    def test_sort_by_mem_then_scope(self):
+        prev = rows((10, 1, "S", 0), (20, 1, "S", 0))
+        curr = rows((10, 1, "S", 50), (20, 1, "S", 0))
+        details = {
+            10: {"scope": "b", "user": "u", "mem": 10, "threads": 1, "cmd": "a"},
+            20: {"scope": "a", "user": "u", "mem": 99, "threads": 1, "cmd": "b"},
+        }
+        by_mem = view.top_model(prev, curr, 1.0, 100, details, sort="mem")
+        self.assertEqual([row["pid"] for row in by_mem], [20, 10])
+        by_scope = view.top_model(prev, curr, 1.0, 100, details, sort="scope")
+        self.assertEqual([row["pid"] for row in by_scope], [20, 10])
+
+    def test_render_shows_delta_psi_decision(self):
+        model = [
+            {
+                "pid": 10,
+                "scope": "scope-a",
+                "user": "ada",
+                "cpu": 1.0,
+                "mem_pct": 0.1,
+                "mem": 8,
+                "threads": 1,
+                "state": "R",
+                "cmd": "x",
+                "delta_per_min": 12.0,
+                "psi": 0.5,
+                "decision": "stop",
+            }
+        ]
+        out = view.render_top(model, args())
+        self.assertIn("D/MIN", out)
+        self.assertIn("PSI", out)
+        self.assertIn("DEC", out)
+        self.assertIn("stop", out)
+
+
+class TreeExtrasTests(unittest.TestCase):
+    def test_target_filters_groups(self):
+        table = ProcTable(rows((10, 1, "S", 0), (20, 1, "S", 0)))
+        scopes = {10: "app-firefox", 20: "app-code"}
+        model = view.tree_model(table, scopes.get, target="firefox")
+        self.assertEqual([scope for scope, *_rest in model], ["app-firefox"])
+
+    def test_provenance_arrow_on_root(self):
+        table = ProcTable(rows((10, 1, "S", 0)))
+        model = view.tree_model(table, lambda pid: "scope-a", parents={1: "niri"})
+        out = view.render_tree(model, args())
+        self.assertIn("← niri", out)
+
+    def test_edges_rendered_under_scope(self):
+        table = ProcTable(rows((10, 1, "S", 0)))
+        model = view.tree_model(
+            table,
+            lambda pid: "scope-adb",
+            edges={"scope-adb": [("studio", "tcp 5037")]},
+        )
+        out = view.render_tree(model, args())
+        self.assertIn("⇠ studio: tcp 5037", out)
+
+
+class RegistryShapeTests(unittest.TestCase):
+    def test_top_has_once_and_sort_tree_has_target(self):
+        from taema.cli import registry
+
+        by_name = {entry["name"]: entry for entry in registry.COMMANDS}
+        top_names = {names[0] for names, _opts in by_name["top"]["arguments"]}
+        self.assertIn("--once", top_names)
+        self.assertIn("--sort", top_names)
+        tree_names = {names[0] for names, _opts in by_name["tree"]["arguments"]}
+        self.assertIn("target", tree_names)
 
 
 class ProcessHelpersTests(unittest.TestCase):

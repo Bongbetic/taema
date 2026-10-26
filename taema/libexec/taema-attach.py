@@ -65,9 +65,35 @@ def load_rules(path=None):
         )
     try:
         with open(path, "rb") as f:
-            return tomllib.load(f).get("protected", {})
+            protected = tomllib.load(f).get("protected", {})
     except (OSError, tomllib.TOMLDecodeError) as e:
         raise Refused("system config %s unreadable: %s" % (path, e))
+    if not _valid_rules(protected):
+        raise Refused("system config %s has invalid protected rules" % path)
+    return protected
+
+
+def _valid_rules(protected):
+    """Mirror the Rust helper's string_list: a string list or a bare string."""
+    if not isinstance(protected, dict):
+        return False
+    for key in ("comm", "cgroup_prefix"):
+        if not _string_list(protected.get(key)):
+            return False
+    env_prefix = protected.get("env_prefix")
+    if env_prefix is not None:
+        if not isinstance(env_prefix, dict):
+            return False
+        for value in env_prefix.values():
+            if not _string_list(value):
+                return False
+    return True
+
+
+def _string_list(value):
+    if value is None or isinstance(value, str):
+        return True
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
 def starttime(pid):

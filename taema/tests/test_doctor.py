@@ -122,6 +122,11 @@ class DoctorChecks(unittest.TestCase):
         store = kwargs.pop("store", self.store)
         units = kwargs.pop("units", [])
         group_ids = kwargs.pop("group_ids", [self.group_gid])
+        # A fixed backend: probing the real one makes the all-ok report
+        # depend on the machine having desktop notification tooling.
+        notify = kwargs.pop(
+            "notify", {"backend": "scripted", "capabilities": ["actions", "body"]}
+        )
         return doctor.diagnose(
             self.cfg,
             store,
@@ -129,6 +134,7 @@ class DoctorChecks(unittest.TestCase):
             system_root=self.system_root,
             uid=self.uid,
             group_ids=group_ids,
+            notify=notify,
             **kwargs,
         )
 

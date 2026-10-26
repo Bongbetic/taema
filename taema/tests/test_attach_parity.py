@@ -5,8 +5,8 @@ same pids) and compares exit code, stdout, stderr, and produced files.
 Log timestamps and temp paths are normalized before comparison.
 
 Cases marked code-only cover inputs where the Python helper crashes with a
-traceback (non-ASCII digits, out-of-range pids, mistyped root config): the
-Rust helper refuses cleanly with the same exit code instead.
+traceback (non-ASCII digits, out-of-range pids): the Rust helper refuses
+cleanly with the same exit code instead.
 """
 
 import importlib.machinery
@@ -85,6 +85,49 @@ class Sides:
     def setup(self, build):
         for side in ("py", "rs"):
             build(self.paths(side))
+
+
+class LoadRulesTests(unittest.TestCase):
+    """The Python helper refuses mistyped [protected] rules like the Rust one."""
+
+    def load(self, helper, text):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "taema.toml")
+        with open(path, "w") as f:
+            f.write(text)
+        os.chmod(path, 0o644)
+        real_stat = os.stat
+
+        def fake_stat(target, *args, **kwargs):
+            info = real_stat(target, *args, **kwargs)
+            if target == path:
+                return SimpleNamespace(
+                    st_uid=0, st_mode=info.st_mode, st_size=info.st_size
+                )
+            return info
+
+        with mock.patch.object(os, "stat", side_effect=fake_stat):
+            return helper.load_rules(path)
+
+    def test_mistyped_protected_refuses(self):
+        helper = load_helper()
+        with self.assertRaises(helper.Refused) as caught:
+            self.load(helper, "protected = 1\n")
+        self.assertIn("invalid protected rules", str(caught.exception))
+
+    def test_mistyped_rule_value_refuses(self):
+        helper = load_helper()
+        with self.assertRaises(helper.Refused):
+            self.load(helper, "[protected]\ncomm = 1\n")
+
+    def test_valid_rules_load(self):
+        rules = self.load(load_helper(), '[protected]\ncomm = ["x"]\n')
+        self.assertEqual(rules, {"comm": ["x"]})
+
+    def test_bare_string_rule_loads(self):
+        rules = self.load(load_helper(), '[protected]\ncomm = "x"\n')
+        self.assertEqual(rules, {"comm": "x"})
 
 
 class ParityTests(unittest.TestCase):
@@ -449,9 +492,7 @@ class ParityTests(unittest.TestCase):
         self.check("writable config", ["move", "scope-x", "99"], writable)
         self.check("dir config", ["move", "scope-x", "99"], directory)
         self.check("broken toml", ["move", "scope-x", "99"], broken_toml)
-        self.check(
-            "mistyped config", ["move", "scope-x", "99"], mistyped, code_only=True
-        )
+        self.check("mistyped config", ["move", "scope-x", "99"], mistyped)
 
     def test_sudo_gate(self):
         self.check(
@@ -519,7 +560,17 @@ class ParityTests(unittest.TestCase):
             "refusal after move", ["move", "scope-x", str(pid), "abc"], self.build_scope
         )
 
+    @staticmethod
+    def own_cgroup_is_session():
+        cg = cgroup_of(os.getpid())
+        return bool(re.fullmatch(r"/[0-9]+(/.*)?", cg)) or cg.startswith(
+            "/user/%d/" % os.getuid()
+        )
+
     def test_not_moved(self):
+        if not self.own_cgroup_is_session():
+            self.skipTest("test process is not in a session cgroup")
+
         def build(paths):
             self.write_config(paths)
             dest = os.path.join(paths["scope"], "scope-x")
@@ -999,7 +1050,6 @@ class ParityTests(unittest.TestCase):
             "scope not owned by uid ",
             "bad pid",
             "gone, skipped",
-            "not moved: ",
             "is protected",
             "is in protected cgroup ",
             "has protected ",
@@ -1026,6 +1076,10 @@ class ParityTests(unittest.TestCase):
             "OOM record directory must be root-owned and mode 0700",
             "pidfd_open(0) failed: ",
         ]
+        # The not-moved refusal needs the test process itself inside a
+        # session cgroup, which container runners lack.
+        if self.own_cgroup_is_session():
+            catalog.append("not moved: ")
         # The login-session refusal needs an own-uid pid outside a session
         # cgroup, which some machines lack.
         if self.foreign_cgroup_pid() is not None:

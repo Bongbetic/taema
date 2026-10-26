@@ -470,6 +470,8 @@ Useful options:
 taema run --bind NAME CMD...      # stop the scope when CMD itself exits
 taema run --owner PID NAME CMD... # stop the scope when PID exits
 taema run --join NAME CMD...      # add a process to an existing scope
+taema launch --app NAME CMD...    # start CMD inside its own reserved app scope
+taema launch --bind -- CMD...     # stop the app scope when CMD itself exits
 taema kill --dry-run NAME         # show the decisions, change nothing
 taema kill -t 3 NAME              # 3 s between SIGTERM and SIGKILL
 taema kill --keep adb NAME        # move adb aside instead of killing it

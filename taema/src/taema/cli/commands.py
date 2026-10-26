@@ -940,6 +940,93 @@ def cmd_run(a):
     os.execvp(a.cmd[0], a.cmd)
 
 
+# ---- launch -------------------------------------------------------------------------------
+
+
+def cmd_launch(a):
+    from .. import agent as agent_mod
+
+    cfg, _store, _units = _load(a)
+    cmd = list(getattr(a, "cmd", None) or [])
+    if not cmd:
+        return die("launch needs a command to run", 2)
+    app = getattr(a, "app", None) or os.path.basename(cmd[0])
+    if not app or not cgroup.valid_rel(app) or "/" in app or len(app) > 32:
+        return die("bad app name (use a-z 0-9 _ -, max 32)", 2)
+    base = cgroup.base()
+    if not os.path.isdir(base):
+        return die(
+            "%s missing; is the taema service running and are you in the taema group? (sv status taema)"
+            % base
+        )
+    if getattr(a, "dry_run", False):
+        print("dry run: reserve app-%s and attach %s" % (app, " ".join(cmd)))
+        return 0
+    unit = getattr(a, "unit", None) or None
+    owner = os.getpid() if getattr(a, "bind", False) else None
+    session = agent_mod.session_key()
+    reply = ask(
+        cfg,
+        {
+            "cmd": "launch_prepare",
+            "app": app,
+            "pid": os.getpid(),
+            "session": session,
+            "unit": unit,
+            "owner": owner,
+        },
+    )
+    if reply is None:
+        return _launch_offline(cfg, app, cmd)
+    if "error" in reply:
+        return die("launch failed: %s" % reply["error"])
+    scope = reply.get("scope", "")
+    if reply.get("via") == "agent":
+        attached = ask(cfg, {"cmd": "attach", "scope": scope, "pids": [os.getpid()]})
+        if not (attached and attached.get("ok")):
+            ask(cfg, {"cmd": "launch_release", "scope": scope})
+            return die(
+                "attach failed: %s"
+                % (attached or {}).get("error", "daemon did not attach")
+            )
+    else:
+        try:
+            engine.helper_move(cfg, scope, [os.getpid()])
+        except engine.Refused as e:
+            ask(cfg, {"cmd": "launch_release", "scope": scope})
+            return die("attach failed: %s" % e)
+    claim = ask(
+        cfg,
+        {
+            "cmd": "launch_claim",
+            "scope": scope,
+            "pid": os.getpid(),
+            "app": app,
+        },
+    )
+    if not (claim and claim.get("ok")):
+        ask(cfg, {"cmd": "launch_release", "scope": scope})
+        return die(
+            "launch failed: %s" % (claim or {}).get("error", "claim was refused")
+        )
+    os.execvp(cmd[0], cmd)
+
+
+def _launch_offline(cfg, app, cmd):
+    """Without a daemon there is no reservation: scope the leaf directly, unmanaged."""
+    leaf = "%s/app-%s" % (cgroup.base(), app)
+    try:
+        os.makedirs(leaf, exist_ok=True)
+        engine.helper_move(cfg, "app-" + app, [os.getpid()])
+    except (OSError, engine.Refused) as e:
+        return die("attach failed: %s" % e)
+    print(
+        "taema: daemon not running; app-%s is not auto-managed" % app,
+        file=sys.stderr,
+    )
+    os.execvp(cmd[0], cmd)
+
+
 # ---- kill ---------------------------------------------------------------------------------
 
 
@@ -1562,6 +1649,7 @@ def _why_identity(key, cfg, store, live=None):
             "kind": live.kind,
             "validated": bool(live.validated),
             "reason": live.reason or "",
+            "desktop_id": getattr(live, "desktop_id", None) or "",
         }
     persisted = store.app_identity(key) or {}
     invalid = policy.bad_owner(key, policy.owner_deny(cfg))
@@ -1571,6 +1659,7 @@ def _why_identity(key, cfg, store, live=None):
         "kind": persisted.get("kind") or key.split(":", 1)[0],
         "validated": invalid is None,
         "reason": invalid or "",
+        "desktop_id": persisted.get("desktop_id") or "",
     }
 
 
@@ -1900,12 +1989,23 @@ def cmd_explain(a):
             kill_count = sum(item["action"] == "kill" for item in plan)
             action = "stop" if kill_count else "keep"
             reason = "%d of %d members eligible to stop" % (kill_count, len(plan))
+            launch_apps = store.data.get("launch_apps") if store else None
+            launch = launch_apps.get(scope) if isinstance(launch_apps, dict) else None
+            if not isinstance(launch, dict):
+                launch = None
+            launch_key = members[0]["apps"][0] if launch and members else None
             explanation = _why_report(
                 cfg,
                 store,
+                key=launch_key,
                 target_scope=scope,
                 scope_live=True,
                 members=members,
+                provenance=(
+                    store.latest_app_instance(launch_key)
+                    if launch_key and store
+                    else None
+                ),
                 trigger=authorization.GC_STOP,
                 facts=facts,
                 action=action,
@@ -1920,6 +2020,10 @@ def cmd_explain(a):
                     },
                 ),
             )
+            if launch and explanation.get("identity") is not None:
+                explanation["identity"]["desktop_id"] = (
+                    explanation["identity"].get("desktop_id") or launch.get("app") or ""
+                )
             label = target_query
         elif selected.kind == "pid":
             pid = selected.pid

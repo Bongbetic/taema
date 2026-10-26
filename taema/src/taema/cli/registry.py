@@ -36,6 +36,25 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "launch",
+        "aliases": (),
+        "help": "launch CMD inside its own reserved app scope",
+        "handler": "cmd_launch",
+        "arguments": (
+            (("--app",), {"metavar": "NAME", "help": "app name for the scope"}),
+            (("--unit",), {"metavar": "UNIT", "help": "unit to record on the app"}),
+            (
+                ("--bind",),
+                {
+                    "action": "store_true",
+                    "help": "stop the scope when CMD itself exits",
+                },
+            ),
+            (("--dry-run",), {"action": "store_true"}),
+            (("cmd",), {"remainder": True}),
+        ),
+    },
+    {
         "name": "kill",
         "aliases": ("stop",),
         "help": "stop a scope; shared members are moved aside, not killed",

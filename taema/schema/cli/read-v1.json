@@ -727,6 +727,9 @@
     },
     "reason": {
      "type": "string"
+    },
+    "desktop_id": {
+     "type": "string"
     }
    },
    "additionalProperties": false

@@ -85,6 +85,31 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "bar",
+        "aliases": (),
+        "help": "stream bar state in waybar, i3bar, json, or plain",
+        "handler": "cmd_bar",
+        "read": True,
+        "arguments": (
+            (
+                ("--format",),
+                {
+                    "metavar": "FORMAT",
+                    "default": "plain",
+                    "choices": ("waybar", "i3bar", "json", "plain"),
+                    "help": "output format",
+                },
+            ),
+            (
+                ("--follow",),
+                {
+                    "action": "store_true",
+                    "help": "stream one line per state change",
+                },
+            ),
+        ),
+    },
+    {
         "name": "kill",
         "aliases": ("stop",),
         "help": "stop a scope; shared members are moved aside, not killed",

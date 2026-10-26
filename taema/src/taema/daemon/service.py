@@ -4497,6 +4497,8 @@ class Daemon:
                     )
                     if isinstance(record, dict)
                 ],
+                "deprioritized": self._deprioritized_count(),
+                "freed_today_bytes": self._freed_today_bytes(),
                 "config_error": self.config_error,
                 "config": list(self.cfg.get("_sources", [])),
                 "unit_errors": list(self.cfg.get("_unit_errors", [])),
@@ -4645,6 +4647,38 @@ class Daemon:
             "leftover_leaves": len(cgroup.subdirs(base + "/" + engine.LEFTOVER)),
             "auto_stops": list(self.auto_stops),
         }
+
+    def _deprioritized_count(self):
+        states = self.store.data.get("qos_scopes", {})
+        if not isinstance(states, dict):
+            return 0
+        return sum(
+            1
+            for state in states.values()
+            if isinstance(state, dict) and state.get("deprioritized") is True
+        )
+
+    def _freed_today_bytes(self):
+        try:
+            now = time.time()
+            midnight = (
+                now
+                - (time.localtime(now).tm_hour * 3600)
+                - (time.localtime(now).tm_min * 60)
+                - time.localtime(now).tm_sec
+            )
+            window = self.store.db.report_window(midnight, now, ())
+        except Exception:
+            return 0
+        freed = window.get("memory_freed_bytes", {})
+        if not isinstance(freed, dict):
+            return 0
+        total = 0
+        for key in ("stop", "reclaim"):
+            value = freed.get(key, 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                total += value
+        return total
 
     def guard_status(self):
         """Return only the guard state intended for the status view model."""

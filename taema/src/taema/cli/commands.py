@@ -54,6 +54,7 @@ knowledge = _LazyModule("knowledge", "taema.store.knowledge")
 policy = _LazyModule("policy", "taema.config.policy")
 transfer = _LazyModule("transfer", "taema.store.transfer")
 desktop = _LazyModule("desktop", "taema.desktop")
+bar = _LazyModule("bar", "taema.bar")
 _pressure_guard = _LazyModule("_pressure_guard", "taema.governor.guard")
 
 _REQUEST_IDS = count(1)
@@ -1103,6 +1104,48 @@ def cmd_desktop_list(a):
             )
         )
     return 0
+
+
+# ---- bar ----------------------------------------------------------------------------------
+
+
+def cmd_bar(a):
+    from .. import events as event_views
+
+    cfg, _store, _units = _load(a)
+    format_name = getattr(a, "format", None) or "plain"
+    if format_name not in bar.FORMATS:
+        return die(
+            "unknown bar format %r (use %s)" % (format_name, ", ".join(bar.FORMATS)),
+            2,
+        )
+    reply = ask(cfg, {"cmd": "status"})
+    if reply is None:
+        print(bar.render(format_name, bar.error_model()))
+        return 1
+    model = bar.model_from_status(reply)
+    print(bar.render(format_name, model))
+    if not getattr(a, "follow", False):
+        return 0
+    last = model
+    for result in subscribe(cfg, event_views.TOPICS, 1 << 60):
+        if not isinstance(result, dict) or (
+            "error" in result and "event" not in result
+        ):
+            print(bar.render(format_name, bar.error_model()))
+            return 1
+        if "event" not in result and "resync" not in result:
+            continue
+        reply = ask(cfg, {"cmd": "status"})
+        if reply is None:
+            print(bar.render(format_name, bar.error_model()))
+            return 1
+        model = bar.model_from_status(reply)
+        if model != last:
+            print(bar.render(format_name, model))
+            last = model
+    print(bar.render(format_name, bar.error_model()))
+    return 1
 
 
 # ---- kill ---------------------------------------------------------------------------------

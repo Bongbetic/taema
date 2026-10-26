@@ -3825,8 +3825,37 @@ def _top_scope(pid, base):
     return os.path.basename(rel.rstrip("/")) or "(outside)"
 
 
-def _top_details(pids, windows=None):
+def _scope_psi_avg10(pid, cache):
+    """Memory PSI avg10 of the pid's scope cgroup, cached per scope path."""
+    rel = cgroup.proc_cgroup(pid)
+    if not rel:
+        return None
+    if rel in cache:
+        return cache[rel]
+    root = os.environ.get("TAEMA_CGROOT", "/sys/fs/cgroup")
+    value = None
+    try:
+        with open(
+            os.path.join(root, rel.lstrip("/"), "memory.pressure"),
+            encoding="ascii",
+        ) as source:
+            for line in source:
+                fields = line.split()
+                if len(fields) >= 2 and fields[0] == "some":
+                    for field in fields[1:]:
+                        if field.startswith("avg10="):
+                            value = float(field[6:])
+                            break
+    except (OSError, ValueError):
+        value = None
+    cache[rel] = value
+    return value
+
+
+def _top_details(pids, windows=None, decisions=None):
     window_pids = windows if isinstance(windows, dict) else {}
+    decisions = decisions if isinstance(decisions, dict) else {}
+    psi_cache = {}
     try:
         base = cgroup.base()
     except OSError:
@@ -3836,8 +3865,11 @@ def _top_details(pids, windows=None):
         try:
             cmd = inspect.cmdline(pid) or "[%s]" % inspect.comm(pid)
             marker = window_pids.get(str(pid))
+            scope = _top_scope(pid, base)
             details[pid] = {
-                "scope": _top_scope(pid, base),
+                "scope": scope,
+                "psi": _scope_psi_avg10(pid, psi_cache),
+                "decision": decisions.get(scope, ""),
                 "user": inspect.username(inspect.uid_of(pid)),
                 "mem": inspect.rss_bytes(pid) or 0,
                 "threads": inspect.thread_count(pid) or 0,
@@ -3891,6 +3923,11 @@ def cmd_top(a):
             return die("top count must be an integer", 2)
         if count <= 0:
             return die("top count must be positive", 2)
+    sort_name = (getattr(a, "sort", None) or "cpu").lower()
+    if sort_name not in ("cpu", "mem", "delta", "psi", "scope", "pid"):
+        return die("top --sort must be cpu, mem, delta, psi, scope, or pid", 2)
+    if getattr(a, "once", False):
+        count = 1
     as_json = bool(getattr(a, "json", False) or getattr(a, "jsonl", False))
     try:
         live_stdin = bool(sys.stdin.isatty())
@@ -3901,18 +3938,27 @@ def cmd_top(a):
     time.sleep(interval)
     frames = 0
     first = True
-    cfg, _store, _units = _load(a)
+    cfg, store, _units = _load(a)
     window_pids = _daemon_windows(cfg).get("pids", {})
+    previous_details = None
     while True:
         current = inspect.ProcTable.scan()
+        details = _top_details(
+            current.rows,
+            windows=window_pids,
+            decisions=_scope_decisions(store),
+        )
         model = view.top_model(
             previous.rows,
             current.rows,
             interval,
             hz,
-            _top_details(current.rows, windows=window_pids),
+            details,
+            previous_details,
+            sort=sort_name,
         )
         previous = current
+        previous_details = details
         frames += 1
         if as_json:
             view.emit(view.record("top", {"rows": model}), a, view.render_top(model, a))
@@ -3951,6 +3997,56 @@ def _tree_scope(pid, base):
     return rel.rstrip("/") or "(outside)"
 
 
+def _scope_decisions(store):
+    """Latest decision kind per scope leaf, for the top table."""
+    out = {}
+    if store is None:
+        return out
+    try:
+        rows = store.db.decisions(limit=200)
+    except Exception:
+        return out
+    for row in rows:
+        scope = row.get("scope") or ""
+        leaf = os.path.basename(scope.rstrip("/"))
+        if leaf and leaf not in out:
+            out[leaf] = row.get("kind", "")
+    return out
+
+
+def _tree_edges(table, base):
+    """Scope -> [(peer scope leaf, detail)] dependency edges between scopes."""
+    groups = {}
+    for pid in table.rows:
+        groups.setdefault(_tree_scope(pid, base), set()).add(pid)
+    try:
+        snap = inspect.Snapshot()
+    except Exception:
+        return {}
+    out = {}
+    for scope, members in groups.items():
+        try:
+            found = inspect.edges(members, snap)
+        except Exception:
+            continue
+        lines = set()
+        for member, member_edges in found.items():
+            for edge in member_edges:
+                for peer in edge.get("peers", []):
+                    peer_scope = _tree_scope(peer, base)
+                    if peer_scope == scope:
+                        continue
+                    lines.add(
+                        (
+                            os.path.basename(peer_scope.rstrip("/")) or peer_scope,
+                            edge.get("detail", edge.get("kind", "")),
+                        )
+                    )
+        if lines:
+            out[scope] = sorted(lines)
+    return out
+
+
 def cmd_tree(a):
     """Process trees grouped under scope headers."""
     from . import view
@@ -3962,13 +4058,39 @@ def cmd_tree(a):
     table = inspect.ProcTable.scan(include_zombies=True)
     cfg, _store, _units = _load(a)
     window_pids = _daemon_windows(cfg).get("pids", {})
+    parents = {}
+    scopes = {pid: _tree_scope(pid, base) for pid in table.rows}
+    for pid, proc in table.rows.items():
+        if proc.ppid and scopes.get(proc.ppid) != scopes[pid]:
+            try:
+                parents[proc.ppid] = inspect.comm(proc.ppid) or ""
+            except OSError:
+                continue
+    parents = {pid: comm for pid, comm in parents.items() if comm}
     model = view.tree_model(
-        table, lambda pid: _tree_scope(pid, base), windows=window_pids
+        table,
+        lambda pid: _tree_scope(pid, base),
+        windows=window_pids,
+        target=getattr(a, "target", None),
+        parents=parents,
+        edges=_tree_edges(table, base),
     )
     if getattr(a, "json", False) or getattr(a, "jsonl", False):
         document = view.record(
             "tree",
-            {"groups": [{"scope": scope, "nodes": nodes} for scope, nodes in model]},
+            {
+                "groups": [
+                    {
+                        "scope": scope,
+                        "nodes": nodes,
+                        "edges": [
+                            {"peer": peer, "detail": detail}
+                            for peer, detail in edge_lines
+                        ],
+                    }
+                    for scope, nodes, edge_lines in model
+                ]
+            },
         )
         view.emit(document, a, view.render_tree(model, a))
         return 0

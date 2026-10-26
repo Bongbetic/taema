@@ -2468,6 +2468,9 @@
     "cpu",
     "mem_pct",
     "mem",
+    "delta_per_min",
+    "psi",
+    "decision",
     "threads",
     "state",
     "window",
@@ -2495,6 +2498,23 @@
     "mem": {
      "type": "number",
      "minimum": 0
+    },
+    "delta_per_min": {
+     "type": "number"
+    },
+    "psi": {
+     "anyOf": [
+      {
+       "type": "number",
+       "minimum": 0
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "decision": {
+     "type": "string"
     },
     "threads": {
      "type": "integer",
@@ -2535,7 +2555,8 @@
    "type": "object",
    "required": [
     "scope",
-    "nodes"
+    "nodes",
+    "edges"
    ],
    "properties": {
     "scope": {
@@ -2546,6 +2567,28 @@
      "items": {
       "$ref": "#/$defs/tree-node"
      }
+    },
+    "edges": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree-edge"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree-edge": {
+   "type": "object",
+   "required": [
+    "peer",
+    "detail"
+   ],
+   "properties": {
+    "peer": {
+     "type": "string"
+    },
+    "detail": {
+     "type": "string"
     }
    },
    "additionalProperties": false
@@ -2557,6 +2600,7 @@
     "depth",
     "state",
     "zombies",
+    "parent",
     "window"
    ],
    "properties": {
@@ -2574,6 +2618,16 @@
     "zombies": {
      "type": "integer",
      "minimum": 0
+    },
+    "parent": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
     },
     "window": {
      "type": "string"

@@ -77,17 +77,35 @@ def _clip(value, width, wide=False):
     return value[: width - 1] + "…"
 
 
-def top_model(previous, current, interval_s, hz, details):
-    """CPU-sorted rows from two snapshots. details maps pid to scope/user/mem."""
+_TOP_SORTS = {
+    "cpu": lambda row: (-row["cpu"], -row["mem"], -row["pid"]),
+    "mem": lambda row: (-row["mem"], -row["pid"]),
+    "delta": lambda row: (-row["delta_per_min"], -row["pid"]),
+    "psi": lambda row: (-(row["psi"] or 0.0), -row["pid"]),
+    "scope": lambda row: (row["scope"], -row["cpu"], -row["pid"]),
+    "pid": lambda row: (row["pid"],),
+}
+
+
+def top_model(
+    previous, current, interval_s, hz, details, previous_details=None, sort="cpu"
+):
+    """Sorted rows from two snapshots. details maps pid to scope/user/mem."""
     rows = []
     span = max(interval_s * hz, 1)
     total = details.get("__total__", 0) or 0
+    previous_details = previous_details or {}
     for pid, proc in current.items():
         old = previous.get(pid)
         before = old.cpu if old is not None else proc.cpu
         cpu = max(0.0, (proc.cpu - before)) * 100.0 / span
         info = details.get(pid, {})
         mem = info.get("mem", 0)
+        prev_mem = previous_details.get(pid, {}).get("mem")
+        if prev_mem is None or interval_s <= 0:
+            delta_per_min = 0.0
+        else:
+            delta_per_min = (mem - prev_mem) * 60.0 / interval_s
         rows.append(
             {
                 "pid": pid,
@@ -96,13 +114,16 @@ def top_model(previous, current, interval_s, hz, details):
                 "cpu": cpu,
                 "mem_pct": (100.0 * mem / total) if total else 0.0,
                 "mem": mem,
+                "delta_per_min": delta_per_min,
+                "psi": info.get("psi"),
+                "decision": info.get("decision", ""),
                 "threads": info.get("threads", 0),
                 "state": proc.state,
                 "window": info.get("window", ""),
                 "cmd": info.get("cmd", ""),
             }
         )
-    rows.sort(key=lambda row: (-row["cpu"], -row["mem"], -row["pid"]))
+    rows.sort(key=_TOP_SORTS.get(sort, _TOP_SORTS["cpu"]))
     return rows
 
 
@@ -110,12 +131,18 @@ def render_top(model, args):
     """Fixed-column top table that fits the terminal width."""
     width = getattr(args, "_width", 80)
     wide = getattr(args, "wide", False)
-    lines = [_clip("PID SCOPE   USER %CPU %MEM RSS  THR S W CMD", width, wide)]
+    lines = [
+        _clip("PID SCOPE   USER %CPU %MEM RSS  D/MIN PSI S W DEC CMD", width, wide)
+    ]
     for row in model:
-        cmd_width = 0 if wide or width <= 0 else max(1, width - 41)
+        cmd_width = 0 if wide or width <= 0 else max(1, width - 60)
+        delta = row.get("delta_per_min") or 0.0
+        delta_text = "%s%s" % ("+" if delta >= 0 else "-", _format_memory(abs(delta)))
+        psi = row.get("psi")
+        psi_text = "-" if psi is None else "%.2f" % psi
         lines.append(
             _clip(
-                "%-3d %-7s %-4s %5.1f %4.1f %-4s %-3d %s %s %s"
+                "%-3d %-7s %-4s %5.1f %4.1f %-4s %6s %5s %s %s %-4s %s"
                 % (
                     row["pid"],
                     _clip(row["scope"], 7, wide),
@@ -123,9 +150,11 @@ def render_top(model, args):
                     row["cpu"],
                     row["mem_pct"],
                     _clip(_format_memory(row["mem"]), 4, wide),
-                    row["threads"],
+                    delta_text,
+                    psi_text,
                     row["state"],
                     row.get("window", ""),
+                    _clip(row.get("decision", ""), 4, wide),
                     _clip(row["cmd"], cmd_width, wide),
                 ),
                 width,
@@ -135,9 +164,17 @@ def render_top(model, args):
     return "\n".join(lines) + "\n"
 
 
-def tree_model(table, scope_of, windows=None):
-    """Process trees grouped by scope. Returns [(scope, [(pid, depth, node)])]."""
+def tree_model(table, scope_of, windows=None, target=None, parents=None, edges=None):
+    """Process trees grouped by scope.
+
+    Returns [(scope, nodes, edge_lines)]. target keeps only scopes whose
+    name contains it; parents maps outside pids to launcher names shown
+    as provenance arrows on roots; edges maps a scope to (peer, detail)
+    dependency lines.
+    """
     window_pids = windows if isinstance(windows, dict) else {}
+    parents = parents if isinstance(parents, dict) else {}
+    edges = edges if isinstance(edges, dict) else {}
     kids = {}
     for pid, proc in table.rows.items():
         kids.setdefault(proc.ppid, []).append(pid)
@@ -154,6 +191,8 @@ def tree_model(table, scope_of, windows=None):
         groups.setdefault(scope_of(pid), []).append(pid)
     model = []
     for scope in sorted(groups):
+        if target and target not in scope:
+            continue
         members = set(groups[scope])
         roots = sorted(pid for pid in members if table.rows[pid].ppid not in members)
         nodes = []
@@ -167,6 +206,9 @@ def tree_model(table, scope_of, windows=None):
                     "depth": depth,
                     "state": table.rows[pid].state,
                     "zombies": reaped.get(pid, 0),
+                    "parent": (
+                        parents.get(table.rows[pid].ppid) if depth == 0 else None
+                    ),
                     "window": (
                         "F"
                         if isinstance(marker, dict) and marker.get("focused")
@@ -179,7 +221,7 @@ def tree_model(table, scope_of, windows=None):
             young = [kid for kid in kids.get(pid, []) if kid in members]
             for kid in reversed(young):
                 stack.append((kid, depth + 1, True))
-        model.append((scope, nodes))
+        model.append((scope, nodes, list(edges.get(scope, ()))))
     return model
 
 
@@ -189,8 +231,12 @@ def render_tree(model, args):
     wide = getattr(args, "wide", False)
     limit = 0 if wide or width <= 0 else width
     lines = []
-    for scope, nodes in model:
+    for entry in model:
+        scope, nodes = entry[0], entry[1]
+        edge_lines = entry[2] if len(entry) > 2 else ()
         lines.append(_clip(scope, limit, wide))
+        for peer, detail in edge_lines:
+            lines.append(_clip("  ⇠ %s: %s" % (peer, detail), limit, wide))
         for index, node in enumerate(nodes):
             depth = node["depth"]
             if depth == 0:
@@ -206,6 +252,8 @@ def render_tree(model, args):
             text = "%s%d" % (prefix, node["pid"])
             if depth > 0:
                 text += " %s" % node["state"]
+            if node.get("parent"):
+                text += " ← %s" % node["parent"]
             if node.get("window") == "F":
                 text += " ◉"
             elif node.get("window"):

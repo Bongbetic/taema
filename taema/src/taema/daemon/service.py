@@ -8,6 +8,7 @@ a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re
 
 import collections
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 import json
 import os
 import re
@@ -205,6 +206,7 @@ class Daemon:
         self.window_state = {}  # session -> {windows, focused, pids, updated}
         self._window_rates = {}  # session -> [recent window event timestamps]
         self._windowless_since = {}  # scope -> when it was last seen windowed
+        self.launch_reservations = {}  # scope -> {app, unit, pid, expires, owner}
         self._recovery_notified = set()  # sessions told about store recovery
         self._digest_at = {}  # session -> last digest job timestamp
         self._close_history = {}  # app -> [close timestamps, last hour]
@@ -4521,6 +4523,12 @@ class Daemon:
             return {"watching": self.watch_owner(leaf, owner)}
         if c == "attach":
             return self.attach(msg)
+        if c == "launch_prepare":
+            return self.launch_prepare(msg)
+        if c == "launch_claim":
+            return self.launch_claim(msg)
+        if c == "launch_release":
+            return self.launch_release(msg)
         if c == "register_agent":
             return self.register_agent(msg)
         if c == "agent_beat":
@@ -4679,6 +4687,8 @@ class Daemon:
             return {"error": "pid gone or not yours"}
         if scope == policy.AGENT_LEAF:
             return self.attach_agent(pids)
+        if scope.startswith("app-"):
+            return self.attach_app(scope, pids)
         done = []
         with self.store.decision_context(
             "containment",
@@ -4697,6 +4707,194 @@ class Daemon:
                 done.append(p)
             self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
         return {"ok": True, "attached": done}
+
+    def attach_app(self, scope, pids):
+        """Move same-uid pids into an app-NAME leaf through the root helper's move."""
+        done = []
+        with self.store.decision_context(
+            "containment",
+            scope=scope,
+            owner=pids[0] if pids else None,
+            authority="user",
+            mode=self.mode,
+            why="attach launched processes to their reserved app scope",
+        ):
+            try:
+                engine.helper_move(self.cfg, scope, list(dict.fromkeys(pids)))
+            except engine.Refused as e:
+                self.store.log(event="refusal", scope=scope, why=str(e))
+                return {"error": "attach failed: %s" % e, "attached": done}
+            done.extend(dict.fromkeys(pids))
+            self.store.log(event="attach", scope=scope, pids=done[:8])
+        return {"ok": True, "attached": done}
+
+    def launch_prepare(self, msg):
+        """Reserve an app scope for `taema launch`: create the leaf, hold it 5 seconds."""
+        app, pid = msg.get("app"), msg.get("pid")
+        session, unit, owner = msg.get("session"), msg.get("unit"), msg.get("owner")
+        if (
+            not isinstance(app, str)
+            or not app
+            or not cgroup.valid_rel(app)
+            or "/" in app
+            or len(app) > 32
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or (unit is not None and not isinstance(unit, str))
+            or (
+                owner is not None
+                and (not isinstance(owner, int) or isinstance(owner, bool))
+            )
+        ):
+            return {"error": "bad request"}
+        if inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        if owner is not None and (owner <= 1 or inspect.uid_of(owner) != os.getuid()):
+            return {"error": "owner gone or not yours"}
+        base = "app-" + app
+        scope = ""
+        for suffix in range(0, 100):
+            candidate = base if suffix == 0 else "%s-%d" % (base, suffix + 1)
+            path = os.path.join(cgroup.base(), candidate)
+            try:
+                live = bool(os.path.isdir(path) and cgroup.tree_procs(path))
+            except OSError:
+                live = True
+            if not live:
+                scope = candidate
+                break
+        if not scope:
+            return {"error": "no free launch scope"}
+        try:
+            cgroup.mkleaf(scope)
+        except OSError as error:
+            return {"error": "scope unavailable: %s" % error}
+        now = time.time()
+        self.launch_reservations[scope] = {
+            "app": app,
+            "unit": unit,
+            "pid": pid,
+            "session": session,
+            "owner": owner,
+            "expires": now + 5.0,
+        }
+        while len(self.launch_reservations) > 64:
+            oldest = min(
+                self.launch_reservations,
+                key=lambda name: self.launch_reservations[name]["expires"],
+            )
+            del self.launch_reservations[oldest]
+        via = (
+            "agent"
+            if isinstance(session, str)
+            and self.agents.get(session, {}).get("state") == "up"
+            else "helper"
+        )
+        return {"ok": True, "scope": scope, "via": via, "expires": now + 5.0}
+
+    def launch_claim(self, msg):
+        """Register the launched instance once its pid has arrived in the scope."""
+        scope, pid, app = msg.get("scope"), msg.get("pid"), msg.get("app")
+        if (
+            not isinstance(scope, str)
+            or not isinstance(app, str)
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+        ):
+            return {"error": "bad request"}
+        reservation = self.launch_reservations.get(scope)
+        if reservation is None or reservation.get("app") != app:
+            return {"error": "no reservation for scope"}
+        if inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        try:
+            members = cgroup.tree_procs(os.path.join(cgroup.base(), scope))
+        except OSError:
+            members = []
+        if pid not in members:
+            return {"error": "pid never arrived in scope"}
+        start = inspect.starttime(pid)
+        if start is None:
+            return {"error": "pid gone"}
+        now = time.time()
+        identity = SimpleNamespace(
+            key=app,
+            display=app,
+            exe="",
+            kind="launch",
+            desktop_id=app,
+            unit=reservation.get("unit"),
+            validated=False,
+            device=None,
+            inode=None,
+        )
+        self.store.record_identity(
+            identity,
+            {
+                "pid": pid,
+                "start": start,
+                "born": now,
+                "scope": scope,
+                "launched_by": "launch",
+            },
+        )
+        launch_apps = self.store.data.get("launch_apps")
+        if not isinstance(launch_apps, dict):
+            launch_apps = {}
+            self.store.data["launch_apps"] = launch_apps
+        launch_apps[scope] = {
+            "app": app,
+            "unit": reservation.get("unit"),
+            "launched_by": "launch",
+        }
+        while len(launch_apps) > 256:
+            launch_apps.pop(next(iter(launch_apps)))
+        del self.launch_reservations[scope]
+        owner = reservation.get("owner")
+        watching = self.watch_owner(scope, owner) if owner else False
+        self.store.log(event="launch", scope=scope, pids=[pid])
+        return {"ok": True, "scope": scope, "watching": watching}
+
+    def launch_release(self, msg):
+        """Drop a launch reservation; remove the leaf when it stayed empty."""
+        scope = msg.get("scope")
+        if not isinstance(scope, str) or not cgroup.valid_rel(scope):
+            return {"error": "bad request"}
+        self.launch_reservations.pop(scope, None)
+        try:
+            members = cgroup.tree_procs(os.path.join(cgroup.base(), scope))
+        except OSError:
+            members = []
+        if not members:
+            try:
+                os.rmdir(os.path.join(cgroup.base(), scope))
+            except OSError:
+                pass
+        return {"ok": True}
+
+    def launch_sweep(self, now=None):
+        """Reap expired launch reservations and prune the launch mapping."""
+        now = time.time() if now is None else now
+        for scope, reservation in list(self.launch_reservations.items()):
+            if reservation["expires"] > now:
+                continue
+            del self.launch_reservations[scope]
+            path = os.path.join(cgroup.base(), scope)
+            try:
+                members = cgroup.tree_procs(path)
+            except OSError:
+                members = []
+            if not members:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+            self.store.log(event="launch_expired", scope=scope)
+        launch_apps = self.store.data.get("launch_apps")
+        if isinstance(launch_apps, dict):
+            for scope in list(launch_apps):
+                if not os.path.isdir(os.path.join(cgroup.base(), scope)):
+                    del launch_apps[scope]
 
     def attach_agent(self, pids):
         """Move same-uid pids into the agent leaf with a direct write, no helper."""
@@ -7557,6 +7755,9 @@ class Daemon:
             if now - self.last.get("windowless", 0.0) >= 30.0:
                 self.last["windowless"] = now
                 self.guarded(lambda: self.windowless_pass(now=now))
+            if now - self.last.get("launch", 0.0) >= 1.0:
+                self.last["launch"] = now
+                self.guarded(lambda: self.launch_sweep(now=now))
             self._run_listener_wake_if_due(now)
             self.drain_collector_events()
             self.guarded(self.agent_watch_pass)

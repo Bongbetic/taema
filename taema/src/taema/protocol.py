@@ -80,6 +80,21 @@ _COMMANDS = {
     "freeze": ({"scope": "string"}, ("scope",)),
     "thaw": ({"scope": "string", "all": "boolean"}, ()),
     "feedback": ({}, ()),
+    "launch_prepare": (
+        {
+            "app": "string",
+            "pid": "integer",
+            "session": "string",
+            "unit": "string",
+            "owner": "integer",
+        },
+        ("app", "pid"),
+    ),
+    "launch_claim": (
+        {"scope": "string", "pid": "integer", "app": "string"},
+        ("scope", "pid", "app"),
+    ),
+    "launch_release": ({"scope": "string"}, ("scope",)),
 }
 
 

@@ -629,11 +629,14 @@ def render_explanation(target, explanation):
     lines = ["explain: %s" % target]
     if identity:
         lines.append(
-            "identity: %s (%s; %s)"
+            "identity: %s (%s; %s%s)"
             % (
                 identity.get("key", "unknown"),
                 identity.get("display", "unknown"),
                 "validated" if identity.get("validated") else "unvalidated",
+                "; desktop=%s" % identity["desktop_id"]
+                if identity.get("desktop_id")
+                else "",
             )
         )
         if identity.get("reason"):
@@ -693,6 +696,8 @@ def render_explanation(target, explanation):
                     confidence_text,
                 )
             )
+    if provenance.get("launched_by"):
+        lines.append("launched_by=%s" % provenance["launched_by"])
     lines.append(
         "protection: %s%s"
         % (

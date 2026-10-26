@@ -2,6 +2,17 @@
 
 ## Behaviour changes
 
+### Launch-time scoping
+
+`taema launch [--app NAME] [--unit UNIT] [--bind] -- CMD…` reserves an
+app scope through `launch_prepare`, moves itself into it, registers the
+instance, and execs the command, so containment and provenance begin
+before the app's first instruction. A reservation expires if the pid
+doesn't arrive within 5 seconds and the empty leaf is removed. Launches
+route through the session agent when one is up (no sudo; the daemon
+attaches) and otherwise use the validated helper `move`. `why` shows
+`launched_by=launch` and the requested app name as the desktop id.
+
 ### Windowless lifecycle
 
 App scopes that lose their last window are tracked, and once they stay

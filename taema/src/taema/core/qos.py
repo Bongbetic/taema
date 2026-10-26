@@ -60,10 +60,14 @@ def _with_default_io_weight(value, weight):
     return "default %d" % weight
 
 
-def _targets(scope_class, path):
+def _targets(scope_class, path, focus_weight=None):
     targets = []
     cpu_idle = os.path.join(path, "cpu.idle")
     cpu_weight = os.path.join(path, "cpu.weight")
+    if scope_class == "foreground":
+        if focus_weight is not None and os.path.isfile(cpu_weight):
+            targets.append(("cpu.weight", str(focus_weight)))
+        return tuple(targets)
     if scope_class == "leftover":
         if os.path.isfile(cpu_idle):
             targets.append(("cpu.idle", "1"))
@@ -90,11 +94,11 @@ def _targets(scope_class, path):
     return tuple(targets)
 
 
-def plan(path, scope_class):
+def plan(path, scope_class, focus_weight=None):
     """Build writes from currently exposed controls, retaining exact original values."""
     writes = []
     available = []
-    for name, desired in _targets(scope_class, path):
+    for name, desired in _targets(scope_class, path, focus_weight):
         try:
             current = _read(os.path.join(path, name))
         except OSError:

@@ -1427,6 +1427,18 @@ def _deprioritized_scopes(store):
     }
 
 
+def _daemon_windows(cfg):
+    """Window summary from the daemon; {} when it is away or silent."""
+    try:
+        reply = ask(cfg, {"cmd": "status"})
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(reply, dict):
+        return {}
+    windows = reply.get("windows")
+    return windows if isinstance(windows, dict) else {}
+
+
 def _walk(
     path,
     depth,
@@ -1434,6 +1446,7 @@ def _walk(
     memory_scopes=None,
     deprioritized_scopes=None,
     frozen_scopes=None,
+    window_scopes=None,
 ):
     pids = cgroup.procs(path)
     comms = []
@@ -1449,6 +1462,7 @@ def _walk(
     else:
         current = metrics.get("current_bytes") if metrics else None
         pressure = metrics.get("psi_avg10") if metrics else None
+    windows = (window_scopes or {}).get(key)
     out.append(
         {
             "depth": depth,
@@ -1460,10 +1474,26 @@ def _walk(
             "commands": sorted(comms),
             "deprioritized": cgroup.rel(path) in (deprioritized_scopes or set()),
             "frozen": cgroup.rel(path) in (frozen_scopes or set()),
+            "windows": (
+                {
+                    "count": windows.get("count", 0),
+                    "focused": bool(windows.get("focused")),
+                }
+                if isinstance(windows, dict)
+                else None
+            ),
         }
     )
     for d in sorted(cgroup.subdirs(path)):
-        _walk(d, depth + 1, out, memory_scopes, deprioritized_scopes, frozen_scopes)
+        _walk(
+            d,
+            depth + 1,
+            out,
+            memory_scopes,
+            deprioritized_scopes,
+            frozen_scopes,
+            window_scopes,
+        )
 
 
 def _count_scopes(base):
@@ -1482,12 +1512,23 @@ def _ls_rows(cfg, store):
     memory_scopes = {scope["name"]: scope for scope in memory_view.get("scopes", [])}
     deprioritized_scopes = _deprioritized_scopes(store)
     frozen_scopes = set((store.data.get("frozen_scopes", {}) if store else {}).keys())
+    window_scopes = _daemon_windows(cfg).get("scopes", {})
+    if not isinstance(window_scopes, dict):
+        window_scopes = {}
     base = cgroup.base()
     if not os.path.isdir(base):
         return None, memory_view
     rows = []
     for d in sorted(cgroup.subdirs(base)):
-        _walk(d, 0, rows, memory_scopes, deprioritized_scopes, frozen_scopes)
+        _walk(
+            d,
+            0,
+            rows,
+            memory_scopes,
+            deprioritized_scopes,
+            frozen_scopes,
+            window_scopes,
+        )
     return rows, memory_view
 
 
@@ -3484,7 +3525,8 @@ def _top_scope(pid, base):
     return os.path.basename(rel.rstrip("/")) or "(outside)"
 
 
-def _top_details(pids):
+def _top_details(pids, windows=None):
+    window_pids = windows if isinstance(windows, dict) else {}
     try:
         base = cgroup.base()
     except OSError:
@@ -3493,12 +3535,20 @@ def _top_details(pids):
     for pid in pids:
         try:
             cmd = inspect.cmdline(pid) or "[%s]" % inspect.comm(pid)
+            marker = window_pids.get(str(pid))
             details[pid] = {
                 "scope": _top_scope(pid, base),
                 "user": inspect.username(inspect.uid_of(pid)),
                 "mem": inspect.rss_bytes(pid) or 0,
                 "threads": inspect.thread_count(pid) or 0,
                 "cmd": " ".join(cmd.split()),
+                "window": (
+                    "F"
+                    if isinstance(marker, dict) and marker.get("focused")
+                    else "w"
+                    if marker is not None
+                    else ""
+                ),
             }
         except OSError:
             continue
@@ -3551,6 +3601,8 @@ def cmd_top(a):
     time.sleep(interval)
     frames = 0
     first = True
+    cfg, _store, _units = _load(a)
+    window_pids = _daemon_windows(cfg).get("pids", {})
     while True:
         current = inspect.ProcTable.scan()
         model = view.top_model(
@@ -3558,7 +3610,7 @@ def cmd_top(a):
             current.rows,
             interval,
             hz,
-            _top_details(current.rows),
+            _top_details(current.rows, windows=window_pids),
         )
         previous = current
         frames += 1
@@ -3608,7 +3660,11 @@ def cmd_tree(a):
     except OSError:
         base = "/"
     table = inspect.ProcTable.scan(include_zombies=True)
-    model = view.tree_model(table, lambda pid: _tree_scope(pid, base))
+    cfg, _store, _units = _load(a)
+    window_pids = _daemon_windows(cfg).get("pids", {})
+    model = view.tree_model(
+        table, lambda pid: _tree_scope(pid, base), windows=window_pids
+    )
     if getattr(a, "json", False) or getattr(a, "jsonl", False):
         document = view.record(
             "tree",

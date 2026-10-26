@@ -2,6 +2,21 @@
 
 ## Behaviour changes
 
+### Niri window feed
+
+The session agent streams window state from niri over `$NIRI_SOCKET`
+(snapshot plus event stream, capped at 50 events per second) and forwards
+open, change, close, and focus facts to the daemon, which validates window
+pids and re-checks start times against reuse. Window titles stay out unless
+`agent.store_titles` is set. Each mapped pid resolves to its scope and app
+instance, and the window's app id becomes the instance's desktop id and
+display name. The focused scope is foreground — never frozen, reclaimed no
+further than page cache — windowed scopes are interactive and exempt from
+deprioritization, and focus boost applies only in the focus profile. Any
+scope with an open window refuses freezing, and opening or focusing a
+window in a frozen scope thaws it at once. `ls`, `top`, `tree`, and the
+dashboard show window state.
+
 ### Actionable review notifications
 
 Each new answerable review produces one desktop notification with actions

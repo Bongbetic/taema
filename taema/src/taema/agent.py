@@ -92,7 +92,7 @@ def ensure_leaf(pid, ask):
 class Agent:
     """One session's relay: register once, then beat until told to stop."""
 
-    def __init__(self, cfg, session=None, backend=None):
+    def __init__(self, cfg, session=None, backend=None, window_backend="select"):
         from . import notify as notify_mod
         from .notifier import JobHandler
 
@@ -115,6 +115,30 @@ class Agent:
             self.capabilities.append("notify")
             if "actions" in backend.capabilities():
                 self.capabilities.append("notify-actions")
+        if window_backend == "select":
+            window_backend = self._select_window_backend()
+        self.window_backend = window_backend
+        self._window_stream = None
+        self._window_pending = []
+        if window_backend is not None:
+            self.capabilities.append("windows")
+
+    def _select_window_backend(self):
+        """Pick the configured window backend; auto means niri when present."""
+        from . import windows as windows_mod
+
+        which = (self.cfg.get("agent", {}) or {}).get("window_backend", "auto")
+        if which in ("off", "none"):
+            return None
+        if which in ("auto", "niri"):
+            if which == "niri" or os.environ.get("NIRI_SOCKET"):
+                return windows_mod.NiriBackend(
+                    store_titles=bool(
+                        (self.cfg.get("agent", {}) or {}).get("store_titles", False)
+                    )
+                )
+            return None
+        return None
 
     def _ask(self, message):
         from .cli.commands import ask
@@ -185,6 +209,98 @@ class Agent:
             return False
         return bool(self.beat())
 
+    def drain_windows(self, clock=None):
+        """Forward window events to the daemon, at most 50 per drain.
+
+        Connects lazily (snapshot first, then the stream), buffers
+        bursts, and drops a dead stream for a reconnect next tick.
+        """
+        import socket as socket_mod
+
+        from . import windows as windows_mod
+
+        backend = self.window_backend
+        if backend is None:
+            return
+        now = int((clock or time.time)())
+        if self._window_stream is None:
+            try:
+                found = backend.snapshot()
+            except (windows_mod.WindowError, OSError):
+                return
+            try:
+                self._window_stream = backend.open_stream()
+            except (windows_mod.WindowError, OSError):
+                self._window_stream = None
+                return
+            self._send_window(
+                {
+                    "kind": "snapshot",
+                    "windows": [self._wire_window(item) for item in found[:512]],
+                },
+                now,
+            )
+        try:
+            while len(self._window_pending) < 500:
+                try:
+                    line = self._window_stream.readline()
+                except socket_mod.timeout:
+                    break
+                if line == "":
+                    raise windows_mod.WindowError("window stream ended")
+                self._window_pending.extend(backend.ingest_line(line))
+        except (windows_mod.WindowError, OSError):
+            self._close_window_stream()
+        batch, self._window_pending = (
+            self._window_pending[:50],
+            self._window_pending[50:],
+        )
+        for event in batch:
+            self._send_window(
+                {
+                    "kind": event["kind"],
+                    "window_id": event.get("window_id"),
+                    **({"app_id": event["app_id"]} if event.get("app_id") else {}),
+                    **({"window_pid": event["pid"]} if event.get("pid") else {}),
+                    "focus": bool(event.get("focus")),
+                    **({"title": event["title"]} if event.get("title") else {}),
+                },
+                now,
+            )
+
+    def _wire_window(self, item):
+        wire = {
+            "window_id": item["id"],
+            "focus": bool(item.get("focused")),
+        }
+        if item.get("app_id"):
+            wire["app_id"] = item["app_id"]
+        if item.get("pid"):
+            wire["window_pid"] = item["pid"]
+        if item.get("title"):
+            wire["title"] = item["title"]
+        return wire
+
+    def _send_window(self, fields, now):
+        message = {
+            "cmd": "window_event",
+            "session": self.session,
+            "pid": self.pid,
+            "time": now,
+            **fields,
+        }
+        if message.get("window_id") is None:
+            message.pop("window_id", None)
+        self._ask(message)
+
+    def _close_window_stream(self):
+        stream, self._window_stream = self._window_stream, None
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
     def run(self, sleep=time.sleep, max_beats=None, clock=time.monotonic):
         """Beat until the compositor goes away; back off while disconnected.
 
@@ -219,6 +335,7 @@ class Agent:
             if not compositor_live(self.compositor):
                 return "compositor-gone"
             self.poll_once()
+            self.drain_windows()
             remaining = deadline - clock()
             if remaining <= 0:
                 return None

@@ -41,6 +41,21 @@ _COMMANDS = {
         },
         ("session", "pid", "kind"),
     ),
+    "window_event": (
+        {
+            "session": "string",
+            "pid": "integer",
+            "kind": "string",
+            "window_id": "integer",
+            "app_id": "string",
+            "window_pid": "integer",
+            "focus": "boolean",
+            "title": "string",
+            "windows": "array",
+            "time": "integer",
+        },
+        ("session", "pid", "kind"),
+    ),
     "job_done": (
         {
             "shell_pid": "integer",
@@ -429,7 +444,13 @@ def _validate_args(command, args):
         pid = args.get("owner") if command == "register" else args.get("shell_pid")
         if pid is not None and pid <= 1:
             _fail("process id must be greater than one")
-    if command in ("register_agent", "agent_beat", "notify_poll", "notify_result"):
+    if command in (
+        "register_agent",
+        "agent_beat",
+        "notify_poll",
+        "notify_result",
+        "window_event",
+    ):
         if not args["session"] or len(args["session"]) > 64:
             _fail("agent session is empty or too long")
         if args["pid"] <= 1:
@@ -448,6 +469,15 @@ def _validate_args(command, args):
 
         if len(_json.dumps(args["facts"], sort_keys=True, default=str)) > 8192:
             _fail("agent facts are too large")
+    if command == "window_event":
+        if args["kind"] not in ("snapshot", "opened", "changed", "closed", "focus"):
+            _fail("window event kind is unknown")
+        if "window_id" in args and args["window_id"] < 0:
+            _fail("window id must be non-negative")
+        if "window_pid" in args and args["window_pid"] <= 1:
+            _fail("process id must be greater than one")
+        if "windows" in args and len(args["windows"]) > 512:
+            _fail("window snapshot holds at most 512 windows")
     if command == "attach":
         if not 0 < len(args["pids"]) <= 64 or any(
             not _is_type(pid, "integer") or pid <= 1 for pid in args["pids"]

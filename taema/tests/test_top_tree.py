@@ -81,10 +81,13 @@ class TopRenderTests(unittest.TestCase):
         ]
         self.assertEqual(
             view.render_top(model, args()),
-            "PID SCOPE   USER %CPU %MEM RSS  THR S CMD\n"
-            "10  scope-a ada  100.0 12.5 1.5K 4   R cc1 foo.c\n"
-            "9   scope-a ada    2.5  4.2 512  1   S sh\n",
+            "PID SCOPE   USER %CPU %MEM RSS  THR S W CMD\n"
+            "10  scope-a ada  100.0 12.5 1.5K 4   R  cc1 foo.c\n"
+            "9   scope-a ada    2.5  4.2 512  1   S  sh\n",
         )
+        # Narrow windows still fit: the whole row clips, not just the command.
+        for line in view.render_top(model, args(width=40)).splitlines():
+            self.assertLessEqual(len(line), 40)
 
     def test_truncates_to_width(self):
         model = [

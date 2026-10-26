@@ -98,6 +98,7 @@ def top_model(previous, current, interval_s, hz, details):
                 "mem": mem,
                 "threads": info.get("threads", 0),
                 "state": proc.state,
+                "window": info.get("window", ""),
                 "cmd": info.get("cmd", ""),
             }
         )
@@ -109,28 +110,34 @@ def render_top(model, args):
     """Fixed-column top table that fits the terminal width."""
     width = getattr(args, "_width", 80)
     wide = getattr(args, "wide", False)
-    lines = [_clip("PID SCOPE   USER %CPU %MEM RSS  THR S CMD", width, wide)]
+    lines = [_clip("PID SCOPE   USER %CPU %MEM RSS  THR S W CMD", width, wide)]
     for row in model:
-        cmd_width = 0 if wide or width <= 0 else max(1, width - 40)
+        cmd_width = 0 if wide or width <= 0 else max(1, width - 41)
         lines.append(
-            "%-3d %-7s %-4s %5.1f %4.1f %-4s %-3d %s %s"
-            % (
-                row["pid"],
-                _clip(row["scope"], 7, wide),
-                _clip(row["user"], 4, wide),
-                row["cpu"],
-                row["mem_pct"],
-                _clip(_format_memory(row["mem"]), 4, wide),
-                row["threads"],
-                row["state"],
-                _clip(row["cmd"], cmd_width, wide),
+            _clip(
+                "%-3d %-7s %-4s %5.1f %4.1f %-4s %-3d %s %s %s"
+                % (
+                    row["pid"],
+                    _clip(row["scope"], 7, wide),
+                    _clip(row["user"], 4, wide),
+                    row["cpu"],
+                    row["mem_pct"],
+                    _clip(_format_memory(row["mem"]), 4, wide),
+                    row["threads"],
+                    row["state"],
+                    row.get("window", ""),
+                    _clip(row["cmd"], cmd_width, wide),
+                ),
+                width,
+                wide,
             )
         )
     return "\n".join(lines) + "\n"
 
 
-def tree_model(table, scope_of):
+def tree_model(table, scope_of, windows=None):
     """Process trees grouped by scope. Returns [(scope, [(pid, depth, node)])]."""
+    window_pids = windows if isinstance(windows, dict) else {}
     kids = {}
     for pid, proc in table.rows.items():
         kids.setdefault(proc.ppid, []).append(pid)
@@ -153,12 +160,20 @@ def tree_model(table, scope_of):
         stack = [(pid, 0, True) for pid in reversed(roots)]
         while stack:
             pid, depth, _last = stack.pop()
+            marker = window_pids.get(str(pid))
             nodes.append(
                 {
                     "pid": pid,
                     "depth": depth,
                     "state": table.rows[pid].state,
                     "zombies": reaped.get(pid, 0),
+                    "window": (
+                        "F"
+                        if isinstance(marker, dict) and marker.get("focused")
+                        else "w"
+                        if marker is not None
+                        else ""
+                    ),
                 }
             )
             young = [kid for kid in kids.get(pid, []) if kid in members]
@@ -191,6 +206,10 @@ def render_tree(model, args):
             text = "%s%d" % (prefix, node["pid"])
             if depth > 0:
                 text += " %s" % node["state"]
+            if node.get("window") == "F":
+                text += " ◉"
+            elif node.get("window"):
+                text += " ●"
             if node["zombies"]:
                 text += " (reaps %d zombie%s)" % (
                     node["zombies"],
@@ -207,13 +226,14 @@ def render_scopes(scopes, args):
     wide = getattr(args, "wide", False)
     color = getattr(args, "_color", False)
     name_width = 28 if wide or width <= 0 else max(12, min(28, width - 39))
-    fixed = name_width + 4 + 2 + 8 + 1 + 6 + 2
+    fixed = name_width + 4 + 2 + 8 + 1 + 6 + 1 + 2 + 2
     command_width = 80 if wide or width <= 0 else max(8, width - fixed)
-    header = "%s %4s  %8s %6s  %s" % (
+    header = "%s %4s  %8s %6s %2s  %s" % (
         "%-*s" % (name_width, "name"),
         "procs",
         "MEM",
         "PSI",
+        "W",
         "comms",
     )
     lines = [_styled(header, "1", color)]
@@ -232,8 +252,13 @@ def render_scopes(scopes, args):
         memory_text = "-" if memory is None else _format_memory(memory)
         pressure = scope["psi_avg10"]
         pressure_text = "-" if pressure is None else "%.2f" % pressure
+        windows = scope.get("windows")
+        if isinstance(windows, dict) and windows.get("count"):
+            window_text = "F" if windows.get("focused") else "%d" % windows["count"]
+        else:
+            window_text = ""
         lines.append(
-            "%s%-*s %4d  %8s %6s  %s"
+            "%s%-*s %4d  %8s %6s %2s  %s"
             % (
                 indent,
                 max(1, name_width - len(indent)),
@@ -241,6 +266,7 @@ def render_scopes(scopes, args):
                 scope["processes"],
                 memory_text,
                 pressure_text,
+                window_text,
                 commands,
             )
         )

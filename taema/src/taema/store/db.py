@@ -1439,6 +1439,21 @@ class StateDB:
             connection.commit()
         return cursor.rowcount
 
+    def set_app_last_window(self, key, value, now=None):
+        """Record the learned last-window policy for one app; 0 rows when unknown."""
+        if self.read_only or not self.available or not isinstance(key, str) or not key:
+            return 0
+        if value not in ("ask", "quit", "keep"):
+            return 0
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE apps SET on_last_window = ?, last_seen = ? WHERE key = ?",
+                (value, now, key),
+            )
+            connection.commit()
+        return cursor.rowcount
+
     def app_identity(self, key):
         """Read the bounded presentation and executable evidence for one app key."""
         if not self.available or not isinstance(key, str) or not key:
@@ -1446,7 +1461,8 @@ class StateDB:
         with self.connection() as connection:
             row = connection.execute(
                 "SELECT key, kind, display, exe, dev, ino, desktop_id, unit, "
-                "first_seen, last_seen, instances, confidence FROM apps WHERE key = ?",
+                "on_last_window, first_seen, last_seen, instances, confidence "
+                "FROM apps WHERE key = ?",
                 (key,),
             ).fetchone()
         return dict(row) if row else None

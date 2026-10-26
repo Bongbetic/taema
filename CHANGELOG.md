@@ -2,6 +2,18 @@
 
 ## Behaviour changes
 
+### M4 release gate: 0.6.0 readiness
+
+`taema status` answers in 43 ms p50 over 100 runs (gate: under 50 ms):
+bare status probes the default daemon socket before loading config,
+the daemon does no file I/O on the request path, and the status reply
+carries a `mem_enabled` flag so the fast path honours `mem.enabled`.
+Every read command's `--json` output validates against its schema.
+`taema(1)` and `taema.toml(5)` ship and install to man1/man5, and shell
+completions install and load for bash, zsh, and fish. A new `m4` VM
+scenario gates releases: mode switch without sudo in under a second,
+invalid config keeps the previous config and reports `file:line`.
+
 ### Status bar feed and quickshell widget
 
 `taema bar --format waybar|i3bar|json|plain [--follow]` writes one

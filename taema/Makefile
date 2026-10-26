@@ -19,6 +19,8 @@ SHELLDIR  = $(DESTDIR)/usr/share/taema/shell
 BASHRCD   = $(DESTDIR)/etc/bash/bashrc.d
 FISHCONF  = $(DESTDIR)/usr/share/fish/vendor_conf.d
 MANDIR    = $(DESTDIR)/usr/share/man/man7
+MAN1DIR   = $(DESTDIR)/usr/share/man/man1
+MAN5DIR   = $(DESTDIR)/usr/share/man/man5
 BASHCOMP  = $(DESTDIR)/usr/share/bash-completion/completions
 ZSHCOMP   = $(DESTDIR)/usr/share/zsh/site-functions
 FISHCOMP  = $(DESTDIR)/usr/share/fish/vendor_completions.d
@@ -46,7 +48,7 @@ test check:
 
 install:
 	install -d $(LIBDIR) $(BINDIR) $(LIBEXEC) $(SVDIR)/log $(CONFDIR)/units $(SUDOERS) \
-		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(EXAMPLES)/autostart $(SHELLDIR) $(BASHRCD) $(FISHCONF) $(MANDIR)
+		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(EXAMPLES)/autostart $(SHELLDIR) $(BASHRCD) $(FISHCONF) $(MANDIR) $(MAN1DIR) $(MAN5DIR)
 	install -d $(BASHCOMP) $(ZSHCOMP) $(FISHCOMP)
 	install -d $(DOCDIR)/schema/ipc $(DOCDIR)/schema/cli
 	find src/taema -type d -print | while read dir; do \
@@ -74,6 +76,8 @@ endif
 	install -m644 examples/autostart/* $(EXAMPLES)/autostart/
 	install -m644 README.md docs/design.md ../docs/identity-resolution.md ../docs/legacy-state-migration.md ../docs/state-schema.md $(DOCDIR)/
 	install -m644 docs/taema-learning.7 $(MANDIR)/taema-learning.7
+	install -m644 docs/taema.1 $(MAN1DIR)/taema.1
+	install -m644 docs/taema.toml.5 $(MAN5DIR)/taema.toml.5
 	install -m644 shell/taema.bash shell/taema.zsh shell/taema.fish $(SHELLDIR)/
 	install -m644 shell/completion.bash $(BASHCOMP)/taema
 	install -m644 shell/_taema $(ZSHCOMP)/_taema

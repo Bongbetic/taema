@@ -1,0 +1,112 @@
+.TH TAEMA.TOML 5 "2026-10-26" "taema 0.6.0" "Tæma Manual"
+.SH NAME
+taema.toml \- tæma configuration file
+.SH DESCRIPTION
+Tæma reads layered TOML configuration: built-in defaults, then
+.IR /etc/taema/taema.toml ,
+.IR /etc/taema/taema.d/*.toml ,
+.IR ~/.config/taema/taema.toml ,
+.IR ~/.config/taema/taema.d/*.toml .
+Later layers override earlier ones; drop-ins sort by filename.
+.B [protected]
+entries always union, so a user file cannot remove a system entry.
+.B TAEMA_CONFIG
+replaces the file layers with one file. An invalid edit keeps the
+previous config and reports
+.IR file:line .
+.SH TOP LEVEL
+.TP
+.B mode
+Lifecycle mode: observe, adopt, enforce, or auto. Default observe.
+.SH PATHS
+.TP
+.B [paths]
+socket, socket_fallback, state_dir, helper. Defaults live under
+.IR ~/.local/state/taema .
+.SH TIMERS
+.TP
+.B [timers]
+adopt_interval, gc_interval, idle_grace, leftover_expire_days.
+.SH PROTECTED
+.TP
+.B [protected]
+comm (list), cgroup_prefix (list), env_prefix (table). Matching processes
+are never stopped.
+.SH LEARNER
+.TP
+.B [learner]
+deny_owners extends the built-in owner-deny classes.
+.TP
+.B [learn]
+enabled, burn-in and probation windows, ask budgets, review_ttl_days,
+identity_denylist, remember_argv, allow_self_authority (default false).
+.SH MEMORY
+.TP
+.B [mem]
+enabled, manage (soft), budget, fraction, floor, reclaim and pressure
+gates, swap_reclaim, zswap, oom_policy.
+.SH VETO, UI, REVIEW
+.TP
+.B [veto]
+enabled, default_expiry, block_reclaim.
+.TP
+.B [ui]
+color, dashboard_refresh, events_tail.
+.TP
+.B [review]
+queue, prompt, prompt_interval.
+.SH AGENT
+.TP
+.B [agent]
+enabled, window_backend (auto), windowless_grace seconds (30),
+max_events_per_s (50), store_titles (false).
+.SH NOTIFY
+.TP
+.B [notify]
+enabled, backend (auto), batch_seconds, max_per_hour, min_mem,
+quiet_hours, ttl, undo_toast_seconds, countdown_seconds, digest.
+.SH FREEZE, QOS, GUARD
+.TP
+.B [freeze]
+enabled, adopt, after, wake_on_connect, max_frozen, cpu_idle_max.
+.TP
+.B [qos]
+enabled, leftover/idle weights, focus_boost, leftover_pids_max.
+.TP
+.B [guard]
+enabled, available_floor, psi_some, psi_full, cooldown,
+freeze_in_adopt, oom adjustments.
+.SH STORE
+.TP
+.B [store]
+path, retention_days, sample_interval, max_events, daily_export.
+.SH EXPERIMENTAL
+.TP
+.B [experimental]
+freeze, guard, window_close, launch_wrap, eventd feature flags.
+.SH PROFILE
+.TP
+.B [profile]
+active (auto or a name), runtime_mode, per-profile overrides
+(default, focus, battery, game, quiet, server).
+.SH UNITS
+Units live in
+.I /etc/taema/units
+and
+.IR ~/.config/taema/units :
+[unit] name, kind, stop_when_unneeded; [match] exe, comm,
+cmdline_contains; [kill] survive_logout, graceful; [gc]
+keep_while_children; [window] backend, requires_window; [[children]]
+carves.
+.SH EXAMPLE
+.PP
+.nf
+mode = "adopt"
+[timers]
+gc_interval = 60
+[notify]
+max_per_hour = 6
+.fi
+.SH SEE ALSO
+.BR taema (1),
+.BR taema-learning (7)

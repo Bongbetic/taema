@@ -163,7 +163,8 @@ def render(format_name, model):
             }
         )
     if format_name == "json":
-        payload = dict(model)
+        payload = {"schema": "taema.bar.v1"}
+        payload.update(model)
         payload["text"] = text
         payload["tooltip"] = tooltip
         return json.dumps(payload, sort_keys=True)

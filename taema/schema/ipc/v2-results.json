@@ -40,7 +40,8 @@
             "reason": {"type": "string"}
           },
           "additionalProperties": false
-        }
+        },
+        "mem_enabled": {"type": "boolean"}
       },
       "additionalProperties": true
     },

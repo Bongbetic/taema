@@ -207,6 +207,8 @@ class Daemon:
         self._window_rates = {}  # session -> [recent window event timestamps]
         self._windowless_since = {}  # scope -> when it was last seen windowed
         self.launch_reservations = {}  # scope -> {app, unit, pid, expires, owner}
+        self._state_gen = 0  # bumped by every state-changing command
+        self._status_cache = None  # (gen, monotonic ts, reply); 1s TTL backstop
         self._recovery_notified = set()  # sessions told about store recovery
         self._digest_at = {}  # session -> last digest job timestamp
         self._close_history = {}  # app -> [close timestamps, last hour]
@@ -4390,10 +4392,18 @@ class Daemon:
         return {"restored": True, "pid": child.pid, "scope": "scope-" + scope}
 
     # ---- socket API ----
+    #: Commands that never change status-visible state; every other command
+    #: bumps the state generation so the cached status reply is rebuilt.
+    _STATUS_PURE_COMMANDS = frozenset(
+        {"status", "doctor", "memory_budget", "notify_poll", "agent_beat", "subscribe"}
+    )
+
     def handle(self, msg):
         if not isinstance(msg, dict):
             return {"error": "bad request"}
         c = msg.get("cmd")
+        if c not in self._STATUS_PURE_COMMANDS:
+            self._state_gen += 1
         if c == "doctor":
             from ..doctor import diagnose
 
@@ -4457,10 +4467,15 @@ class Daemon:
                 return {"error": result.get("error", "thaw refused")}
             return result
         if c == "status":
+            now_mono = time.monotonic()
+            if self._status_cache is not None:
+                cached_gen, cached_at, cached = self._status_cache
+                if cached_gen == self._state_gen and now_mono - cached_at < 1.0:
+                    return cached
             self.store.expire_reviews()
             self._save_if_idle()
             effective_authority = self.effective_authority
-            return {
+            reply = {
                 "mode": self.mode,
                 "authority": effective_authority["value"],
                 "authority_source": effective_authority["source"],
@@ -4506,7 +4521,10 @@ class Daemon:
                 "guard": self.guard_status(),
                 "agents": self.agent_report(),
                 "windows": self.window_summary(),
+                "mem_enabled": memory.config_enabled(self.cfg),
             }
+            self._status_cache = (self._state_gen, now_mono, reply)
+            return reply
         if c == "review":
             self.store.expire_reviews()
             self._save_if_idle()
@@ -6135,8 +6153,8 @@ class Daemon:
             reply = {"error": "%s: %s" % (type(e).__name__, e)}
         if keep_open:
             return
-        if self._summary_dirty and not self._in_tick:
-            self._write_summary_if_dirty()
+        # No file I/O on the request path: the tick at the end of this loop
+        # iteration writes the summary if an event dirtied it.
         try:
             conn.settimeout(0.5)
             conn.sendall((json.dumps(reply) + "\n").encode())
@@ -7036,6 +7054,7 @@ class Daemon:
         except Exception as error:
             self.store.log(event="memory_budget_failed", reason=str(error))
         self._save_if_idle()
+        self._state_gen += 1
         return {"reloaded": True, "sources": list(cfg.get("_sources", []))}
 
     def _running_comms(self):

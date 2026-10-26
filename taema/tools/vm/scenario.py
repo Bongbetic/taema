@@ -430,7 +430,7 @@ def wait_for_auto_status(timeout=30, poll=0.5):
     attempts = 0
     while True:
         attempts += 1
-        result = _run(["/usr/bin/taema", "status"], timeout=10)
+        result = _run(["/usr/bin/taema", "status", "--json"], timeout=10)
         if result.returncode == 0 and '"mode": "auto"' in result.stdout:
             return result, attempts
         if time.monotonic() >= deadline:
@@ -609,7 +609,17 @@ def scenario_smoke(rec, args, tree_holder):
     review_event = wait_for_event(
         os.path.join(args.state_dir, "decisions.log"), "review_created", timeout=timeout
     )
-    review = _run(["/usr/bin/taema", "review"], timeout=30)
+    review = None
+    deadline = time.monotonic() + 15
+    while True:
+        review = _run(["/usr/bin/taema", "review"], timeout=30)
+        if (
+            review.returncode == 0
+            and "review #" in review.stdout
+            and "survivors=" in review.stdout
+        ) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
     rec.step(
         "review-created",
         review.returncode == 0
@@ -3824,12 +3834,197 @@ def image_diff_fraction(first, second):
     return differing / total
 
 
+def _raw_daemon_status(timeout=10):
+    """Ask the daemon over its socket directly, bypassing config file layers."""
+    import socket as socket_mod
+
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    path = os.path.join(runtime_dir, "taema.sock")
+    request = json.dumps({"v": 2, "id": 1, "cmd": "status", "args": {}}) + "\n"
+    sock = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        sock.sendall(request.encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    reply = json.loads(buf.decode() or "{}")
+    if isinstance(reply, dict) and reply.get("ok") is True:
+        return reply.get("result") or {}
+    return {}
+
+
+def scenario_m4(rec, args, tree_holder):
+    """M4 release gate: mode switch, invalid config, completions, status p50."""
+    del tree_holder
+
+    status, attempts = wait_for_auto_status(timeout=60)
+    rec.step(
+        "daemon-ready",
+        status.returncode == 0 and '"mode": "auto"' in status.stdout,
+        "attempts=%d socket={%s} %s"
+        % (attempts, runtime_socket_detail(), (status.stdout or status.stderr)[:300]),
+    )
+
+    started = time.monotonic()
+    switched = _run(["taema", "mode", "adopt"], timeout=30)
+    elapsed = time.monotonic() - started
+    rec.step(
+        "mode-switch-no-sudo",
+        switched.returncode == 0,
+        "rc=%d %.3fs %s"
+        % (switched.returncode, elapsed, (switched.stdout + switched.stderr)[:200]),
+    )
+    rec.step("mode-switch-under-1s", elapsed < 1.0, "%.3fs" % elapsed)
+
+    status = _run(["taema", "status", "--json"], timeout=30)
+    try:
+        mode = json.loads(status.stdout).get("status", {}).get("mode", "")
+    except ValueError:
+        mode = ""
+    rec.step("status-shows-adopt", mode == "adopt", "mode=%r" % mode)
+
+    drop_dir = os.path.join(os.path.expanduser("~"), ".config", "taema", "taema.d")
+    os.makedirs(drop_dir, exist_ok=True)
+    bad_path = os.path.join(drop_dir, "99-m4-bad.toml")
+    with open(bad_path, "w") as handle:
+        handle.write('mode = "adopt"\nbroken = [oops\n')
+    try:
+        reloaded = _run(["taema", "reload"], timeout=30)
+        output = reloaded.stdout + reloaded.stderr
+        rec.step(
+            "invalid-config-reports-file-line",
+            reloaded.returncode != 0 and "99-m4-bad.toml" in output and ":2" in output,
+            "rc=%d %s" % (reloaded.returncode, output[:300]),
+        )
+        try:
+            kept_mode = _raw_daemon_status().get("mode", "")
+        except Exception as error:
+            kept_mode = "socket error: %s" % error
+        rec.step(
+            "invalid-config-keeps-previous", kept_mode == "adopt", "mode=%r" % kept_mode
+        )
+    finally:
+        try:
+            os.remove(bad_path)
+        except OSError:
+            pass
+    healed = _run(["taema", "reload"], timeout=30)
+    rec.step(
+        "reload-after-fix",
+        healed.returncode == 0,
+        (healed.stdout + healed.stderr)[:200],
+    )
+
+    for path in (
+        "/usr/share/bash-completion/completions/taema",
+        "/usr/share/zsh/site-functions/_taema",
+        "/usr/share/fish/vendor_completions.d/taema.fish",
+    ):
+        rec.step(
+            "completion-installed-" + os.path.basename(path),
+            os.path.isfile(path),
+            path,
+        )
+    bash_load = _run(
+        [
+            "bash",
+            "--norc",
+            "-c",
+            "source /usr/share/bash-completion/completions/taema && complete -p taema",
+        ],
+        timeout=30,
+    )
+    rec.step(
+        "completion-loads-bash",
+        bash_load.returncode == 0,
+        bash_load.stdout.strip()[:200],
+    )
+
+    have_zsh = _run(["sh", "-c", "command -v zsh"], timeout=30).returncode == 0
+    have_fish = _run(["sh", "-c", "command -v fish"], timeout=30).returncode == 0
+    if not (have_zsh and have_fish):
+        installed = run_privileged(
+            ["xbps-install", "-Sy", "zsh", "fish-shell"], timeout=300
+        )
+        rec.step(
+            "shells-install",
+            installed.returncode == 0,
+            (installed.stdout + installed.stderr)[-300:],
+        )
+        have_zsh = _run(["sh", "-c", "command -v zsh"], timeout=30).returncode == 0
+        have_fish = _run(["sh", "-c", "command -v fish"], timeout=30).returncode == 0
+    if have_zsh:
+        zsh_load = _run(
+            [
+                "zsh",
+                "-f",
+                "-c",
+                "autoload -Uz compinit && compinit -i && source /usr/share/zsh/site-functions/_taema && (( $+functions[_taema_completion] ))",
+            ],
+            timeout=30,
+        )
+        rec.step(
+            "completion-loads-zsh",
+            zsh_load.returncode == 0,
+            (zsh_load.stdout + zsh_load.stderr)[:200],
+        )
+    else:
+        rec.step("completion-loads-zsh", False, "zsh not installed")
+    if have_fish:
+        fish_load = _run(
+            [
+                "fish",
+                "--no-config",
+                "-c",
+                "source /usr/share/fish/vendor_completions.d/taema.fish; complete -c taema",
+            ],
+            timeout=30,
+        )
+        rec.step(
+            "completion-loads-fish",
+            fish_load.returncode == 0,
+            (fish_load.stdout + fish_load.stderr)[:200],
+        )
+    else:
+        rec.step("completion-loads-fish", False, "fish not installed")
+
+    latencies = []
+    for _ in range(100):
+        begun = time.monotonic()
+        probe = _run(["taema", "status"], timeout=30)
+        latencies.append((time.monotonic() - begun) * 1000.0)
+        if probe.returncode != 0:
+            break
+    latencies.sort()
+    p50 = latencies[len(latencies) // 2] if latencies else float("inf")
+    rec.step(
+        "status-p50-under-50ms",
+        len(latencies) == 100 and p50 < 50.0,
+        "n=%d p50=%.1fms min=%.1f max=%.1f"
+        % (
+            len(latencies),
+            p50,
+            latencies[0] if latencies else -1,
+            latencies[-1] if latencies else -1,
+        ),
+    )
+    return all(step["ok"] for step in rec.steps)
+
+
 SCENARIOS = {
     "smoke": scenario_smoke,
     "m0": scenario_m0,
     "m1": scenario_m1,
     "m2": scenario_m2,
     "m3": scenario_m3,
+    "m4": scenario_m4,
     "upgrade": scenario_upgrade,
     "remove": scenario_remove,
     "graphical": scenario_graphical,

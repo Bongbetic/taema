@@ -1,0 +1,211 @@
+.TH TAEMA 1 "2026-10-26" "taema 0.6.0" "Tæma Manual"
+.SH NAME
+taema \- dependency-aware, self-managing cgroup v2 process scopes
+.SH SYNOPSIS
+.B taema
+.RI [GLOBAL] " COMMAND " [ARGS]
+.SH DESCRIPTION
+Tæma adopts processes into cgroup scopes, learns which leftovers are safe to
+stop, and stops them under pair authority. A per-user daemon
+.RB ( taema\ daemon )
+owns lifecycle passes; the CLI reads state and sends requests over a Unix
+socket.
+.PP
+Lifecycle modes, weakest first:
+.BR observe ,
+.BR adopt ,
+.BR enforce ,
+.BR auto .
+.BI "taema mode " MODE
+switches the running daemon without sudo.
+.SH COMMANDS
+.SS Scopes and launching
+.TP
+.B taema run [--bind] [--owner PID] [--join] NAME CMD...
+Run CMD inside scope-NAME, stopping the scope when the owner exits.
+.TP
+.B taema launch [--app NAME] [--unit UNIT] [--bind] -- CMD...
+Reserve an app scope, attach, register provenance, and exec CMD.
+.TP
+.B taema kill NAME
+Stop a scope; shared members are moved aside, not killed.
+.TP
+.B taema ls
+List scopes.
+.TP
+.B taema top
+Live process table sorted by CPU, memory, then PID.
+.TP
+.B taema tree
+Process trees grouped under scope headers.
+.SS Inspecting and teaching
+.TP
+.B taema status
+Show daemon and policy status.
+.TP
+.B taema explain [TARGET]
+Explain a process, scope, app, pair, or latest decision.
+.B why
+is an alias.
+.TP
+.B taema review [--interactive]
+List pending reviews or answer them interactively.
+.TP
+.B taema answer ID CHOICE
+Answer a review with stop, keep, standalone, or never.
+.TP
+.B taema teach OWNER SURVIVOR CHOICE
+Record an explicit pair answer without waiting for a review.
+.TP
+.B taema learn show|apps|pairs|signatures
+Inspect learned state.
+.TP
+.B taema history TARGET
+Show the timeline of one app or scope.
+.TP
+.B taema recent
+List the latest automatic actions.
+.TP
+.B taema report --day|--week|--month
+Summarize cleanup activity.
+.TP
+.B taema events [--since SEQ] [--follow]
+Query or follow the event log.
+.TP
+.B taema dash
+Curses dashboard; --once prints one snapshot.
+.TP
+.B taema prompt
+Print the cached prompt summary without contacting the daemon.
+.TP
+.B taema bar --format waybar|i3bar|json|plain [--follow]
+Stream bar state, one line per state change.
+.SS Acting and overruling
+.TP
+.B taema keep TARGET
+Keep an executable or owner/survivor pair.
+.TP
+.B taema do-not-kill TARGET
+Veto a target or the latest automatic stop.
+.TP
+.B taema forget TARGET
+Forget an executable or veto.
+.TP
+.B taema undo [ID]
+Reverse a retained automatic action.
+.TP
+.B taema restore ID
+Relaunch a stopped root by decision id.
+.TP
+.B taema mute APP
+Mute an app's notifications.
+.TP
+.B taema hold [TARGET]
+Pause actions without changing mode.
+.TP
+.B taema resume [TARGET]
+Resume actions.
+.TP
+.B taema snooze DURATION|until TIME
+Hold all actions for a duration or until a local time.
+.TP
+.B taema freeze SCOPE
+Manually freeze a safe leftover scope.
+.TP
+.B taema thaw [SCOPE|--all]
+Thaw managed scopes.
+.TP
+.B taema gc [--dry-run] [--memory]
+Show or collect idle scopes.
+.TP
+.B taema adopt
+Adopt eligible processes into scopes.
+.SS Configuration and units
+.TP
+.B taema mode MODE
+Switch lifecycle mode without restarting the daemon.
+.TP
+.B taema profile NAME
+Select a configuration profile or return to automatic selection.
+.TP
+.B taema config
+Show or edit layered configuration.
+.TP
+.B taema reload
+Reload configuration and units in the daemon.
+.TP
+.B taema unit draft|dry-run|lint
+Unit authoring tools.
+.SS Desktop and session
+.TP
+.B taema desktop wrap|unwrap|list
+Wrap launcher entries with taema launch.
+.TP
+.B taema agent
+Relay this session's desktop facts to the daemon.
+.TP
+.B taema watch
+Print live changes as plain lines.
+.SS Maintenance
+.TP
+.B taema doctor
+Check system support and report setup problems.
+.TP
+.B taema backup [--to FILE]
+Write a tarball with the database, user config, and user units.
+.TP
+.B taema restore-backup FILE
+Restore state, config, and units from a backup tarball.
+.TP
+.B taema reset --learning|--vetoes|--history|--all
+Clear state after a backup.
+.TP
+.B taema memory [top|pressure|budget|watch|reclaim]
+Host and per-scope memory accounting.
+.TP
+.B taema daemon
+Run the per-user daemon.
+.SH OPTIONS
+Global options accepted before or after the command:
+.BR --json ,
+.BR --jsonl ,
+.BR --plain ,
+.BR --wide ,
+.BR --no-color ,
+.BR --quiet ,
+.BR --yes ,
+.BR --socket " PATH" ,
+.BR --config " PATH" ,
+.BR --verbose .
+Read commands emit schema-tagged JSON with
+.BR --json .
+.SH FILES
+.TP
+.I /etc/taema/taema.toml
+System configuration.
+.TP
+.I ~/.config/taema/taema.toml
+User configuration; drop-ins live in
+.IR taema.d .
+.TP
+.I /etc/taema/units, ~/.config/taema/units
+Unit files.
+.TP
+.I ~/.local/share/applications
+User desktop entry overrides written by
+.BR "taema desktop wrap" .
+.SH EXAMPLES
+.TP
+.B taema run editor code .
+Start the editor inside scope-editor.
+.TP
+.B taema launch --app firefox -- firefox
+Start firefox inside its own reserved app scope.
+.TP
+.B taema why scope-firefox
+Explain what tæma would do to the scope and why.
+.SH SEE ALSO
+.BR taema.toml (5),
+.BR taema-learning (7)
+.SH AUTHORS
+soubarnak.

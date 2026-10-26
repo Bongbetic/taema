@@ -145,6 +145,17 @@ class IpcV2Tests(unittest.TestCase):
             )
         )
 
+    def test_serve_leaves_summary_write_for_the_tick(self):
+        payload = json.dumps(self.request(7, "status", {})).encode() + b"\n"
+        first, _ = self.converse(payload)
+        self.assertTrue(first["ok"])
+        self.daemon._summary_dirty = True
+        with mock.patch.object(self.daemon, "_write_summary_if_dirty") as writer:
+            second, _ = self.converse(payload)
+        self.assertTrue(second["ok"])
+        writer.assert_not_called()
+        self.assertTrue(self.daemon._summary_dirty)
+
     def test_old_feedback_v1_marker_still_uses_v1_reply(self):
         message = {
             "cmd": "feedback",

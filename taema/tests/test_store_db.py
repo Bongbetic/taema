@@ -767,6 +767,10 @@ class StoreDatabaseTests(unittest.TestCase):
                 "daily_export",
             )
             self.assertTrue(status_daemon.store.export_daily_if_due())
+            # the store changed outside the daemon command stream; move the
+            # generation the way any state-changing command would so the
+            # cached status reply is rebuilt (the 1s TTL would also refresh)
+            status_daemon._state_gen += 1
             self.assertIsNone(status_daemon.handle({"cmd": "status"})["recovery"])
 
     def test_missing_daily_export_recovers_from_legacy_backup(self):

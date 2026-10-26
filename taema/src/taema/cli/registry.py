@@ -14,7 +14,7 @@ GLOBAL_OPTIONS = (
 
 # String annotation: keeps the type visible to checkers without importing typing
 # on the latency-sensitive CLI path.
-COMMANDS: "tuple[dict[str, Any], ...]" = (
+COMMANDS: "tuple[dict[str, object], ...]" = (
     {
         "name": "run",
         "aliases": (),

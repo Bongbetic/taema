@@ -2969,9 +2969,7 @@ def cmd_status(a):
             "guard": reply["guard"]
             if "guard" in reply
             else _pressure_guard.empty_status(),
-            "config": list(
-                reply["config"] if "config" in reply else cfg["_sources"]
-            ),
+            "config": list(reply["config"] if "config" in reply else cfg["_sources"]),
             "config_error": reply.get("config_error") or client_config_error,
             "details": reply,
         }

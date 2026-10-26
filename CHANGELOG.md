@@ -2,6 +2,19 @@
 
 ## Behaviour changes
 
+### Actionable review notifications
+
+Each new answerable review produces one desktop notification with actions
+and wait — "Stop when it closes", "Keep", "Never", and "Details" — through
+the default notify-send backend. The notification carries the review's
+nonce; the agent reports the click with `notify_result` and the daemon
+answers through exactly the `taema answer` path, with the same rate limits,
+audit trail, and expiry. Clicking after expiry or on an answered review
+shows a short "question expired" toast with Details. Review waits slice at
+60 seconds with heartbeat keepalives so long waits never mark the agent
+down. Without an agent or an action-capable server, reviews wait for the
+shell hint and `taema review` as before.
+
 ### Notification policy, toasts, and countdowns
 
 The agent polls a per-session notification queue (`notify_poll`) and shows

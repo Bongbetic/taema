@@ -136,6 +136,20 @@ class NotifySendBackend:
     def close(self, nid):
         raise NotifyError("notify-send cannot close notification %r" % (nid,))
 
+    def cancel_wait(self, receipt):
+        """Abandon a --wait process; the notification itself stays up."""
+        proc = receipt.get("proc")
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
 
 def _default_runner(argv, **kwargs):
     return subprocess.run(argv, **kwargs)  # noqa: S603 - argv only, never a shell line
@@ -230,6 +244,9 @@ class GDBusBackend:
 
     def wait_for_action(self, receipt, timeout):
         raise NotifyError("the gdbus backend is one-way; it cannot wait")
+
+    def cancel_wait(self, receipt):
+        pass
 
     def close(self, nid):
         self._call("CloseNotification", ["%d" % nid])
@@ -469,6 +486,9 @@ class DBusNotifier:
     def close(self, nid):
         self._connection().call_close(nid)
 
+    def cancel_wait(self, receipt):
+        pass
+
 
 class NullNotifier:
     """No tool backend: sends vanish, waits report no-backend."""
@@ -486,6 +506,9 @@ class NullNotifier:
 
     def wait_for_action(self, receipt, timeout):
         return ("closed", "no-backend")
+
+    def cancel_wait(self, receipt):
+        pass
 
     def close(self, nid):
         pass

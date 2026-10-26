@@ -83,6 +83,29 @@ def render_error(kind, detail, markup_ok):
     return "taema: %s" % kind, detail, []
 
 
+def render_review(app, detail, markup_ok):
+    """One actionable review: stop, keep, never, or details."""
+    return (
+        "%s needs a decision" % _bold(app, markup_ok),
+        detail,
+        [
+            ("stop", "Stop when it closes"),
+            ("keep", "Keep"),
+            ("never", "Never"),
+            ("details", "Details"),
+        ],
+    )
+
+
+def render_expired(markup_ok):
+    """A click that arrived after the review was resolved or expired."""
+    return (
+        "question expired",
+        "The review was answered or expired.",
+        [("details", "Details")],
+    )
+
+
 def render_digest(counts, markup_ok):
     """The optional daily digest: one line of counts."""
     body = "%s stops, %s frozen, %s reclaimed, %s open reviews" % (
@@ -225,8 +248,12 @@ class JobHandler:
         apps = self._muted_apps(job)
         return bool(apps) and all(self.policy.muted(app) for app in apps)
 
-    def handle(self, jobs, profile, mutes, report):
-        """Apply policy to fresh jobs, flush due batches; quiet drops all."""
+    def handle(self, jobs, profile, mutes, report, keepalive=None):
+        """Apply policy to fresh jobs, flush due batches; quiet drops all.
+
+        `keepalive` runs between review wait slices (a beat, usually);
+        returning False abandons the wait.
+        """
         now = self.clock()
         self.policy.set_mutes(mutes)
         if self.policy.quiet_now(now, profile, self.localtime(now)):
@@ -235,7 +262,7 @@ class JobHandler:
             handler = getattr(self, "_job_" + str(job.get("kind", "")), None)
             if handler is not None:
                 try:
-                    handler(job, now, report)
+                    handler(job, now, report, keepalive)
                 except Exception:
                     continue
         for batch in self.policy.flush(now):
@@ -253,7 +280,7 @@ class JobHandler:
         except Exception:
             return False
 
-    def _job_close(self, job, now, report):
+    def _job_close(self, job, now, report, keepalive):
         if self._muted(job):
             return
         self.policy.close_event(
@@ -263,7 +290,7 @@ class JobHandler:
             now,
         )
 
-    def _job_undo(self, job, now, report):
+    def _job_undo(self, job, now, report, keepalive):
         from .notify import NotifyError
 
         if self._muted(job):
@@ -292,7 +319,7 @@ class JobHandler:
         if outcome == ("action", "undo"):
             report({"kind": "undo", "decision_id": job.get("decision_id")})
 
-    def _job_countdown(self, job, now, report):
+    def _job_countdown(self, job, now, report, keepalive):
         from .notify import NotifyError
 
         if self._muted(job):
@@ -326,7 +353,7 @@ class JobHandler:
                 }
             )
 
-    def _job_guard(self, job, now, report):
+    def _job_guard(self, job, now, report, keepalive):
         summary, body, actions = render_guard(
             "reclaimed %s via %s"
             % (format_mb(job.get("bytes_freed", 0)), job.get("trigger", "?")),
@@ -334,7 +361,7 @@ class JobHandler:
         )
         self._send(summary, body, actions)
 
-    def _job_error(self, job, now, report):
+    def _job_error(self, job, now, report, keepalive):
         kind = job.get("error_kind", "?")
         if not self.policy.error_allowed(kind, now):
             return
@@ -344,6 +371,77 @@ class JobHandler:
         if self._send(summary, body, actions):
             self.policy.note_error(kind, now)
 
-    def _job_digest(self, job, now, report):
+    def _job_digest(self, job, now, report, keepalive):
         summary, body, actions = render_digest(job, self._markup())
         self._send(summary, body, actions)
+
+    def _job_review(self, job, now, report, keepalive):
+        from .notify import NotifyError
+
+        if self._muted(job):
+            return
+        if "actions" not in self.backend.capabilities():
+            return
+        summary, body, actions = render_review(
+            job.get("app", "?"), job.get("detail", ""), self._markup()
+        )
+        try:
+            receipt = self.backend.send(
+                summary, body, actions=actions, markup=self._markup(), wait=True
+            )
+        except NotifyError:
+            return
+        if receipt is None:
+            return
+        while True:
+            try:
+                outcome = self.backend.wait_for_action(receipt, 60)
+            except NotifyError:
+                return
+            if outcome[0] == "timeout":
+                if keepalive is not None and not keepalive():
+                    cancel = getattr(self.backend, "cancel_wait", None)
+                    if cancel is not None:
+                        try:
+                            cancel(receipt)
+                        except NotifyError:
+                            pass
+                    return
+                continue
+            if outcome == ("action", "details"):
+                self._show_detail(job)
+                return
+            if outcome[0] == "action" and outcome[1] in ("stop", "keep", "never"):
+                reply = report(
+                    {
+                        "kind": "review",
+                        "nonce": job.get("nonce"),
+                        "choice": outcome[1],
+                    }
+                )
+                if reply is not None and not reply.get("ok"):
+                    self._show_expired(job)
+                return
+            return
+
+    def _show_detail(self, job):
+        self._send(job.get("app", "?"), job.get("detail", ""), [])
+
+    def _show_expired(self, job):
+        from .notify import NotifyError
+
+        summary, body, actions = render_expired(self._markup())
+        try:
+            receipt = self.backend.send(
+                summary, body, actions=actions, markup=self._markup(), wait=True
+            )
+        except NotifyError:
+            return
+        if receipt is None:
+            return
+        try:
+            outcome = self.backend.wait_for_action(receipt, 10)
+        except NotifyError:
+            return
+        if outcome == ("action", "details"):
+            self._show_detail(job)

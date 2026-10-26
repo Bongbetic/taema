@@ -718,7 +718,7 @@ class NotifyResultTest(unittest.TestCase):
                 "cmd": "notify_result",
                 "session": "s1",
                 "pid": os.getpid(),
-                "kind": "review",
+                "kind": "bogus",
                 "nonce": "n1",
             }
         )

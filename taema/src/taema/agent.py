@@ -162,6 +162,7 @@ class Agent:
             reply.get("profile", "auto"),
             reply.get("mutes", []),
             self._report,
+            keepalive=self._keepalive,
         )
         for job in jobs:
             seq = job.get("seq") if isinstance(job, dict) else None
@@ -169,7 +170,7 @@ class Agent:
                 self.cursor = seq
 
     def _report(self, payload):
-        self._ask(
+        return self._ask(
             {
                 "cmd": "notify_result",
                 "session": self.session,
@@ -177,6 +178,12 @@ class Agent:
                 **payload,
             }
         )
+
+    def _keepalive(self):
+        """Beat between review wait slices; False abandons the wait."""
+        if not compositor_live(self.compositor):
+            return False
+        return bool(self.beat())
 
     def run(self, sleep=time.sleep, max_beats=None, clock=time.monotonic):
         """Beat until the compositor goes away; back off while disconnected.

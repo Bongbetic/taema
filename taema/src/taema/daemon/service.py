@@ -201,6 +201,7 @@ class Daemon:
         self.notify_queues = {}  # session -> [jobs]; drained by notify_poll
         self.notify_seq = 0
         self.countdowns = {}  # nonce -> learned-stop countdown awaiting objection
+        self.review_nonces = {}  # nonce -> review awaiting a toast answer
         self._recovery_notified = set()  # sessions told about store recovery
         self._digest_at = {}  # session -> last digest job timestamp
         self._close_history = {}  # app -> [close timestamps, last hour]
@@ -1372,6 +1373,7 @@ class Daemon:
                             survivors=review["survivors"],
                             pids=review["pids"],
                         )
+                        self._emit_review_job(review)
                         self._save_if_idle()
             except engine.Refused as e:
                 self.store.log(event="leftover_move_refused", scope=name, error=str(e))
@@ -2548,6 +2550,7 @@ class Daemon:
                         pids=review["pids"],
                         source="gc",
                     )
+                    self._emit_review_job(review)
                     before = review["id"]
         else:
             review = self.store.add_scope_review(leaf, why, memory=memory_bytes)
@@ -4766,7 +4769,13 @@ class Daemon:
         return session, record
 
     def notify_agents(self, job):
-        """Queue one notification job for every up session agent."""
+        """Queue one notification job for every up session agent.
+
+        Off when notifications are disabled: headless and opted-out
+        installs never queue, and agents show nothing.
+        """
+        if not self.cfg.get("notify", {}).get("enabled", True):
+            return 0
         self.notify_seq += 1
         body = dict(job)
         envelope = {
@@ -4869,7 +4878,69 @@ class Daemon:
             return self._countdown_answer(msg)
         if kind == "undo":
             return self._toast_undo(msg)
+        if kind == "review":
+            return self._review_answer(msg)
         return {"error": "unknown notification result kind"}
+
+    def _emit_review_job(self, review):
+        """Queue one actionable notification for a new answerable review."""
+        if (
+            not isinstance(review, dict)
+            or review.get("kind") == "scope"
+            or review.get("state") != "open"
+        ):
+            return None
+        while len(self.review_nonces) >= 128:
+            oldest = min(
+                self.review_nonces, key=lambda n: self.review_nonces[n]["created"]
+            )
+            del self.review_nonces[oldest]
+        nonce = _secure_token_hex(8)
+        self.review_nonces[nonce] = {
+            "review_id": review["id"],
+            "created": time.time(),
+        }
+        survivors = ", ".join(review.get("survivors", [])) or "leftovers"
+        detail = "%s in %s" % (survivors, review.get("scope", "?"))
+        if isinstance(review.get("mem"), int):
+            detail += " · %d MB" % (review["mem"] // (1024 * 1024))
+        self.notify_agents(
+            {
+                "kind": "review",
+                "nonce": nonce,
+                "review_id": review["id"],
+                "app": review.get("owner") or "?",
+                "detail": detail,
+                "ttl": 600,
+            }
+        )
+        return nonce
+
+    def _review_answer(self, msg):
+        """Answer a review from a toast through the `taema answer` path."""
+        nonce, choice = msg.get("nonce"), msg.get("choice")
+        if not isinstance(nonce, str) or not nonce or choice not in knowledge.CHOICES:
+            return {"error": "bad request"}
+        mapping = self.review_nonces.pop(nonce, None)
+        if mapping is None:
+            return {"error": "review is missing, expired, or not answerable"}
+        reply = self.handle(
+            {
+                "cmd": "feedback",
+                "v": 2,
+                "id": "review-notify-%s" % nonce,
+                "op": "review_answer",
+                "review_id": mapping["review_id"],
+                "choice": choice,
+            }
+        )
+        if (
+            not isinstance(reply, dict)
+            or reply.get("error")
+            or not reply.get("ok", True)
+        ):
+            return {"error": "review is missing, expired, or not answerable"}
+        return {"ok": True, "review_id": mapping["review_id"], "choice": choice}
 
     def _countdown_answer(self, msg):
         nonce, choice = msg.get("nonce"), msg.get("choice")

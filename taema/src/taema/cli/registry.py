@@ -273,6 +273,22 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         "help": "check system support and report setup problems",
         "handler": "cmd_doctor",
         "read": True,
+        "arguments": (
+            (
+                ("--fix",),
+                {
+                    "action": "store_true",
+                    "help": "repair safe items; print root commands unless --sudo",
+                },
+            ),
+            (
+                ("--sudo",),
+                {
+                    "action": "store_true",
+                    "help": "run the printed root commands for doctor --fix",
+                },
+            ),
+        ),
     },
     {
         "name": "config",

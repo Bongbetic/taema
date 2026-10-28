@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import socket
 import sqlite3
+import stat
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -547,6 +548,283 @@ class DoctorChecks(unittest.TestCase):
             ) as diagnose:
                 self.assertEqual(daemon.handle({"cmd": "doctor"}), expected)
             diagnose.assert_called_once_with(daemon.cfg, daemon.store, daemon.units)
+
+
+class DoctorFix(DoctorChecks):
+    """`taema doctor --fix` repairs what it safely can (issue #75)."""
+
+    def test_fix_flags_registered(self):
+        from taema.cli import registry
+
+        entry = next(item for item in registry.COMMANDS if item["name"] == "doctor")
+        flags = {names[0] for names, _ in entry.get("arguments", ())}
+        self.assertIn("--fix", flags)
+        self.assertIn("--sudo", flags)
+
+    def test_fix_runs_repair_and_reports(self):
+        fixes = [
+            {"name": "state dir", "status": "fixed", "message": "created it"},
+            {
+                "name": "controllers",
+                "status": "needs-root",
+                "message": "cannot write subtree_control",
+                "command": "sudo sh -c 'echo +memory > /sys/fs/cgroup/subtree'",
+            },
+        ]
+        args = SimpleNamespace(
+            json=False, jsonl=False, quiet=False, config=None, fix=True, sudo=False
+        )
+        with (
+            mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
+            mock.patch.object(commands, "ask", return_value=None),
+            mock.patch.object(commands.knowledge, "Store", return_value=self.store),
+            mock.patch.object(commands.policy, "load_units", return_value=[]),
+            mock.patch.object(
+                doctor,
+                "diagnose",
+                return_value={
+                    "schema": "taema.doctor.v1",
+                    "status": "ok",
+                    "checks": [],
+                },
+            ),
+            mock.patch.object(doctor, "repair", return_value=fixes) as repair,
+            mock.patch.object(view, "emit"),
+        ):
+            self.assertEqual(commands.cmd_doctor(args), 1)
+        repair.assert_called_once()
+        self.assertFalse(repair.call_args.kwargs["sudo"])
+
+        with (
+            mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
+            mock.patch.object(commands, "ask", return_value=None),
+            mock.patch.object(commands.knowledge, "Store", return_value=self.store),
+            mock.patch.object(commands.policy, "load_units", return_value=[]),
+            mock.patch.object(
+                doctor,
+                "diagnose",
+                return_value={
+                    "schema": "taema.doctor.v1",
+                    "status": "ok",
+                    "checks": [],
+                },
+            ),
+            mock.patch.object(
+                doctor,
+                "repair",
+                return_value=[
+                    {"name": "state dir", "status": "fixed", "message": "created it"}
+                ],
+            ),
+            mock.patch.object(view, "emit"),
+        ):
+            self.assertEqual(commands.cmd_doctor(args), 0)
+
+    def test_fix_creates_missing_dirs_and_repairs_perms(self):
+        self.cfg["paths"]["state_dir"] = os.path.join(self.temp.name, "new-state")
+        self.cfg["paths"]["hooks_dir"] = os.path.join(self.temp.name, "new-hooks")
+        config_dir = os.path.join(self.temp.name, "new-config")
+        with mock.patch.object(policy, "user_config_dir", return_value=config_dir):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+            again = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["state dir"]["status"], "fixed")
+        self.assertEqual(by_name["hooks dir"]["status"], "fixed")
+        self.assertEqual(by_name["config dir"]["status"], "fixed")
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.cfg["paths"]["state_dir"]).st_mode), 0o700
+        )
+        self.assertTrue(all(item["status"] == "skipped" for item in again))
+
+        os.chmod(self.cfg["paths"]["state_dir"], 0o755)
+        with mock.patch.object(policy, "user_config_dir", return_value=config_dir):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["state dir"]["status"], "fixed")
+        self.assertIn("0700", by_name["state dir"]["message"])
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.cfg["paths"]["state_dir"]).st_mode), 0o700
+        )
+
+    def test_fix_enables_controllers_or_reports_root(self):
+        from taema.core import cgroup as cgroup_mod
+
+        control = cgroup_mod.base(os.getuid()) + "/cgroup.subtree_control"
+        self.write(control, "+cpu +pids\n")
+        fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["controllers"]["status"], "fixed")
+        content = Path(control).read_text()
+        self.assertIn("+io", content)
+        self.assertIn("+memory", content)
+
+        again = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in again}
+        self.assertEqual(by_name["controllers"]["status"], "skipped")
+
+        self.write(control, "+cpu +pids\n")
+        os.chmod(control, 0o444)
+        try:
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        finally:
+            os.chmod(control, 0o644)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["controllers"]["status"], "needs-root")
+        self.assertIn("subtree_control", " ".join(by_name["controllers"]["command"]))
+
+    def test_fix_sudo_runs_root_commands(self):
+        from taema.core import cgroup as cgroup_mod
+
+        control = cgroup_mod.base(os.getuid()) + "/cgroup.subtree_control"
+        self.write(control, "+cpu +pids\n")
+        os.chmod(control, 0o444)
+        calls = []
+        try:
+            fixes = doctor.repair(
+                self.cfg,
+                self.store,
+                system_root=self.system_root,
+                sudo=True,
+                runner=lambda argv: calls.append(argv) or SimpleNamespace(returncode=0),
+            )
+        finally:
+            os.chmod(control, 0o644)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["controllers"]["status"], "fixed")
+        self.assertTrue(calls)
+        self.assertIn("subtree_control", " ".join(calls[0]))
+
+    def test_fix_migrates_legacy_store_and_prunes_stale(self):
+        fresh = os.path.join(self.temp.name, "mig-state")
+        os.makedirs(fresh)
+        with open(os.path.join(fresh, "knowledge.json"), "w", encoding="utf-8") as out:
+            json.dump({"exes": {}}, out)
+        for day in ("20200101", "20200102", "20200103", "20200104", "20200105"):
+            Path(os.path.join(fresh, "state-export-%s.json" % day)).write_text("{}\n")
+        runtime = os.path.join(self.temp.name, "runtime")
+        os.makedirs(os.path.join(runtime, "taema"))
+        hold_marker = os.path.join(runtime, "taema", "HOLD")
+        Path(hold_marker).write_text(json.dumps({"held": False}))
+        cfg = dict(self.cfg)
+        cfg["paths"] = dict(self.cfg["paths"], state_dir=fresh)
+        config_dir = os.path.join(self.temp.name, "mig-config")
+        with (
+            mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}),
+            mock.patch.object(policy, "user_config_dir", return_value=config_dir),
+        ):
+            fixes = doctor.repair(cfg, None, system_root=self.system_root)
+            again = doctor.repair(cfg, None, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["store migration"]["status"], "fixed")
+        self.assertTrue(os.path.isfile(os.path.join(fresh, "state.db")))
+        remaining = sorted(
+            name
+            for name in os.listdir(fresh)
+            if name.startswith("state-export-")
+        )
+        self.assertEqual(
+            remaining,
+            [
+                "state-export-20200103.json",
+                "state-export-20200104.json",
+                "state-export-20200105.json",
+            ],
+        )
+        self.assertFalse(os.path.exists(hold_marker))
+        by_name = {item["name"]: item for item in again}
+        self.assertEqual(by_name["store migration"]["status"], "skipped")
+        self.assertEqual(by_name["stale flags"]["status"], "skipped")
+
+    def test_fix_second_run_changes_nothing(self):
+        config_home = os.path.join(self.temp.name, "idem-xdg")
+        runtime = os.path.join(self.temp.name, "idem-runtime")
+        os.makedirs(runtime)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": config_home, "XDG_RUNTIME_DIR": runtime},
+            ),
+            mock.patch.object(
+                policy, "user_config_dir", return_value=config_home
+            ),
+        ):
+            first = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+            second = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        self.assertTrue(first)
+        self.assertFalse(
+            [item for item in first if item["status"] in ("fail", "needs-root")]
+        )
+        self.assertTrue(
+            all(item["status"] == "skipped" for item in second),
+            [item for item in second if item["status"] != "skipped"],
+        )
+
+    def test_fix_end_to_end_reports_each_repair(self):
+        config_home = os.path.join(self.temp.name, "e2e-xdg")
+        runtime = os.path.join(self.temp.name, "e2e-runtime")
+        os.makedirs(runtime)
+        args = SimpleNamespace(
+            json=False, jsonl=False, quiet=False, config=None, fix=True, sudo=False
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": config_home, "XDG_RUNTIME_DIR": runtime},
+            ),
+            mock.patch.object(
+                policy, "user_config_dir", return_value=config_home
+            ),
+            mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
+            mock.patch.object(commands, "ask", return_value=None),
+            mock.patch.object(commands.knowledge, "Store", return_value=self.store),
+            mock.patch.object(commands.policy, "load_units", return_value=[]),
+            mock.patch.object(view, "emit") as emit,
+        ):
+            self.assertEqual(commands.cmd_doctor(args), 0)
+        models = [call.args[0] for call in emit.call_args_list]
+        repair_report = next(
+            item for item in models if item.get("schema") == "taema.doctor.repair.v1"
+        )
+        names = {item["name"] for item in repair_report["fixes"]}
+        self.assertTrue(
+            {
+                "state dir",
+                "config dir",
+                "hooks dir",
+                "controllers",
+                "agent autostart",
+                "store migration",
+                "stale flags",
+            }
+            <= names
+        )
+
+    def test_fix_installs_agent_autostart(self):
+        source = (
+            self.system_root
+            + "/usr/share/examples/taema/autostart/taema-agent.desktop"
+        )
+        body = "[Desktop Entry]\nName=taema session agent\nExec=taema agent\n"
+        self.write(source, body)
+        config_home = os.path.join(self.temp.name, "xdg")
+        dest = os.path.join(config_home, "autostart", "taema-agent.desktop")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home}):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+            again = doctor.repair(
+                self.cfg, self.store, system_root=self.system_root
+            )
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["agent autostart"]["status"], "fixed")
+        self.assertEqual(Path(dest).read_text(), body)
+        by_name = {item["name"]: item for item in again}
+        self.assertEqual(by_name["agent autostart"]["status"], "skipped")
+
+        self.write(dest, "customized by user\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home}):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["agent autostart"]["status"], "skipped")
+        self.assertEqual(Path(dest).read_text(), "customized by user\n")
 
 
 if __name__ == "__main__":

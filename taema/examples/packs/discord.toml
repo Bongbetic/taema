@@ -1,0 +1,5 @@
+[unit]
+name = "discord"
+kind = "app"
+[match]
+comm = "Discord"

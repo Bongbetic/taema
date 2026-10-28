@@ -1,0 +1,5 @@
+[unit]
+name = "libvirt-qemu"
+kind = "app"
+[match]
+comm = "qemu-system-x86_64"

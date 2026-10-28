@@ -4118,8 +4118,139 @@ def cmd_tree(a):
 def cmd_unit(a):
     """Unit authoring tools."""
     del a
-    print("usage: taema unit <new|draft|test|dry-run|lint>")
+    print("usage: taema unit <new|draft|test|dry-run|lint|list|enable|disable|install>")
     return 2
+
+
+def _unit_cfg(args):
+    return policy.load_config(path=getattr(args, "config", None))
+
+
+def cmd_unit_list(a):
+    """List units with their source and whether they are active."""
+    cfg = _unit_cfg(a)
+    for entry in policy.describe_units(cfg):
+        print(
+            "%s %s %s"
+            % (entry["name"], entry["source"], "yes" if entry["active"] else "no")
+        )
+    return 0
+
+
+def _unit_filename_for(cfg, name):
+    """Map a unit name to its unit filename across all unit directories."""
+    for directory in policy.units_dirs(cfg):
+        if not os.path.isdir(directory):
+            continue
+        for filename in sorted(os.listdir(directory)):
+            if not filename.endswith(".toml"):
+                continue
+            if filename[: -len(".toml")] == name:
+                return filename
+            unit, error = policy.read_unit_file(os.path.join(directory, filename))
+            if error is None and unit.get("unit", {}).get("name") == name:
+                return filename
+    return None
+
+
+def cmd_unit_disable(a):
+    """Mask a unit with a user tombstone so the loader skips it."""
+    cfg = _unit_cfg(a)
+    filename = _unit_filename_for(cfg, a.name)
+    if filename is None:
+        return die("no such unit: %s" % a.name, 1)
+    units_dir = os.path.join(policy.user_config_dir(), "units")
+    os.makedirs(units_dir, exist_ok=True)
+    tombstone = os.path.join(units_dir, filename + ".disabled")
+    if os.path.exists(tombstone):
+        print("already disabled: %s" % a.name)
+        return 0
+    with open(tombstone, "w", encoding="utf-8") as stream:
+        stream.write("")
+    print("disabled: %s" % a.name)
+    return 0
+
+
+def cmd_unit_enable(a):
+    """Remove a user tombstone so the unit loads again."""
+    cfg = _unit_cfg(a)
+    filename = _unit_filename_for(cfg, a.name)
+    tombstone = None
+    if filename is not None:
+        tombstone = os.path.join(
+            policy.user_config_dir(), "units", filename + ".disabled"
+        )
+    else:
+        orphan = os.path.join(
+            policy.user_config_dir(), "units", a.name + ".toml.disabled"
+        )
+        if os.path.isfile(orphan):
+            tombstone = orphan
+    if tombstone is None:
+        return die("no such unit: %s" % a.name, 1)
+    if not os.path.isfile(tombstone):
+        print("already enabled: %s" % a.name)
+        return 0
+    os.unlink(tombstone)
+    print("enabled: %s" % a.name)
+    return 0
+
+
+def _pack_dirs():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        "/usr/share/examples/taema/packs",
+        os.path.join(here, "..", "..", "..", "examples", "packs"),
+    ]
+
+
+def _pack_source(name):
+    filename = name + ".toml"
+    for directory in _pack_dirs():
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate, directory
+    return None, None
+
+
+def _available_packs():
+    for directory in _pack_dirs():
+        if os.path.isdir(directory):
+            return sorted(
+                path[: -len(".toml")]
+                for path in os.listdir(directory)
+                if path.endswith(".toml")
+            )
+    return []
+
+
+def cmd_unit_install(a):
+    """Install a curated pack to the user units directory."""
+    source, _directory = _pack_source(a.name)
+    if source is None:
+        return die(
+            "no such pack: %s (available: %s)" % (a.name, ", ".join(_available_packs())),
+            2,
+        )
+    unit, error = policy.read_unit_file(source)
+    if error is not None:
+        print(error)
+        return 2
+    problems = policy.validate_unit(unit)
+    if problems:
+        for problem in problems:
+            print("%s: %s" % (source, problem))
+        return 2
+    units_dir = os.path.join(policy.user_config_dir(), "units")
+    os.makedirs(units_dir, exist_ok=True)
+    target = os.path.join(units_dir, a.name + ".toml")
+    if os.path.exists(target) and not getattr(a, "force", False):
+        return die("unit file exists: %s (use --force to overwrite)" % target, 1)
+    with open(source, "rb") as origin, open(target, "wb") as destination:
+        destination.write(origin.read())
+    os.chmod(target, 0o600)
+    print(target)
+    return 0
 
 
 def _stdin_is_tty():

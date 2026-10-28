@@ -833,6 +833,13 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         ),
     },
     {
+        "name": "setup",
+        "aliases": (),
+        "help": "walk from install to a working setup",
+        "handler": "cmd_setup",
+        "read": True,
+    },
+    {
         "name": "restore-backup",
         "aliases": (),
         "help": "restore state, config, and units from a backup tarball",

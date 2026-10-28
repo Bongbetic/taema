@@ -4215,59 +4215,24 @@ def cmd_unit_enable(a):
     return 0
 
 
-def _pack_dirs():
-    here = os.path.dirname(os.path.abspath(__file__))
-    return [
-        "/usr/share/examples/taema/packs",
-        os.path.join(here, "..", "..", "..", "examples", "packs"),
-    ]
-
-
-def _pack_source(name):
-    filename = name + ".toml"
-    for directory in _pack_dirs():
-        candidate = os.path.join(directory, filename)
-        if os.path.isfile(candidate):
-            return candidate, directory
-    return None, None
-
-
-def _available_packs():
-    for directory in _pack_dirs():
-        if os.path.isdir(directory):
-            return sorted(
-                path[: -len(".toml")]
-                for path in os.listdir(directory)
-                if path.endswith(".toml")
-            )
-    return []
-
-
 def cmd_unit_install(a):
     """Install a curated pack to the user units directory."""
-    source, _directory = _pack_source(a.name)
+    source = policy.pack_source(a.name)
     if source is None:
         return die(
-            "no such pack: %s (available: %s)" % (a.name, ", ".join(_available_packs())),
+            "no such pack: %s (available: %s)"
+            % (a.name, ", ".join(policy.available_packs())),
             2,
         )
-    unit, error = policy.read_unit_file(source)
-    if error is not None:
-        print(error)
-        return 2
-    problems = policy.validate_unit(unit)
-    if problems:
-        for problem in problems:
-            print("%s: %s" % (source, problem))
-        return 2
     units_dir = os.path.join(policy.user_config_dir(), "units")
-    os.makedirs(units_dir, exist_ok=True)
-    target = os.path.join(units_dir, a.name + ".toml")
-    if os.path.exists(target) and not getattr(a, "force", False):
-        return die("unit file exists: %s (use --force to overwrite)" % target, 1)
-    with open(source, "rb") as origin, open(target, "wb") as destination:
-        destination.write(origin.read())
-    os.chmod(target, 0o600)
+    ok, message, target = policy.install_pack_file(
+        source, units_dir, a.name, force=getattr(a, "force", False)
+    )
+    if not ok:
+        if os.path.exists(target):
+            return die(message, 1)
+        print(message)
+        return 2
     print(target)
     return 0
 
@@ -4566,6 +4531,29 @@ def cmd_unit_lint(a):
     for problem in problems:
         print("%s: %s" % (a.file, problem))
     return 2 if problems else 0
+
+
+def cmd_setup(a):
+    """Walk a new user from install to a working setup."""
+    from .. import setup as setup_mod
+
+    cfg, store = _load_status(a)
+    report = setup_mod.run_setup(
+        cfg,
+        store,
+        system_root="/",
+        proc_root=None,
+        yes=getattr(a, "yes", False),
+    )
+    for step in report["steps"]:
+        print("%s: %s: %s" % (step["name"], step["status"], step["message"]))
+    for path in report["wrote"]:
+        print("wrote %s" % path)
+    for command in report["root_commands"]:
+        print("needs root: %s" % command)
+    if any(step["status"] == "fail" for step in report["steps"]):
+        return 1
+    return 0
 
 
 def cmd_unit_dry_run(a):

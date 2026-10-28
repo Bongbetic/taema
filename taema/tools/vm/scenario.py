@@ -492,6 +492,57 @@ class ResultRecorder:
 # ---- scenarios -------------------------------------------------------------
 
 
+def scenario_setup(rec, args, tree_holder):
+    """Fresh account to a working setup via `taema setup --yes` in under 2 minutes."""
+    del tree_holder
+    home = os.path.join(args.artifacts, "setup-home")
+    config_home = os.path.join(home, ".config")
+    os.makedirs(config_home, exist_ok=True)
+    env = dict(os.environ, HOME=home, XDG_CONFIG_HOME=config_home)
+    begun = time.monotonic()
+    first = subprocess.run(
+        ["/usr/bin/taema", "setup", "--yes"],
+        capture_output=True,
+        text=True,
+        timeout=110,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    elapsed = time.monotonic() - begun
+    rec.step("setup-exit-zero", first.returncode == 0, first.stderr.strip()[:1000])
+    rec.step("setup-under-two-minutes", elapsed < 120, "%.1fs" % elapsed)
+    dropin = os.path.join(config_home, "taema", "taema.d", "40-setup.toml")
+    try:
+        with open(dropin, encoding="utf-8") as stream:
+            body = stream.read()
+    except OSError as error:
+        body = "missing: %s" % error
+    rec.step("setup-dropin-mode", 'mode = "' in body, body.strip()[:300])
+    autostart = os.path.join(config_home, "autostart", "taema-agent.desktop")
+    rec.step("setup-agent-autostart", os.path.isfile(autostart), autostart)
+    units = os.path.join(config_home, "taema", "units")
+    rec.step(
+        "setup-units-dir",
+        os.path.isdir(units),
+        ",".join(sorted(os.listdir(units)))[:1000] if os.path.isdir(units) else "missing",
+    )
+    second = subprocess.run(
+        ["/usr/bin/taema", "setup", "--yes"],
+        capture_output=True,
+        text=True,
+        timeout=110,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    rec.step("setup-second-exit-zero", second.returncode == 0, second.stderr.strip()[:1000])
+    rec.step(
+        "setup-idempotent",
+        "wrote " not in second.stdout,
+        second.stdout.strip()[-500:],
+    )
+    return all(step["ok"] for step in rec.steps)
+
+
 def scenario_smoke(rec, args, tree_holder):
     """Contain a GUI-like tree, close the root, verify survivor containment."""
     timeout = args.timeout
@@ -4319,6 +4370,7 @@ def scenario_m4(rec, args, tree_holder):
 SCENARIOS = {
     "smoke": scenario_smoke,
     "m0": scenario_m0,
+    "setup": scenario_setup,
     "m1": scenario_m1,
     "m2": scenario_m2,
     "m3": scenario_m3,

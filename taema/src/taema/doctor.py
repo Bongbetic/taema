@@ -1408,25 +1408,6 @@ def _repair_dirs(cfg, fixes):
 
 _DESIRED_CONTROLLERS = ("cpu", "io", "memory", "pids")
 
-_AUTOSTART_FILENAME = "taema-agent.desktop"
-
-
-def _autostart_source(system_root):
-    """Locate the packaged agent autostart snippet, if the package ships it."""
-    candidates = [
-        _rooted(system_root, "/usr/share/examples/taema/autostart/" + _AUTOSTART_FILENAME),
-        os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "examples",
-            "autostart",
-            _AUTOSTART_FILENAME,
-        ),
-    ]
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
 
 def _legacy_marker_present(dbpath):
     try:
@@ -1625,54 +1606,15 @@ def _repair_stale_flags(state_dir, store, fixes):
 
 
 def _repair_autostart(fixes, system_root):
+    from . import desktop as desktop_mod
+
     config_home = policy.xdg("XDG_CONFIG_HOME", "~/.config")
-    dest = os.path.join(config_home, "autostart", _AUTOSTART_FILENAME)
-    source = _autostart_source(system_root)
-    if source is None:
-        fixes.append(
-            {
-                "name": "agent autostart",
-                "status": "skipped",
-                "message": "packaged autostart snippet not found; install the taema package",
-            }
-        )
-        return
-    try:
-        with open(source, encoding="utf-8") as stream:
-            wanted = stream.read()
-        if os.path.isfile(dest):
-            with open(dest, encoding="utf-8") as stream:
-                current = stream.read()
-            if current == wanted:
-                fixes.append(
-                    {
-                        "name": "agent autostart",
-                        "status": "skipped",
-                        "message": "%s already installed" % dest,
-                    }
-                )
-            else:
-                fixes.append(
-                    {
-                        "name": "agent autostart",
-                        "status": "skipped",
-                        "message": "%s is customized; left in place" % dest,
-                    }
-                )
-            return
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "w", encoding="utf-8") as stream:
-            stream.write(wanted)
-        os.chmod(dest, 0o644)
-        fixes.append(
-            {
-                "name": "agent autostart",
-                "status": "fixed",
-                "message": "installed %s" % dest,
-            }
-        )
-    except OSError as error:
-        fixes.append({"name": "agent autostart", "status": "fail", "message": str(error)})
+    status, message = desktop_mod.ensure_agent_autostart(
+        system_root=system_root, config_home=config_home
+    )
+    if status == "skipped" and message == "packaged autostart snippet not found":
+        message = "packaged autostart snippet not found; install the taema package"
+    fixes.append({"name": "agent autostart", "status": status, "message": message})
 
 
 def _default_runner(argv):

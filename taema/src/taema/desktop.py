@@ -166,6 +166,63 @@ def wrap(filename):
     }
 
 
+AUTOSTART_FILENAME = "taema-agent.desktop"
+
+
+def _rooted(root, path):
+    return os.path.join(root, path.lstrip("/"))
+
+
+def autostart_source(system_root="/"):
+    """The packaged agent autostart snippet, or None when not installed."""
+    candidates = [
+        _rooted(system_root, "/usr/share/examples/taema/autostart/" + AUTOSTART_FILENAME),
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "..",
+            "examples",
+            "autostart",
+            AUTOSTART_FILENAME,
+        ),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def ensure_agent_autostart(system_root="/", config_home=None):
+    """Install the session-agent autostart entry when missing.
+
+    Returns (status, message) with status fixed, skipped, or fail. A
+    customized entry is left in place; a missing snippet source is a skip.
+    """
+    if config_home is None:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    else:
+        base = config_home
+    dest = os.path.join(base, "autostart", AUTOSTART_FILENAME)
+    source = autostart_source(system_root)
+    if source is None:
+        return "skipped", "packaged autostart snippet not found"
+    try:
+        with open(source, encoding="utf-8") as stream:
+            wanted = stream.read()
+        if os.path.isfile(dest):
+            with open(dest, encoding="utf-8") as stream:
+                current = stream.read()
+            if current == wanted:
+                return "skipped", "%s already installed" % dest
+            return "skipped", "%s is customized; left in place" % dest
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as stream:
+            stream.write(wanted)
+        os.chmod(dest, 0o644)
+        return "fixed", "installed %s" % dest
+    except OSError as error:
+        return "fail", str(error)
+
+
 def unwrap(filename):
     """Remove our user override for one entry; foreign files are left alone."""
     filename = _normalize(filename)

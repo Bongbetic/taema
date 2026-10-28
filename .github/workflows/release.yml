@@ -1,7 +1,9 @@
 # Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
-# The build jobs test and build the arch-specific .xbps on glibc and musl; the sign job
-# signs an XBPS repository per architecture and attaches the packages, the vendor
-# distfile, and the repodata to the GitHub release (xbps reads it from
+# A draft release is opened first; the build jobs test and build the arch-specific
+# .xbps on glibc and musl (the musl job avoids Node-based actions, which cannot run
+# on musl, by cloning with git and uploading via the gh CLI); the sign job signs an
+# XBPS repository per architecture and attaches the packages, the vendor distfile,
+# and the repodata to the draft before publishing it (xbps reads it from
 # releases/latest/download); then the template job bumps version and both checksums in
 # taema/srcpkgs/taema/template and the README download names.
 name: release
@@ -15,8 +17,21 @@ permissions:
   pull-requests: write
 
 jobs:
+  prepare:
+    name: draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+              --title "tæma ${GITHUB_REF_NAME#taema-v}" --draft --notes ""
+          fi
   build:
     name: build (${{ matrix.arch }})
+    needs: prepare
     runs-on: ubuntu-latest
     container: ghcr.io/void-linux/void-${{ matrix.libc }}:latest
     strategy:
@@ -35,6 +50,13 @@ jobs:
           xbps-install -Syu xbps
           xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow github-cli findutils tzdata cargo tar gzip
       - uses: actions/checkout@v4
+        if: matrix.libc != 'musl'
+      - name: Check out source without Node
+        if: matrix.libc == 'musl'
+        run: |
+          git clone "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" checkout "$GITHUB_REF_NAME"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Check tag against version
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -54,10 +76,18 @@ jobs:
         run: |
           su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && tools/vendor-dist.sh '$RUNNER_TEMP/repo'"
       - uses: actions/upload-artifact@v4
+        if: matrix.libc != 'musl'
         with:
           name: repo-${{ matrix.arch }}
           path: ${{ runner.temp }}/repo/
           if-no-files-found: error
+      - name: Upload package to draft release
+        if: matrix.libc == 'musl'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+            --clobber "${{ runner.temp }}/repo/"*
 
   sign:
     needs: build
@@ -69,6 +99,12 @@ jobs:
           pattern: repo-*
           merge-multiple: true
           path: ${{ github.workspace }}/assets
+      - name: Fetch musl assets from draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*musl*" --dir "${{ github.workspace }}/assets" --clobber
       - uses: actions/checkout@v4
       - name: Sign repository and publish release
         env:
@@ -109,10 +145,12 @@ jobs:
           NOTES
           cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"
           notes="$(cat "$RUNNER_TEMP/notes.md")"
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --title "tæma ${version}" \
-            --notes "$notes" --generate-notes \
+          gh release upload "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --clobber \
             "$out"/*
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --title "tæma ${version}" \
+            --notes "$notes" --draft=false
 
   template:
     needs: sign

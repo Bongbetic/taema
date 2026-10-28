@@ -4508,6 +4508,22 @@ def _m5_popen_launch(niri_env, artifacts, tag, app, cmd, logs):
     return proc, log_path
 
 
+def _m5_popen_agent(niri_env, artifacts, tag, launch_logs):
+    """Start `taema agent` with output captured to the artifacts directory."""
+    log_path = os.path.join(artifacts, "m5-agent-%s.log" % tag)
+    log = open(log_path, "w")
+    launch_logs.append(log)
+    proc = subprocess.Popen(
+        ["taema", "agent"],
+        env=niri_env,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    return proc, log_path
+
+
 def _m5_wait_launch_scope(proc, log_path, prefixes, timeout=60):
     """Wait until the launched pid sits in a matching scope.
 
@@ -4645,19 +4661,18 @@ def scenario_m5(rec, args, tree_holder):
         _m5_write_fast()
         rec.step("fast-delays", True, "batch 0 s, grace 3 s, adopt 2 s")
 
-        agent = subprocess.Popen(
-            ["taema", "agent"],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        agent, agent_log = _m5_popen_agent(niri_env, args.artifacts, "1", launch_logs)
         try:
             wait_for_audit_event(log_path, "agent_up", None, timeout=30)
             rec.step("agent-registered", True, "agent_up in decisions.log")
         except ScenarioError as error:
-            rec.step("agent-registered", False, str(error))
+            detail = str(error)
+            if agent.poll() is not None:
+                detail += " (agent exited rc=%s; see %s)" % (
+                    agent.returncode,
+                    os.path.basename(agent_log),
+                )
+            rec.step("agent-registered", False, detail)
             return False
 
         # Bullet 1: last-window close with a surviving child reviews fast.
@@ -4864,19 +4879,18 @@ def scenario_m5(rec, args, tree_holder):
             degraded.returncode == 0 and "Traceback" not in degraded_text,
             degraded_text[:200],
         )
-        agent = subprocess.Popen(
-            ["taema", "agent"],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        agent, agent_log = _m5_popen_agent(niri_env, args.artifacts, "2", launch_logs)
         try:
             wait_for_audit_event(log_path, "agent_up", None, timeout=30)
             rec.step("agent-reregisters", True, "agent_up within 30 s")
         except ScenarioError as error:
-            rec.step("agent-reregisters", False, str(error))
+            detail = str(error)
+            if agent.poll() is not None:
+                detail += " (agent exited rc=%s; see %s)" % (
+                    agent.returncode,
+                    os.path.basename(agent_log),
+                )
+            rec.step("agent-reregisters", False, detail)
 
         # Bullet 5: a scripted storm of 50 closes stays within the hourly cap.
         storm_before = len(notify_records(session))

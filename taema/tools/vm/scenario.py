@@ -4492,6 +4492,58 @@ def _m5_wait_new_review(before, timeout=30):
     raise ScenarioError("no new review appeared within %ss" % timeout)
 
 
+def _m5_popen_launch(niri_env, artifacts, tag, app, cmd, logs):
+    """Start `taema launch` with stderr captured to the artifacts directory."""
+    log_path = os.path.join(artifacts, "m5-launch-%s.log" % tag)
+    log = open(log_path, "w")
+    logs.append(log)
+    proc = subprocess.Popen(
+        ["taema", "launch", "--app", app, "--"] + list(cmd),
+        env=niri_env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=log,
+        start_new_session=True,
+    )
+    return proc, log_path
+
+
+def _m5_wait_launch_scope(proc, log_path, prefixes, timeout=60):
+    """Wait until the launched pid sits in a matching scope.
+
+    Fail fast with the launch log when the child dies first instead of
+    waiting out the timeout on a pid that will never arrive.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as handle:
+                    tail = handle.read()[-2000:]
+            except OSError:
+                tail = "<no launch log>"
+            tail = tail.strip().splitlines()
+            raise ScenarioError(
+                "launch exited rc=%s before entering %s: %s"
+                % (
+                    proc.returncode,
+                    list(prefixes),
+                    "; ".join(tail[-5:]) if tail else "<silent>",
+                )
+            )
+        try:
+            rel = scope_of(proc.pid)
+            if any(scope_matches(rel, p) for p in prefixes):
+                return rel
+        except ScenarioError:
+            pass
+        time.sleep(0.5)
+    raise ScenarioError(
+        "pid %d not in any scope matching %s within %ss"
+        % (proc.pid, list(prefixes), timeout)
+    )
+
+
 def _m5_close_window(niri_env, window_id):
     """Close one window through the compositor; fall back to client SIGTERM."""
     reply = subprocess.run(
@@ -4538,6 +4590,7 @@ def scenario_m5(rec, args, tree_holder):
     session = None
     agent = None
     launched = []
+    launch_logs = []
     try:
         # Default delays first: with stock batching (60 s) and grace (30 s) a
         # fresh close must produce no review within 5 s and keep its scope.
@@ -4550,27 +4603,17 @@ def scenario_m5(rec, args, tree_holder):
         # the fresh app scope, then execs foot so the windowed root keeps the
         # launched pid. A second launch would reserve a *different* scope, so
         # the survivor must be born inside the first one.
-        default_root = subprocess.Popen(
-            [
-                "taema",
-                "launch",
-                "--app",
-                default_app,
-                "--",
-                "foot",
-                "sh",
-                "-c",
-                "sleep 300 & exec foot",
-            ],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        default_root, default_log = _m5_popen_launch(
+            niri_env,
+            args.artifacts,
+            "default",
+            default_app,
+            ["foot", "sh", "-c", "sleep 300 & exec foot"],
+            launch_logs,
         )
         launched.append(default_root)
-        default_scope = wait_for_scope(
-            default_root.pid, ("app-" + default_app,), timeout=60
+        default_scope = _m5_wait_launch_scope(
+            default_root, default_log, ("app-" + default_app,), timeout=60
         )
         default_windows = wait_window_count(niri_env, 1)
         default_id = default_windows[0].get("id")
@@ -4619,26 +4662,18 @@ def scenario_m5(rec, args, tree_holder):
         # Bullet 1: last-window close with a surviving child reviews fast.
         before = _m5_review_ids() or []
         close_app = "m5close"
-        foot = subprocess.Popen(
-            [
-                "taema",
-                "launch",
-                "--app",
-                close_app,
-                "--",
-                "foot",
-                "sh",
-                "-c",
-                "sleep 300 & exec foot",
-            ],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        foot, foot_log = _m5_popen_launch(
+            niri_env,
+            args.artifacts,
+            "close",
+            close_app,
+            ["foot", "sh", "-c", "sleep 300 & exec foot"],
+            launch_logs,
         )
         launched.append(foot)
-        close_scope = wait_for_scope(foot.pid, ("app-" + close_app,), timeout=60)
+        close_scope = _m5_wait_launch_scope(
+            foot, foot_log, ("app-" + close_app,), timeout=60
+        )
         windows = wait_window_count(niri_env, 1)
         window_id = windows[0].get("id")
         rec.step("close-window-open", window_id is not None, "id=%s" % window_id)
@@ -4700,16 +4735,13 @@ def scenario_m5(rec, args, tree_holder):
         reloaded = _run(["taema", "reload"], timeout=30)
         rec.step("quit-unit-reloads", reloaded.returncode == 0, "m5quit unit")
         quit_app = "m5quit"
-        quit_foot = subprocess.Popen(
-            ["taema", "launch", "--app", quit_app, "--", "foot"],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        quit_foot, quit_log = _m5_popen_launch(
+            niri_env, args.artifacts, "quit", quit_app, ["foot"], launch_logs
         )
         launched.append(quit_foot)
-        quit_scope = wait_for_scope(quit_foot.pid, ("app-" + quit_app,), timeout=60)
+        quit_scope = _m5_wait_launch_scope(
+            quit_foot, quit_log, ("app-" + quit_app,), timeout=60
+        )
         quit_windows = wait_window_count(niri_env, 1)
         _m5_close_window(niri_env, quit_windows[0].get("id"))
         rec.step(
@@ -4718,26 +4750,18 @@ def scenario_m5(rec, args, tree_holder):
             "scope stopped past 3 s grace",
         )
         reopen_app = "m5quit2"
-        first = subprocess.Popen(
-            ["taema", "launch", "--app", reopen_app, "--", "foot"],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        first, first_log = _m5_popen_launch(
+            niri_env, args.artifacts, "reopen1", reopen_app, ["foot"], launch_logs
         )
         launched.append(first)
-        reopen_scope = wait_for_scope(first.pid, ("app-" + reopen_app,), timeout=60)
+        reopen_scope = _m5_wait_launch_scope(
+            first, first_log, ("app-" + reopen_app,), timeout=60
+        )
         first_windows = wait_window_count(niri_env, 1)
         _m5_close_window(niri_env, first_windows[0].get("id"))
         time.sleep(1)
-        second = subprocess.Popen(
-            ["taema", "launch", "--app", reopen_app, "--", "foot"],
-            env=niri_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        second, _second_log = _m5_popen_launch(
+            niri_env, args.artifacts, "reopen2", reopen_app, ["foot"], launch_logs
         )
         launched.append(second)
         try:
@@ -4932,6 +4956,11 @@ def scenario_m5(rec, args, tree_holder):
             try:
                 if proc.poll() is None:
                     proc.terminate()
+            except OSError:
+                pass
+        for handle in launch_logs:
+            try:
+                handle.close()
             except OSError:
                 pass
         if agent is not None and agent.poll() is None:

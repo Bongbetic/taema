@@ -89,6 +89,39 @@ class ReadmeTest(unittest.TestCase):
         self.assertIn("tools/build-xbps.sh", checks)
 
 
+class FuzzJobTest(unittest.TestCase):
+    def test_ci_runs_fuzz_targets_with_a_short_budget(self):
+        text = read(CI)
+        self.assertIn("cargo-fuzz", text, "no cargo-fuzz install in CI")
+        self.assertRegex(text, r"cargo fuzz run \S+.*max_total_time=\d+")
+        for target in ("argv", "rules", "oom_record"):
+            self.assertIn(target, text, f"CI fuzz misses target {target}")
+
+
+class LongFuzzTest(unittest.TestCase):
+    FUZZ = os.path.join(REPO, ".github", "workflows", "fuzz.yml")
+
+    def test_scheduled_chunked_campaign(self):
+        self.assertTrue(os.path.isfile(self.FUZZ), "missing .github/workflows/fuzz.yml")
+        text = read(self.FUZZ)
+        # Manually triggered or scheduled.
+        self.assertIn("workflow_dispatch", text)
+        self.assertRegex(text, r"schedule:\n\s+- cron:")
+        # Chunked: more than one chunk per target.
+        self.assertRegex(text, r"[Cc]hunks?")
+        self.assertIn("max_total_time", text)
+        # Corpus kept between runs.
+        self.assertIn("actions/cache", text)
+        self.assertIn("corpus", text)
+        # Total fuzzing time reported.
+        self.assertIn("GITHUB_STEP_SUMMARY", text)
+
+    def test_long_campaign_covers_all_targets(self):
+        text = read(self.FUZZ)
+        for target in ("argv", "rules", "oom_record"):
+            self.assertIn(target, text, f"long fuzz misses target {target}")
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     def test_release_still_tests_and_builds_on_tags(self):
         text = read(RELEASE)

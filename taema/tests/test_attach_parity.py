@@ -514,6 +514,7 @@ class ParityTests(unittest.TestCase):
     def test_pid_edges(self):
         gone = self.gone_pid()
         self.check("bad pid text", ["move", "scope-x", "abc"], self.build_scope)
+        self.check("empty pid", ["move", "scope-x", ""], self.build_scope)
         self.check("pid zero", ["move", "scope-x", "0"], self.build_scope)
         self.check("pid one", ["move", "scope-x", "1"], self.build_scope)
         self.check("gone pid", ["move", "scope-x", str(gone)], self.build_scope)

@@ -198,6 +198,23 @@ class ArchDetectTest(unittest.TestCase):
         )
 
 
+class FuzzExclusionTest(unittest.TestCase):
+    def test_fuzz_crate_stays_out_of_the_locked_workspace(self):
+        with open(os.path.join(ROOT, "rust", "Cargo.toml"), encoding="utf-8") as f:
+            workspace = f.read()
+        self.assertRegex(workspace, r'exclude\s*=\s*\[[^\]]*"fuzz"')
+
+    def test_install_ships_no_fuzz_sources(self):
+        r = subprocess.run(
+            ["make", "-n", "install"],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("fuzz", r.stdout)
+
+
 class MakefileNativeTest(unittest.TestCase):
     def dry_run(self, *args):
         r = subprocess.run(

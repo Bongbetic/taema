@@ -1,0 +1,94 @@
+# Long fuzz campaigns for the privileged helper's parsers.
+#
+# Each target runs in chunks of bounded libFuzzer runs so one workflow run
+# stays inside job time limits. The corpus is cached between runs, and the
+# total fuzzing time is reported to the run summary. Trigger it by hand
+# (optional chunk tuning) or let the weekly schedule drive it.
+name: fuzz-long
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes_per_chunk:
+        description: Minutes of libFuzzer time per chunk
+        default: "10"
+      chunks:
+        description: Chunks per target per run
+        default: "6"
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }} (long)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [argv, rules, oom_record]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Restore corpus from previous runs
+        uses: actions/cache/restore@v4
+        with:
+          path: taema/rust/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz in chunks
+        run: |
+          minutes="${MINUTES_PER_CHUNK:-10}"
+          chunks="${CHUNKS:-6}"
+          budget=$((minutes * 60))
+          start=$(date +%s)
+          i=1
+          while [ "$i" -le "$chunks" ]; do
+            echo "--- chunk $i/$chunks: ${minutes} min on ${{ matrix.target }} ---"
+            cargo fuzz run "${{ matrix.target }}" -- -max_total_time="$budget"
+            i=$((i + 1))
+          done
+          elapsed=$(($(date +%s) - start))
+          {
+            echo "## fuzz ${{ matrix.target }}: $((elapsed / 60)) min wall time"
+            echo "$chunks chunks x ${minutes} min libFuzzer budget, corpus kept for the next run."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          MINUTES_PER_CHUNK: ${{ inputs.minutes_per_chunk }}
+          CHUNKS: ${{ inputs.chunks }}
+        working-directory: taema/rust/fuzz
+      - name: Save corpus for the next run
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: taema/rust/fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashers-${{ matrix.target }}
+          path: taema/rust/fuzz/artifacts/
+
+  total:
+    name: report total fuzzing time
+    needs: [fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the campaign total
+        run: |
+          minutes="${MINUTES_PER_CHUNK:-10}"
+          chunks="${CHUNKS:-6}"
+          total=$((minutes * chunks * 3))
+          {
+            echo "## fuzz-long total: ${total} min libFuzzer budget"
+            echo "${chunks} chunks x ${minutes} min x 3 targets (argv, rules, oom_record)."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          MINUTES_PER_CHUNK: ${{ inputs.minutes_per_chunk }}
+          CHUNKS: ${{ inputs.chunks }}

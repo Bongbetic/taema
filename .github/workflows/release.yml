@@ -33,7 +33,7 @@ jobs:
       - name: Install build tools
         run: |
           xbps-install -Syu xbps
-          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow github-cli findutils tzdata cargo
+          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow github-cli findutils tzdata cargo tar gzip
       - uses: actions/checkout@v4
       - name: Check tag against version
         run: |

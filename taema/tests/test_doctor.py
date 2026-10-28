@@ -763,6 +763,10 @@ class DoctorFix(DoctorChecks):
         config_home = os.path.join(self.temp.name, "e2e-xdg")
         runtime = os.path.join(self.temp.name, "e2e-runtime")
         os.makedirs(runtime)
+        # Diagnose against the fixture root: group, helper, service, and
+        # cgroup checks read the live machine, which containers may lack.
+        # Repair keeps running against the same fixtures.
+        real_diagnose = doctor.diagnose
         args = SimpleNamespace(
             json=False, jsonl=False, quiet=False, config=None, fix=True, sudo=False
         )
@@ -779,6 +783,13 @@ class DoctorFix(DoctorChecks):
             mock.patch.object(commands.knowledge, "Store", return_value=self.store),
             mock.patch.object(commands.policy, "load_units", return_value=[]),
             mock.patch.object(view, "emit") as emit,
+            mock.patch.object(
+                doctor,
+                "diagnose",
+                side_effect=lambda cfg, store=None, units=None, **kw: real_diagnose(
+                    cfg, store, units, system_root=self.system_root, **kw
+                ),
+            ),
         ):
             self.assertEqual(commands.cmd_doctor(args), 0)
         models = [call.args[0] for call in emit.call_args_list]

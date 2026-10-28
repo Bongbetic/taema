@@ -393,10 +393,12 @@ class CliViews(unittest.TestCase):
             with (
                 mock.patch.object(commands, "_load_status", return_value=(cfg, store)),
                 mock.patch.object(commands, "ask", return_value=None),
+                mock.patch.object(commands, "_fast_status_probe", return_value=None),
                 mock.patch.dict(os.environ, {"TAEMA_MEM": "0"}),
                 mock.patch.object(
                     commands.cgroup, "base", return_value="/missing/cgroup"
                 ),
+                mock.patch("taema.suggest.trailing", return_value=[]),
                 redirect_stdout(output),
             ):
                 result = commands.main([])

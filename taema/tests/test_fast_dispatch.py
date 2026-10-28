@@ -109,12 +109,14 @@ class DispatchTests(unittest.TestCase):
         )
 
     def test_make_dry_run_installs_fast(self):
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust install")
         dest = tempfile.mkdtemp()
         self.addCleanup(
             lambda: subprocess.run(["rm", "-rf", dest], check=False)
         )
         r = subprocess.run(
-            ["make", "-n", "install", "DESTDIR=" + dest],
+            ["make", "-n", "install", "XBPS_ARCH=", "DESTDIR=" + dest],
             capture_output=True,
             text=True,
             cwd=ROOT,

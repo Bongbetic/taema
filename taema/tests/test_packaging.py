@@ -175,8 +175,15 @@ class ArchDetectTest(unittest.TestCase):
             "%s\narch=${XBPS_ARCH:-$(default_arch)}; printf '%%s' \"$arch\""
             % (uname_out, ldd_out, func)
         )
+        if env is None:
+            # Scrub ambient overrides: the probe tests detection, not inheritance.
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "XBPS_ARCH"
+            }
         r = subprocess.run(
-            ["sh", "-c", probe], capture_output=True, text=True, env=env or dict(os.environ)
+            ["sh", "-c", probe], capture_output=True, text=True, env=env
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip()
@@ -227,11 +234,13 @@ class MakefileNativeTest(unittest.TestCase):
         return r.stdout
 
     def test_release_build_is_offline(self):
-        out = self.dry_run("rust-helper-release")
+        out = self.dry_run("rust-helper-release", "XBPS_ARCH=")
         self.assertIn("cargo build --locked --offline --release", out)
         self.assertNotIn("--target", out)
 
     def test_musl_arch_selects_the_static_target(self):
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust build")
         out = self.dry_run("rust-helper-release", "XBPS_ARCH=x86_64-musl")
         self.assertIn("--target x86_64-unknown-linux-musl", out)
         install = self.dry_run("install", "XBPS_ARCH=x86_64-musl", "DESTDIR=/tmp/nope")
@@ -242,6 +251,8 @@ class MakefileNativeTest(unittest.TestCase):
 
 class InstalledDocumentationTest(unittest.TestCase):
     def test_install_publishes_learning_manual_and_state_docs(self):
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust install")
         with tempfile.TemporaryDirectory() as staged:
             result = subprocess.run(
                 ["make", "DESTDIR=" + staged, "install"],

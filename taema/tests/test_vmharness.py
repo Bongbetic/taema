@@ -862,11 +862,13 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn("taema forget --all APP", release)
         self.assertIn("optional boolean `all` field", release)
 
-    def test_release_workflow_combines_manual_and_generated_release_notes(self):
+    def test_release_workflow_publishes_draft_with_changelog_notes(self):
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('notes="$(cat "$RUNNER_TEMP/notes.md")"', workflow)
         self.assertIn('--title "tæma ${version}"', workflow)
-        self.assertIn('--notes "$notes" --generate-notes', workflow)
+        self.assertIn("--draft --notes", workflow)
+        self.assertIn("--draft=false", workflow)
+        self.assertNotIn("--generate-notes", workflow)
         self.assertNotIn("--notes-file", workflow)
 
     def test_ci_void_job_builds_per_libc_arch(self):

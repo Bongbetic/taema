@@ -48,7 +48,7 @@ test check:
 
 install:
 	install -d $(LIBDIR) $(BINDIR) $(LIBEXEC) $(SVDIR)/log $(CONFDIR)/units $(SUDOERS) \
-		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(EXAMPLES)/autostart $(EXAMPLES)/packs $(SHELLDIR) $(BASHRCD) $(FISHCONF) $(MANDIR) $(MAN1DIR) $(MAN5DIR)
+		$(DOCDIR) $(EXAMPLES)/units $(EXAMPLES)/hooks $(EXAMPLES)/autostart $(EXAMPLES)/packs $(EXAMPLES)/widgets $(SHELLDIR) $(BASHRCD) $(FISHCONF) $(MANDIR) $(MAN1DIR) $(MAN5DIR)
 	install -d $(BASHCOMP) $(ZSHCOMP) $(FISHCOMP)
 	install -d $(DOCDIR)/schema/ipc $(DOCDIR)/schema/cli
 	find src/taema -type d -print | while read dir; do \
@@ -75,6 +75,7 @@ endif
 	install -m755 examples/hooks/* $(EXAMPLES)/hooks/
 	install -m644 examples/autostart/* $(EXAMPLES)/autostart/
 	install -m644 examples/packs/*.toml $(EXAMPLES)/packs/
+	install -m644 widgets/taema-bar/*.qml $(EXAMPLES)/widgets/
 	install -m644 README.md docs/design.md ../docs/identity-resolution.md ../docs/legacy-state-migration.md ../docs/state-schema.md $(DOCDIR)/
 	install -m644 docs/taema-learning.7 $(MANDIR)/taema-learning.7
 	install -m644 docs/taema.1 $(MAN1DIR)/taema.1

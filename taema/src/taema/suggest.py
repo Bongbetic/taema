@@ -279,7 +279,7 @@ def _wraps(store, cfg):
                 "title": "wrap %s for launch-time scoping" % app,
                 "detail": "%d recorded instances and no wrapper yet"
                 % launches,
-                "payload": {"app": app, "file": filename},
+                "payload": {"app": app, "file": filename, "launches": launches},
             }
         )
     return found

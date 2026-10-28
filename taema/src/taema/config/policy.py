@@ -1253,6 +1253,60 @@ def load_units(cfg):
     return [by_name[k] for k in sorted(by_name)]
 
 
+def pack_dirs():
+    """Candidate directories holding curated unit packs, installed first."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        "/usr/share/examples/taema/packs",
+        os.path.join(here, "..", "..", "..", "examples", "packs"),
+    ]
+
+
+def pack_source(name):
+    """The pack file for NAME, or None when no curated pack has that name."""
+    if not isinstance(name, str) or not name or "/" in name or name.startswith("."):
+        return None
+    filename = name + ".toml"
+    for directory in pack_dirs():
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def available_packs():
+    """Sorted names of the curated unit packs."""
+    for directory in pack_dirs():
+        if os.path.isdir(directory):
+            return sorted(
+                path[: -len(".toml")]
+                for path in os.listdir(directory)
+                if path.endswith(".toml")
+            )
+    return []
+
+
+def install_pack_file(source, units_dir, name, force=False):
+    """Lint a pack and copy it into a units directory.
+
+    Returns (ok, message, target). Refuses to overwrite unless forced.
+    """
+    unit, error = read_unit_file(source)
+    if error is not None:
+        return False, error, ""
+    problems = validate_unit(unit)
+    if problems:
+        return False, "; ".join(problems), ""
+    os.makedirs(units_dir, exist_ok=True)
+    target = os.path.join(units_dir, name + ".toml")
+    if os.path.exists(target) and not force:
+        return False, "unit file exists: %s (use --force to overwrite)" % target, target
+    with open(source, "rb") as origin, open(target, "wb") as destination:
+        destination.write(origin.read())
+    os.chmod(target, 0o600)
+    return True, target, target
+
+
 def _unit_dir_source(path):
     system = os.path.abspath(SYSTEM_UNITS)
     user = os.path.abspath(os.path.join(user_config_dir(), "units"))

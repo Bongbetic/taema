@@ -395,6 +395,45 @@ class LaunchCommandTest(unittest.TestCase):
         mover.assert_not_called()
         ex.assert_called_once_with("true", ["true"])
 
+    def test_prepare_request_passes_protocol_validation(self):
+        import taema.cli.commands as cli
+        from taema import protocol
+        from tests.test_phase0 import tmp
+
+        for args, want in (
+            (self._args(), {"unit": False, "owner": False}),
+            (self._args(unit="u1", bind=True), {"unit": "u1", "owner": True}),
+        ):
+            seen = []
+            with FakeCg():
+                cfg = make_cfg(tmp())
+                with (
+                    mock.patch.object(cli, "_load", return_value=(cfg, None, [])),
+                    mock.patch.object(
+                        cli,
+                        "ask",
+                        side_effect=self._ask(
+                            seen,
+                            {"ok": True, "scope": "app-x", "via": "helper"},
+                        ),
+                    ),
+                    mock.patch.object(cli.engine, "helper_move"),
+                    mock.patch.object(cli.os, "execvp"),
+                ):
+                    cli.cmd_launch(args)
+            prepare = seen[0]
+            if want["unit"] is False:
+                self.assertNotIn("unit", prepare)
+            else:
+                self.assertEqual(prepare["unit"], want["unit"])
+            if want["owner"] is False:
+                self.assertNotIn("owner", prepare)
+            else:
+                self.assertEqual(prepare["owner"], os.getpid())
+            validated = dict(prepare)
+            validated.pop("cmd", None)
+            protocol._validate_args("launch_prepare", validated)
+
     def test_bind_sends_owner(self):
         import taema.cli.commands as cli
         from tests.test_phase0 import tmp

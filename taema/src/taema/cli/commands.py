@@ -1022,17 +1022,17 @@ def cmd_launch(a):
     unit = getattr(a, "unit", None) or None
     owner = os.getpid() if getattr(a, "bind", False) else None
     session = agent_mod.session_key()
-    reply = ask(
-        cfg,
-        {
-            "cmd": "launch_prepare",
-            "app": app,
-            "pid": os.getpid(),
-            "session": session,
-            "unit": unit,
-            "owner": owner,
-        },
-    )
+    request = {
+        "cmd": "launch_prepare",
+        "app": app,
+        "pid": os.getpid(),
+        "session": session,
+    }
+    if unit is not None:
+        request["unit"] = unit
+    if owner is not None:
+        request["owner"] = owner
+    reply = ask(cfg, request)
     if reply is None:
         return _launch_offline(cfg, app, cmd)
     if "error" in reply:

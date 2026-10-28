@@ -352,6 +352,23 @@ class ServiceDelegationTest(unittest.TestCase):
         self.assertNotIn("PYTHONMALLOC=malloc", daemon_wrapper)
         self.assertIn("bin/taemad", makefile)
 
+    def test_user_service_primes_agent_leaf_before_privilege_drop(self):
+        with open(
+            os.path.join(ROOT, "libexec/taemad-user"), encoding="utf-8"
+        ) as source:
+            user_run = source.read()
+        manager_prime = user_run.index('"$cg/manager/cgroup.procs"')
+        agent_prime = user_run.index('"$cg/agent/cgroup.procs"')
+        privilege_drop = user_run.index("exec setpriv")
+        self.assertLess(manager_prime, agent_prime)
+        self.assertLess(agent_prime, privilege_drop)
+        agent_block = user_run[manager_prime:privilege_drop]
+        self.assertIn('mkdir -p "$cg/agent"', agent_block)
+        self.assertIn(
+            'chown "$uid:$gid" "$cg/agent" "$cg/agent/cgroup.procs"',
+            agent_block,
+        )
+
     def test_root_service_primes_readable_bytecode_before_privilege_drop(self):
         with open(os.path.join(ROOT, "bin/taemad"), encoding="utf-8") as source:
             daemon_wrapper = source.read()

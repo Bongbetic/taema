@@ -43,6 +43,11 @@ umask 077
 mkdir -p "$cg/manager"
 chown "$uid:$gid" "$cg/manager" "$cg/manager/cgroup.procs"
 printf '%s\n' "$$" > "$cg/manager/cgroup.procs"
+# Prime the agent leaf the same way: a fresh cgroup.procs is root-owned, so
+# without this neither the agent's direct join nor the daemon's direct attach
+# could write there.
+mkdir -p "$cg/agent"
+chown "$uid:$gid" "$cg/agent" "$cg/agent/cgroup.procs"
 
 exec setpriv --reuid="$uid" --regid="$gid" --init-groups --inh-caps=-all --reset-env \
     env HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/$uid" \

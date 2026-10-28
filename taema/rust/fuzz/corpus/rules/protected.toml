@@ -1,0 +1,3 @@
+[protected]
+comm = ["sshd", "bash"]
+cgroup_prefix = ["user.slice"]

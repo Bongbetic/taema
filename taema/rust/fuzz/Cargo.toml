@@ -1,0 +1,32 @@
+[package]
+name = "taema-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+taema-attach = { path = "../attach" }
+
+[[bin]]
+name = "argv"
+path = "fuzz_targets/argv.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "rules"
+path = "fuzz_targets/rules.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "oom_record"
+path = "fuzz_targets/oom_record.rs"
+test = false
+bench = false
+
+[workspace]

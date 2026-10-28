@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["attach"]
+members = ["attach", "fast"]
 
 [workspace.package]
 edition = "2021"

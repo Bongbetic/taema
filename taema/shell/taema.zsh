@@ -9,7 +9,11 @@
 
 [[ -o interactive && -t 0 && -t 1 ]] || return 0
 [[ -z ${TAEMA_NO_PROMPT-} ]] || return 0
-typeset -g _taema_hook=${TAEMA_HOOK:-/usr/libexec/taema/taema-hook}
+typeset -g _taema_hook=${TAEMA_HOOK:-}
+if [[ -z $_taema_hook ]]; then
+    _taema_hook=/usr/libexec/taema/taema-fast
+    [[ -x $_taema_hook ]] || _taema_hook=/usr/libexec/taema/taema-hook
+fi
 [[ -x $_taema_hook ]] || return 0
 (( ${precmd_functions[(Ie)_taema_precmd]} )) && return 0       # sourced twice
 

@@ -730,8 +730,26 @@ class HarnessCliParsingTest(VmTestCase):
     def test_parse_scenarios_all(self):
         self.assertEqual(
             vmh.parse_scenarios("all"),
-            ["smoke", "m0", "m1", "m2", "m3", "m4", "upgrade", "remove", "graphical"],
+            [
+                "smoke",
+                "m0",
+                "m1",
+                "m2",
+                "m3",
+                "m4",
+                "m5",
+                "upgrade",
+                "remove",
+                "graphical",
+            ],
         )
+
+    def test_m5_fast_config_disables_batching_and_grace(self):
+        text = scenario._m5_fast_config_text()
+        self.assertIn("batch_seconds = 0", text)
+        self.assertIn("windowless_grace = 3", text)
+        self.assertIn("launch_wrap = true", text)
+        self.assertTrue(scenario._m5_dropin_path().endswith("taema.d/99-m5-fast.toml"))
 
     def test_m0_acceptance_is_a_registered_guest_scenario(self):
         self.assertIn("m0", vmh.SCENARIOS)
@@ -749,6 +767,16 @@ class HarnessCliParsingTest(VmTestCase):
             item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:m3"
         )
         self.assertIn("scenario.py m3", step["argv"][-1])
+
+    def test_m5_release_acceptance_is_a_registered_guest_scenario(self):
+        self.assertIn("m5", vmh.SCENARIOS)
+        self.assertIn("m5", scenario.SCENARIOS)
+        cfg = vmh.load_config(self.write_config(libcs=["glibc"], scenarios=["m5"]))
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["m5"], kvm=False)
+        step = next(
+            item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:m5"
+        )
+        self.assertIn("scenario.py m5", step["argv"][-1])
 
     def test_graphical_is_a_registered_guest_scenario(self):
         self.assertIn("graphical", vmh.SCENARIOS)
@@ -813,7 +841,7 @@ class HarnessSurfacesTest(unittest.TestCase):
 
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
-        self.assertEqual(vmh.read_version(ROOT), "0.6.0")
+        self.assertEqual(vmh.read_version(ROOT), "0.7.0")
 
     def test_release_notes_document_0_5_0_resource_governor(self):
         notes = read_text(os.path.join(REPO, "CHANGELOG.md"))

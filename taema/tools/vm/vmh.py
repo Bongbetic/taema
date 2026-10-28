@@ -48,7 +48,18 @@ LEARNING_REPLAY_FIXTURE = os.path.join(
 GUEST_TMP = "/tmp/taema-vm"
 
 LIBCS = ("glibc", "musl")
-SCENARIOS = ("smoke", "m0", "m1", "m2", "m3", "m4", "upgrade", "remove", "graphical")
+SCENARIOS = (
+    "smoke",
+    "m0",
+    "m1",
+    "m2",
+    "m3",
+    "m4",
+    "m5",
+    "upgrade",
+    "remove",
+    "graphical",
+)
 ACCELS = ("auto", "kvm", "tcg")
 IMAGE_KEYS = ("dir", "tarball", "rootfs", "base", "kernel", "initrd")
 

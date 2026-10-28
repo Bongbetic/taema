@@ -89,6 +89,7 @@ endif
 	install -m644 README.md docs/design.md ../docs/identity-resolution.md ../docs/legacy-state-migration.md ../docs/state-schema.md $(DOCDIR)/
 	install -m644 docs/taema-learning.7 $(MANDIR)/taema-learning.7
 	install -m644 docs/taema.1 $(MAN1DIR)/taema.1
+	install -m644 docs/taema-agent.1 $(MAN1DIR)/taema-agent.1
 	install -m644 docs/taema.toml.5 $(MAN5DIR)/taema.toml.5
 	install -m644 shell/taema.bash shell/taema.zsh shell/taema.fish $(SHELLDIR)/
 	install -m644 shell/completion.bash $(BASHCOMP)/taema

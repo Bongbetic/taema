@@ -139,6 +139,17 @@ Built-in scenarios:
   decodes with the stdlib-only `read_png` (no new dependencies). The
   capture lands in the artifacts directory as `graphical.png`;
   `image_diff_fraction` compares two captures.
+- **m5** — the 0.7.0 desktop and session gate (issue #67) inside the
+  graphical session with the session agent up: default batching and grace
+  delays verified first with batching and grace at stock values, then with
+  fast test delays a last-window close with a surviving child reviews
+  within 3 seconds and Stop applies it, `on_last_window = quit` stops past
+  the grace while a reopen inside the grace cancels the stop, a wrapped
+  desktop entry launches in its scope with `launched_by=launch` and the
+  desktop id in `why`, killing the agent degrades to process-only mode and
+  a restart re-registers within 30 seconds, a scripted storm of 50 closes
+  stays within `max_per_hour` with a widget-feed screenshot, and the
+  `taema-agent(1)` page plus the niri autostart snippet are installed.
 
 ## Artifacts
 
@@ -182,6 +193,23 @@ Populate the root image cache with the explicit network option when needed.
 M3's pressure probe runs only inside QEMU and confines its memory hogs, cgroups, and temporary
 configuration to the disposable guest. It needs a low-memory guest and at least 610 seconds
 per libc to complete the idle-footprint gate.
+
+## M5 release acceptance
+
+Run the m5 scenario on both libcs before the 0.7.0 tag:
+
+```sh
+make -C taema vm-test VMFLAGS="--allow-network --scenarios m5"
+```
+
+It starts the disposable graphical session (weston headless plus nested
+niri under a test-owned `XDG_RUNTIME_DIR`), writes a fast test drop-in
+(`batch_seconds = 0`, `windowless_grace = 3`, fast adopt, `launch_wrap`
+enabled) only after proving the stock 60-second batching delay and the
+30-second grace hold, then checks every M5 criterion from issue #67 with
+the session agent up. The drop-in and the `m5quit` unit are removed and
+the daemon restarted during teardown. Captures land next to the
+per-scenario results as `m5.png` and `m5-notify.jsonl`.
 
 ## CI
 

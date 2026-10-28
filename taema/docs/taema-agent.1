@@ -1,0 +1,60 @@
+.TH TAEMA-AGENT 1 "2026-10-28" "taema 0.7.0" "Tæma Manual"
+.SH NAME
+taema agent \- relay this session's desktop facts to the tæma daemon
+.SH SYNOPSIS
+.B taema agent
+.SH DESCRIPTION
+The session agent runs once per graphical session and relays desktop facts
+to the per-user daemon, which keeps every decision. The agent itself decides
+nothing: it streams window open, change, close, and focus facts from the
+compositor, reports notification actions and launch requests, and polls the
+daemon's notification queue through the configured backend.
+.PP
+Only one agent runs per session, held under a lock. On start it joins the
+protected
+.I agent
+leaf (asking the daemon to attach it only when a direct move fails),
+registers its capabilities, and beats every 30 seconds with exponential
+reconnect backoff capped at 30 seconds. The daemon accepts
+.I register_agent
+and
+.I agent_beat
+only from the same uid, marks agents down after 3 missed beats with
+.I agent_up
+and
+.I agent_down
+audit events, and refuses stale facts so it decides on process data only.
+The agent exits when the compositor socket goes away. The agent leaf is
+never adopted, frozen, deprioritized, reclaimed, undone, stopped, or
+removed.
+.PP
+Without an agent, or without an action-capable notification server, reviews
+wait for the shell hint and
+.BR taema review .
+Killing the agent degrades the daemon to process-only mode without errors,
+and a restarted agent re-registers within 30 seconds.
+.SH SESSION SETUP
+The agent needs a Wayland compositor socket. For niri, start it from the
+compositor configuration:
+.PP
+.RS
+spawn-at-startup "taema" "agent"
+.RE
+.PP
+An example snippet ships under
+.IR /usr/share/examples/taema/autostart/niri-taema-agent.kdl ,
+with an XDG autostart entry
+.IR taema-agent.desktop
+alongside it.
+.SH FILES
+.TP
+.I /usr/share/examples/taema/autostart/niri-taema-agent.kdl
+Example niri
+.I spawn-at-startup
+entry.
+.TP
+.I /usr/share/examples/taema/autostart/taema-agent.desktop
+XDG autostart entry for desktop environments that honour it.
+.SH SEE ALSO
+.BR taema (1),
+.BR taema.toml (5)

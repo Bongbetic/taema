@@ -24,6 +24,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -4367,6 +4368,584 @@ def scenario_m4(rec, args, tree_holder):
     return all(step["ok"] for step in rec.steps)
 
 
+# ---- M5 release acceptance: desktop and session integration -------------------
+#
+# Issue #67 gate for the 0.7.0 tag. Runs the windowed M5 checks inside the
+# disposable graphical session from start_graphical_session with the session
+# agent up: last-window review within 3 s with Stop applied, on_last_window
+# quit plus reopen-cancel, wrapped-desktop launch provenance, agent loss and
+# re-registration, a 50-close notification storm under max_per_hour with a
+# widget-feed screenshot, and the installed agent man page plus autostart
+# snippet. Default batching and grace delays are verified in a separate run
+# first so the fast drop-in below never masks them.
+
+
+_M5_DROPIN_NAME = "99-m5-fast.toml"
+_M5_NOTIFY_CAP = 6
+
+
+def _m5_config_home():
+    """The guest test user's config home (honours XDG_CONFIG_HOME)."""
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return home
+
+
+def _m5_dropin_path():
+    return os.path.join(_m5_config_home(), "taema", "taema.d", _M5_DROPIN_NAME)
+
+
+def _m5_fast_config_text():
+    """Test-only delays: no batching, short grace, fast adopt, wrap enabled."""
+    return (
+        "# taema-vm-m5: fast delays for the M5 gate; removed on teardown.\n"
+        "[notify]\n"
+        "batch_seconds = 0\n"
+        "\n"
+        "[agent]\n"
+        "windowless_grace = 3\n"
+        "\n"
+        "[timers]\n"
+        "adopt_interval = 2\n"
+        "\n"
+        "[experimental]\n"
+        "launch_wrap = true\n"
+    )
+
+
+def _m5_snapshot():
+    paths = [
+        _m5_dropin_path(),
+        os.path.join(_m5_config_home(), "taema", "units", "m5quit.toml"),
+    ]
+    snapshot = {}
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                snapshot[path] = handle.read()
+        except FileNotFoundError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _m5_write_fast():
+    dropin = _m5_dropin_path()
+    os.makedirs(os.path.dirname(dropin), exist_ok=True)
+    with open(dropin, "w") as handle:
+        handle.write(_m5_fast_config_text())
+    reloaded = _run(["taema", "reload"], timeout=30)
+    if reloaded.returncode != 0:
+        raise ScenarioError(
+            "m5 fast config reload failed: %s%s" % (reloaded.stdout, reloaded.stderr)
+        )
+
+
+def _m5_restore(snapshot):
+    for path, contents in snapshot.items():
+        if contents is None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        else:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(contents)
+    return run_privileged(["sv", "restart", "taema"], timeout=45)
+
+
+def _m5_cli_json(argv, timeout=30):
+    """Run a read-only CLI command; return parsed JSON or None."""
+    reply = _run(argv, timeout=timeout)
+    if reply.returncode != 0:
+        return None
+    try:
+        return json.loads(reply.stdout or "")
+    except ValueError:
+        return None
+
+
+def _m5_review_ids(timeout=30):
+    data = _m5_cli_json(["taema", "review", "--json"], timeout=timeout)
+    if isinstance(data, dict):
+        data = data.get("reviews")
+    if not isinstance(data, list):
+        return None
+    ids = []
+    for item in data:
+        if isinstance(item, dict) and item.get("id") is not None:
+            ids.append(item["id"])
+    return ids
+
+
+def _m5_wait_new_review(before, timeout=30):
+    """Poll until a review id appears that was not in `before`; return it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ids = _m5_review_ids()
+        if ids is not None:
+            fresh = [item for item in ids if item not in before]
+            if fresh:
+                return fresh[0]
+        time.sleep(0.25)
+    raise ScenarioError("no new review appeared within %ss" % timeout)
+
+
+def _m5_close_window(niri_env, window_id):
+    """Close one window through the compositor; fall back to client SIGTERM."""
+    reply = subprocess.run(
+        ["niri", "msg", "action", "focus-window", "--id", str(window_id)],
+        env=niri_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if reply.returncode == 0:
+        closed = subprocess.run(
+            ["niri", "msg", "action", "close-window"],
+            env=niri_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if closed.returncode == 0:
+            return "compositor"
+    return "terminate"
+
+
+def scenario_m5(rec, args, tree_holder):
+    """M5 gate (#67): windowed lifecycle, launch, agent, notify cap, docs."""
+    del tree_holder
+    missing = [tool for tool in GRAPHICAL_TOOLS if shutil.which(tool) is None]
+    rec.step(
+        "graphical-tools",
+        not missing,
+        "missing: %s" % ",".join(missing) if missing else "all present",
+    )
+    if missing:
+        return False
+    status, _attempts = wait_for_auto_status(timeout=60)
+    rec.step(
+        "daemon-ready",
+        status.returncode == 0,
+        (status.stdout + status.stderr)[:200],
+    )
+    if status.returncode != 0:
+        return False
+    log_path = os.path.join(args.state_dir, "decisions.log")
+    snapshot = _m5_snapshot()
+    session = None
+    agent = None
+    launched = []
+    try:
+        # Default delays first: with stock batching (60 s) and grace (30 s) a
+        # fresh close must produce no review within 5 s and keep its scope.
+        session = start_graphical_session(args.artifacts)
+        rec.step("session-up", True, "niri=%s" % session["niri_display"])
+        niri_env = session["niri_env"]
+        before = _m5_review_ids() or []
+        default_app = "m5default"
+        # One launch carries both halves: the shell backgrounds a sleeper in
+        # the fresh app scope, then execs foot so the windowed root keeps the
+        # launched pid. A second launch would reserve a *different* scope, so
+        # the survivor must be born inside the first one.
+        default_root = subprocess.Popen(
+            [
+                "taema",
+                "launch",
+                "--app",
+                default_app,
+                "--",
+                "foot",
+                "sh",
+                "-c",
+                "sleep 300 & exec foot",
+            ],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        launched.append(default_root)
+        default_scope = wait_for_scope(
+            default_root.pid, ("app-" + default_app,), timeout=60
+        )
+        default_windows = wait_window_count(niri_env, 1)
+        default_id = default_windows[0].get("id")
+        _m5_close_window(niri_env, default_id)
+        try:
+            wait_window_count(niri_env, 0, timeout=15)
+            closed_ok = True
+        except ScenarioError:
+            closed_ok = False
+        rec.step("default-close", closed_ok, "window went away")
+        time.sleep(5)
+        delayed = _m5_review_ids()
+        rec.step(
+            "default-batch-delays-review",
+            delayed is not None and len(delayed) == len(before),
+            "reviews before=%d after=%d (batch holds)"
+            % (len(before), len(delayed or [])),
+        )
+        try:
+            default_kept = scope_members(default_scope) != []
+            default_kept_note = "scope %s kept inside 30 s grace" % default_scope
+        except ScenarioError as error:
+            default_kept, default_kept_note = False, str(error)
+        rec.step("default-grace-holds-scope", default_kept, default_kept_note)
+        if default_root.poll() is None:
+            default_root.terminate()
+
+        _m5_write_fast()
+        rec.step("fast-delays", True, "batch 0 s, grace 3 s, adopt 2 s")
+
+        agent = subprocess.Popen(
+            ["taema", "agent"],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            wait_for_audit_event(log_path, "agent_up", None, timeout=30)
+            rec.step("agent-registered", True, "agent_up in decisions.log")
+        except ScenarioError as error:
+            rec.step("agent-registered", False, str(error))
+            return False
+
+        # Bullet 1: last-window close with a surviving child reviews fast.
+        before = _m5_review_ids() or []
+        close_app = "m5close"
+        foot = subprocess.Popen(
+            [
+                "taema",
+                "launch",
+                "--app",
+                close_app,
+                "--",
+                "foot",
+                "sh",
+                "-c",
+                "sleep 300 & exec foot",
+            ],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        launched.append(foot)
+        close_scope = wait_for_scope(foot.pid, ("app-" + close_app,), timeout=60)
+        windows = wait_window_count(niri_env, 1)
+        window_id = windows[0].get("id")
+        rec.step("close-window-open", window_id is not None, "id=%s" % window_id)
+        closed_at = time.monotonic()
+        _m5_close_window(niri_env, window_id)
+        if foot.poll() is None:
+            try:
+                foot.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                foot.terminate()
+        try:
+            wait_window_count(niri_env, 0, timeout=15)
+            rec.step("close-last-window", True, "window went away")
+        except ScenarioError as error:
+            rec.step("close-last-window", False, str(error))
+        try:
+            review_id = _m5_wait_new_review(before, timeout=30)
+            elapsed = time.monotonic() - closed_at
+            rec.step(
+                "review-within-3s",
+                elapsed < 3.0,
+                "review %s after %.1fs" % (review_id, elapsed),
+            )
+        except ScenarioError as error:
+            rec.step("review-within-3s", False, str(error))
+            return False
+        answered = _run(["taema", "answer", str(review_id), "stop"], timeout=30)
+        rec.step(
+            "stop-applies",
+            answered.returncode == 0,
+            (answered.stdout + answered.stderr)[:200],
+        )
+        helper_gone = False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                helper_gone = scope_members(close_scope) == []
+            except ScenarioError:
+                helper_gone = True
+            if helper_gone:
+                break
+            time.sleep(0.25)
+        rec.step("stop-reaps-survivor", helper_gone, "sleep helper exited")
+        rec.step(
+            "stop-removes-scope",
+            wait_for_scope_gone(close_scope, timeout=20),
+            close_scope,
+        )
+
+        # Bullet 2: on_last_window=quit stops after grace; reopen cancels.
+        unit_path = os.path.join(_m5_config_home(), "taema", "units", "m5quit.toml")
+        os.makedirs(os.path.dirname(unit_path), exist_ok=True)
+        with open(unit_path, "w") as handle:
+            handle.write(
+                '[unit]\nname = "m5quit"\nkind = "app"\n\n'
+                '[match]\ncomm = "foot"\n\n'
+                '[desktop]\non_last_window = "quit"\n'
+            )
+        reloaded = _run(["taema", "reload"], timeout=30)
+        rec.step("quit-unit-reloads", reloaded.returncode == 0, "m5quit unit")
+        quit_app = "m5quit"
+        quit_foot = subprocess.Popen(
+            ["taema", "launch", "--app", quit_app, "--", "foot"],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        launched.append(quit_foot)
+        quit_scope = wait_for_scope(quit_foot.pid, ("app-" + quit_app,), timeout=60)
+        quit_windows = wait_window_count(niri_env, 1)
+        _m5_close_window(niri_env, quit_windows[0].get("id"))
+        rec.step(
+            "quit-after-grace",
+            wait_for_scope_gone(quit_scope, timeout=48),
+            "scope stopped past 3 s grace",
+        )
+        reopen_app = "m5quit2"
+        first = subprocess.Popen(
+            ["taema", "launch", "--app", reopen_app, "--", "foot"],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        launched.append(first)
+        reopen_scope = wait_for_scope(first.pid, ("app-" + reopen_app,), timeout=60)
+        first_windows = wait_window_count(niri_env, 1)
+        _m5_close_window(niri_env, first_windows[0].get("id"))
+        time.sleep(1)
+        second = subprocess.Popen(
+            ["taema", "launch", "--app", reopen_app, "--", "foot"],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        launched.append(second)
+        try:
+            wait_window_count(niri_env, 1, timeout=30)
+            reopened = True
+        except ScenarioError as error:
+            reopened, reopen_note = False, str(error)
+        time.sleep(8)
+        try:
+            members = scope_members(reopen_scope) if reopened else []
+        except ScenarioError as error:
+            members, reopen_note = [], str(error)
+        rec.step(
+            "reopen-cancels-stop",
+            bool(reopened) and second.poll() is None and members != [],
+            "scope %s survived reopen inside grace" % reopen_scope
+            if reopened
+            else reopen_note,
+        )
+        for proc in (quit_foot, first, second):
+            if proc.poll() is None:
+                proc.terminate()
+
+        # Bullet 3: a wrapped desktop entry launches in its scope with proof.
+        apps_dir = os.path.join(
+            os.path.expanduser("~"), ".local", "share", "applications"
+        )
+        os.makedirs(apps_dir, exist_ok=True)
+        entry = os.path.join(apps_dir, "m5wrap.desktop")
+        with open(entry, "w") as handle:
+            handle.write(
+                "[Desktop Entry]\nType=Application\nName=M5Wrap\n"
+                "Exec=sleep 300\nNoDisplay=true\n"
+            )
+        wrapped = _run(["taema", "desktop", "wrap", "m5wrap.desktop"], timeout=30)
+        rec.step(
+            "desktop-wrap",
+            wrapped.returncode == 0,
+            (wrapped.stdout + wrapped.stderr)[:200],
+        )
+        listed = _run(["taema", "desktop", "list"], timeout=30)
+        rec.step(
+            "desktop-list",
+            listed.returncode == 0 and "m5wrap" in (listed.stdout or ""),
+            (listed.stdout or "")[:200],
+        )
+        override = os.path.join(apps_dir, "m5wrap.desktop")
+        exec_argv = None
+        try:
+            with open(override, encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("Exec="):
+                        exec_argv = shlex.split(line[len("Exec=") :].strip())
+                        break
+        except OSError as error:
+            exec_argv = None
+            rec.step("desktop-exec", False, "unreadable override: %s" % error)
+        if exec_argv:
+            rec.step("desktop-exec", True, " ".join(exec_argv)[:120])
+            wrap_proc = subprocess.Popen(
+                exec_argv,
+                env=niri_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            launched.append(wrap_proc)
+            try:
+                wrap_scope = wait_for_scope(wrap_proc.pid, ("app-",), timeout=60)
+                why = _run(["taema", "why", str(wrap_proc.pid)], timeout=30)
+                why_text = (why.stdout or "") + (why.stderr or "")
+                rec.step(
+                    "why-launched-by",
+                    why.returncode == 0 and "launched_by=launch" in why_text,
+                    "%s %s" % (wrap_scope, why_text[:160]),
+                )
+                rec.step(
+                    "why-desktop-id",
+                    why.returncode == 0 and "m5wrap" in why_text,
+                    "%s %s" % (wrap_scope, why_text[:160]),
+                )
+            except ScenarioError as error:
+                rec.step("why-launched-by", False, str(error))
+                rec.step("why-desktop-id", False, "no scope: %s" % error)
+
+        # Bullet 4: killing the agent degrades cleanly; restart re-registers.
+        if agent is not None and agent.poll() is None:
+            agent.terminate()
+            try:
+                agent.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                agent.kill()
+        time.sleep(2)
+        degraded = _run(["taema", "status"], timeout=30)
+        degraded_text = (degraded.stdout or "") + (degraded.stderr or "")
+        rec.step(
+            "agent-loss-degrades",
+            degraded.returncode == 0 and "Traceback" not in degraded_text,
+            degraded_text[:200],
+        )
+        agent = subprocess.Popen(
+            ["taema", "agent"],
+            env=niri_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            wait_for_audit_event(log_path, "agent_up", None, timeout=30)
+            rec.step("agent-reregisters", True, "agent_up within 30 s")
+        except ScenarioError as error:
+            rec.step("agent-reregisters", False, str(error))
+
+        # Bullet 5: a scripted storm of 50 closes stays within the hourly cap.
+        storm_before = len(notify_records(session))
+        storm_ok = True
+        for index in range(50):
+            tree = spawn_gui_tree(
+                os.path.join(args.artifacts, "m5-storm-%02d" % index), children=1
+            )
+            try:
+                wait_for_scope(tree["root"], ("app-",), timeout=30)
+            except ScenarioError as error:
+                rec.step("storm-%02d-adopted" % index, False, str(error))
+                storm_ok = False
+                break
+            close_root(tree["root"], timeout=15)
+            for pid in tree["children"]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        if storm_ok:
+            rec.step("storm-50-closes", True, "50 roots closed")
+        storm_after = len(notify_records(session))
+        rec.step(
+            "storm-within-cap",
+            (storm_after - storm_before) <= _M5_NOTIFY_CAP,
+            "notifications +%d (cap %d/hr)"
+            % (storm_after - storm_before, _M5_NOTIFY_CAP),
+        )
+        shot = os.path.join(args.artifacts, "m5.png")
+        take_screenshot(niri_env, shot)
+        try:
+            img = read_png(shot)
+            rec.step(
+                "screenshot",
+                img["width"] > 0 and img["height"] > 0 and len(set(img["pixels"])) > 1,
+                "%dx%d" % (img["width"], img["height"]),
+            )
+        except (OSError, ValueError) as error:
+            rec.step("screenshot", False, "unreadable PNG: %s" % error)
+        widget = "/usr/share/examples/taema/widgets/TaemaBar.qml"
+        feed = _run(["taema", "bar", "--format", "json"], timeout=30)
+        rec.step(
+            "widget-feed-live",
+            os.path.isfile(widget) and feed.returncode == 0,
+            "widget installed=%s bar rc=%d" % (os.path.isfile(widget), feed.returncode),
+        )
+
+        # Bullet 6: the agent man page and autostart snippet are installed.
+        rec.step(
+            "agent-man-page",
+            os.path.isfile("/usr/share/man/man1/taema-agent.1"),
+            "taema-agent(1)",
+        )
+        rec.step(
+            "niri-autostart",
+            os.path.isfile("/usr/share/examples/taema/autostart/niri-taema-agent.kdl"),
+            "niri-taema-agent.kdl",
+        )
+        version = _run(["taema", "--version"], timeout=30)
+        rec.step(
+            "version-0.7.0",
+            version.returncode == 0 and "0.7.0" in (version.stdout or ""),
+            (version.stdout or "").strip()[:80],
+        )
+        try:
+            shutil.copy2(
+                session["notify_log"],
+                os.path.join(args.artifacts, "m5-notify.jsonl"),
+            )
+        except OSError:
+            pass
+    except ScenarioError as error:
+        rec.step("m5", False, str(error))
+        return False
+    finally:
+        for proc in launched:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except OSError:
+                pass
+        if agent is not None and agent.poll() is None:
+            agent.terminate()
+            try:
+                agent.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                agent.kill()
+        if session is not None:
+            stop_graphical_session(session)
+        _m5_restore(snapshot)
+    return all(step["ok"] for step in rec.steps)
+
+
 SCENARIOS = {
     "smoke": scenario_smoke,
     "m0": scenario_m0,
@@ -4375,6 +4954,7 @@ SCENARIOS = {
     "m2": scenario_m2,
     "m3": scenario_m3,
     "m4": scenario_m4,
+    "m5": scenario_m5,
     "upgrade": scenario_upgrade,
     "remove": scenario_remove,
     "graphical": scenario_graphical,

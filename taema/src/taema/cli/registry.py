@@ -798,6 +798,41 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         ),
     },
     {
+        "name": "suggest",
+        "aliases": (),
+        "help": "list ranked improvements, or apply one by id",
+        "handler": "cmd_suggest",
+        "read": True,
+        "optional_children": True,
+        "children": (
+            {
+                "name": "apply",
+                "help": "apply one suggestion by id after confirmation",
+                "handler": "cmd_suggest_apply",
+                "arguments": (
+                    (
+                        ("identifier",),
+                        {},
+                    ),
+                    (
+                        ("--choice",),
+                        {
+                            "choices": ("stop", "keep", "standalone", "never"),
+                            "help": "answer for a stale-review suggestion",
+                        },
+                    ),
+                    (
+                        ("--force",),
+                        {
+                            "action": "store_true",
+                            "help": "overwrite an existing unit file",
+                        },
+                    ),
+                ),
+            },
+        ),
+    },
+    {
         "name": "restore-backup",
         "aliases": (),
         "help": "restore state, config, and units from a backup tarball",

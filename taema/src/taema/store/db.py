@@ -2742,6 +2742,7 @@ class StateDB:
             "qos_exempt": {},
             "memory_scopes": {},
             "frozen_scopes": {},
+            "windowless_grace": {},
         }
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2762,6 +2763,7 @@ class StateDB:
                     "qos_scopes",
                     "qos_exempt",
                     "memory_scopes",
+                    "windowless_grace",
                 ):
                     value = data.get(key, optional_meta_defaults.get(key))
                     if key not in optional_meta_defaults:

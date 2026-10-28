@@ -7,6 +7,7 @@ import shlex
 import sqlite3
 import stat
 import subprocess
+import time
 from urllib.parse import quote
 
 from .config import policy
@@ -1362,20 +1363,18 @@ def render(report):
 
 def _repair_dirs(cfg, fixes):
     """Create missing state/config/hooks directories and enforce their modes."""
-    from .config import policy as policy_mod
-
     paths = cfg.get("paths", {})
     if not isinstance(paths, dict):
         paths = {}
     targets = []
     state_dir = paths.get("state_dir")
     if isinstance(state_dir, str) and state_dir:
-        targets.append((policy_mod.expand(state_dir), 0o700, "state dir"))
-    config_dir = policy_mod.user_config_dir()
+        targets.append((policy.expand(state_dir), 0o700, "state dir"))
+    config_dir = policy.user_config_dir()
     targets.append((config_dir, 0o700, "config dir"))
     hooks_dir = paths.get("hooks_dir")
     if isinstance(hooks_dir, str) and hooks_dir:
-        targets.append((policy_mod.expand(hooks_dir), 0o755, "hooks dir"))
+        targets.append((policy.expand(hooks_dir), 0o755, "hooks dir"))
     for path, mode, name in targets:
         try:
             if not os.path.isdir(path):
@@ -1523,8 +1522,6 @@ def _runtime_hold_marker():
 
 
 def _repair_stale_flags(state_dir, store, fixes):
-    import time as time_mod
-
     removed = []
     failed = []
     if state_dir is not None:
@@ -1574,7 +1571,7 @@ def _repair_stale_flags(state_dir, store, fixes):
             if (
                 isinstance(snooze, (int, float))
                 and not isinstance(snooze, bool)
-                and snooze > time_mod.time()
+                and snooze > time.time()
             ):
                 active_claim = True
         hold_active = False
@@ -1628,9 +1625,7 @@ def _repair_stale_flags(state_dir, store, fixes):
 
 
 def _repair_autostart(fixes, system_root):
-    from .config import policy as policy_mod
-
-    config_home = policy_mod.xdg("XDG_CONFIG_HOME", "~/.config")
+    config_home = policy.xdg("XDG_CONFIG_HOME", "~/.config")
     dest = os.path.join(config_home, "autostart", _AUTOSTART_FILENAME)
     source = _autostart_source(system_root)
     if source is None:

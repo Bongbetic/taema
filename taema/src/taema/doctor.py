@@ -1,7 +1,9 @@
 """Read-only checks that explain whether tæma can run safely on this machine."""
 
+import json
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -1355,4 +1357,458 @@ def render(report):
             "[%s] %s: %s — fix: %s"
             % (item["status"], item["name"], item["message"], item["fix"])
         )
+    return "\n".join(lines) + "\n"
+
+
+def _repair_dirs(cfg, fixes):
+    """Create missing state/config/hooks directories and enforce their modes."""
+    from .config import policy as policy_mod
+
+    paths = cfg.get("paths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+    targets = []
+    state_dir = paths.get("state_dir")
+    if isinstance(state_dir, str) and state_dir:
+        targets.append((policy_mod.expand(state_dir), 0o700, "state dir"))
+    config_dir = policy_mod.user_config_dir()
+    targets.append((config_dir, 0o700, "config dir"))
+    hooks_dir = paths.get("hooks_dir")
+    if isinstance(hooks_dir, str) and hooks_dir:
+        targets.append((policy_mod.expand(hooks_dir), 0o755, "hooks dir"))
+    for path, mode, name in targets:
+        try:
+            if not os.path.isdir(path):
+                os.makedirs(path, mode=mode, exist_ok=True)
+                os.chmod(path, mode)
+                fixes.append(
+                    {"name": name, "status": "fixed", "message": "created %s" % path}
+                )
+            elif stat.S_IMODE(os.stat(path).st_mode) != mode:
+                os.chmod(path, mode)
+                fixes.append(
+                    {
+                        "name": name,
+                        "status": "fixed",
+                        "message": "set mode %04o on %s" % (mode, path),
+                    }
+                )
+            else:
+                fixes.append(
+                    {
+                        "name": name,
+                        "status": "skipped",
+                        "message": "%s already present with mode %04o" % (path, mode),
+                    }
+                )
+        except OSError as error:
+            fixes.append(
+                {"name": name, "status": "fail", "message": str(error)}
+            )
+
+
+_DESIRED_CONTROLLERS = ("cpu", "io", "memory", "pids")
+
+_AUTOSTART_FILENAME = "taema-agent.desktop"
+
+
+def _autostart_source(system_root):
+    """Locate the packaged agent autostart snippet, if the package ships it."""
+    candidates = [
+        _rooted(system_root, "/usr/share/examples/taema/autostart/" + _AUTOSTART_FILENAME),
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "examples",
+            "autostart",
+            _AUTOSTART_FILENAME,
+        ),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _legacy_marker_present(dbpath):
+    try:
+        uri = "file:%s?mode=ro" % quote(os.path.abspath(dbpath))
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'migration.legacy_import'"
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is not None
+    except (OSError, sqlite3.Error, TypeError, IndexError):
+        return False
+
+
+def _schema_version(dbpath):
+    try:
+        uri = "file:%s?mode=ro" % quote(os.path.abspath(dbpath))
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            row = connection.execute("PRAGMA user_version").fetchone()
+        finally:
+            connection.close()
+        return row[0] if row else None
+    except (OSError, sqlite3.Error, TypeError, IndexError):
+        return None
+
+
+def _repair_store(cfg, fixes):
+    from .store import db as db_mod
+    from .store import knowledge as knowledge_mod
+
+    paths = cfg.get("paths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+    state_dir_value = paths.get("state_dir")
+    if not isinstance(state_dir_value, str) or not state_dir_value:
+        fixes.append(
+            {
+                "name": "store migration",
+                "status": "skipped",
+                "message": "no state dir configured; nothing to migrate",
+            }
+        )
+        return None
+    state_dir = policy.expand(state_dir_value)
+    legacy = os.path.join(state_dir, "knowledge.json")
+    dbpath = os.path.join(state_dir, "state.db")
+    if _legacy_marker_present(dbpath):
+        fixes.append(
+            {
+                "name": "store migration",
+                "status": "skipped",
+                "message": "legacy store already imported",
+            }
+        )
+        return state_dir
+    version = _schema_version(dbpath) if os.path.isfile(dbpath) else None
+    if (
+        not os.path.isfile(legacy)
+        and version is not None
+        and version >= db_mod.SCHEMA_VERSION
+    ):
+        fixes.append(
+            {
+                "name": "store migration",
+                "status": "skipped",
+                "message": "store schema is current; nothing to migrate",
+            }
+        )
+        return state_dir
+    try:
+        knowledge_mod.Store(state_dir, cfg.get("seeds") or {})
+    except Exception as error:
+        fixes.append(
+            {"name": "store migration", "status": "fail", "message": str(error)}
+        )
+        return None
+    fixes.append(
+        {
+            "name": "store migration",
+            "status": "fixed",
+            "message": "opened the store so pending migrations apply",
+        }
+    )
+    return state_dir
+
+
+def _runtime_hold_marker():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(runtime, "taema", "HOLD")
+
+
+def _repair_stale_flags(state_dir, store, fixes):
+    import time as time_mod
+
+    removed = []
+    failed = []
+    if state_dir is not None:
+        try:
+            exports = sorted(
+                name
+                for name in os.listdir(state_dir)
+                if name.startswith("state-export-") and name.endswith(".json")
+            )
+        except OSError:
+            exports = []
+        for name in exports[:-3]:
+            path = os.path.join(state_dir, name)
+            try:
+                os.unlink(path)
+                removed.append(name)
+            except OSError as error:
+                failed.append("%s: %s" % (name, error))
+    marker = _runtime_hold_marker()
+    marker_handled = False
+    try:
+        with open(marker, encoding="utf-8") as stream:
+            marker_value = stream.read()
+    except FileNotFoundError:
+        marker_value = None
+    except OSError:
+        marker_value = "unreadable"
+    if marker_value is None:
+        pass
+    elif marker_value == "unreadable":
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "skipped",
+                "message": "hold marker is unreadable; left in place",
+            }
+        )
+        marker_handled = True
+    else:
+        try:
+            claimed = json.loads(marker_value) if marker_value else {}
+        except ValueError:
+            claimed = {}
+        active_claim = claimed.get("held") is True if isinstance(claimed, dict) else True
+        if isinstance(claimed, dict):
+            snooze = claimed.get("snooze_until")
+            if (
+                isinstance(snooze, (int, float))
+                and not isinstance(snooze, bool)
+                and snooze > time_mod.time()
+            ):
+                active_claim = True
+        hold_active = False
+        if active_claim:
+            if store is not None:
+                try:
+                    hold_active = bool(store.hold_reason())
+                except Exception:
+                    hold_active = True
+            else:
+                hold_active = True
+        if hold_active:
+            fixes.append(
+                {
+                    "name": "stale flags",
+                    "status": "skipped",
+                    "message": "hold marker reflects an active hold; left in place",
+                }
+            )
+            marker_handled = True
+        else:
+            try:
+                os.unlink(marker)
+                removed.append("hold marker")
+            except OSError as error:
+                failed.append("hold marker: %s" % error)
+    if failed:
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "fail",
+                "message": "; ".join(failed),
+            }
+        )
+    elif removed:
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "fixed",
+                "message": "removed %s" % ", ".join(sorted(removed)),
+            }
+        )
+    elif not marker_handled:
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "skipped",
+                "message": "no stale exports or hold markers",
+            }
+        )
+
+
+def _repair_autostart(fixes, system_root):
+    from .config import policy as policy_mod
+
+    config_home = policy_mod.xdg("XDG_CONFIG_HOME", "~/.config")
+    dest = os.path.join(config_home, "autostart", _AUTOSTART_FILENAME)
+    source = _autostart_source(system_root)
+    if source is None:
+        fixes.append(
+            {
+                "name": "agent autostart",
+                "status": "skipped",
+                "message": "packaged autostart snippet not found; install the taema package",
+            }
+        )
+        return
+    try:
+        with open(source, encoding="utf-8") as stream:
+            wanted = stream.read()
+        if os.path.isfile(dest):
+            with open(dest, encoding="utf-8") as stream:
+                current = stream.read()
+            if current == wanted:
+                fixes.append(
+                    {
+                        "name": "agent autostart",
+                        "status": "skipped",
+                        "message": "%s already installed" % dest,
+                    }
+                )
+            else:
+                fixes.append(
+                    {
+                        "name": "agent autostart",
+                        "status": "skipped",
+                        "message": "%s is customized; left in place" % dest,
+                    }
+                )
+            return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as stream:
+            stream.write(wanted)
+        os.chmod(dest, 0o644)
+        fixes.append(
+            {
+                "name": "agent autostart",
+                "status": "fixed",
+                "message": "installed %s" % dest,
+            }
+        )
+    except OSError as error:
+        fixes.append({"name": "agent autostart", "status": "fail", "message": str(error)})
+
+
+def _default_runner(argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+
+def _repair_controllers(uid, fixes, sudo, runner):
+    from .core import cgroup as cgroup_mod
+
+    resolved = os.getuid() if uid is None else uid
+    control = os.path.join(cgroup_mod.base(resolved), "cgroup.subtree_control")
+    try:
+        with open(control, encoding="utf-8") as stream:
+            enabled = {
+                token.lstrip("+") for token in stream.read().split() if token
+            }
+    except OSError:
+        fixes.append(
+            {
+                "name": "controllers",
+                "status": "skipped",
+                "message": "user subtree has no subtree_control; start the service first",
+            }
+        )
+        return
+    missing = [name for name in _DESIRED_CONTROLLERS if name not in enabled]
+    if not missing:
+        fixes.append(
+            {
+                "name": "controllers",
+                "status": "skipped",
+                "message": "delegated controllers already include %s"
+                % " ".join(_DESIRED_CONTROLLERS),
+            }
+        )
+        return
+    fragment = " ".join("+" + name for name in missing)
+    command = ["sudo", "sh", "-c", "echo '%s' > %s" % (fragment, control)]
+    try:
+        with open(control, "w", encoding="utf-8") as stream:
+            stream.write(
+                " ".join(
+                    "+" + name
+                    for name in sorted(enabled | set(missing), key=str.lower)
+                )
+                + "\n"
+            )
+    except OSError:
+        if sudo:
+            run = runner or _default_runner
+            try:
+                result = run(command)
+            except (OSError, subprocess.SubprocessError) as error:
+                fixes.append(
+                    {"name": "controllers", "status": "fail", "message": str(error)}
+                )
+                return
+            if getattr(result, "returncode", 1) == 0:
+                fixes.append(
+                    {
+                        "name": "controllers",
+                        "status": "fixed",
+                        "message": "enabled %s via %s"
+                        % (" ".join(missing), shlex.join(command)),
+                    }
+                )
+            else:
+                fixes.append(
+                    {
+                        "name": "controllers",
+                        "status": "fail",
+                        "message": "root command exited %s"
+                        % getattr(result, "returncode", "?"),
+                        "command": command,
+                    }
+                )
+        else:
+            fixes.append(
+                {
+                    "name": "controllers",
+                    "status": "needs-root",
+                    "message": "subtree_control is not writable; enable %s"
+                    % " ".join(missing),
+                    "command": command,
+                }
+            )
+        return
+    fixes.append(
+        {
+            "name": "controllers",
+            "status": "fixed",
+            "message": "enabled %s on the delegated subtree" % " ".join(missing),
+        }
+    )
+
+
+def repair(cfg, store=None, *, system_root="/", uid=None, sudo=False, runner=None):
+    """Apply the safe subset of doctor fixes and report each one.
+
+    Read-only checks stay untouched: this only creates missing directories,
+    repairs ownership-safe permissions, enables delegated controllers where
+    writable, installs the session-agent autostart entry, opens the store so
+    pending migrations apply, and prunes stale state exports and hold
+    markers. Anything needing root is reported with its command and runs
+    only when ``sudo`` is true. Every entry is ``{"name", "status",
+    "message"[, "command"]}`` with status one of ``fixed``, ``skipped``,
+    ``needs-root``, or ``fail``. Running repair twice changes nothing the
+    second time.
+    """
+    fixes = []
+    _repair_dirs(cfg, fixes)
+    _repair_controllers(uid, fixes, sudo, runner)
+    _repair_autostart(fixes, system_root)
+    state_dir = _repair_store(cfg, fixes)
+    _repair_stale_flags(state_dir, store, fixes)
+    return fixes
+
+
+def render_repair(fixes):
+    """Render one line per applied or pending fix."""
+    lines = ["doctor --fix: %d action(s)" % len(fixes)]
+    for item in fixes:
+        line = "[%s] %s: %s" % (
+            item["status"],
+            item["name"],
+            item["message"],
+        )
+        if item["status"] == "needs-root" and item.get("command"):
+            command = item["command"]
+            if not isinstance(command, str):
+                command = shlex.join(command)
+            line += " — run: %s" % command
+        lines.append(line)
     return "\n".join(lines) + "\n"

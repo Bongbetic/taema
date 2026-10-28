@@ -3062,6 +3062,22 @@ def cmd_doctor(a):
             store_error=store_error,
         )
     view.emit(report, a, doctor.render(report))
+    if getattr(a, "fix", False):
+        fixes = doctor.repair(
+            cfg,
+            store,
+            sudo=getattr(a, "sudo", False),
+        )
+        repair_report = {
+            "schema": "taema.doctor.repair.v1",
+            "status": "fail"
+            if any(item["status"] in ("fail", "needs-root") for item in fixes)
+            else "ok",
+            "fixes": fixes,
+        }
+        view.emit(repair_report, a, doctor.render_repair(fixes))
+        if repair_report["status"] == "fail":
+            return 1
     return 1 if report.get("status") == "fail" else 0
 
 

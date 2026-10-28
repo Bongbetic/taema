@@ -7,7 +7,10 @@
 # Off unless the shell is interactive on a terminal, TAEMA_NO_PROMPT is unset and the hook
 # program is executable.
 
-set -g __taema_hook /usr/libexec/taema/taema-hook
+set -g __taema_hook /usr/libexec/taema/taema-fast
+if not test -x $__taema_hook
+    set __taema_hook /usr/libexec/taema/taema-hook
+end
 set -q TAEMA_HOOK; and set __taema_hook $TAEMA_HOOK
 
 if status is-interactive; and isatty stdin; and isatty stdout; and not set -q TAEMA_NO_PROMPT; and test -x $__taema_hook; and not functions -q __taema_postexec

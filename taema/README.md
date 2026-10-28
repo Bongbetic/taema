@@ -510,6 +510,11 @@ taema watch
 taema prompt
 ```
 
+The shell hooks report through the native `taema-fast` client when it is installed
+(`usr/libexec/taema/taema-fast`), falling back to the Python `taema-hook`; set
+`TAEMA_HOOK` to override both. `taema-fast prompt` reads the same cached segment
+as `taema prompt` without starting Python, for use in a shell prompt.
+
 A review shows its owner, surviving apps, close count, memory, age, provenance, and survivor
 signature. Answer it with `taema answer ID stop|keep|standalone|never`, or use the interactive
 review command. `never` adds an app veto; `standalone` remembers that the survivor should have

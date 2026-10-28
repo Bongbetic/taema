@@ -104,6 +104,7 @@ class InstalledDocumentationTest(unittest.TestCase):
                 "usr/share/doc/taema/legacy-state-migration.md",
                 "usr/bin/taemad",
                 "usr/libexec/taema/taemad-user",
+                "usr/libexec/taema/taema-fast",
             ):
                 with self.subTest(path=path):
                     self.assertTrue(os.path.isfile(os.path.join(staged, path)), path)

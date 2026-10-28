@@ -65,6 +65,7 @@ else
 	install -m755 libexec/taema-attach $(LIBEXEC)/taema-attach
 	install -m755 libexec/taema-attach.py $(LIBEXEC)/taema-attach.py
 	install -m755 rust/target/release/taema-attach $(LIBEXEC)/taema-attach.rs
+	install -m755 rust/target/release/taema-fast $(LIBEXEC)/taema-fast
 endif
 	install -m755 sv/taema/run sv/taema/finish $(SVDIR)/
 	install -m755 sv/taema/log/run $(SVDIR)/log/

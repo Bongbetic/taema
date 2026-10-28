@@ -251,15 +251,24 @@ def package_repo_dir(cfg):
     return repo
 
 
-def package_path(cfg):
+# D20: packages are built only for x86_64 glibc and x86_64 musl.
+LIBC_ARCH = {"glibc": "x86_64", "musl": "x86_64-musl"}
+
+
+def package_arches(libcs):
+    """XBPS architectures needed to cover the selected libcs, in order."""
+    return [LIBC_ARCH[c] for c in dict.fromkeys(libcs) if c in LIBC_ARCH]
+
+
+def package_path(cfg, arch="x86_64"):
     return os.path.join(
-        package_repo_dir(cfg), "taema-%s_1.noarch.xbps" % read_version()
+        package_repo_dir(cfg), "taema-%s_1.%s.xbps" % (read_version(), arch)
     )
 
 
 def previous_version(cfg):
     m = re.match(
-        r"taema-(.+?)(?:_\d+)?\.noarch\.xbps$",
+        r"taema-(.+?)(?:_\d+)?\.(?:noarch|x86_64(?:-musl)?)\.xbps$",
         os.path.basename(cfg["images"]["previous_url"]),
     )
     if not m:
@@ -518,7 +527,16 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     key, pub = ssh_key_paths(cfg)
     vmadmin = "vmadmin"
     repo_name = os.path.basename(cfg["paths"]["package_repo"].rstrip("/"))
-    pkg = package_path(cfg)
+    repo = package_repo_dir(cfg)
+    packages = [
+        {
+            "arch": arch,
+            "path": package_path(cfg, arch),
+            "argv": ["sh", BUILD_XBPS, repo],
+            "env": {"XBPS_ARCH": arch},
+        }
+        for arch in package_arches(libcs)
+    ]
     prev = previous_pkg_path(cfg)
     network_urls = [image_spec(cfg, c)["url"] for c in libcs]
     if (
@@ -620,15 +638,22 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
         "kvm": kvm,
         "scenarios": scenarios,
         "libcs": libcs,
-        "package": {"path": pkg, "argv": ["sh", BUILD_XBPS, package_repo_dir(cfg)]},
+        "packages": packages,
         "network": {"urls": network_urls},
         "vms": vms,
     }
 
 
 def print_plan(plan, out):
-    out.write("package: %s\n" % plan["package"]["path"])
-    out.write("build: %s\n" % " ".join(plan["package"]["argv"]))
+    for package in plan["packages"]:
+        out.write("package: %s\n" % package["path"])
+        out.write(
+            "build: %s\n"
+            % " ".join(
+                ["%s=%s" % item for item in sorted(package["env"].items())]
+                + package["argv"]
+            )
+        )
     for url in plan["network"]["urls"]:
         out.write("network: %s\n" % url)
     for vm in plan["vms"]:
@@ -901,21 +926,31 @@ def build_image(cfg, libc, log=None):
 # ---- package build ---------------------------------------------------------
 
 
-def build_package(cfg):
-    r = subprocess.run(
-        ["sh", BUILD_XBPS, package_repo_dir(cfg)],
-        cwd=TAEMA_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        raise RunError(
-            "package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:])
+def build_package(cfg, libcs=None):
+    """Build one package per needed arch; the suite runs once, on the first."""
+    arches = package_arches(libcs or cfg["libcs"])
+    built = []
+    for index, arch in enumerate(arches):
+        env = dict(os.environ, XBPS_ARCH=arch)
+        if index > 0:
+            # tests already ran with the first arch; only (re)build binaries.
+            env["SKIP_TESTS"] = "1"
+        r = subprocess.run(
+            ["sh", BUILD_XBPS, package_repo_dir(cfg)],
+            cwd=TAEMA_ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
         )
-    pkg = package_path(cfg)
-    if not os.path.isfile(pkg):
-        raise RunError("package build produced no %s" % pkg)
-    return pkg
+        if r.returncode != 0:
+            raise RunError(
+                "package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:])
+            )
+        pkg = package_path(cfg, arch)
+        if not os.path.isfile(pkg):
+            raise RunError("package build produced no %s" % pkg)
+        built.append(pkg)
+    return built
 
 
 # ---- run pipeline ----------------------------------------------------------
@@ -1190,13 +1225,19 @@ def cmd_run(cfg, args, out, err):
                 raise HarnessError("base image for %s missing" % libc)
 
     if args.no_build:
-        if not os.path.isfile(package_path(cfg)):
+        missing = [
+            package_path(cfg, arch)
+            for arch in package_arches(libcs)
+            if not os.path.isfile(package_path(cfg, arch))
+        ]
+        if missing:
             raise HarnessError(
-                "package not built: %s (run without --no-build)" % package_path(cfg)
+                "package not built: %s (run without --no-build)"
+                % ", ".join(missing)
             )
     else:
         err.write("vmh: building package from the working tree\n")
-        build_package(cfg)
+        build_package(cfg, libcs)
 
     summary = {"accel": plan["accel"], "scenarios": scenarios, "vms": {}}
     failed = False

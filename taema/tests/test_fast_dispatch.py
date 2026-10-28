@@ -104,7 +104,7 @@ class DispatchTests(unittest.TestCase):
     def test_makefile_installs_fast(self):
         body = read("Makefile")
         self.assertIn(
-            "install -m755 rust/target/release/taema-fast $(LIBEXEC)/taema-fast",
+            "install -m755 $(RUST_OUT)/taema-fast $(LIBEXEC)/taema-fast",
             body,
         )
 

@@ -141,12 +141,13 @@ The first sync asks whether to import the repository key. The fingerprint is
 
 ### From a release file
 
-Download `taema-<version>_1.noarch.xbps` from the
+Download `taema-<version>_1.x86_64.xbps` (glibc) or
+`taema-<version>_1.x86_64-musl.xbps` (musl) from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty
 directory, index it, and install it:
 
 ```sh
-xbps-rindex -a taema-*.noarch.xbps
+xbps-rindex -a taema-*_1.x86_64*.xbps
 sudo xbps-install --repository="$PWD" taema
 ```
 

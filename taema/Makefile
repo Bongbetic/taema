@@ -32,11 +32,20 @@ all:
 
 # The Rust helper builds offline from the vendored crates. WITHOUT_RUST=1
 # skips it: tests skip the parity corpus and install ships Python only.
+# XBPS_ARCH=x86_64-musl selects the static musl target (D20: packages are
+# built only for x86_64 glibc and x86_64 musl).
+ifeq ($(XBPS_ARCH),x86_64-musl)
+CARGO_TARGET = --target x86_64-unknown-linux-musl
+RUST_OUT = rust/target/x86_64-unknown-linux-musl/release
+else
+CARGO_TARGET =
+RUST_OUT = rust/target/release
+endif
 rust-helper:
 	$(CARGO) build --locked --offline --manifest-path rust/Cargo.toml
 
 rust-helper-release:
-	$(CARGO) build --locked --offline --release --manifest-path rust/Cargo.toml
+	$(CARGO) build --locked --offline --release $(CARGO_TARGET) --manifest-path rust/Cargo.toml
 
 ifndef WITHOUT_RUST
 test check: rust-helper
@@ -64,8 +73,8 @@ ifdef WITHOUT_RUST
 else
 	install -m755 libexec/taema-attach $(LIBEXEC)/taema-attach
 	install -m755 libexec/taema-attach.py $(LIBEXEC)/taema-attach.py
-	install -m755 rust/target/release/taema-attach $(LIBEXEC)/taema-attach.rs
-	install -m755 rust/target/release/taema-fast $(LIBEXEC)/taema-fast
+	install -m755 $(RUST_OUT)/taema-attach $(LIBEXEC)/taema-attach.rs
+	install -m755 $(RUST_OUT)/taema-fast $(LIBEXEC)/taema-fast
 endif
 	install -m755 sv/taema/run sv/taema/finish $(SVDIR)/
 	install -m755 sv/taema/log/run $(SVDIR)/log/

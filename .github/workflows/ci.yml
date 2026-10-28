@@ -22,7 +22,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        libc: [glibc, musl]
+        include:
+          - libc: glibc
+            arch: x86_64
+          - libc: musl
+            arch: x86_64-musl
+    env:
+      XBPS_ARCH: ${{ matrix.arch }}
     steps:
       - name: Install tools
         run: |

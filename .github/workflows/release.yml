@@ -1,6 +1,9 @@
 # Push a tag named taema-vX.Y.Z (X.Y.Z must equal __version__ in taema/src/taema/__init__.py).
-# The workflow tests, builds the .xbps, signs an XBPS repository and attaches it, with the package,
-# to the GitHub release (xbps reads it from releases/latest/download), then commits a bump of version and checksum in taema/srcpkgs/taema/template and in the README.
+# The build jobs test and build the arch-specific .xbps on glibc and musl; the sign job
+# signs an XBPS repository per architecture and attaches the packages, the vendor
+# distfile, and the repodata to the GitHub release (xbps reads it from
+# releases/latest/download); then the template job bumps version and both checksums in
+# taema/srcpkgs/taema/template and the README download names.
 name: release
 
 on:
@@ -12,9 +15,20 @@ permissions:
   pull-requests: write
 
 jobs:
-  release:
+  build:
+    name: build (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    container: ghcr.io/void-linux/void-glibc:latest
+    container: ghcr.io/void-linux/void-${{ matrix.libc }}:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            arch: x86_64
+          - libc: musl
+            arch: x86_64-musl
+    env:
+      XBPS_ARCH: ${{ matrix.arch }}
     steps:
       - name: Install build tools
         run: |
@@ -34,31 +48,54 @@ jobs:
           useradd -m builder
           mkdir -p "$RUNNER_TEMP/repo"
           chown -R builder "$GITHUB_WORKSPACE" "$RUNNER_TEMP/repo"
-          su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && tools/build-xbps.sh '$RUNNER_TEMP/repo'"
-      - name: Sign repository
-        env:
-          XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
+          su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && XBPS_ARCH='${{ matrix.arch }}' tools/build-xbps.sh '$RUNNER_TEMP/repo'"
+      - name: Build vendor distfile
+        if: matrix.arch == 'x86_64'
         run: |
-          out="$RUNNER_TEMP/assets"
-          mkdir -p "$out"
-          cp "$RUNNER_TEMP/repo/taema-${VERSION}_1.noarch.xbps" "$out/"
-          [ -n "$XBPS_PRIVKEY" ] || { echo "secret XBPS_PRIVKEY is not set; publishing the package only" >&2; exit 0; }
-          key="$RUNNER_TEMP/privkey.pem"
-          umask 077
-          printf '%s\n' "$XBPS_PRIVKEY" > "$key"
-          umask 022
-          cd "$out"
-          # The package is noarch: index it for every architecture Void supports.
-          for arch in x86_64 x86_64-musl i686 aarch64 aarch64-musl armv7l armv7l-musl armv6l armv6l-musl; do
-            XBPS_ARCH=$arch xbps-rindex -a "taema-${VERSION}_1.noarch.xbps"
-            XBPS_ARCH=$arch xbps-rindex --privkey "$key" --signedby "Bongbetic <soubarna@live.in>" -s .
-          done
-          xbps-rindex --privkey "$key" -S "taema-${VERSION}_1.noarch.xbps"
-          rm -f "$key"
-      - name: Publish release
+          su builder -s /bin/sh -c "cd '$GITHUB_WORKSPACE/taema' && tools/vendor-dist.sh '$RUNNER_TEMP/repo'"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repo-${{ matrix.arch }}
+          path: ${{ runner.temp }}/repo/
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    container: ghcr.io/void-linux/void-glibc:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: repo-*
+          merge-multiple: true
+          path: ${{ github.workspace }}/assets
+      - uses: actions/checkout@v4
+      - name: Sign repository and publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
         run: |
+          version=${GITHUB_REF_NAME#taema-v}
+          out="${{ github.workspace }}/assets"
+          if [ -n "$XBPS_PRIVKEY" ]; then
+            key="$RUNNER_TEMP/privkey.pem"
+            umask 077
+            printf '%s\n' "$XBPS_PRIVKEY" > "$key"
+            umask 022
+            cd "$out"
+            # D20: packages are built only for x86_64 glibc and x86_64 musl.
+            for arch in x86_64 x86_64-musl; do
+              XBPS_ARCH=$arch xbps-rindex -a "taema-${version}_1.${arch}.xbps"
+              XBPS_ARCH=$arch xbps-rindex --privkey "$key" --signedby "Bongbetic <soubarna@live.in>" -s .
+            done
+            for arch in x86_64 x86_64-musl; do
+              xbps-rindex --privkey "$key" -S "taema-${version}_1.${arch}.xbps"
+            done
+            rm -f "$key"
+            cd "$GITHUB_WORKSPACE"
+          else
+            echo "secret XBPS_PRIVKEY is not set; publishing the package only" >&2
+          fi
           cat > "$RUNNER_TEMP/notes.md" <<NOTES
           Add the repository once, then install and update like any other package:
 
@@ -73,12 +110,12 @@ jobs:
           cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"
           notes="$(cat "$RUNNER_TEMP/notes.md")"
           gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" --title "tæma ${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" --title "tæma ${version}" \
             --notes "$notes" --generate-notes \
-            "$RUNNER_TEMP"/assets/*
+            "$out"/*
 
   template:
-    needs: release
+    needs: sign
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,13 +126,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=${GITHUB_REF_NAME#taema-v}
-          sum=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | sha256sum | cut -d' ' -f1)
+          src_sum=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | sha256sum | cut -d' ' -f1)
+          vendor_sum=$(curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/taema-vendor-${version}.tar.gz" | sha256sum | cut -d' ' -f1)
           t=taema/srcpkgs/taema/template
-          if grep -q "^version=${version}\$" "$t" && grep -q "^checksum=${sum}\$" "$t"; then
+          if grep -q "^version=${version}\$" "$t" && grep -q "^checksum=\"${src_sum} ${vendor_sum}\"\$" "$t"; then
             echo "template already current"; exit 0
           fi
-          sed -i "s/^version=.*/version=${version}/; s/^revision=.*/revision=1/; s/^checksum=.*/checksum=${sum}/" "$t"
-          sed -i "s/taema-[0-9][0-9.]*_1\.noarch/taema-${version}_1.noarch/" README.md
+          sed -i "s/^version=.*/version=${version}/; s/^revision=.*/revision=1/; s/^checksum=.*/checksum=\"${src_sum} ${vendor_sum}\"/" "$t"
+          sed -i "s/taema-<version>_1\.x86_64\.xbps/taema-${version}_1.x86_64.xbps/; s/taema-<version>_1\.x86_64-musl\.xbps/taema-${version}_1.x86_64-musl.xbps/" README.md
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "Template and README: taema ${version}"

@@ -65,6 +65,7 @@ class SyntaxTest(unittest.TestCase):
             "libexec/taemad-user",
             "bin/taemad",
             "tools/build-xbps.sh",
+            "tools/vendor-dist.sh",
         ):
             with self.subTest(script=rel):
                 r = subprocess.run(
@@ -83,6 +84,143 @@ class SyntaxTest(unittest.TestCase):
             user_run = stream.read()
         self.assertIn("export TAEMA_HOLD", service_run)
         self.assertIn('TAEMA_HOLD="${TAEMA_HOLD:-0}"', user_run)
+
+
+class TemplateLayoutTest(unittest.TestCase):
+    def read_template(self):
+        with open(os.path.join(ROOT, "srcpkgs", "taema", "template")) as f:
+            fields = {}
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    fields[key] = value.strip('"')
+            return fields
+
+    def test_native_package_targets_x86_64_glibc_and_musl(self):
+        fields = self.read_template()
+        self.assertEqual(fields["archs"], "x86_64*")
+        self.assertIn("cargo", fields["hostmakedepends"].split())
+        self.assertIn("scdoc", fields["hostmakedepends"].split())
+        self.assertEqual(
+            fields["depends"], "python3>=3.11 iproute2 util-linux sudo runit shadow"
+        )
+
+    def test_vendor_distfile_is_listed_with_its_checksum(self):
+        fields = self.read_template()
+        distfiles = fields["distfiles"].split()
+        checksums = fields["checksum"].split()
+        self.assertEqual(len(distfiles), 2)
+        self.assertEqual(len(checksums), 2)
+        self.assertTrue(distfiles[0].endswith(".tar.gz"))
+        self.assertIn("taema-vendor-", distfiles[1])
+        self.assertTrue(all(len(s) == 64 for s in checksums))
+
+    def test_template_vendor_checksum_matches_the_script(self):
+        fields = self.read_template()
+        with tempfile.TemporaryDirectory() as out:
+            r = subprocess.run(
+                ["sh", os.path.join(ROOT, "tools", "vendor-dist.sh"), out],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            recorded = r.stdout.split()
+            self.assertEqual(len(recorded), 2)
+        self.assertEqual(fields["checksum"].split()[1], recorded[0])
+
+
+class VendorDistTest(unittest.TestCase):
+    def test_distfile_is_deterministic_with_repo_prefix(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as first:
+            with tempfile.TemporaryDirectory() as second:
+                sums = []
+                for out in (first, second):
+                    r = subprocess.run(
+                        ["sh", os.path.join(ROOT, "tools", "vendor-dist.sh"), out],
+                        capture_output=True,
+                        text=True,
+                        cwd=ROOT,
+                    )
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    sums.append(r.stdout.split()[0])
+                    names = os.listdir(out)
+                    self.assertEqual(len(names), 1)
+                    self.assertTrue(names[0].startswith("taema-vendor-"))
+                self.assertEqual(sums[0], sums[1])
+                path = os.path.join(first, names[0])
+                with tarfile.open(path) as tar:
+                    members = tar.getnames()
+                self.assertTrue(
+                    all(n.startswith("taema/rust/vendor/") for n in members),
+                    members[:3],
+                )
+                self.assertIn("taema/rust/vendor/libc/Cargo.toml", members)
+
+
+class ArchDetectTest(unittest.TestCase):
+    def detect(self, uname_out, ldd_out, env=None):
+        script = os.path.join(ROOT, "tools", "build-xbps.sh")
+        with open(script) as f:
+            body = f.read()
+        start = body.index("default_arch() {")
+        end = body.index("}", body.index("printf", start)) + 1
+        func = body[start:end]
+        probe = (
+            "uname() { printf '%s'; };\n"
+            "ldd() { printf '%s'; };\n"
+            "%s\narch=${XBPS_ARCH:-$(default_arch)}; printf '%%s' \"$arch\""
+            % (uname_out, ldd_out, func)
+        )
+        r = subprocess.run(
+            ["sh", "-c", probe], capture_output=True, text=True, env=env or dict(os.environ)
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_musl_host_gets_musl_arch(self):
+        self.assertEqual(
+            self.detect("x86_64", "musl libc (x86_64)"), "x86_64-musl"
+        )
+
+    def test_glibc_host_keeps_uname_arch(self):
+        self.assertEqual(
+            self.detect("x86_64", "ldd (GNU libc) 2.40"), "x86_64"
+        )
+
+    def test_explicit_arch_wins_over_detection(self):
+        env = dict(os.environ, XBPS_ARCH="x86_64-musl")
+        self.assertEqual(
+            self.detect("aarch64", "ldd (GNU libc) 2.40", env), "x86_64-musl"
+        )
+
+
+class MakefileNativeTest(unittest.TestCase):
+    def dry_run(self, *args):
+        r = subprocess.run(
+            ["make", "-n", *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_release_build_is_offline(self):
+        out = self.dry_run("rust-helper-release")
+        self.assertIn("cargo build --locked --offline --release", out)
+        self.assertNotIn("--target", out)
+
+    def test_musl_arch_selects_the_static_target(self):
+        out = self.dry_run("rust-helper-release", "XBPS_ARCH=x86_64-musl")
+        self.assertIn("--target x86_64-unknown-linux-musl", out)
+        install = self.dry_run("install", "XBPS_ARCH=x86_64-musl", "DESTDIR=/tmp/nope")
+        self.assertIn(
+            "rust/target/x86_64-unknown-linux-musl/release/taema-fast", install
+        )
 
 
 class InstalledDocumentationTest(unittest.TestCase):

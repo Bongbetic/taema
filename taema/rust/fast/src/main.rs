@@ -11,7 +11,7 @@
 // fast path: identical command lines, identical output, IPC v2. It never
 // fails loudly: any error exits 0, exactly like the Python versions.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
@@ -106,20 +106,13 @@ fn hyphen_break_at(chars: &[char], i: usize) -> bool {
     if chars.get(i) != Some(&'-') {
         return false;
     }
-    let behind_a = i >= 2
-        && is_letter(chars[i - 2])
-        && is_letter(chars[i - 1]);
-    let behind_b = i >= 3
-        && is_letter(chars[i - 3])
-        && chars[i - 2] == '-'
-        && is_letter(chars[i - 1]);
+    let behind_a = i >= 2 && is_letter(chars[i - 2]) && is_letter(chars[i - 1]);
+    let behind_b =
+        i >= 3 && is_letter(chars[i - 3]) && chars[i - 2] == '-' && is_letter(chars[i - 1]);
     if !(behind_a || behind_b) {
         return false;
     }
-    let ahead = match chars.get(i + 1) {
-        Some(c) if is_letter(*c) => true,
-        _ => false,
-    };
+    let ahead = matches!(chars.get(i + 1), Some(c) if is_letter(*c));
     if !ahead {
         return false;
     }
@@ -174,7 +167,6 @@ fn split_chunks(text: &str) -> Vec<String> {
     }
     chunks.into_iter().filter(|c| !c.is_empty()).collect()
 }
-
 
 fn wrap_chunks(mut chunks: Vec<String>, width: usize, subsequent_indent: &str) -> Vec<String> {
     // Port of TextWrapper._wrap_chunks with the hook's options: initial
@@ -371,7 +363,9 @@ fn format_question(q: &Value) -> Vec<String> {
         }
         lines.push(format!("  [2] part of another app: {}", desc.join(", ")));
     }
-    lines.push("  [3] standalone app: give them their own scope, never stop with a parent".to_string());
+    lines.push(
+        "  [3] standalone app: give them their own scope, never stop with a parent".to_string(),
+    );
     lines.push("  [4] never stop these survivors".to_string());
     lines.push("  [Enter] ask me later".to_string());
     lines
@@ -388,7 +382,10 @@ fn format_question(q: &Value) -> Vec<String> {
 }
 
 enum Act {
-    Answer { choice: String, owner: Option<String> },
+    Answer {
+        choice: String,
+        owner: Option<String>,
+    },
     Menu,
     Later,
 }
@@ -451,7 +448,11 @@ fn confirmation(q: &Value, choice: &str, owner: Option<&str>, reply: &Value) -> 
         .map(|l| clean(&pystr_key(l, "key", "?"), 32))
         .collect();
     let keys = keys.join(", ");
-    let keys = if keys.is_empty() { "them".to_string() } else { keys };
+    let keys = if keys.is_empty() {
+        "them".to_string()
+    } else {
+        keys
+    };
     if choice == "standalone" {
         return format!("tæma: noted, {keys} will have their own scope.");
     }
@@ -459,7 +460,10 @@ fn confirmation(q: &Value, choice: &str, owner: Option<&str>, reply: &Value) -> 
         Some(v) => pystr(Some(v)),
         None => owner.unwrap_or("").to_string(),
     };
-    format!("tæma: noted, {keys} will stop when {} closes.", clean(&name, 48))
+    format!(
+        "tæma: noted, {keys} will stop when {} closes.",
+        clean(&name, 48)
+    )
 }
 
 // ---- IPC v2 ---------------------------------------------------------------
@@ -532,8 +536,7 @@ fn connect_timeout(path: &str, timeout: Duration) -> std::io::Result<UnixStream>
         addr.sun_path[i] = b as libc::c_char;
     }
     #[allow(clippy::cast_possible_truncation)]
-    let addr_len =
-        (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+    let addr_len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
     let ret = unsafe {
         libc::connect(
             fd,
@@ -659,9 +662,7 @@ fn request(
                             "error".to_string(),
                             e.get("message")
                                 .cloned()
-                                .unwrap_or_else(|| {
-                                    Value::String("request failed".to_string())
-                                }),
+                                .unwrap_or_else(|| Value::String("request failed".to_string())),
                         );
                         return Some(Value::Object(err));
                     }
@@ -784,8 +785,8 @@ fn read_key(fd: RawFd, timeout: Duration) -> String {
         }
         let mut new = old;
         new.c_lflag &= !(libc::ICANON | libc::ECHO);
-        new.c_cc[libc::VMIN as usize] = 1;
-        new.c_cc[libc::VTIME as usize] = 0;
+        new.c_cc[libc::VMIN] = 1;
+        new.c_cc[libc::VTIME] = 0;
         if libc::tcsetattr(fd, libc::TCSADRAIN, &new) != 0 {
             return String::new();
         }
@@ -793,9 +794,7 @@ fn read_key(fd: RawFd, timeout: Duration) -> String {
         let mut out = String::new();
         if wait_readable(fd, deadline) {
             let mut byte = [0u8; 1];
-            if libc::read(fd, byte.as_mut_ptr() as *mut libc::c_void, 1) == 1
-                && byte[0] != 0x1b
-            {
+            if libc::read(fd, byte.as_mut_ptr() as *mut libc::c_void, 1) == 1 && byte[0] != 0x1b {
                 out.push(byte[0] as char);
             }
             libc::tcflush(fd, libc::TCIFLUSH);
@@ -933,12 +932,7 @@ fn ask_on_fd(shell: i64, fd: RawFd, paths: &[String]) -> Option<&'static str> {
         Some(Value::Object(map)) if map.get("ok") == Some(&Value::Bool(true)) => {
             let done = say(
                 fd,
-                &confirmation(
-                    &question,
-                    &choice,
-                    owner.as_deref(),
-                    &Value::Object(map),
-                ),
+                &confirmation(&question, &choice, owner.as_deref(), &Value::Object(map)),
             );
             if !done {
                 return None;
@@ -956,7 +950,7 @@ fn ask_on_fd(shell: i64, fd: RawFd, paths: &[String]) -> Option<&'static str> {
 }
 
 fn cmd_ask(shell: i64) {
-    let fd = unsafe { libc::open(b"/dev/tty\0".as_ptr() as *const libc::c_char, libc::O_RDWR | libc::O_NOCTTY) };
+    let fd = unsafe { libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
     if fd < 0 {
         return;
     }
@@ -975,10 +969,16 @@ fn cmd_prompt_in(dir: &str) {
         },
         Err(_) => return,
     };
-    let first: String = content.split('\n').next().unwrap_or("").chars().take(2048).collect();
+    let first: String = content
+        .split('\n')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(2048)
+        .collect();
     let summary = first.trim_end_matches(['\r', '\n']);
     if !summary.is_empty() {
-        print!("{summary}\n");
+        println!("{summary}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 }
@@ -1135,14 +1135,9 @@ mod tests {
             Act::Answer { choice, owner }
             if choice == "stop" && owner.as_deref() == Some("npm")
         ));
-        assert!(matches!(
-            map_key("2", cands),
-            Act::Menu
-        ));
-        let two: Value = serde_json::from_str(
-            r#"{"candidates": [{"key": "npm"}, {"key": "code"}]}"#,
-        )
-        .unwrap();
+        assert!(matches!(map_key("2", cands), Act::Menu));
+        let two: Value =
+            serde_json::from_str(r#"{"candidates": [{"key": "npm"}, {"key": "code"}]}"#).unwrap();
         let two = two.get("candidates").and_then(|v| v.as_array()).unwrap();
         assert!(matches!(
             map_key("2", two),
@@ -1157,8 +1152,7 @@ mod tests {
         for key in ["", "x", "5", "0", "9"] {
             assert!(matches!(map_key(key, cands), Act::Later), "{key:?}");
         }
-        let one: Value =
-            serde_json::from_str(r#"{"candidates": [{"key": "npm"}]}"#).unwrap();
+        let one: Value = serde_json::from_str(r#"{"candidates": [{"key": "npm"}]}"#).unwrap();
         let one = one.get("candidates").and_then(|v| v.as_array()).unwrap();
         assert!(matches!(map_key("2", one), Act::Later));
     }

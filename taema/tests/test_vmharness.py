@@ -315,15 +315,30 @@ class PlanTest(VmTestCase):
 
     def test_plan_package_path(self):
         plan = vmh.build_plan(self.cfg, kvm=False)
+        version = vmh.read_version(ROOT)
         self.assertEqual(
-            plan["package"]["path"],
-            os.path.join(
-                ROOT, "build", "repo", "taema-%s_1.noarch.xbps" % vmh.read_version(ROOT)
-            ),
-        )
-        self.assertEqual(
-            plan["package"]["argv"],
-            ["sh", vmh.BUILD_XBPS, vmh.package_repo_dir(self.cfg)],
+            plan["packages"],
+            [
+                {
+                    "arch": "x86_64",
+                    "path": os.path.join(
+                        ROOT, "build", "repo", "taema-%s_1.x86_64.xbps" % version
+                    ),
+                    "argv": ["sh", vmh.BUILD_XBPS, vmh.package_repo_dir(self.cfg)],
+                    "env": {"XBPS_ARCH": "x86_64"},
+                },
+                {
+                    "arch": "x86_64-musl",
+                    "path": os.path.join(
+                        ROOT,
+                        "build",
+                        "repo",
+                        "taema-%s_1.x86_64-musl.xbps" % version,
+                    ),
+                    "argv": ["sh", vmh.BUILD_XBPS, vmh.package_repo_dir(self.cfg)],
+                    "env": {"XBPS_ARCH": "x86_64-musl"},
+                },
+            ],
         )
 
     def test_plan_package_repo_can_be_outside_the_worktree(self):
@@ -331,10 +346,21 @@ class PlanTest(VmTestCase):
         self.cfg["paths"]["package_repo"] = repo
         plan = vmh.build_plan(self.cfg, kvm=False)
         self.assertEqual(
-            plan["package"]["path"],
-            os.path.join(repo, "taema-%s_1.noarch.xbps" % vmh.read_version(ROOT)),
+            [p["path"] for p in plan["packages"]],
+            [
+                os.path.join(repo, "taema-%s_1.x86_64.xbps" % vmh.read_version(ROOT)),
+                os.path.join(
+                    repo, "taema-%s_1.x86_64-musl.xbps" % vmh.read_version(ROOT)
+                ),
+            ],
         )
-        self.assertEqual(plan["package"]["argv"], ["sh", vmh.BUILD_XBPS, repo])
+        for package in plan["packages"]:
+            self.assertEqual(package["argv"], ["sh", vmh.BUILD_XBPS, repo])
+            self.assertEqual(package["env"], {"XBPS_ARCH": package["arch"]})
+
+    def test_plan_single_libc_builds_only_its_arch(self):
+        plan = vmh.build_plan(self.cfg, libcs=["musl"], kvm=False)
+        self.assertEqual([p["arch"] for p in plan["packages"]], ["x86_64-musl"])
 
     def test_plan_bootstraps_test_user_ssh_key(self):
         pub = vmh.ssh_key_paths(self.cfg)[1]
@@ -423,19 +449,48 @@ class PackageBuildTest(VmTestCase):
         cfg = vmh.load_config(self.write_config())
         repo = os.path.join(self.tmp, "external-package-repo")
         cfg["paths"]["package_repo"] = repo
-        package = vmh.package_path(cfg)
+        calls = []
 
         def fake_run(argv, **kwargs):
             self.assertEqual(argv, ["sh", vmh.BUILD_XBPS, repo])
             self.assertEqual(kwargs["cwd"], vmh.TAEMA_ROOT)
+            arch = kwargs["env"]["XBPS_ARCH"]
+            calls.append((arch, kwargs["env"].get("SKIP_TESTS")))
             os.makedirs(repo, exist_ok=True)
-            with open(package, "wb") as f:
+            with open(vmh.package_path(cfg, arch), "wb") as f:
                 f.write(b"package")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         with mock.patch.object(vmh.subprocess, "run", side_effect=fake_run) as run:
-            self.assertEqual(vmh.build_package(cfg), package)
-        run.assert_called_once()
+            built = vmh.build_package(cfg)
+        self.assertEqual(run.call_count, 2)
+        # the suite runs once, with the first arch
+        self.assertEqual(calls, [("x86_64", None), ("x86_64-musl", "1")])
+        self.assertEqual(
+            built,
+            [vmh.package_path(cfg, arch) for arch in ("x86_64", "x86_64-musl")],
+        )
+
+    def test_build_single_libc_runs_the_suite(self):
+        cfg = vmh.load_config(self.write_config(libcs=["musl"]))
+
+        def fake_run(argv, **kwargs):
+            self.assertNotIn("SKIP_TESTS", kwargs["env"])
+            repo = argv[-1]
+            os.makedirs(repo, exist_ok=True)
+            with open(vmh.package_path(cfg, kwargs["env"]["XBPS_ARCH"]), "wb") as f:
+                f.write(b"package")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(vmh.subprocess, "run", side_effect=fake_run):
+            built = vmh.build_package(cfg, ["musl"])
+        self.assertEqual(built, [vmh.package_path(cfg, "x86_64-musl")])
+
+    def test_previous_version_accepts_arch_suffixes(self):
+        cfg = vmh.load_config(self.write_config())
+        self.assertEqual(vmh.previous_version(cfg), "0.3.0")
+        cfg["images"]["previous_url"] = "https://example.com/taema-1.2.3_1.x86_64-musl.xbps"
+        self.assertEqual(vmh.previous_version(cfg), "1.2.3")
 
 
 class PreviousPackageBuildTest(VmTestCase):
@@ -782,9 +837,27 @@ class HarnessSurfacesTest(unittest.TestCase):
     def test_release_workflow_combines_manual_and_generated_release_notes(self):
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('notes="$(cat "$RUNNER_TEMP/notes.md")"', workflow)
-        self.assertIn('--title "tæma ${VERSION}"', workflow)
+        self.assertIn('--title "tæma ${version}"', workflow)
         self.assertIn('--notes "$notes" --generate-notes', workflow)
         self.assertNotIn("--notes-file", workflow)
+
+    def test_ci_void_job_builds_per_libc_arch(self):
+        workflow = read_text(os.path.join(REPO, ".github", "workflows", "ci.yml"))
+        self.assertIn("arch: x86_64-musl", workflow)
+        self.assertIn("XBPS_ARCH: ${{ matrix.arch }}", workflow)
+
+    def test_release_workflow_builds_only_x86_64_glibc_and_musl(self):
+        workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
+        self.assertIn("void-${{ matrix.libc }}", workflow)
+        self.assertIn("arch: x86_64", workflow)
+        self.assertIn("arch: x86_64-musl", workflow)
+        self.assertNotIn("i686", workflow)
+        self.assertNotIn("aarch64", workflow)
+        self.assertNotIn("noarch", workflow)
+        self.assertIn("tools/vendor-dist.sh", workflow)
+        self.assertIn("taema-vendor-${version}.tar.gz", workflow)
+        self.assertIn("vendor_sum", workflow)
+        self.assertIn('checksum=\\"${src_sum} ${vendor_sum}\\"', workflow)
 
     def test_readme_mode_table_describes_adopt_lifecycle(self):
         readme = read_text(os.path.join(REPO, "README.md"))
@@ -810,12 +883,14 @@ class HarnessSurfacesTest(unittest.TestCase):
             self.assertIn(target + ":", mk)
         self.assertIn("tools/vm/vmh.py run", mk)
 
-    def test_package_builder_indexes_for_host_and_musl_guests(self):
+    def test_package_builder_indexes_per_arch(self):
         script = read_text(os.path.join(ROOT, "tools", "build-xbps.sh"))
-        self.assertIn('xbps-rindex -f -a "$repo/$pkg.noarch.xbps"', script)
-        self.assertIn(
-            'XBPS_ARCH=x86_64-musl xbps-rindex -f -a "$repo/$pkg.noarch.xbps"', script
-        )
+        self.assertIn('arch=${XBPS_ARCH:-$(default_arch)}', script)
+        self.assertIn('pkg="taema-${version}_${revision}"', script)
+        self.assertIn('xbps-create -A "$arch" -n "$pkg"', script)
+        self.assertIn('"$repo/$pkg.$arch.xbps"', script)
+        self.assertIn('XBPS_ARCH=$arch xbps-rindex -f -a "$repo/$pkg.$arch.xbps"', script)
+        self.assertNotIn("noarch", script)
 
     def test_workflow_is_opt_in_kvm_only_and_uploads_artifacts(self):
         wf = read_text(os.path.join(REPO, ".github", "workflows", "vm-harness.yml"))

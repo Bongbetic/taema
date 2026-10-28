@@ -24,8 +24,24 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 
-unsafe extern "C" {
-    fn pidfd_open(pid: libc::pid_t, flags: libc::c_uint) -> libc::c_int;
+/// pidfd_open via the raw syscall: the libc wrapper is missing from musl
+/// libc archives old enough to matter for static builds, while the
+/// syscall number is stable on every kernel new enough to implement it
+/// (5.3+); older kernels fail both spellings with ENOSYS.
+fn pidfd_open_sys(pid: libc::pid_t, flags: libc::c_uint) -> libc::c_int {
+    // SAFETY: a direct syscall with integer arguments has no memory effects.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            pid as libc::c_long,
+            flags as libc::c_long,
+        )
+    };
+    if ret < 0 {
+        -1
+    } else {
+        ret as libc::c_int
+    }
 }
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -599,7 +615,7 @@ fn move_one(
         )));
     }
     // SAFETY: pidfd_open with flags 0 either returns a fresh fd or -1.
-    let fd = unsafe { pidfd_open(pid as libc::pid_t, 0) };
+    let fd = pidfd_open_sys(pid as libc::pid_t, 0);
     if fd < 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if errno == libc::ESRCH {
@@ -1056,7 +1072,7 @@ fn pidfd_or_refused(pid: i64) -> Result<FdGuard, Refused> {
         )));
     }
     // SAFETY: pidfd_open with flags 0 either returns a fresh fd or -1.
-    let fd = unsafe { pidfd_open(pid as libc::pid_t, 0) };
+    let fd = pidfd_open_sys(pid as libc::pid_t, 0);
     if fd < 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if errno == libc::ESRCH {

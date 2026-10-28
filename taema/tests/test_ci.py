@@ -36,8 +36,9 @@ class VoidJobsTest(unittest.TestCase):
         text = read(CI)
         # Either two literal jobs or a libc matrix over the official Void images.
         literal = "void-glibc" in text and "void-musl" in text
-        matrix = "void-${{ matrix.libc }}" in text and re.search(
-            r"libc:\s*\[glibc,\s*musl\]", text
+        matrix = "void-${{ matrix.libc }}" in text and (
+            re.search(r"libc:\s*\[glibc,\s*musl\]", text)
+            or ("- libc: glibc" in text and "- libc: musl" in text)
         )
         self.assertTrue(literal or matrix, "no Void glibc and musl container jobs")
 

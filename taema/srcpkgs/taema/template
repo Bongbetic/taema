@@ -5,15 +5,16 @@ revision=1
 build_wrksrc=taema
 build_style=gnu-makefile
 make_check_target=test
-hostmakedepends="cargo"
+archs="x86_64*"
+hostmakedepends="cargo scdoc"
 depends="python3>=3.11 iproute2 util-linux sudo runit shadow"
 checkdepends="python3 iproute2"
 short_desc="Dependency-aware, self-managing cgroup v2 process scopes"
 maintainer="soubarnak <soubarna@live.in>"
 license="custom:PolyForm-Noncommercial-1.0.0"
 homepage="https://github.com/Bongbetic/taema"
-distfiles="https://github.com/Bongbetic/taema/archive/refs/tags/taema-v${version}.tar.gz"
-checksum=cd972e64098cfd00ae69060c35ef9eed6cca3f85e12ced4233ffb49ab2c87212
+distfiles="https://github.com/Bongbetic/taema/archive/refs/tags/taema-v${version}.tar.gz https://github.com/Bongbetic/taema/releases/download/taema-v${version}/taema-vendor-${version}.tar.gz"
+checksum="cd972e64098cfd00ae69060c35ef9eed6cca3f85e12ced4233ffb49ab2c87212 d3403864526c045d68a2dc02965685c75157bbcb7b19b4a9f179e4cb42bdf232"
 system_groups="taema"
 conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 

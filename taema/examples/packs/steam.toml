@@ -1,0 +1,5 @@
+[unit]
+name = "steam"
+kind = "app"
+[match]
+comm = "steam"

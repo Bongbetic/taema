@@ -1,0 +1,5 @@
+[unit]
+name = "android-emulator"
+kind = "app"
+[match]
+comm = "emulator"

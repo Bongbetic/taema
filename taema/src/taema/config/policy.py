@@ -770,6 +770,7 @@ _UNIT_TABLES = {
     "desktop": {"app_id", "on_last_window"},
     "mem": {"class", "background", "save_state", "pause", "swap_max", "max"},
     "kill": {"graceful", "keep", "hook", "never_stop", "survive_logout"},
+    "source": {"learned"},
     "gc": {
         "keep_while_children",
         "no_attach_grace",
@@ -833,6 +834,11 @@ def validate_unit(unit, peaks=None):
         for key in sorted(section):
             if key not in allowed:
                 errors.append("unknown key [%s] %s" % (table, key))
+    source = unit.get("source", {})
+    if not isinstance(source, dict):
+        errors.append("[source] must be a table")
+    elif "learned" in source and not isinstance(source["learned"], bool):
+        errors.append("[source] learned must be true or false")
     head = unit.get("unit")
     if not isinstance(head, dict):
         errors.append("[unit] table is required")
@@ -1192,14 +1198,36 @@ def file_fingerprint(paths):
     return tuple(result)
 
 
+def _mask_name(filename):
+    if filename.endswith(".toml.disabled"):
+        return filename[: -len(".disabled")]
+    return None
+
+
+def masked_units(cfg):
+    """Unit filenames disabled by a tombstone in the same or a later directory."""
+    masks = {}
+    for index, directory in enumerate(units_dirs(cfg)):
+        if not os.path.isdir(directory):
+            continue
+        for filename in sorted(os.listdir(directory)):
+            masked = _mask_name(filename)
+            if masked is not None:
+                masks.setdefault(masked, index)
+    return masks
+
+
 def load_units(cfg):
     by_name = {}
     errors = []
-    for d in units_dirs(cfg):
+    masks = masked_units(cfg)
+    for index, d in enumerate(units_dirs(cfg)):
         if not os.path.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".toml"):
+                if fn in masks and masks[fn] >= index:
+                    continue
                 path = os.path.join(d, fn)
                 try:
                     with open(path, "rb") as f:
@@ -1223,6 +1251,69 @@ def load_units(cfg):
                 by_name[fn] = u
     cfg["_unit_errors"] = errors
     return [by_name[k] for k in sorted(by_name)]
+
+
+def _unit_dir_source(path):
+    system = os.path.abspath(SYSTEM_UNITS)
+    user = os.path.abspath(os.path.join(user_config_dir(), "units"))
+    absolute = os.path.abspath(path)
+    if absolute == system or absolute.startswith(system + os.sep):
+        return "system"
+    if absolute == user or absolute.startswith(user + os.sep):
+        return "user"
+    return "custom"
+
+
+def describe_units(cfg):
+    """One entry per unit for `unit list`: name, source, active, file.
+
+    Source is system, user, or learned (a user file the learner wrote,
+    marked with `[source] learned = true`). Masked units still appear,
+    with active False.
+    """
+    loaded = {unit.get("unit", {}).get("name"): unit for unit in load_units(cfg)}
+    entries = {}
+    for name, unit in loaded.items():
+        if not name:
+            continue
+        source = "learned" if unit.get("source", {}).get("learned") is True else None
+        if source is None:
+            source = _unit_dir_source(unit.get("_file", ""))
+        entries[name] = {
+            "name": name,
+            "source": source,
+            "active": True,
+            "file": unit.get("_file", ""),
+        }
+    for filename in sorted(masked_units(cfg)):
+        name = os.path.basename(filename)[: -len(".toml")]
+        for directory in units_dirs(cfg):
+            candidate = os.path.join(directory, filename)
+            if os.path.isfile(candidate):
+                break
+        else:
+            candidate = ""
+        if name in entries and entries[name]["active"]:
+            continue
+        if name not in entries:
+            source = "learned"
+            if candidate:
+                unit, error = read_unit_file(candidate)
+                if error is None:
+                    name = unit.get("unit", {}).get("name", name)
+                    if unit.get("source", {}).get("learned") is not True:
+                        source = _unit_dir_source(candidate)
+                else:
+                    source = _unit_dir_source(candidate)
+            entries[name] = {
+                "name": name,
+                "source": source,
+                "active": False,
+                "file": candidate,
+            }
+        else:
+            entries[name]["active"] = False
+    return [entries[key] for key in sorted(entries)]
 
 
 def unit_for_scope(units, leaf_name):

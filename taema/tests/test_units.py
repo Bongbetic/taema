@@ -501,5 +501,159 @@ class UnitTestOpTests(unittest.TestCase):
                     self.assertIsNone(store.apply_feedback_command(dict(message)))
 
 
+PACK_NAMES = (
+    "vscode",
+    "jetbrains",
+    "android-emulator",
+    "podman",
+    "libvirt-qemu",
+    "docker-rootless",
+    "incus",
+    "virtualbox",
+    "steam",
+    "discord",
+    "electron",
+)
+
+
+def _pack_dir():
+    return Path(__file__).resolve().parents[1] / "examples" / "packs"
+
+
+class UnitManageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.system = os.path.join(self.temp.name, "system")
+        self.userbase = os.path.join(self.temp.name, "user")
+        self.user = os.path.join(self.userbase, "units")
+        os.makedirs(self.system)
+        os.makedirs(self.user)
+        self._system = mock.patch.object(policy, "SYSTEM_UNITS", self.system)
+        self._system.start()
+        self.addCleanup(self._system.stop)
+        self._home = mock.patch.object(
+            policy, "user_config_dir", return_value=self.userbase
+        )
+        self._home.start()
+        self.addCleanup(self._home.stop)
+        self.root = os.path.join(self.temp.name, "root")
+        os.makedirs(self.root)
+
+    def write(self, directory, name, body):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(body)
+        return path
+
+    def test_list_shows_source_and_active(self):
+        self.write(
+            self.system,
+            "a.toml",
+            '[unit]\nname = "app-a"\nkind = "app"\n[match]\ncomm = "a"\n',
+        )
+        self.write(
+            self.user,
+            "b.toml",
+            '[unit]\nname = "app-b"\nkind = "app"\n[match]\ncomm = "b"\n'
+            "[source]\nlearned = true\n",
+        )
+        self.write(
+            self.system,
+            "c.toml",
+            '[unit]\nname = "app-c"\nkind = "app"\n[match]\ncomm = "c"\n',
+        )
+        self.write(self.user, "c.toml.disabled", "")
+        code, output = run_cli(self.root, "unit", "list")
+        self.assertEqual(code, 0)
+        lines = {
+            parts[0]: parts[1:3]
+            for parts in (line.split() for line in output.strip().splitlines())
+            if parts
+        }
+        self.assertEqual(lines["app-a"], ["system", "yes"])
+        self.assertEqual(lines["app-b"], ["learned", "yes"])
+        self.assertEqual(lines["app-c"], ["system", "no"])
+
+    def test_disable_enable_roundtrip(self):
+        self.write(
+            self.system,
+            "a.toml",
+            '[unit]\nname = "app-a"\nkind = "app"\n[match]\ncomm = "a"\n',
+        )
+        code, _output = run_cli(self.root, "unit", "disable", "app-a")
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.user, "a.toml.disabled")))
+        code, output = run_cli(self.root, "unit", "list")
+        self.assertEqual(code, 0)
+        self.assertIn("app-a system no", output)
+        code, _output = run_cli(self.root, "unit", "enable", "app-a")
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.user, "a.toml.disabled")))
+        code, output = run_cli(self.root, "unit", "list")
+        self.assertIn("app-a system yes", output)
+
+    def test_disable_unknown_unit_fails(self):
+        from contextlib import redirect_stderr
+
+        error = io.StringIO()
+        with redirect_stderr(error):
+            code, _output = run_cli(self.root, "unit", "disable", "nope")
+        self.assertEqual(code, 1)
+        self.assertIn("no such unit", error.getvalue())
+
+    def test_enable_unknown_and_idempotent(self):
+        from contextlib import redirect_stderr
+
+        self.write(
+            self.system,
+            "a.toml",
+            '[unit]\nname = "app-a"\nkind = "app"\n[match]\ncomm = "a"\n',
+        )
+        error = io.StringIO()
+        with redirect_stderr(error):
+            code, _output = run_cli(self.root, "unit", "enable", "nope")
+        self.assertEqual(code, 1)
+        self.assertIn("no such unit", error.getvalue())
+        code, output = run_cli(self.root, "unit", "enable", "app-a")
+        self.assertEqual(code, 0)
+        self.assertIn("already enabled", output)
+        self.write(self.user, "ghost.toml.disabled", "")
+        code, _output = run_cli(self.root, "unit", "enable", "ghost")
+        self.assertEqual(code, 0)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.user, "ghost.toml.disabled"))
+        )
+
+    def test_install_from_pack(self):
+        code, _output = run_cli(self.root, "unit", "install", "vscode")
+        self.assertEqual(code, 0)
+        installed = os.path.join(self.user, "vscode.toml")
+        self.assertTrue(os.path.isfile(installed))
+        unit, error = policy.read_unit_file(installed)
+        self.assertIsNone(error)
+        self.assertEqual(policy.validate_unit(unit), [])
+        code, _output = run_cli(self.root, "unit", "install", "vscode")
+        self.assertEqual(code, 1)
+        code, _output = run_cli(self.root, "unit", "install", "vscode", "--force")
+        self.assertEqual(code, 0)
+        from contextlib import redirect_stderr
+
+        error = io.StringIO()
+        with redirect_stderr(error):
+            code, _output = run_cli(self.root, "unit", "install", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("vscode", error.getvalue())
+
+    def test_all_packs_lint_clean(self):
+        packs = sorted(_pack_dir().glob("*.toml"))
+        self.assertEqual({path.stem for path in packs}, set(PACK_NAMES))
+        for path in packs:
+            with self.subTest(pack=path.stem):
+                unit, error = policy.read_unit_file(str(path))
+                self.assertIsNone(error)
+                self.assertEqual(policy.validate_unit(unit), [])
+
+
 if __name__ == "__main__":
     unittest.main()

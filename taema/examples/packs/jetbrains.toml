@@ -1,0 +1,5 @@
+[unit]
+name = "jetbrains"
+kind = "app"
+[match]
+cmdline_contains = "jetbrains"

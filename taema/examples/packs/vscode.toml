@@ -1,0 +1,5 @@
+[unit]
+name = "vscode"
+kind = "app"
+[match]
+comm = "code"

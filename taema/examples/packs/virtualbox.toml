@@ -1,0 +1,5 @@
+[unit]
+name = "virtualbox"
+kind = "app"
+[match]
+comm = "VirtualBox"

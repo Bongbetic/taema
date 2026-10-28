@@ -1,0 +1,5 @@
+[unit]
+name = "docker-rootless"
+kind = "app"
+[match]
+comm = "dockerd"

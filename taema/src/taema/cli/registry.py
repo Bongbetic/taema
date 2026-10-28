@@ -737,6 +737,42 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
                 "read": True,
                 "arguments": ((("file",), {}),),
             },
+            {
+                "name": "list",
+                "help": "list units with source and active state",
+                "handler": "cmd_unit_list",
+                "read": True,
+            },
+            {
+                "name": "enable",
+                "help": "unmask a unit so it loads again",
+                "handler": "cmd_unit_enable",
+                "arguments": ((("name",), {}),),
+            },
+            {
+                "name": "disable",
+                "help": "mask a unit with a user tombstone",
+                "handler": "cmd_unit_disable",
+                "arguments": ((("name",), {}),),
+            },
+            {
+                "name": "install",
+                "help": "install a curated pack to the user units",
+                "handler": "cmd_unit_install",
+                "arguments": (
+                    (
+                        ("name",),
+                        {},
+                    ),
+                    (
+                        ("--force",),
+                        {
+                            "action": "store_true",
+                            "help": "overwrite an existing unit file",
+                        },
+                    ),
+                ),
+            },
         ),
     },
     {

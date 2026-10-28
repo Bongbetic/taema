@@ -4599,16 +4599,17 @@ def scenario_m5(rec, args, tree_holder):
         niri_env = session["niri_env"]
         before = _m5_review_ids() or []
         default_app = "m5default"
-        # One launch carries both halves: the shell backgrounds a sleeper in
-        # the fresh app scope, then execs foot so the windowed root keeps the
-        # launched pid. A second launch would reserve a *different* scope, so
-        # the survivor must be born inside the first one.
+        # One launch carries both halves: the shell detaches a sleeper with
+        # setsid (new session, no controlling terminal, so the pty hangup on
+        # window close cannot reach it) and waits, while foot itself owns the
+        # window. A second launch would reserve a *different* scope, so the
+        # survivor must be born inside the first one.
         default_root, default_log = _m5_popen_launch(
             niri_env,
             args.artifacts,
             "default",
             default_app,
-            ["foot", "sh", "-c", "sleep 300 & exec foot"],
+            ["foot", "sh", "-c", "setsid sleep 300 & wait"],
             launch_logs,
         )
         launched.append(default_root)
@@ -4667,7 +4668,7 @@ def scenario_m5(rec, args, tree_holder):
             args.artifacts,
             "close",
             close_app,
-            ["foot", "sh", "-c", "sleep 300 & exec foot"],
+            ["foot", "sh", "-c", "setsid sleep 300 & wait"],
             launch_logs,
         )
         launched.append(foot)

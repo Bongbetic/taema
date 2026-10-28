@@ -3013,6 +3013,25 @@ def cmd_status(a):
         view.render_status(model, a, summary=bool(getattr(a, "_summary", False))),
         records,
     )
+    if (
+        result in (0, 3)
+        and bool(getattr(a, "_summary", False))
+        and not (getattr(a, "json", False) or getattr(a, "jsonl", False))
+    ):
+        from .. import suggest as suggest_mod
+
+        reader = store
+        if reader is None:
+            try:
+                reader = _status_store(policy.load_config())
+            except Exception:
+                reader = None
+        try:
+            trailer = suggest_mod.trailing(reader, cfg, 1) if reader is not None else []
+        except Exception:
+            trailer = []
+        for line in trailer:
+            print(line)
     return result
 
 
@@ -4253,6 +4272,50 @@ def cmd_unit_install(a):
     return 0
 
 
+def cmd_suggest(a):
+    """List ranked improvement suggestions with ids."""
+    from .. import suggest as suggest_mod
+
+    cfg, store = _load_status(a)
+    ranked = suggest_mod.rank(store, cfg)
+    if not ranked:
+        print("no suggestions.")
+        return 0
+    for item in ranked:
+        print("%s [%s] %s" % (item["id"], item["kind"], item["title"]))
+        print("  %s" % item["detail"])
+    return 0
+
+
+def cmd_suggest_apply(a):
+    """Apply one suggestion by id after confirmation."""
+    from .. import suggest as suggest_mod
+
+    cfg, reader = _load_status(a)
+    ranked = suggest_mod.rank(reader, cfg)
+    match = next((item for item in ranked if item["id"] == a.identifier), None)
+    if match is None:
+        return die(
+            "no such suggestion: %s" % a.identifier
+            + (" (available: %s)" % ", ".join(item["id"] for item in ranked) if ranked else ""),
+            2,
+        )
+    if not _confirm_bulk("apply suggestion", [match["title"]], a):
+        return 1
+    store = _writable_store(cfg)
+    ok, message = suggest_mod.apply_suggestion(
+        store,
+        cfg,
+        match,
+        choice=getattr(a, "choice", None),
+        force=getattr(a, "force", False),
+    )
+    if ok:
+        store.save()
+    print(message)
+    return 0 if ok else 1
+
+
 def _stdin_is_tty():
     try:
         return bool(sys.stdin.isatty())
@@ -4539,7 +4602,6 @@ def cmd_report(a):
     name, span = windows[0]
     end = time.time()
     cfg, store = _load_events(a)
-    del cfg
     report = store.report_window(end - span, end)
     report["window"] = name
     if getattr(a, "json", False):
@@ -4578,6 +4640,14 @@ def cmd_report(a):
             "  %s launches=%d closes=%d kills=%d"
             % (row["leftover"], row["launches"], row["closes"], row["kills"])
         )
+    from .. import suggest as suggest_mod
+
+    try:
+        trailer = suggest_mod.trailing(store, cfg, 3)
+    except Exception:
+        trailer = []
+    for line in trailer:
+        print(line)
     return 0
 
 

@@ -109,8 +109,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # $GITHUB_WORKSPACE, not the github.workspace context: the
+          # download-artifact action lands files in the container path.
           gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
-            --pattern "*musl*" --dir "${{ github.workspace }}/assets" --clobber
+            --pattern "*musl*" --dir "$GITHUB_WORKSPACE/assets" --clobber
       - uses: actions/checkout@v4
       - name: Sign repository and publish release
         env:
@@ -118,7 +120,7 @@ jobs:
           XBPS_PRIVKEY: ${{ secrets.XBPS_PRIVKEY }}
         run: |
           version=${GITHUB_REF_NAME#taema-v}
-          out="${{ github.workspace }}/assets"
+          out="$GITHUB_WORKSPACE/assets"
           if [ -n "$XBPS_PRIVKEY" ]; then
             key="$RUNNER_TEMP/privkey.pem"
             umask 077

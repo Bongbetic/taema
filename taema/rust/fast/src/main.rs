@@ -5,11 +5,15 @@
 // taema-fast kill SHELLPID [WORD]              a kill/taema line ended
 // taema-fast ask SHELLPID                      show the pending question, read one key
 // taema-fast prompt                            print the cached prompt segment
+// taema-fast launch [--app NAME] [--unit UNIT] [--bind] [--dry-run] [-- CMD...]
+// taema-fast bar [--format FORMAT] [--follow]
 // ```
 //
-// Faithful port of `libexec/taema-hook` (done/kill/ask) and the `taema prompt`
-// fast path: identical command lines, identical output, IPC v2. It never
-// fails loudly: any error exits 0, exactly like the Python versions.
+// Faithful port of `libexec/taema-hook` (done/kill/ask), the `taema prompt`
+// fast path, `taema launch`, and `taema bar`: identical command lines,
+// identical output, IPC v2. Hook paths never fail loudly: any error exits 0,
+// exactly like the Python versions. Launch and bar report errors like the
+// Python CLI (exit 1 usage, 2 bad target).
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -472,7 +476,25 @@ fn confirmation(q: &Value, choice: &str, owner: Option<&str>, reply: &Value) -> 
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
-fn sock_paths_with(taema_socket: Option<String>, home: Option<String>) -> Vec<String> {
+fn state_home_with(xdg_state: Option<String>, home: Option<String>) -> Option<String> {
+    if let Some(xdg) = xdg_state {
+        if !xdg.is_empty() {
+            return Some(format!("{xdg}/taema"));
+        }
+    }
+    if let Some(home) = home {
+        if !home.is_empty() {
+            return Some(format!("{home}/.local/state/taema"));
+        }
+    }
+    None
+}
+
+fn sock_paths_with(
+    taema_socket: Option<String>,
+    xdg_state: Option<String>,
+    home: Option<String>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(env) = taema_socket {
         if !env.is_empty() {
@@ -484,10 +506,8 @@ fn sock_paths_with(taema_socket: Option<String>, home: Option<String>) -> Vec<St
         let uid = unsafe { libc::getuid() };
         out.push(format!("/run/user/{uid}/taema.sock"));
     }
-    if let Some(home) = home {
-        if !home.is_empty() {
-            out.push(format!("{home}/.local/state/taema/taema.sock"));
-        }
+    if let Some(state_home) = state_home_with(xdg_state, home) {
+        out.push(format!("{state_home}/taema.sock"));
     }
     out
 }
@@ -495,8 +515,18 @@ fn sock_paths_with(taema_socket: Option<String>, home: Option<String>) -> Vec<St
 fn sock_paths() -> Vec<String> {
     sock_paths_with(
         std::env::var("TAEMA_SOCKET").ok(),
+        std::env::var("XDG_STATE_HOME").ok(),
         std::env::var("HOME").ok(),
     )
+}
+
+fn sock_paths_for(override_path: Option<String>) -> Vec<String> {
+    if let Some(path) = override_path {
+        if !path.is_empty() {
+            return vec![path];
+        }
+    }
+    sock_paths()
 }
 
 fn runtime_dir() -> String {
@@ -688,6 +718,1084 @@ fn args_object(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
         map.insert((*k).to_string(), v.clone());
     }
     map
+}
+
+// ---- shared CLI errors ------------------------------------------------------
+// Matches `taema.cli.commands.die` and `framework._usage_error` for the
+// launch/bar paths (exit 1 usage, 2 bad target).
+
+fn die_message(message: &str, code: i32) -> i32 {
+    eprintln!("taema: {message}");
+    let hint = match code {
+        4 => "Inspect the target's safety state before changing policy.",
+        3 => "Start or check the taema daemon, then retry the command.",
+        2 => "List current targets with `taema ls` and choose one exactly.",
+        _ => "Check the arguments and run `taema COMMAND --help` for usage.",
+    };
+    eprintln!("hint: {hint}");
+    eprintln!("suggestion: Run `taema --help` to see related commands.");
+    code
+}
+
+fn usage_error(message: &str) -> i32 {
+    eprintln!("taema: {message}");
+    eprintln!("hint: check the command spelling and its required arguments.");
+    eprintln!("suggestion: Run `taema --help` to see the available commands and options.");
+    1
+}
+
+// ---- cgroup -----------------------------------------------------------------
+// Mirrors `taema.core.cgroup` for the launch path. TAEMA_CGROOT is read at
+// runtime so tests can point the fast client at a fake tree.
+
+fn cg_root() -> String {
+    std::env::var("TAEMA_CGROOT").unwrap_or_else(|_| "/sys/fs/cgroup".to_string())
+}
+
+fn cg_base() -> String {
+    let uid = unsafe { libc::getuid() };
+    format!("{}/user/{uid}", cg_root())
+}
+
+fn valid_rel(rel: &str) -> bool {
+    let bytes = rel.as_bytes();
+    if bytes.is_empty() || bytes.len() > 97 {
+        return false;
+    }
+    if !matches!(bytes[0], b'a'..=b'z' | b'0'..=b'9') {
+        return false;
+    }
+    if !bytes[1..]
+        .iter()
+        .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'/' | b'-'))
+    {
+        return false;
+    }
+    rel.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+fn valid_app(app: &str) -> bool {
+    !app.is_empty() && valid_rel(app) && !app.contains('/') && app.len() <= 32
+}
+
+fn session_key() -> String {
+    match std::env::var("XDG_SESSION_ID") {
+        Ok(s) if !s.is_empty() => s,
+        _ => "default".to_string(),
+    }
+}
+
+fn helper_path() -> String {
+    std::env::var("TAEMA_HELPER").unwrap_or_else(|_| "/usr/libexec/taema/taema-attach".to_string())
+}
+
+fn errno_message(err: &std::io::Error) -> String {
+    match err.raw_os_error() {
+        Some(no) => {
+            let msg = unsafe {
+                let ptr = libc::strerror(no);
+                if ptr.is_null() {
+                    format!("Unknown error {no}")
+                } else {
+                    std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+                }
+            };
+            format!("[Errno {no}] {msg}")
+        }
+        None => err.to_string(),
+    }
+}
+
+// ---- bar --------------------------------------------------------------------
+// Faithful port of `taema.bar`: model, text, tooltip, and four formats.
+// Output is byte-identical to the Python path.
+
+const BAR_FORMATS: [&str; 4] = ["waybar", "i3bar", "json", "plain"];
+
+fn bar_number(value: Option<&Value>) -> i64 {
+    match value {
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                i
+            } else if let Some(u) = n.as_u64() {
+                if u <= i64::MAX as u64 {
+                    u as i64
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn bar_str<'a>(obj: &'a Value, key: &str, default: &'a str) -> &'a str {
+    match obj.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => s.as_str(),
+        _ => default,
+    }
+}
+
+fn bar_hold(obj: &Value) -> String {
+    match obj.get("hold") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => String::new(),
+    }
+}
+
+fn format_memory(value: i64) -> String {
+    let mut amount = value.max(0) as f64;
+    for unit in ["B", "K", "M", "G", "T"] {
+        if amount < 1024.0 || unit == "T" {
+            if unit == "B" {
+                return format!("{}", amount as i64);
+            }
+            return format!("{amount:.1}{unit}");
+        }
+        amount /= 1024.0;
+    }
+    format!("{amount:.1}T")
+}
+
+fn model_from_status(reply: &Value) -> Value {
+    let empty = serde_json::json!({});
+    let obj = if reply.is_object() { reply } else { &empty };
+    let guard = match obj.get("guard") {
+        Some(v) if v.is_object() => v,
+        _ => &empty,
+    };
+    let agents = match obj.get("agents") {
+        Some(v) if v.is_object() => v,
+        _ => &empty,
+    };
+    let frozen: Vec<&Value> = match obj.get("frozen_scopes") {
+        Some(Value::Array(a)) => a.iter().collect(),
+        _ => Vec::new(),
+    };
+    let hold = bar_hold(obj);
+    let pressure = guard.get("active") == Some(&Value::Bool(true));
+    let reviews = bar_number(obj.get("reviews"));
+    let kind = if !hold.is_empty() {
+        "hold"
+    } else if pressure {
+        "pressure"
+    } else if reviews > 0 {
+        "review"
+    } else {
+        "ok"
+    };
+    let agent_running = agents
+        .as_object()
+        .map(|m| {
+            m.values().any(|record| {
+                record.is_object() && record.get("state") == Some(&Value::String("up".to_string()))
+            })
+        })
+        .unwrap_or(false);
+    json!({
+        "mode": bar_str(obj, "mode", "unknown"),
+        "profile": bar_str(obj, "profile", "auto"),
+        "reviews": reviews,
+        "frozen": frozen.len() as i64,
+        "deprioritized": bar_number(obj.get("deprioritized")),
+        "freed_today_bytes": bar_number(obj.get("freed_today_bytes")),
+        "hold": hold,
+        "pressure": pressure,
+        "agent_running": agent_running,
+        "class": kind,
+    })
+}
+
+fn error_model() -> Value {
+    json!({
+        "mode": "unknown",
+        "profile": "auto",
+        "reviews": 0,
+        "frozen": 0,
+        "deprioritized": 0,
+        "freed_today_bytes": 0,
+        "hold": "",
+        "pressure": false,
+        "agent_running": false,
+        "class": "error",
+    })
+}
+
+fn model_i64(model: &Value, key: &str) -> i64 {
+    bar_number(model.get(key))
+}
+
+fn model_str<'a>(model: &'a Value, key: &str) -> &'a str {
+    match model.get(key) {
+        Some(Value::String(s)) => s.as_str(),
+        _ => "",
+    }
+}
+
+fn render_text(model: &Value) -> String {
+    if model_str(model, "class") == "error" {
+        return "tæma error".to_string();
+    }
+    let mut segments: Vec<String> = Vec::new();
+    let reviews = model_i64(model, "reviews");
+    let frozen = model_i64(model, "frozen");
+    let deprioritized = model_i64(model, "deprioritized");
+    if reviews != 0 {
+        segments.push(format!("⟲{reviews}"));
+    }
+    if frozen != 0 {
+        segments.push(format!("❄{frozen}"));
+    }
+    if deprioritized != 0 {
+        segments.push(format!("↓{deprioritized}"));
+    }
+    segments.push(format_memory(model_i64(model, "freed_today_bytes")));
+    format!("tæma {}", segments.join(" "))
+}
+
+fn render_tooltip(model: &Value) -> String {
+    if model_str(model, "class") == "error" {
+        return "tæma: daemon unreachable".to_string();
+    }
+    let mut lines = vec![
+        format!(
+            "mode {} · profile {}",
+            model_str(model, "mode"),
+            model_str(model, "profile")
+        ),
+        format!("{} reviews", model_i64(model, "reviews")),
+        format!("{} frozen", model_i64(model, "frozen")),
+        format!("{} deprioritized", model_i64(model, "deprioritized")),
+        format!(
+            "{} freed today",
+            format_memory(model_i64(model, "freed_today_bytes"))
+        ),
+    ];
+    let hold = model_str(model, "hold");
+    if !hold.is_empty() {
+        lines.push(format!("held: {hold}"));
+    }
+    if model.get("pressure") == Some(&Value::Bool(true)) {
+        lines.push("pressure: guard active".to_string());
+    }
+    if model.get("agent_running") != Some(&Value::Bool(true)) {
+        lines.push("agent not running".to_string());
+    }
+    lines.join("\n")
+}
+
+fn short_text(model: &Value) -> String {
+    if model_str(model, "class") == "error" {
+        return "tæma !".to_string();
+    }
+    let reviews = model_i64(model, "reviews");
+    let frozen = model_i64(model, "frozen");
+    let deprioritized = model_i64(model, "deprioritized");
+    if reviews != 0 {
+        return format!("tæma ⟲{reviews}");
+    }
+    if frozen != 0 {
+        return format!("tæma ❄{frozen}");
+    }
+    if deprioritized != 0 {
+        return format!("tæma ↓{deprioritized}");
+    }
+    "tæma".to_string()
+}
+
+fn class_color(class: &str) -> &'static str {
+    match class {
+        "review" => "#e5c07c",
+        "pressure" => "#e06c75",
+        "hold" => "#61afef",
+        "error" => "#ff5555",
+        _ => "#8a8a8a",
+    }
+}
+
+// Python `json.dumps` with ensure_ascii=True and separators (', ', ': ').
+// Byte-identical to the CLI views: spaces after separators, non-ASCII as \uXXXX.
+
+fn py_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x7f => out.push(c),
+            c => {
+                let cp = c as u32;
+                if cp <= 0xffff {
+                    out.push_str(&format!("\\u{:04x}", cp));
+                } else {
+                    let v = cp - 0x10000;
+                    let high = 0xd800 + (v >> 10);
+                    let low = 0xdc00 + (v & 0x3ff);
+                    out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn py_string(s: &str) -> String {
+    format!("\"{}\"", py_escape(s))
+}
+
+fn py_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => py_string(s),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(py_value).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, val)| format!("{}: {}", py_string(k), py_value(val)))
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+    }
+}
+
+fn render_bar(format_name: &str, model: &Value) -> Result<String, String> {
+    let text = render_text(model);
+    let tooltip = render_tooltip(model);
+    match format_name {
+        "plain" => Ok(text),
+        "waybar" => {
+            let mut map = serde_json::Map::new();
+            map.insert("text".to_string(), Value::String(text));
+            map.insert("tooltip".to_string(), Value::String(tooltip));
+            map.insert(
+                "class".to_string(),
+                Value::String(model_str(model, "class").to_string()),
+            );
+            Ok(py_value(&Value::Object(map)))
+        }
+        "i3bar" => {
+            let mut map = serde_json::Map::new();
+            map.insert("full_text".to_string(), Value::String(text));
+            map.insert("short_text".to_string(), Value::String(short_text(model)));
+            map.insert(
+                "color".to_string(),
+                Value::String(class_color(model_str(model, "class")).to_string()),
+            );
+            map.insert(
+                "urgent".to_string(),
+                Value::Bool(model_str(model, "class") == "error"),
+            );
+            Ok(py_value(&Value::Object(map)))
+        }
+        "json" => {
+            let mut sorted = std::collections::BTreeMap::new();
+            sorted.insert(
+                "schema".to_string(),
+                Value::String("taema.bar.v1".to_string()),
+            );
+            if let Some(obj) = model.as_object() {
+                for (k, v) in obj {
+                    sorted.insert(k.clone(), v.clone());
+                }
+            }
+            sorted.insert("text".to_string(), Value::String(text));
+            sorted.insert("tooltip".to_string(), Value::String(tooltip));
+            let ordered: serde_json::Map<String, Value> = sorted.into_iter().collect();
+            Ok(py_value(&Value::Object(ordered)))
+        }
+        other => Err(format!("unknown bar format: {other:?}")),
+    }
+}
+
+// ---- python fallback ----------------------------------------------------------
+// For --help/--version/--config the Python CLI owns the exact text. Exec it
+// so help never drifts; the latency-critical paths never hit this.
+
+fn fallback_to_python() -> i32 {
+    let all: Vec<String> = std::env::args().collect();
+    let rest = if all.len() > 1 { &all[1..] } else { &[] };
+    // Prefer `taema` on PATH (installed layout).
+    let mut tried: Vec<String> = Vec::new();
+    if let Ok(status) = std::process::Command::new("taema").args(rest).status() {
+        return status.code().unwrap_or(1);
+    } else {
+        tried.push("taema on PATH".to_string());
+    }
+    // Dev checkout: <root>/taema/bin/taema relative to this exe.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..5 {
+            if let Some(d) = dir.clone() {
+                let cand = d.join("bin/taema");
+                // exe is rust/target/<profile>/taema-fast; bin is taema/bin/taema.
+                // Walk up looking for taema/bin/taema.
+                let up1 = d.join("../../bin/taema");
+                for c in [cand, up1, d.join("taema/bin/taema")] {
+                    if c.is_file() {
+                        if let Ok(status) = std::process::Command::new(&c).args(rest).status() {
+                            return status.code().unwrap_or(1);
+                        }
+                    }
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            } else {
+                break;
+            }
+        }
+        let _ = tried;
+    }
+    for cand in ["/usr/bin/taema"] {
+        if std::path::Path::new(cand).is_file() {
+            if let Ok(status) = std::process::Command::new(cand).args(rest).status() {
+                return status.code().unwrap_or(1);
+            }
+        }
+    }
+    eprintln!("taema: python fallback not found; install taema or use --help");
+    1
+}
+
+// ---- launch -----------------------------------------------------------------
+// Faithful port of `taema.cli.commands.cmd_launch` without the config load:
+// reserve via launch_prepare, move in, claim, exec. Identical messages.
+
+struct LaunchOpts {
+    app: Option<String>,
+    unit: Option<String>,
+    bind: bool,
+    dry_run: bool,
+    socket: Option<String>,
+    cmd: Vec<String>,
+}
+
+fn parse_launch(argv: &[String]) -> Result<LaunchOpts, i32> {
+    let mut app: Option<String> = None;
+    let mut unit: Option<String> = None;
+    let mut bind = false;
+    let mut dry_run = false;
+    let mut socket: Option<String> = None;
+    let mut cmd: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        if tok == "--" {
+            // Everything after is the command.
+            cmd.extend_from_slice(&argv[i + 1..]);
+            break;
+        }
+        if tok == "--app" {
+            if i + 1 >= argv.len() {
+                return Err(usage_error("argument --app: expected one argument"));
+            }
+            app = Some(argv[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix("--app=") {
+            app = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if tok == "--unit" {
+            if i + 1 >= argv.len() {
+                return Err(usage_error("argument --unit: expected one argument"));
+            }
+            unit = Some(argv[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix("--unit=") {
+            unit = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if tok == "--socket" {
+            if i + 1 >= argv.len() {
+                return Err(usage_error("argument --socket: expected one argument"));
+            }
+            socket = Some(argv[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix("--socket=") {
+            socket = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if tok == "--config" || tok.starts_with("--config=") {
+            std::process::exit(fallback_to_python());
+        }
+        if tok == "--bind" {
+            bind = true;
+            i += 1;
+            continue;
+        }
+        if tok == "--dry-run" {
+            dry_run = true;
+            i += 1;
+            continue;
+        }
+        if tok == "-h" || tok == "--help" || tok == "--version" {
+            std::process::exit(fallback_to_python());
+        }
+        // Accepted globals that do not affect launch; ignored for parity.
+        if matches!(
+            tok,
+            "--plain" | "--wide" | "--no-color" | "--quiet" | "--yes" | "--pick" | "--verbose"
+        ) {
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') {
+            return Err(usage_error(&format!("unrecognized arguments: {tok}")));
+        }
+        // First positional starts the remainder.
+        cmd.extend_from_slice(&argv[i..]);
+        break;
+    }
+    // Strip a leading `--` kept by argparse REMAINDER shapes.
+    if cmd.first().map(|s| s.as_str()) == Some("--") {
+        cmd.remove(0);
+    }
+    Ok(LaunchOpts {
+        app,
+        unit,
+        bind,
+        dry_run,
+        socket,
+        cmd,
+    })
+}
+
+fn direct_move(scope: &str, pid: i64) -> Result<(), std::io::Error> {
+    let path = format!("{}/{}/cgroup.procs", cg_base(), scope);
+    std::fs::write(path, format!("{pid}\n"))
+}
+
+fn sudo_move(scope: &str, pid: i64) -> Result<(), String> {
+    let helper = helper_path();
+    let out = std::process::Command::new("sudo")
+        .args(["-n", &helper, "move", scope, &pid.to_string()])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if err.is_empty() {
+        Err("move failed".to_string())
+    } else {
+        Err(err)
+    }
+}
+
+fn move_self(scope: &str, pid: i64) -> Result<(), String> {
+    match direct_move(scope, pid) {
+        Ok(()) => Ok(()),
+        Err(e) => match e.raw_os_error() {
+            Some(code) if code == libc::EACCES as i32 || code == libc::EPERM as i32 => {
+                sudo_move(scope, pid)
+            }
+            _ => {
+                // Direct write failed for another reason (missing leaf,
+                // gone pid): still try the helper once, matching the daemon
+                // attach_agent fast-path-then-helper order.
+                match sudo_move(scope, pid) {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(errno_message(&e)),
+                }
+            }
+        },
+    }
+}
+
+fn cmd_launch(argv: &[String]) -> i32 {
+    let opts = match parse_launch(argv) {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    if opts.cmd.is_empty() {
+        return die_message("launch needs a command to run", 2);
+    }
+    let prog = if opts.cmd[0] == "--" && opts.cmd.len() > 1 {
+        opts.cmd[1].clone()
+    } else {
+        opts.cmd[0].clone()
+    };
+    // Derive app from the command basename when --app is absent.
+    let derived = prog.rsplit('/').next().unwrap_or(&prog).to_string();
+    let app = opts.app.clone().unwrap_or(derived);
+    if !valid_app(&app) {
+        return die_message("bad app name (use a-z 0-9 _ -, max 32)", 2);
+    }
+    let base = cg_base();
+    if !std::path::Path::new(&base).is_dir() {
+        return die_message(
+            &format!(
+                "{base} missing; is the taema service running and are you in the taema group? (sv status taema)"
+            ),
+            1,
+        );
+    }
+    if opts.dry_run {
+        // Matches Python exactly: stripped cmd, no daemon contact.
+        let mut cmd = opts.cmd.clone();
+        if cmd.first().map(|s| s.as_str()) == Some("--") {
+            cmd.remove(0);
+        }
+        println!("dry run: reserve app-{app} and attach {}", cmd.join(" "));
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        return 0;
+    }
+    let pid = unsafe { libc::getpid() } as i64;
+    let mut args = args_object(&[
+        ("app", Value::String(app.clone())),
+        ("pid", json!(pid)),
+        ("session", Value::String(session_key())),
+    ]);
+    if let Some(u) = &opts.unit {
+        args.insert("unit".to_string(), Value::String(u.clone()));
+    }
+    if opts.bind {
+        args.insert("owner".to_string(), json!(pid));
+    }
+    let paths = sock_paths_for(opts.socket.clone());
+    let reply = request("launch_prepare", &args, Duration::from_secs(3), &paths);
+    let reply = match reply {
+        None => {
+            // Offline: scope the leaf directly, unmanaged.
+            let leaf = format!("{base}/app-{app}");
+            if let Err(e) = std::fs::create_dir_all(&leaf) {
+                return die_message(&format!("attach failed: {}", errno_message(&e)), 1);
+            }
+            if let Err(msg) = move_self(&format!("app-{app}"), pid) {
+                return die_message(&format!("attach failed: {msg}"), 1);
+            }
+            eprintln!("taema: daemon not running; app-{app} is not auto-managed");
+            return exec_cmd(&opts.cmd);
+        }
+        Some(v) => v,
+    };
+    if reply.get("error").is_some() {
+        let msg = reply
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request failed");
+        return die_message(&format!("launch failed: {msg}"), 1);
+    }
+    let scope = reply
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if scope.is_empty() {
+        return die_message("launch failed: claim was refused", 1);
+    }
+    let via = reply.get("via").and_then(|v| v.as_str()).unwrap_or("");
+    if via == "agent" {
+        let attach_args = args_object(&[
+            ("scope", Value::String(scope.clone())),
+            ("pids", json!([pid])),
+        ]);
+        let attached = request("attach", &attach_args, Duration::from_secs(3), &paths);
+        let ok = attached
+            .as_ref()
+            .and_then(|v| v.get("ok"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !ok {
+            let _ = request(
+                "launch_release",
+                &args_object(&[("scope", Value::String(scope.clone()))]),
+                Duration::from_secs(3),
+                &paths,
+            );
+            let msg = attached
+                .as_ref()
+                .and_then(|v| v.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("daemon did not attach");
+            return die_message(&format!("attach failed: {msg}"), 1);
+        }
+    } else {
+        if let Err(msg) = move_self(&scope, pid) {
+            let _ = request(
+                "launch_release",
+                &args_object(&[("scope", Value::String(scope.clone()))]),
+                Duration::from_secs(3),
+                &paths,
+            );
+            return die_message(&format!("attach failed: {msg}"), 1);
+        }
+    }
+    let claim_args = args_object(&[
+        ("scope", Value::String(scope.clone())),
+        ("pid", json!(pid)),
+        ("app", Value::String(app.clone())),
+    ]);
+    let claim = request("launch_claim", &claim_args, Duration::from_secs(3), &paths);
+    let ok = claim
+        .as_ref()
+        .and_then(|v| v.get("ok"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !ok {
+        let _ = request(
+            "launch_release",
+            &args_object(&[("scope", Value::String(scope.clone()))]),
+            Duration::from_secs(3),
+            &paths,
+        );
+        let msg = claim
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("claim was refused");
+        return die_message(&format!("launch failed: {msg}"), 1);
+    }
+    exec_cmd(&opts.cmd)
+}
+
+fn exec_cmd(cmd: &[String]) -> i32 {
+    use std::ffi::CString;
+    if cmd.is_empty() {
+        return die_message("launch needs a command to run", 2);
+    }
+    let mut stripped = cmd.to_vec();
+    if stripped.first().map(|s| s.as_str()) == Some("--") {
+        stripped.remove(0);
+    }
+    if stripped.is_empty() {
+        return die_message("launch needs a command to run", 2);
+    }
+    let prog = CString::new(stripped[0].as_str()).unwrap_or_else(|_| CString::new("true").unwrap());
+    let cstrs: Vec<CString> = stripped
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+        .collect();
+    let mut ptrs: Vec<*const libc::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    unsafe {
+        libc::execvp(prog.as_ptr(), ptrs.as_ptr() as *const *const libc::c_char);
+        let err = std::io::Error::last_os_error();
+        let msg = errno_message(&err);
+        // exec failed: match Python's die-on-OSError path.
+        eprintln!("taema: {msg}");
+        eprintln!("hint: Check the arguments and run `taema COMMAND --help` for usage.");
+        eprintln!("suggestion: Run `taema --help` to see related commands.");
+        // Flush to avoid interleaving with the caller's stderr.
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(1);
+    }
+}
+
+// ---- bar command ------------------------------------------------------------
+// Faithful port of `taema.cli.commands.cmd_bar`: one line per state change
+// over a subscribe stream. Identical rendering in every format.
+
+struct BarOpts {
+    format: String,
+    follow: bool,
+    socket: Option<String>,
+    quiet: bool,
+}
+
+fn parse_bar(argv: &[String]) -> Result<BarOpts, i32> {
+    let mut format: Option<String> = None;
+    let mut follow = false;
+    let mut socket: Option<String> = None;
+    let mut json_force = false;
+    let mut quiet = false;
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        if tok == "--format" {
+            if i + 1 >= argv.len() {
+                return Err(usage_error("argument --format: expected one argument"));
+            }
+            format = Some(argv[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix("--format=") {
+            format = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if tok == "--socket" {
+            if i + 1 >= argv.len() {
+                return Err(usage_error("argument --socket: expected one argument"));
+            }
+            socket = Some(argv[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(v) = tok.strip_prefix("--socket=") {
+            socket = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if tok == "--config" || tok.starts_with("--config=") {
+            std::process::exit(fallback_to_python());
+        }
+        if tok == "--follow" {
+            follow = true;
+            i += 1;
+            continue;
+        }
+        if tok == "--json" || tok == "--jsonl" {
+            json_force = true;
+            i += 1;
+            continue;
+        }
+        if tok == "--quiet" {
+            quiet = true;
+            i += 1;
+            continue;
+        }
+        if tok == "-h" || tok == "--help" || tok == "--version" {
+            std::process::exit(fallback_to_python());
+        }
+        if matches!(
+            tok,
+            "--plain" | "--wide" | "--no-color" | "--yes" | "--pick" | "--verbose"
+        ) {
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') {
+            return Err(usage_error(&format!("unrecognized arguments: {tok}")));
+        }
+        return Err(usage_error(&format!("unrecognized arguments: {tok}")));
+    }
+    let mut name = format.unwrap_or_else(|| "plain".to_string());
+    if json_force {
+        name = "json".to_string();
+    }
+    if !BAR_FORMATS.contains(&name.as_str()) {
+        // Match argparse's invalid-choice text exactly (exit 1).
+        return Err(usage_error(&format!(
+            "argument --format: invalid choice: '{}' (choose from 'waybar', 'i3bar', 'json', 'plain')",
+            name
+        )));
+    }
+    Ok(BarOpts {
+        format: name,
+        follow,
+        socket,
+        quiet,
+    })
+}
+
+fn print_bar_line(format_name: &str, model: &Value, quiet: bool) -> i32 {
+    match render_bar(format_name, model) {
+        Ok(line) => {
+            if !quiet {
+                println!("{line}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            0
+        }
+        Err(msg) => die_message(&msg, 2),
+    }
+}
+
+fn status_request(paths: &[String]) -> Option<Value> {
+    request("status", &args_object(&[]), Duration::from_secs(3), paths)
+}
+
+fn subscribe_stream(paths: &[String]) -> Option<UnixStream> {
+    let id = REQUEST_ID.fetch_add(1, Ordering::SeqCst) + 1;
+    let topics = json!(["status", "scope", "review", "decision", "memory", "guard", "profile"]);
+    let env = json!({
+        "v": 2,
+        "id": id,
+        "cmd": "subscribe",
+        "args": {"topics": topics, "since_seq": 1152921504606846976i64},
+    });
+    let line = serde_json::to_string(&env).unwrap() + "\n";
+    for path in paths {
+        let mut stream = match connect_timeout(path, Duration::from_secs(3)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        if stream.write_all(line.as_bytes()).is_err() {
+            continue;
+        }
+        // Leave read timeout unset: the stream stays open.
+        let _ = stream.set_read_timeout(None);
+        // Wrap blocking: connect_timeout leaves O_NONBLOCK cleared.
+        let _ = stream.set_nonblocking(false);
+        return Some(stream);
+    }
+    None
+}
+
+fn read_stream_line(stream: &mut UnixStream, id: u64, buf: &mut Vec<u8>) -> Option<Value> {
+    let mut chunk = [0u8; 65536];
+    loop {
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            match serde_json::from_slice::<Value>(&line) {
+                Ok(Value::Object(map)) => {
+                    if map.get("v") != Some(&json!(2)) {
+                        return Some(Value::Object(map));
+                    }
+                    match map.get("id") {
+                        Some(Value::Number(n)) if n.as_u64() == Some(id) => {}
+                        _ => {
+                            let mut err = serde_json::Map::new();
+                            err.insert(
+                                "error".to_string(),
+                                Value::String("response id mismatch".to_string()),
+                            );
+                            return Some(Value::Object(err));
+                        }
+                    }
+                    if map.get("ok") == Some(&Value::Bool(true)) {
+                        if let Some(result) = map.get("result") {
+                            return Some(result.clone());
+                        }
+                        return Some(json!({}));
+                    }
+                    if let Some(Value::Object(e)) = map.get("error") {
+                        let mut err = serde_json::Map::new();
+                        err.insert(
+                            "error".to_string(),
+                            e.get("message")
+                                .cloned()
+                                .unwrap_or_else(|| Value::String("request failed".to_string())),
+                        );
+                        return Some(Value::Object(err));
+                    }
+                    return Some(Value::Object(map));
+                }
+                Ok(other) => return Some(other),
+                Err(_) => {
+                    let mut err = serde_json::Map::new();
+                    err.insert(
+                        "error".to_string(),
+                        Value::String("invalid stream reply".to_string()),
+                    );
+                    return Some(Value::Object(err));
+                }
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                if buf.is_empty() {
+                    return None;
+                }
+                // Partial trailing bytes without newline: treat as EOF.
+                return None;
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn cmd_bar(argv: &[String]) -> i32 {
+    let opts = match parse_bar(argv) {
+        Ok(o) => o,
+        Err(code) => return code,
+    };
+    let paths = sock_paths_for(opts.socket.clone());
+    let reply = status_request(&paths);
+    let mut last = match reply {
+        None => {
+            let model = error_model();
+            let code = print_bar_line(&opts.format, &model, opts.quiet);
+            return if code == 0 { 1 } else { code };
+        }
+        Some(v) => {
+            if v.get("error").is_some() {
+                let model = error_model();
+                let code = print_bar_line(&opts.format, &model, opts.quiet);
+                return if code == 0 { 1 } else { code };
+            }
+            let model = model_from_status(&v);
+            let code = print_bar_line(&opts.format, &model, opts.quiet);
+            if code != 0 {
+                return code;
+            }
+            if !opts.follow {
+                return 0;
+            }
+            model
+        }
+    };
+    // Follow: re-query status on every subscribed event, print on change.
+    let mut stream = match subscribe_stream(&paths) {
+        None => {
+            let model = error_model();
+            let code = print_bar_line(&opts.format, &model, opts.quiet);
+            return if code == 0 { 1 } else { code };
+        }
+        Some(s) => s,
+    };
+    // Recover the subscribe id: the stream used the last REQUEST_ID value.
+    // Re-derive by peeking: subscribe_stream incremented once, so the id is
+    // the current counter value.
+    let sub_id = REQUEST_ID.load(Ordering::SeqCst);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let result = match read_stream_line(&mut stream, sub_id, &mut buf) {
+            None => {
+                let model = error_model();
+                let code = print_bar_line(&opts.format, &model, opts.quiet);
+                return if code == 0 { 1 } else { code };
+            }
+            Some(v) => v,
+        };
+        if result.get("error").is_some() && result.get("event").is_none() {
+            let model = error_model();
+            let code = print_bar_line(&opts.format, &model, opts.quiet);
+            return if code == 0 { 1 } else { code };
+        }
+        if result.get("event").is_none() && result.get("resync").is_none() {
+            continue;
+        }
+        let reply = status_request(&paths);
+        let model = match reply {
+            None => {
+                let model = error_model();
+                let code = print_bar_line(&opts.format, &model, opts.quiet);
+                return if code == 0 { 1 } else { code };
+            }
+            Some(v) => {
+                if v.get("error").is_some() {
+                    let model = error_model();
+                    let code = print_bar_line(&opts.format, &model, opts.quiet);
+                    return if code == 0 { 1 } else { code };
+                }
+                model_from_status(&v)
+            }
+        };
+        if model != last {
+            let code = print_bar_line(&opts.format, &model, opts.quiet);
+            if code != 0 {
+                return code;
+            }
+            last = model;
+        }
+    }
 }
 
 // ---- terminal -------------------------------------------------------------
@@ -985,9 +2093,17 @@ fn cmd_prompt_in(dir: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("prompt") {
+    if args.get(1).map(|s| s.as_str()) == Some("prompt") && args.len() == 2 {
         cmd_prompt_in(&runtime_dir());
         std::process::exit(0);
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("launch") {
+        let code = cmd_launch(&args[2..]);
+        std::process::exit(code);
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("bar") {
+        let code = cmd_bar(&args[2..]);
+        std::process::exit(code);
     }
     if args.len() < 3 {
         std::process::exit(0);
@@ -1197,7 +2313,11 @@ mod tests {
     fn sock_paths_honors_overrides() {
         let uid = unsafe { libc::getuid() };
         assert_eq!(
-            sock_paths_with(Some("/tmp/x.sock".to_string()), Some("/home/u".to_string())),
+            sock_paths_with(
+                Some("/tmp/x.sock".to_string()),
+                None,
+                Some("/home/u".to_string())
+            ),
             vec![
                 "/tmp/x.sock".to_string(),
                 format!("/run/user/{uid}/taema.sock"),
@@ -1205,12 +2325,31 @@ mod tests {
             ]
         );
         assert_eq!(
-            sock_paths_with(None, None),
+            sock_paths_with(
+                None,
+                Some("/tmp/state".to_string()),
+                Some("/home/u".to_string())
+            ),
+            vec![
+                format!("/run/user/{uid}/taema.sock"),
+                "/tmp/state/taema/taema.sock".to_string(),
+            ]
+        );
+        assert_eq!(
+            sock_paths_with(None, None, None),
             vec![format!("/run/user/{uid}/taema.sock")]
         );
         assert_eq!(
-            sock_paths_with(Some("".to_string()), Some("".to_string())),
+            sock_paths_with(
+                Some("".to_string()),
+                Some("".to_string()),
+                Some("".to_string())
+            ),
             vec![format!("/run/user/{uid}/taema.sock")]
+        );
+        assert_eq!(
+            sock_paths_for(Some("/tmp/only.sock".to_string())),
+            vec!["/tmp/only.sock".to_string()]
         );
     }
 

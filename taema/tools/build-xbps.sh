@@ -28,7 +28,8 @@ if [ -z "${SKIP_TESTS:-}" ]; then
     make -C "$here" test
 fi
 stage=$(mktemp -d)
-trap 'rm -rf "$stage"' EXIT
+eventd_stage=$(mktemp -d)
+trap 'rm -rf "$stage" "$eventd_stage"' EXIT
 make -C "$here" DESTDIR="$stage" XBPS_ARCH="$arch" install
 install -Dm644 "$here/../LICENSE" "$stage/usr/share/licenses/taema/LICENSE"
 # xbps-create picks up INSTALL and REMOVE from the root of the staged tree; these are the
@@ -37,7 +38,11 @@ install -m755 "$here/srcpkgs/taema/INSTALL" "$stage/INSTALL"
 install -m755 "$here/srcpkgs/taema/REMOVE" "$stage/REMOVE"
 
 pkg="taema-${version}_${revision}"
-rm -f "$repo/$pkg.$arch.xbps"
+eventd_pkg="taema-eventd-${version}_${revision}"
+rm -f "$repo/$pkg.$arch.xbps" "$repo/$eventd_pkg.$arch.xbps"
+# The optional forwarder ships apart so installs without TAEMA_EVENTD stay lean.
+mkdir -p "$eventd_stage/usr/bin"
+mv "$stage/usr/bin/taema-eventd" "$eventd_stage/usr/bin/taema-eventd"
 (cd "$repo" && xbps-create -A "$arch" -n "$pkg" \
     -s "Dependency-aware, self-managing cgroup v2 process scopes" \
     -D "python3>=3.11_1 iproute2>=0 util-linux>=0 sudo>=0 runit>=0 shadow>=0" \
@@ -45,5 +50,12 @@ rm -f "$repo/$pkg.$arch.xbps"
     -m "soubarnak <soubarna@live.in>" \
     --config-files "/etc/taema/taema.toml /etc/taema/units/*.toml" \
     "$stage")
+(cd "$repo" && xbps-create -A "$arch" -n "$eventd_pkg" \
+    -s "Optional kernel process-event forwarder for taema" \
+    -D "taema>=${version}_${revision} python3>=3.11_1" \
+    -l custom:PolyForm-Noncommercial-1.0.0 -H https://github.com/Bongbetic/taema \
+    -m "soubarnak <soubarna@live.in>" \
+    "$eventd_stage")
 XBPS_ARCH=$arch xbps-rindex -f -a "$repo/$pkg.$arch.xbps"
-echo "built $repo/$pkg.$arch.xbps"
+XBPS_ARCH=$arch xbps-rindex -f -a "$repo/$eventd_pkg.$arch.xbps"
+echo "built $repo/$pkg.$arch.xbps $repo/$eventd_pkg.$arch.xbps"

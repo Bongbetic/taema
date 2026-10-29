@@ -1,0 +1,11 @@
+#!/bin/sh
+# taema-eventd: optional root forwarder for kernel process events.
+# Installed copy runs the package from /usr/lib/taema; a checkout runs ../src.
+# Runs as root under the taema runit service; enabled via TAEMA_EVENTD=1 in
+# the service conf. Off by default (D13).
+lib=/usr/lib/taema
+here=$(dirname "$(readlink -f "$0")")
+[ -d "$here/../src/taema" ] && lib=$here/../src
+unset PYTHONPYCACHEPREFIX
+PYTHONPATH="$lib" PYTHONDONTWRITEBYTECODE=1 \
+    exec /usr/bin/python3 -P -m taema.eventd "$@"

@@ -1,7 +1,7 @@
 #!/bin/sh
 # taema: delegate a cgroup v2 subtree (/sys/fs/cgroup/user/<uid>) to each member of the
 # taema group and supervise one taema daemon per member. Runs as root under runsv.
-# Optional settings in ./conf: TAEMA_GROUP, TAEMA_CONTROLLERS.
+# Optional settings in ./conf: TAEMA_GROUP, TAEMA_CONTROLLERS, TAEMA_EVENTD.
 exec 2>&1
 set -u
 PATH=/usr/bin:/usr/sbin:/bin:/sbin
@@ -34,6 +34,15 @@ case ${TAEMA_HOLD:-0} in
     *) log "invalid TAEMA_HOLD value; using 0"; TAEMA_HOLD=0 ;;
 esac
 export TAEMA_HOLD
+
+# TAEMA_EVENTD=1 starts the optional root process-event forwarder (taema-eventd).
+# Off by default (D13): the daemon keeps its exact polling behaviour without it.
+case ${TAEMA_EVENTD:-0} in
+    1) TAEMA_EVENTD=1 ;;
+    0|'') TAEMA_EVENTD=0 ;;
+    *) log "invalid TAEMA_EVENTD value; using 0"; TAEMA_EVENTD=0 ;;
+esac
+export TAEMA_EVENTD
 
 # enable_controllers DIR: write +CTRL for each wanted controller DIR offers and has not
 # enabled. One refusing controller is logged and skipped.
@@ -126,6 +135,23 @@ mkdir -p "$SVDIR"
 
 sync_members start
 [ -n "$(member_list)" ] || log "group $GROUP has no members; add one with: usermod -aG $GROUP USER (picked up within a minute)"
+
+# The optional root process-event forwarder never outlives this service run.
+EVENTD_PIDFILE=/run/taema/eventd.pid
+if [ -r "$EVENTD_PIDFILE" ]; then
+    old=$(cat "$EVENTD_PIDFILE" 2>/dev/null) || old=
+    case $old in
+    ''|*[!0-9]*) ;;
+    *) kill "$old" 2>/dev/null ;;
+    esac
+fi
+rm -f "$EVENTD_PIDFILE"
+if [ "$TAEMA_EVENTD" = 1 ]; then
+    mkdir -p /run/taema/events /var/log/taema
+    /usr/bin/taema-eventd /run/taema/events >>/var/log/taema/eventd.log 2>&1 &
+    printf '%s\n' "$!" > "$EVENTD_PIDFILE"
+    log "started taema-eventd"
+fi
 
 # runsv execs runsvdir below, so this shell keeps its pid. The loop exits when that pid is
 # gone, so no loop survives "sv restart taema".

@@ -64,6 +64,7 @@ class SyntaxTest(unittest.TestCase):
             "libexec/taema-attach",
             "libexec/taemad-user",
             "bin/taemad",
+            "bin/taema-eventd",
             "tools/build-xbps.sh",
             "tools/vendor-dist.sh",
         ):
@@ -90,8 +91,10 @@ class TemplateLayoutTest(unittest.TestCase):
     def read_template(self):
         with open(os.path.join(ROOT, "srcpkgs", "taema", "template")) as f:
             fields = {}
-            for line in f:
-                line = line.strip()
+            for raw in f:
+                if raw[:1] in (" ", "\t"):
+                    continue
+                line = raw.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
                     fields[key] = value.strip('"')

@@ -176,6 +176,27 @@ class PressureHigh:
     trigger: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProcBorn:
+    pid: int
+    ppid: int
+    start: int
+    born: float
+    exe: str
+    comm: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcExited:
+    pid: int
+    ppid: int
+    start: int
+    born: float
+    exited: float
+    exe: str
+    comm: str
+
+
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -285,6 +306,9 @@ class Daemon:
         self.collector_events = collections.deque()
         self._collector_event_set = set()
         self.collector_event_drops = 0
+        self.eventd_sock = None
+        self.eventd_buffer = bytearray()
+        self.eventd_pending = {}
         self.last_guard_check = 0.0
         self.guard_last_steps = {}
         self.guard_state = pressure_guard.empty_status()
@@ -542,6 +566,8 @@ class Daemon:
                 MemoryReconcile,
                 ReclaimReconcile,
                 PressureHigh,
+                ProcBorn,
+                ProcExited,
             ),
         ):
             raise TypeError("unsupported collector event: %s" % type(event).__name__)
@@ -582,6 +608,10 @@ class Daemon:
             self.guarded(self.reclaim_pass)
         elif isinstance(event, PressureHigh):
             self.guarded(lambda: self.guard_pass(event.trigger))
+        elif isinstance(event, ProcBorn):
+            self._on_proc_born(event)
+        elif isinstance(event, ProcExited):
+            self._on_proc_exited(event)
 
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
@@ -625,6 +655,191 @@ class Daemon:
         os.close(fd)
         self.stop_leaf(leaf, "owner %d exited" % pid, owner=pid)
         return True
+
+    # ---- eventd collector (optional; off by default per D13) ----
+    def eventd_enabled(self):
+        """True when the service opted into the root process-event forwarder."""
+        if os.environ.get("TAEMA_EVENTD") == "1":
+            return True
+        experimental = self.cfg.get("experimental") or {}
+        return bool(experimental.get("eventd"))
+
+    def eventd_socket_path(self):
+        """Per-user forwarder socket; overridable for tests via TAEMA_EVENTD_SOCKET."""
+        override = os.environ.get("TAEMA_EVENTD_SOCKET")
+        if override:
+            return override
+        from .. import eventd as eventd_source
+
+        return "%s/%d.sock" % (
+            os.environ.get("TAEMA_EVENTD_DIR", eventd_source.DEFAULT_RUN_DIR),
+            os.getuid(),
+        )
+
+    def _open_eventd(self):
+        """Connect to the forwarder when enabled; stay silent when it is absent."""
+        if not self.eventd_enabled() or self.eventd_sock is not None:
+            return
+        path = self.eventd_socket_path()
+        try:
+            if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                return
+        except OSError:
+            return
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            sock.connect(path)
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        self.eventd_sock = sock
+        self.sel.register(sock, selectors.EVENT_READ, "eventd")
+
+    def _close_eventd(self):
+        sock, self.eventd_sock = self.eventd_sock, None
+        if sock is None:
+            return
+        try:
+            self.sel.unregister(sock)
+        except (OSError, ValueError, KeyError):
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def poll_eventd(self):
+        """Drain available forwarder records into the collector queue; return count."""
+        if not self.eventd_enabled():
+            return 0
+        if self.eventd_sock is None:
+            self._open_eventd()
+            if self.eventd_sock is None:
+                return 0
+        count = 0
+        while True:
+            try:
+                chunk = self.eventd_sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                self._close_eventd()
+                break
+            if not chunk:
+                self._close_eventd()
+                break
+            self.eventd_buffer += chunk
+        if self.eventd_buffer:
+            from .. import eventd as eventd_source
+
+            records, rest = eventd_source.decode_records(bytes(self.eventd_buffer))
+            self.eventd_buffer = bytearray(rest)
+            count = self.ingest_eventd_records(records)
+        return count
+
+    def ingest_eventd_records(self, records):
+        """Queue validated forwarder records; drop other uids (isolation)."""
+        mine = os.getuid()
+        count = 0
+        for record in records:
+            if record.uid != mine:
+                continue
+            born = record.ts_ns / 1e9
+            if record.kind == "exit":
+                self.queue_collector_event(
+                    ProcExited(
+                        record.pid,
+                        record.ppid,
+                        record.start,
+                        born,
+                        born,
+                        record.exe,
+                        record.comm,
+                    )
+                )
+            else:
+                self.queue_collector_event(
+                    ProcBorn(
+                        record.pid,
+                        record.ppid,
+                        record.start,
+                        born,
+                        record.exe,
+                        record.comm,
+                    )
+                )
+            count += 1
+        return count
+
+    def _eventd_identity(self, exe, comm, ppid):
+        name = comm or (os.path.basename(exe) if exe else "")
+        if not name:
+            name = "unknown"
+        parent_app = None
+        if ppid:
+            entry = self.lineage.entry(ppid)
+            if entry is not None:
+                parent_app = entry.get("key")
+        identity = SimpleNamespace(
+            key="exe:" + name,
+            display=name,
+            exe=exe,
+            kind="eventd",
+            desktop_id=None,
+            unit=None,
+            validated=False,
+            device=None,
+            inode=None,
+        )
+        return identity, parent_app
+
+    def _on_proc_born(self, event):
+        if len(self.eventd_pending) >= MAX_COLLECTOR_EVENTS:
+            oldest = next(iter(self.eventd_pending))
+            del self.eventd_pending[oldest]
+        self.eventd_pending[event.pid] = event
+        identity, parent_app = self._eventd_identity(event.exe, event.comm, event.ppid)
+        self.store.record_identity(
+            identity,
+            {
+                "pid": event.pid,
+                "start": event.start,
+                "born": event.born,
+                "exited": None,
+                "parent_app": parent_app,
+                "scope": None,
+                "terminal": 0,
+                "class": "eventd",
+                "runtime": None,
+                "launched_by": "eventd",
+                "parent_evidence": [],
+            },
+        )
+
+    def _on_proc_exited(self, event):
+        born = self.eventd_pending.pop(event.pid, None)
+        born_time = born.born if born is not None else event.born
+        identity, parent_app = self._eventd_identity(event.exe, event.comm, event.ppid)
+        self.store.record_identity(
+            identity,
+            {
+                "pid": event.pid,
+                "start": event.start,
+                "born": born_time,
+                "exited": event.exited,
+                "parent_app": parent_app,
+                "scope": None,
+                "terminal": 0,
+                "class": "eventd",
+                "runtime": None,
+                "launched_by": "eventd",
+                "parent_evidence": [],
+            },
+        )
 
     def stop_leaf(self, leaf, why, owner=None):
         path = "%s/%s" % (cgroup.base(), leaf)
@@ -8186,6 +8401,7 @@ class Daemon:
                 self.last["launch"] = now
                 self.guarded(lambda: self.launch_sweep(now=now))
             self._run_listener_wake_if_due(now)
+            self.guarded(self.poll_eventd)
             self.drain_collector_events()
             self.guarded(self.agent_watch_pass)
             self.guarded(self.qos_pass)
@@ -9914,6 +10130,7 @@ class Daemon:
             pass
         self.guarded(self.check_socket)
         self.guarded(self._sync_pressure_monitor)
+        self.guarded(self._open_eventd)
         self.store.log(
             event="daemon_start", mode=self.mode, units=[u["_file"] for u in self.units]
         )
@@ -9931,6 +10148,8 @@ class Daemon:
                     self.guarded(self.collect_leaf_events)
                 elif key.data == "pressure":
                     self.guarded(self._collect_pressure_events)
+                elif key.data == "eventd":
+                    self.guarded(self.poll_eventd)
                 elif isinstance(key.data, tuple) and key.data[0] == "subscriber":
                     conn = key.data[1]
                     if mask & selectors.EVENT_READ:
@@ -9949,6 +10168,7 @@ class Daemon:
         for qid in list(self.pending):
             self.drop_question(qid)
         self._close_pressure_monitor()
+        self.guarded(self._close_eventd)
         self.guarded(lambda: self.thaw_all_managed_scopes("daemon shutdown"))
         self.guarded(lambda: self.memory_governor_pass(force_restore=True))
         self.store.log(event="daemon_stop")

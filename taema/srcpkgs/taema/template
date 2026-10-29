@@ -21,3 +21,11 @@ conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 post_install() {
 	vlicense ${wrksrc}/LICENSE
 }
+
+taema-eventd_package() {
+	short_desc="Optional kernel process-event forwarder for taema"
+	depends="taema>=${version}_${revision}"
+	pkg_install() {
+		vmove usr/bin/taema-eventd
+	}
+}

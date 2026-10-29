@@ -637,6 +637,84 @@ def _memory_oom_group_check(base, controllers):
     )
 
 
+def _guard_psi_trigger_check(cfg, base, system_root):
+    """Probe writable guard triggers in delegated cgroup and host PSI, in that order."""
+    guard_cfg = cfg.get("guard", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(guard_cfg, dict):
+        guard_cfg = {}
+    settings = {
+        "some": guard_cfg.get(
+            "psi_some", policy._DEFAULTS["guard"]["psi_some"]
+        ),
+        "full": guard_cfg.get(
+            "psi_full", policy._DEFAULTS["guard"]["psi_full"]
+        ),
+    }
+    sources = pressure_guard.psi_trigger_sources(
+        os.path.join(base, "memory.pressure"),
+        proc_root=_rooted(system_root, "/proc"),
+    )
+    attempts = []
+    for source, path in sources:
+        monitor = pressure_guard.PsiTriggerMonitor()
+        try:
+            failures = monitor.open_triggers(path, settings)
+            metrics = tuple(monitor.metrics)
+        except Exception as error:  # diagnostics should keep reporting other features
+            failures = ["%s: %s" % (type(error).__name__, error)]
+            metrics = ()
+        finally:
+            try:
+                monitor.close()
+            except OSError:
+                pass
+        attempts.append(
+            {
+                "source": source,
+                "path": path,
+                "metrics": list(metrics),
+                "failures": list(failures),
+            }
+        )
+        if metrics:
+            required = set(settings)
+            writable = required.issubset(metrics)
+            failed_sources = attempts[:-1]
+            message = (
+                "writable PSI trigger source=%s path=%s metrics=%s"
+                % (source, path, ",".join(metrics))
+            )
+            if failed_sources:
+                message += "; delegated trigger unavailable, using host PSI fallback"
+            if failures:
+                message += "; unavailable metrics: %s" % ", ".join(failures)
+            return _check(
+                "guard PSI triggers",
+                "ok" if writable else "warn",
+                message,
+                "No action required; host-wide PSI is a labeled fallback."
+                if source == "host-proc"
+                else "A writable trigger is active for each configured PSI metric."
+                if writable
+                else "The daemon will monitor only metrics with writable PSI triggers.",
+            )
+    summary = "; ".join(
+        "%s %s: %s"
+        % (
+            attempt["source"],
+            attempt["path"],
+            ", ".join(attempt["failures"]) or "no configured metric is writable",
+        )
+        for attempt in attempts
+    )
+    return _check(
+        "guard PSI triggers",
+        "warn",
+        "no writable PSI trigger source: %s" % summary,
+        "Guard floor sampling remains available; enable writable PSI triggers for earlier pressure actions.",
+    )
+
+
 def _kernel_checks(base, controllers, system_root, cfg=None):
     proc_swaps_path = _rooted(system_root, "/proc/swaps")
     proc_swaps = _read(proc_swaps_path)
@@ -701,16 +779,22 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
     checks.append(_process_oom_score_check(system_root))
     memory_features = {
         "memory accounting": "memory.current and memory.stat",
+        "memory.stat breakdown": "memory.stat anon, file, inactive_file, shmem, and slab fields",
         "memory peak usage": "memory.peak",
         "memory pressure": "memory.pressure or /proc/pressure/memory",
+        "guard PSI triggers": "writable memory PSI trigger on cgroup or host source",
         "memory reclaim": "memory.reclaim or memory.high fallback",
         "memory low reservation": "memory.low",
         "memory OOM group kill": "memory.oom.group",
         "memory soft cap": "memory.high",
+        "memory low protection": "memory.low",
         "memory hard cap": "memory.max",
+        "memory OOM group": "memory.oom.group",
         "swap accounting": "memory.swap.current and memory.swap.max",
         "zswap accounting": "memory.zswap.current",
         "memory OOM events": "memory.events or memory.events.local",
+        "memory high events": "memory.events high counter",
+        "memory max events": "memory.events max counter",
     }
     if not memory.enabled(cfg):
         checks.extend(
@@ -753,6 +837,30 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 )
             )
 
+        stat_path = os.path.join(base, "memory.stat")
+        stat_text = _read(stat_path)
+        stat_fields = {
+            fields[0]
+            for line in (stat_text or "").splitlines()
+            if len(fields := line.split()) >= 2
+        }
+        required_stat = {"anon", "file", "inactive_file", "shmem", "slab"}
+        missing_stat = sorted(required_stat - stat_fields)
+        checks.append(
+            _check(
+                "memory.stat breakdown",
+                "ok",
+                "memory.stat reports anon, file, inactive_file, shmem, and slab",
+            )
+            if not missing_stat
+            else _check(
+                "memory.stat breakdown",
+                "warn",
+                "memory.stat is missing fields: %s" % ", ".join(missing_stat),
+                "Kernel memory.stat fields vary; missing breakdowns remain unknown.",
+            )
+        )
+
         peak_path = os.path.join(base, "memory.peak")
         checks.append(
             _check("memory peak usage", "ok", "memory.peak is available")
@@ -781,6 +889,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 else "Enable PSI in the kernel to report pressure.",
             )
         )
+        checks.append(_guard_psi_trigger_check(cfg, base, system_root))
 
         reclaim_path = os.path.join(base, "memory.reclaim")
         high_path = os.path.join(base, "memory.high")
@@ -804,6 +913,22 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 ("memory low reservation", "memory.low"),
                 ("memory soft cap", "memory.high"),
                 ("memory hard cap", "memory.max"),
+            )
+        )
+        checks.append(
+            _feature_check(
+                "memory low protection",
+                os.path.join(base, "memory.low"),
+                controllers,
+                "memory",
+            )
+        )
+        checks.append(
+            _feature_check(
+                "memory OOM group",
+                os.path.join(base, "memory.oom.group"),
+                controllers,
+                "memory",
             )
         )
         checks.append(
@@ -834,21 +959,56 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "Cgroup swap accounting remains the fallback for compressed swap.",
             )
         )
+        event_fields = set()
+        for filename in ("memory.events.local", "memory.events"):
+            event_text = _read(os.path.join(base, filename))
+            if event_text is None:
+                continue
+            event_fields.update(
+                fields[0]
+                for line in event_text.splitlines()
+                if len(fields := line.split()) >= 2
+            )
         checks.append(
             _check(
                 "memory OOM events",
                 "ok",
-                "memory.events or memory.events.local is available",
+                "memory.events reports oom and oom_kill counters",
             )
-            if any(
-                os.path.isfile(os.path.join(base, filename))
-                for filename in ("memory.events.local", "memory.events")
-            )
+            if {"oom", "oom_kill"} <= event_fields
             else _check(
                 "memory OOM events",
                 "warn",
-                "cgroup OOM event files are unsupported; process exits remain observable",
-                "No action required; event counters are optional.",
+                "memory.events oom or oom_kill counters are unavailable",
+                "No action required; process exits remain observable.",
+            )
+        )
+        checks.append(
+            _check(
+                "memory high events",
+                "ok",
+                "memory.events reports the high counter",
+            )
+            if "high" in event_fields
+            else _check(
+                "memory high events",
+                "warn",
+                "memory.events high counter is unavailable",
+                "Kernel high-event accounting is optional; pressure reporting remains available.",
+            )
+        )
+        checks.append(
+            _check(
+                "memory max events",
+                "ok",
+                "memory.events reports the max counter",
+            )
+            if "max" in event_fields
+            else _check(
+                "memory max events",
+                "warn",
+                "memory.events max counter is unavailable",
+                "Kernel limit-event accounting is optional; process exits remain observable.",
             )
         )
         checks.append(_memory_oom_group_check(base, controllers))
@@ -871,6 +1031,55 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "io.weight", os.path.join(base, "io.weight"), controllers, "io"
             ),
         ]
+    )
+    oom_score_path = _rooted(system_root, "/proc/self/oom_score_adj")
+    oom_score = _read(oom_score_path)
+    try:
+        score_value = int((oom_score or "").strip())
+        score_supported = -1000 <= score_value <= 1000
+    except ValueError:
+        score_supported = False
+    checks.append(
+        _check(
+            "OOM score adjustment",
+            "ok",
+            "the current process exposes a readable oom_score_adj value",
+        )
+        if score_supported
+        else _check(
+            "OOM score adjustment",
+            "warn",
+            "/proc/self/oom_score_adj is unavailable or unreadable",
+            "OOM priority adjustment is skipped when the procfs control is unavailable.",
+        )
+    )
+
+    paths = cfg.get("paths", {})
+    helper_value = paths.get("helper", policy.HELPER) if isinstance(paths, dict) else None
+    helper_path = (
+        _rooted(system_root, policy.expand(helper_value))
+        if isinstance(helper_value, str)
+        else None
+    )
+    helper_text = _read(helper_path) if helper_path else None
+    helper_has_restore = (
+        helper_text is not None
+        and "oom-restore" in helper_text
+        and "oom-record" in helper_text
+    )
+    checks.append(
+        _check(
+            "OOM restore helper",
+            "ok",
+            "taema-attach provides oom-record and oom-restore operations",
+        )
+        if helper_has_restore
+        else _check(
+            "OOM restore helper",
+            "warn",
+            "taema-attach oom-record or oom-restore is unavailable",
+            "Reinstall the taema helper to record and restore managed OOM adjustments.",
+        )
     )
     zswap_paths = (
         "/sys/module/zswap/parameters/enabled",

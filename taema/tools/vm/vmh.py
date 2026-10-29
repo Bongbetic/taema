@@ -120,6 +120,11 @@ def _validate(raw, path="<config>"):
     if raw.get("accel", "auto") not in ACCELS:
         raise HarnessError("%s: unknown accel %r" % (path, raw.get("accel")))
     need("memory_mb", int, 512)
+    if "m3" in scenarios:
+        if "m3_memory_mb" not in raw:
+            raw = dict(raw)
+            raw["m3_memory_mb"] = 768
+        need("m3_memory_mb", int, 512)
     need("cpus", int, 1)
     need("boot_timeout_s", int, 1)
     need("scenario_timeout_s", int, 1)
@@ -188,6 +193,9 @@ def with_overrides(
         new["accel"] = accel
     if memory_mb is not None:
         new["memory_mb"] = memory_mb
+        # An explicit guest size also sizes the M3 low-memory allocation;
+        # otherwise M3 pins qemu to m3_memory_mb (768 MiB default).
+        new["m3_memory_mb"] = memory_mb
     return _validate(new, "<cli>")
 
 
@@ -294,6 +302,15 @@ def needs_previous_package(scenarios):
     return any(name in scenarios for name in ("m1", "upgrade"))
 
 
+def validate_network_opt_in(scenarios, allow_network):
+    """Refuse M3 before boot unless its guest-only earlyoom install is authorized."""
+    if "m3" in scenarios and not allow_network:
+        raise HarnessError(
+            "scenario m3 installs earlyoom inside the disposable guest; "
+            "re-run with --allow-network"
+        )
+
+
 def bootstrap_sources(pub, package_repo, previous, scenarios):
     """Files copied to a guest before provisioning and scenario execution."""
     sources = [
@@ -323,6 +340,8 @@ def scenario_command(name, cfg, repo_name, previous):
         name,
         GUEST_TMP,
     )
+    if name == "m3":
+        remote += " --expected-memory-mb %s" % cfg.get("m3_memory_mb", 768)
     if name in ("upgrade", "m1"):
         remote += (
             " --package-dir %s/%s --previous %s/%s"
@@ -525,6 +544,15 @@ def mkimage_argv(cfg, rootfs, pub):
 # ---- plan ------------------------------------------------------------------
 
 
+def qemu_config_for_scenarios(cfg, scenarios):
+    """Apply the low-memory M3 allocation without changing the shared run config."""
+    if "m3" not in scenarios:
+        return cfg
+    qemu_cfg = dict(cfg)
+    qemu_cfg["memory_mb"] = cfg.get("m3_memory_mb", 768)
+    return qemu_cfg
+
+
 def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     """A machine-readable description of everything `run` would do."""
     libcs = list(libcs or cfg["libcs"])
@@ -564,7 +592,8 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
         run_dir = os.path.join(state_dir(cfg), "runs", "RUN-" + libc)
         port = free_port()
         known = os.path.join(run_dir, "known_hosts")
-        qemu = qemu_argv(cfg, libc, kvm=kvm, port=port, run_dir=run_dir)
+        qemu_cfg = qemu_config_for_scenarios(cfg, scenarios)
+        qemu = qemu_argv(qemu_cfg, libc, kvm=kvm, port=port, run_dir=run_dir)
         steps = [
             {"name": "wait-ssh", "user": vmadmin},
             {
@@ -1078,7 +1107,10 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     port = free_port()  # plan port is a preview; pick again for the real run
     known = os.path.join(run_dir, "known_hosts")
     run_dir_abs = run_dir
-    qemu = qemu_argv(cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs)
+    qemu_cfg = qemu_config_for_scenarios(cfg, scenarios)
+    qemu = qemu_argv(
+        qemu_cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs
+    )
     overlay = os.path.join(run_dir, "disk.qcow2")
     ovr = overlay_argv(
         cache_paths(cfg, libc)["base"], overlay, qemu_img=cfg["tools"]["qemu_img"]
@@ -1210,6 +1242,8 @@ def cmd_run(cfg, args, out, err):
         out.write("prerequisites: ok\n")
         return 0
 
+    validate_network_opt_in(scenarios, args.allow_network)
+
     # Network opt-in gate happens before anything is created or executed.
     need_net = []
     for libc in libcs:
@@ -1329,7 +1363,7 @@ def main(argv, out=None, err=None):
     net.add_argument(
         "--allow-network",
         action="store_true",
-        help="permit downloads (base images, previous release)",
+        help="permit downloads (base images, previous release, M3 guest earlyoom)",
     )
     runp = argparse.ArgumentParser(add_help=False)
     runp.add_argument(

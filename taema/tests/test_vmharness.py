@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import types
 import unittest
 from unittest import mock
@@ -99,6 +100,7 @@ class VmTestCase(unittest.TestCase):
             % ", ".join('"%s"' % s for s in (scenarios or ["smoke"])),
             'accel = "auto"',
             "memory_mb = 1024",
+            "m3_memory_mb = 768",
             "cpus = 1",
             "boot_timeout_s = 5",
             "scenario_timeout_s = 5",
@@ -185,6 +187,30 @@ class ConfigTest(VmTestCase):
         with self.assertRaises(vmh.HarnessError):
             vmh.load_config(os.path.join(self.tmp, "absent.toml"))
 
+    def test_legacy_config_without_m3_memory_keeps_normal_vm_memory(self):
+        path = self.write_config()
+        with open(path, encoding="utf-8") as source:
+            config_text = source.read().replace("m3_memory_mb = 768\n", "")
+        with open(path, "w", encoding="utf-8") as target:
+            target.write(config_text)
+
+        cfg = vmh.load_config(path)
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["smoke"], kvm=False)
+        self.assertIn("-m 1024", " ".join(plan["vms"][0]["qemu"]))
+
+    def test_non_m3_config_ignores_m3_only_memory_value(self):
+        path = self.write_config()
+        with open(path, encoding="utf-8") as source:
+            config_text = source.read().replace("m3_memory_mb = 768", 'm3_memory_mb = "fast"')
+        with open(path, "w", encoding="utf-8") as target:
+            target.write(config_text)
+
+        cfg = vmh.load_config(path)
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["smoke"], kvm=False)
+        self.assertIn("-m 1024", " ".join(plan["vms"][0]["qemu"]))
+        with self.assertRaises(vmh.HarnessError):
+            vmh.with_overrides(cfg, scenarios=["m3"])
+
 
 class CacheAndRefusalTest(VmTestCase):
     def test_cache_paths_isolated_per_libc(self):
@@ -261,6 +287,44 @@ class QemuPlanTest(VmTestCase):
         self.assertIn("-accel tcg", joined)
         self.assertIn(vmh.cache_paths(self.cfg, "musl")["kernel"], joined)
         self.assertIn(vmh.cache_paths(self.cfg, "musl")["initrd"], joined)
+
+    def test_run_vm_uses_the_m3_memory_override_from_its_scenario_plan(self):
+        plan = vmh.build_plan(
+            self.cfg, libcs=["glibc"], scenarios=["m3"], kvm=False
+        )
+        run_dir = os.path.join(self.state, "runs", "live-m3")
+        os.makedirs(run_dir)
+        proc = mock.Mock()
+        proc.poll.return_value = 0
+        with (
+            mock.patch.object(vmh, "free_port", return_value=2244),
+            mock.patch.object(vmh, "qemu_argv", return_value=["qemu"]) as qemu_argv,
+            mock.patch.object(
+                vmh.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+            mock.patch.object(vmh.subprocess, "Popen", return_value=proc),
+            mock.patch.object(
+                vmh,
+                "wait_ssh",
+                side_effect=vmh.RunError("stop after qemu configuration"),
+            ),
+        ):
+            with self.assertRaises(vmh.RunError):
+                vmh.run_vm(
+                    self.cfg,
+                    plan["vms"][0],
+                    plan,
+                    ["m3"],
+                    run_dir,
+                    io.StringIO(),
+                    io.StringIO(),
+                )
+
+        qemu_cfg = qemu_argv.call_args.args[0]
+        self.assertEqual(qemu_cfg["memory_mb"], 768)
+        self.assertEqual(self.cfg["memory_mb"], 1024)
 
     def test_hostfwd_is_loopback_only(self):
         run_dir = os.path.join(self.state, "runs", "x")
@@ -413,6 +477,24 @@ class PlanTest(VmTestCase):
         )
         self.assertIn("--previous-version 0.3.0", m1["argv"][-1])
         self.assertIn("--replay-fixture", m2["argv"][-1])
+
+    def test_m3_uses_low_ram_only_when_selected(self):
+        regular = vmh.build_plan(
+            self.cfg, libcs=["glibc"], scenarios=["smoke"], kvm=False
+        )
+        pressure = vmh.build_plan(
+            self.cfg, libcs=["glibc"], scenarios=["m3"], kvm=False
+        )
+        regular_mem = regular["vms"][0]["qemu"].index("-m") + 1
+        pressure_mem = pressure["vms"][0]["qemu"].index("-m") + 1
+        self.assertEqual(regular["vms"][0]["qemu"][regular_mem], "1024")
+        self.assertEqual(pressure["vms"][0]["qemu"][pressure_mem], "768")
+        m3 = next(
+            step
+            for step in pressure["vms"][0]["steps"]
+            if step["name"] == "scenario:m3"
+        )
+        self.assertIn("--expected-memory-mb 768", m3["argv"][-1])
 
     def test_plan_network_inputs_listed(self):
         plan = vmh.build_plan(self.cfg, scenarios=["upgrade"], kvm=False)
@@ -822,6 +904,14 @@ class HarnessCliParsingTest(VmTestCase):
         self.assertIn(os.path.join(ROOT, "tests"), sources)
         self.assertIn(os.path.join(ROOT, "schema"), sources)
 
+    def test_m3_acceptance_is_opt_in_and_registered_in_both_runners(self):
+        self.assertIn("m3", vmh.SCENARIOS)
+        self.assertIn("m3", scenario.SCENARIOS)
+        self.assertEqual(vmh.load_config()["scenarios"], ["smoke", "m0"])
+        with self.assertRaisesRegex(vmh.HarnessError, "--allow-network"):
+            vmh.validate_network_opt_in(["m3"], False)
+        vmh.validate_network_opt_in(["m3"], True)
+
     def test_parse_libcs(self):
         self.assertEqual(vmh.parse_libcs("glibc, musl"), ["glibc", "musl"])
 
@@ -909,6 +999,8 @@ class HarnessSurfacesTest(unittest.TestCase):
         self.assertIn("make -C taema vm-test", docs)
         self.assertIn("Scenario API", docs)
         self.assertIn("--allow-network", docs)
+        self.assertIn("--scenarios m3", docs)
+        self.assertIn("installed only inside the", docs)
         self.assertIn("never", docs)  # host-safety guarantees section
         self.assertIn("cgroups", docs)
         self.assertIn("artifacts", docs)
@@ -1630,6 +1722,33 @@ class ScenarioApiTest(unittest.TestCase):
         for pid in self.tree["children"]:
             self.assertTrue(process_alive(pid), "children must survive a root close")
 
+    def test_spawn_gui_tree_can_exec_root_to_distinct_fixture_binary(self):
+        work = os.path.join(self.tmp, "work-exec-root")
+        self.tree = scenario.spawn_gui_tree(
+            work,
+            children=1,
+            child_argv=[sys.executable, "-c", "import time; time.sleep(3600)"],
+            root_exec=["/bin/sleep", "3600"],
+        )
+        root_exe = os.path.realpath("/bin/%s" % os.path.basename("sleep"))
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                current_root_exe = os.path.realpath(
+                    "/proc/%d/exe" % self.tree["root"]
+                )
+            except OSError:
+                current_root_exe = ""
+            if current_root_exe == root_exe:
+                break
+            time.sleep(0.05)
+
+        child_exe = os.path.realpath("/proc/%d/exe" % self.tree["children"][0])
+        self.assertEqual(current_root_exe, root_exe)
+        self.assertNotEqual(current_root_exe, child_exe)
+        self.assertTrue(process_alive(self.tree["root"]))
+        self.assertTrue(process_alive(self.tree["children"][0]))
+
     def test_spawn_gui_tree_accepts_a_distinct_survivor_command(self):
         tail = shutil.which("tail")
         self.assertIsNotNone(tail)
@@ -1650,6 +1769,662 @@ class ScenarioApiTest(unittest.TestCase):
         self.assertEqual(
             scenario.daemon_scope("shared/helper-123"), "shared/helper-123"
         )
+
+    def test_m3_daemon_metrics_matches_python_module_launcher(self):
+        proc_dir = os.path.join(self.procroot, "731")
+        os.makedirs(proc_dir)
+        with open(os.path.join(proc_dir, "cmdline"), "wb") as f:
+            f.write(b"/usr/bin/python3\0-P\0-m\0taema\0daemon\0")
+        with open(os.path.join(proc_dir, "status"), "w") as f:
+            uid = os.getuid()
+            f.write(
+                "Name:\tpython3\nUid:\t%d\t%d\t%d\t%d\nVmRSS:\t24576 kB\n"
+                % ((uid,) * 4)
+            )
+        stat_fields = ["S"] + ["0"] * 12
+        stat_fields[11] = "17"
+        stat_fields[12] = "23"
+        with open(os.path.join(proc_dir, "stat"), "w") as f:
+            f.write("731 (python3) " + " ".join(stat_fields) + "\n")
+
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            self.assertEqual(scenario._m3_daemon_metrics(), (731, 24576, 40))
+
+    def test_m3_daemon_metrics_prefers_current_scenario_uid(self):
+        for pid, uid, rss in ((731, 1000, 32000), (732, 1001, 24000)):
+            proc_dir = os.path.join(self.procroot, str(pid))
+            os.makedirs(proc_dir)
+            with open(os.path.join(proc_dir, "cmdline"), "wb") as target:
+                target.write(b"/usr/bin/python3\0-P\0-m\0taema\0daemon\0")
+            with open(os.path.join(proc_dir, "status"), "w") as target:
+                target.write("Uid:\t%d\t%d\t%d\t%d\nVmRSS:\t%d kB\n" % ((uid,) * 4 + (rss,)))
+            stat_fields = ["S"] + ["0"] * 12
+            stat_fields[11] = "17"
+            stat_fields[12] = "23"
+            with open(os.path.join(proc_dir, "stat"), "w") as target:
+                target.write("%d (python3) %s\n" % (pid, " ".join(stat_fields)))
+
+        with (
+            mock.patch.object(scenario, "PROCROOT", self.procroot),
+            mock.patch.object(scenario.os, "getuid", return_value=1001),
+        ):
+            self.assertEqual(scenario._m3_daemon_metrics(), (732, 24000, 40))
+
+    def test_m3_daemon_metrics_fails_when_scenario_uid_has_no_daemon(self):
+        proc_dir = os.path.join(self.procroot, "731")
+        os.makedirs(proc_dir)
+        with open(os.path.join(proc_dir, "cmdline"), "wb") as target:
+            target.write(b"/usr/bin/python3\0-P\0-m\0taema\0daemon\0")
+        with open(os.path.join(proc_dir, "status"), "w") as target:
+            target.write("Uid:\t1000\t1000\t1000\t1000\nVmRSS:\t24576 kB\n")
+        with (
+            mock.patch.object(scenario, "PROCROOT", self.procroot),
+            mock.patch.object(scenario.os, "getuid", return_value=1001),
+        ):
+            with self.assertRaisesRegex(scenario.ScenarioError, "scenario UID"):
+                scenario._m3_daemon_metrics()
+
+    def test_m3_daemon_profiles_include_read_only_smaps_breakdown(self):
+        for pid in (731, 732):
+            proc_dir = os.path.join(self.procroot, str(pid))
+            os.makedirs(proc_dir)
+            with open(os.path.join(proc_dir, "cmdline"), "wb") as target:
+                target.write(b"/usr/bin/python3\0-P\0-m\0taema\0daemon\0")
+            with open(os.path.join(proc_dir, "status"), "w") as target:
+                target.write("VmRSS:\t24576 kB\n")
+            with open(os.path.join(proc_dir, "smaps_rollup"), "w") as target:
+                target.write(
+                    "Rss: 24000 kB\nPss: 18000 kB\nAnonymous: 12000 kB\n"
+                    "Pss_Anon: 10000 kB\nPss_File: 8000 kB\n"
+                    "Pss_Shmem: 0 kB\n"
+                )
+
+        with mock.patch.object(scenario, "PROCROOT", self.procroot):
+            profiles = scenario._m3_daemon_profiles()
+
+        self.assertEqual([row["pid"] for row in profiles], [731, 732])
+        self.assertEqual(profiles[0]["rss_kib"], 24576)
+        self.assertEqual(profiles[0]["smaps_rollup"]["rss_kib"], 24000)
+        self.assertEqual(profiles[0]["smaps_rollup"]["anonymous_kib"], 12000)
+        self.assertEqual(
+            profiles[0]["smaps_rollup"]["file_or_shmem_kib"], 12000
+        )
+        self.assertEqual(profiles[0]["smaps_rollup"]["pss_file_kib"], 8000)
+
+    def test_m3_idle_footprint_artifact_includes_start_and_end_profiles(self):
+        config_path = os.path.join(self.tmp, "footprint", "taema.toml")
+        os.makedirs(os.path.dirname(config_path))
+        with open(config_path, "w") as target:
+            target.write(
+                'mode = "enforce"\n[guard]\navailable_floor = 18\n'
+                '[experimental]\nguard = true\n[freeze]\nenabled = true\n'
+            )
+        profile = {
+            "pid": 731,
+            "rss_kib": 24576,
+            "smaps_rollup": {
+                "rss_kib": 24000,
+                "anonymous_kib": 12000,
+                "file_or_shmem_kib": 12000,
+                "pss_file_kib": 8000,
+            },
+        }
+        other_daemon_profile = {
+            "pid": 732,
+            "rss_kib": 50000,
+            "smaps_rollup": {"rss_kib": 50000, "anonymous_kib": 40000},
+        }
+
+        class Recorder:
+            steps = []
+
+            def step(self, name, ok, detail):
+                self.steps.append((name, ok, detail))
+
+        recorder = Recorder()
+        with (
+            mock.patch.object(
+                scenario,
+                "_m0_config_paths",
+                return_value=(config_path, os.path.join(self.tmp, "unit.toml")),
+            ),
+            mock.patch.object(
+                scenario,
+                "_m3_memory_samples",
+                side_effect=lambda _state: {"manager": {"ts": time.time()}},
+            ),
+            mock.patch.object(
+                scenario, "_m3_daemon_metrics", return_value=(731, 24576, 10)
+            ),
+            mock.patch.object(
+                scenario,
+                "_m3_daemon_profiles",
+                return_value=[profile, other_daemon_profile],
+            ),
+        ):
+            scenario._m3_idle_footprint(recorder, self.tmp, duration=0)
+
+        detail = json.loads(recorder.steps[-1][2])
+        self.assertEqual(detail["daemon_profiles_start"], [profile, other_daemon_profile])
+        self.assertEqual(detail["daemon_profiles_end"], [profile, other_daemon_profile])
+        self.assertEqual(detail["max_rss_kib"], 24576)
+
+    def test_m3_qmp_release_waits_past_save_marker_until_process_stops(self):
+        saved = os.path.join(self.tmp, "saved")
+        scope = "user/1001/leftover/app-m3-qmp-731"
+        daemon_scope = scenario.daemon_scope(scope)
+        responses = [
+            {
+                "result": {
+                    "candidates": [[daemon_scope, "no attachment for 0s"]],
+                    "memory": [
+                        {"scope": daemon_scope, "reason": "waiting for a stable CPU sample"}
+                    ],
+                }
+            },
+            {
+                "result": {
+                    "candidates": [[daemon_scope, "no attachment for 1s"]],
+                    "memory": [{"scope": daemon_scope, "reason": "idle"}],
+                }
+            },
+            {"result": {"candidates": [], "memory": []}},
+        ]
+
+        def run_gc(argv, timeout):
+            self.assertEqual(argv, ["/usr/bin/taema", "gc", "--memory", "--json"])
+            self.assertGreaterEqual(timeout, 1)
+            if len([call for call in gc_calls if call]) == 1:
+                with open(saved, "w") as target:
+                    target.write("saved\n")
+            payload = responses.pop(0)
+            return type("Result", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
+
+        gc_calls = []
+
+        def record_gc(argv, timeout):
+            gc_calls.append(argv)
+            return run_gc(argv, timeout)
+
+        with (
+            mock.patch.object(scenario, "_run", side_effect=record_gc),
+            mock.patch.object(scenario, "_process_running", side_effect=[True, True, False]),
+            mock.patch.object(scenario.time, "sleep"),
+        ):
+            evidence = scenario._m3_qmp_release_probe(731, scope, saved, timeout=10)
+
+        self.assertTrue(evidence["eligible"])
+        self.assertTrue(evidence["hook_called"])
+        self.assertTrue(evidence["stopped"])
+        self.assertEqual(evidence["gc_calls"], 3)
+        self.assertEqual(evidence["stable_cpu_waits"], 1)
+        self.assertEqual(len(gc_calls), 3)
+
+    def test_m3_wait_for_daemon_uses_json_running_status(self):
+        unavailable = type(
+            "Result",
+            (),
+            {"returncode": 3, "stdout": json.dumps({"status": {"daemon": "unavailable"}}), "stderr": ""},
+        )()
+        running = type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": json.dumps({"status": {"daemon": "running"}}), "stderr": ""},
+        )()
+        with (
+            mock.patch.object(scenario, "_run", side_effect=[unavailable, running]) as run,
+            mock.patch.object(scenario.time, "sleep"),
+        ):
+            ready, detail = scenario._m3_wait_for_daemon(timeout=1, poll=0)
+
+        self.assertTrue(ready)
+        self.assertIn('"daemon": "running"', detail)
+        self.assertEqual(run.call_count, 2)
+
+    def test_m3_pressure_worker_is_valid_bounded_guest_code(self):
+        compile(scenario.M3_HOG_WORKER, "m3-pressure-worker", "exec")
+        compile(scenario.M3_CACHE_WORKER, "m3-cache-worker", "exec")
+        compile(scenario.M3_QMP_SERVER, "m3-fake-qmp", "exec")
+        self.assertIn("taema-m3-hog", scenario.M3_HOG_WORKER)
+        self.assertIn("step = 4 * 1024 * 1024", scenario.M3_HOG_WORKER)
+        self.assertIn("time.sleep(1.0)", scenario.M3_HOG_WORKER)
+        self.assertIn("int(open(limitfile).read().strip())", scenario.M3_HOG_WORKER)
+        self.assertIn("open(path, 'w+b')", scenario.M3_CACHE_WORKER)
+        self.assertIn("while not os.path.exists(gate)", scenario.M3_CACHE_WORKER)
+        self.assertIn("getattr(mmap, 'MADV_COLD', 20)", scenario.M3_CACHE_WORKER)
+        self.assertIn("server.accept()", scenario.M3_QMP_SERVER)
+        self.assertIn("client.recv(", scenario.M3_QMP_SERVER)
+
+    def test_m3_worker_budget_is_bounded_by_total_and_available_reserve(self):
+        total = 768 * 1024 * 1024
+        available = 500 * 1024 * 1024
+        budget = scenario._m3_bounded_worker_cap(total, available)
+        self.assertLessEqual(budget, total // 2)
+        self.assertGreaterEqual(available - budget, total * 38 // 100)
+        with self.assertRaisesRegex(scenario.ScenarioError, "insufficient MemAvailable"):
+            scenario._m3_bounded_worker_cap(total, total // 3)
+
+    def test_m3_pressure_preflight_records_live_scope_and_memory_high(self):
+        pid = 512
+        scope = "user/%d/leftover/provenance-512" % os.getuid()
+        proc_dir = os.path.join(self.procroot, str(pid))
+        cg_dir = os.path.join(self.cgroot, scope)
+        os.makedirs(proc_dir)
+        os.makedirs(cg_dir)
+        with open(os.path.join(proc_dir, "cgroup"), "w") as target:
+            target.write("0::/%s\n" % scope)
+        with open(os.path.join(cg_dir, "cgroup.procs"), "w") as target:
+            target.write("%d\n" % pid)
+        with open(os.path.join(cg_dir, "memory.high"), "w") as target:
+            target.write("max\n")
+        item = {"pid": pid, "scope": "stale/scope"}
+        with (
+            mock.patch.object(scenario, "PROCROOT", self.procroot),
+            mock.patch.object(scenario, "CGROOT", self.cgroot),
+        ):
+            ok, evidence = scenario._m3_pressure_scope_preflight(item, "leftover/")
+        self.assertTrue(ok)
+        self.assertEqual(item["scope"], scope)
+        self.assertEqual(evidence["proc_cgroup"], "0::/%s" % scope)
+        self.assertTrue(evidence["cgroup_exists"])
+        self.assertTrue(evidence["cgroup_member"])
+        self.assertTrue(evidence["memory_high_available"])
+        self.assertEqual(evidence["memory_high_value"], "max")
+
+    def test_m3_pressure_preflight_reports_missing_scope_without_writing_controls(self):
+        pid = 513
+        scope = "user/%d/leftover/missing" % os.getuid()
+        proc_dir = os.path.join(self.procroot, str(pid))
+        os.makedirs(proc_dir)
+        with open(os.path.join(proc_dir, "cgroup"), "w") as target:
+            target.write("0::/%s\n" % scope)
+        item = {"pid": pid, "scope": scope}
+        with (
+            mock.patch.object(scenario, "PROCROOT", self.procroot),
+            mock.patch.object(scenario, "CGROOT", self.cgroot),
+        ):
+            ok, evidence = scenario._m3_pressure_scope_preflight(item, "leftover/")
+        self.assertFalse(ok)
+        self.assertEqual(evidence["scope"], scope)
+        self.assertFalse(evidence["cgroup_exists"])
+        self.assertFalse(evidence["memory_high_available"])
+
+    def test_m3_cache_fixture_uses_guest_home_and_artifact_markers(self):
+        artifacts = os.path.join(self.tmp, "artifacts")
+        home = os.path.join(self.tmp, "home")
+        paths = scenario._m3_cache_fixture_paths(artifacts, home=home)
+
+        self.assertEqual(os.path.getsize(paths["cache_file"]), 0)
+        self.assertEqual(
+            os.path.commonpath((home, paths["cache_file"])), home
+        )
+        self.assertEqual(
+            os.path.commonpath((artifacts, paths["ready"])), artifacts
+        )
+        self.assertNotEqual(
+            os.path.commonpath((artifacts, paths["cache_file"])), artifacts
+        )
+        shutil.rmtree(paths["cache_dir"])
+
+    def test_m3_cache_mount_info_requires_findmnt_ext4(self):
+        result = subprocess.CompletedProcess(
+            ["findmnt"],
+            0,
+            json.dumps(
+                {
+                    "filesystems": [
+                        {
+                            "fstype": "ext4",
+                            "target": "/home",
+                            "source": "/dev/vda1",
+                        }
+                    ]
+                }
+            ),
+            "",
+        )
+        with (
+            mock.patch.object(scenario.shutil, "which", return_value="/usr/bin/findmnt"),
+            mock.patch.object(scenario, "_run", return_value=result) as findmnt,
+        ):
+            evidence = scenario._m3_cache_mount_info("/home/test/.cache/m3/cache.bin")
+
+        self.assertTrue(evidence["ok"])
+        self.assertEqual(evidence["fstype"], "ext4")
+        self.assertIn("/home/test/.cache/m3/cache.bin", findmnt.call_args.args[0])
+
+    def test_m3_cache_scope_counters_report_reclaimable_file_pages(self):
+        scope = "user/%d/leftover/cache-514" % os.getuid()
+        cg_dir = os.path.join(self.cgroot, scope)
+        os.makedirs(cg_dir)
+        with open(os.path.join(cg_dir, "memory.stat"), "w") as target:
+            target.write(
+                "file 16777216\ninactive_file 8388608\nshmem 1048576\n"
+            )
+
+        with mock.patch.object(scenario, "CGROOT", self.cgroot):
+            counters = scenario._m3_cache_scope_counters(scope)
+
+        self.assertEqual(counters["file_bytes"], 16777216)
+        self.assertEqual(counters["inactive_file_bytes"], 8388608)
+        self.assertEqual(counters["reclaimable_bytes"], 8388608)
+
+    def test_m3_guard_evidence_keeps_selected_actions_under_artifact_limit(self):
+        events = [
+            {"step": "noise", "status": "skipped", "reason": "x" * 500}
+            for _ in range(20)
+        ]
+        samples = [
+            {
+                "pressure_sample": {
+                    "MemAvailable_percent": 55.25,
+                    "global_memory_pressure": ["some avg10=7.0"],
+                },
+                "worker_progress_bytes": {"hog": 4096, "peer": 8192},
+                "guard_psi_thresholds": {"some": "1us/2s", "full": "1us/2s"},
+                "psi_trigger": {
+                    "source": "host-proc",
+                    "path": "/proc/pressure/memory",
+                    "writable": True,
+                    "metrics": ["some", "full"],
+                },
+            }
+            for _ in range(20)
+        ]
+        events[4] = {
+            "step": "page_cache",
+            "status": "acted",
+            "scopes": ["leftover/cache-1"],
+            "bytes_freed": 1048576,
+            "trigger": "some",
+            "reason": "dropped by compact evidence",
+        }
+        events[8] = {
+            "step": "freeze",
+            "status": "acted",
+            "scopes": ["leftover/cache-1"],
+            "trigger": "some",
+        }
+
+        selected = scenario._m3_selected_guard_evidence(events, samples, 4, 8)
+        evidence = {
+            "guard_floor_percent": 35,
+            "fallback_floor_percent": 12,
+            "page_cache_pre_pressure_counters": {
+                "file_bytes": 16 * 1024 * 1024,
+                "inactive_file_bytes": 8 * 1024 * 1024,
+                "reclaimable_bytes": 8 * 1024 * 1024,
+            },
+            "bounded_worker_budget_bytes": 200 * 1024 * 1024,
+            "selected_actions": selected,
+        }
+        serialized = json.dumps(evidence, sort_keys=True)
+
+        self.assertLess(len(serialized), 4000)
+        self.assertEqual(
+            evidence["selected_actions"]["page_cache"]["event"]["step"],
+            "page_cache",
+        )
+        self.assertEqual(
+            evidence["selected_actions"]["freeze"]["event"]["step"],
+            "freeze",
+        )
+        self.assertIn("MemAvailable_percent", serialized)
+        self.assertIn("worker_progress_bytes", serialized)
+        self.assertIn("1us/2s", serialized)
+        self.assertIn("host-proc", serialized)
+
+    def test_m3_cache_worker_waits_for_gate_before_populating_file(self):
+        workdir = os.path.join(self.tmp, "m3-cache")
+        os.makedirs(workdir)
+        cache_file = os.path.join(workdir, "cache.bin")
+        gate_file = os.path.join(workdir, "populate")
+        ready_file = os.path.join(workdir, "ready")
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                scenario.M3_CACHE_WORKER,
+                cache_file,
+                gate_file,
+                ready_file,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            time.sleep(0.2)
+            self.assertIsNone(worker.poll(), "cache worker must wait at the population gate")
+            self.assertFalse(os.path.exists(cache_file))
+            self.assertFalse(os.path.exists(ready_file))
+            with open(gate_file, "w") as target:
+                target.write("promoted-to-leftover\n")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not os.path.isfile(ready_file):
+                if worker.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNone(worker.poll(), "cache worker exited before ready")
+            self.assertTrue(os.path.isfile(ready_file))
+            self.assertEqual(os.path.getsize(cache_file), 16 * 1024 * 1024)
+            with open(ready_file, encoding="utf-8") as source:
+                ready = json.load(source)
+            self.assertEqual(ready["file_bytes"], 16 * 1024 * 1024)
+            self.assertTrue(ready["cold_advice_applied"])
+            self.assertTrue(ready["gate_observed"])
+        finally:
+            worker.kill()
+            worker.communicate(timeout=5)
+
+    def test_m3_leftover_promotion_waits_for_app_adoption_before_closing_root(self):
+        events = []
+
+        def wait_for_scope(pid, prefixes, timeout):
+            events.append(("wait", tuple(prefixes), pid))
+            return (
+                "user/1001/app-m3-pressure-1"
+                if prefixes == ["app-"]
+                else "user/1001/leftover/m3-pressure-1"
+            )
+
+        def close_root(root, timeout):
+            events.append(("close", root))
+
+        def sleep(duration):
+            events.append(("sleep", duration))
+
+        tree = {"root": 41}
+        with (
+            mock.patch.object(scenario, "wait_for_scope", side_effect=wait_for_scope),
+            mock.patch.object(scenario, "close_root", side_effect=close_root),
+            mock.patch.object(scenario, "configured_adopt_interval", return_value=2),
+            mock.patch.object(scenario.time, "sleep", side_effect=sleep),
+        ):
+            app_scope, leftover_scope = scenario._m3_promote_to_leftover(tree, 42)
+
+        self.assertEqual(app_scope, "user/1001/app-m3-pressure-1")
+        self.assertEqual(leftover_scope, "user/1001/leftover/m3-pressure-1")
+        self.assertEqual(
+            events,
+            [
+                ("wait", ("app-",), 42),
+                ("sleep", 5.5),
+                ("close", 41),
+                ("wait", ("leftover/",), 42),
+            ],
+        )
+
+    def test_m3_pressure_policy_initializes_missing_config_directory(self):
+        config_path = os.path.join(self.tmp, "new", "config", "taema.toml")
+        unit_path = os.path.join(self.tmp, "new", "units", "m3.toml")
+        with (
+            mock.patch.object(
+                scenario, "_m0_config_paths", return_value=(config_path, unit_path)
+            ),
+            mock.patch.object(
+                scenario,
+                "run_privileged",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+            mock.patch.object(
+                scenario,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, '{"status": {"mode": "adopt"}}', ""
+                ),
+            ),
+        ):
+            scenario._m3_enable_pressure_policy()
+
+        config = tomllib.loads(read_text(config_path))
+        self.assertEqual(config["mode"], "adopt")
+        self.assertTrue(config["mem"]["reclaim"])
+        self.assertEqual(config["mem"]["pressure_gate"], 100)
+        self.assertTrue(config["guard"]["enabled"])
+        self.assertEqual(config["guard"]["psi_some"], "1us/2s")
+        self.assertEqual(config["guard"]["psi_full"], "1us/2s")
+        self.assertEqual(config["freeze"]["after"], 0)
+
+    def test_m3_prepressure_evidence_reads_appended_events_and_targets_cache_scope(self):
+        path = os.path.join(self.tmp, "decisions.log")
+        before = '{"event":"memory_reclaimed","scope":"leftover/old"}\n'
+        with open(path, "w", encoding="utf-8") as target:
+            target.write(before)
+        offset = os.path.getsize(path)
+        with open(path, "a", encoding="utf-8") as target:
+            target.write(
+                '{"event":"memory_reclaimed","scope":"leftover/cache"}\n'
+                '{"event":"guard_step","step":"page_cache"}\n'
+            )
+
+        events, next_offset = scenario._m3_decision_events_since(path, offset)
+        cache_reclaims = scenario._m3_cache_reclaims_before_pressure(
+            events, "user/1001/leftover/cache"
+        )
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(next_offset, os.path.getsize(path))
+        self.assertEqual(len(cache_reclaims), 1)
+        self.assertEqual(cache_reclaims[0]["scope"], "leftover/cache")
+
+    def test_m3_wake_policy_keeps_slow_reconcile_and_immediate_freeze(self):
+        config_path = os.path.join(self.tmp, "wake", "taema.toml")
+        unit_path = os.path.join(self.tmp, "wake", "units", "m3.toml")
+        status = subprocess.CompletedProcess(
+            ["taema", "status", "--json"],
+            0,
+            '{"status": {"mode": "enforce"}}',
+            "",
+        )
+        with (
+            mock.patch.object(
+                scenario, "_m0_config_paths", return_value=(config_path, unit_path)
+            ),
+            mock.patch.object(scenario, "_m0_snapshot", return_value={}),
+            mock.patch.object(
+                scenario,
+                "run_privileged",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+            mock.patch.object(
+                scenario, "_m3_read_status_mode", return_value=("enforce", status)
+            ),
+        ):
+            scenario._m3_enable_wake_freeze()
+
+        config = tomllib.loads(read_text(config_path))
+        self.assertEqual(config["timers"]["adopt_interval"], 15)
+        self.assertEqual(config["freeze"]["after"], 0)
+
+    def test_m3_status_mode_reads_json_for_adopt_and_enforce(self):
+        for mode in ("adopt", "enforce"):
+            with self.subTest(mode=mode):
+                completed = subprocess.CompletedProcess(
+                    ["taema", "status", "--json"],
+                    0,
+                    '{"status": {"mode": "%s"}}' % mode,
+                    "",
+                )
+                with mock.patch.object(
+                    scenario, "_run", return_value=completed
+                ) as run:
+                    observed, result = scenario._m3_read_status_mode()
+
+                self.assertEqual(observed, mode)
+                self.assertIs(result, completed)
+                self.assertEqual(
+                    run.call_args.args[0],
+                    ["/usr/bin/taema", "status", "--json"],
+                )
+
+    def test_m3_status_mode_rejects_invalid_json_or_nonzero_status(self):
+        cases = (
+            subprocess.CompletedProcess([], 0, "not json", ""),
+            subprocess.CompletedProcess([], 1, '{"status": {"mode": "adopt"}}', ""),
+            subprocess.CompletedProcess([], 0, '{"mode": "adopt"}', ""),
+        )
+        for completed in cases:
+            with self.subTest(completed=completed):
+                with mock.patch.object(scenario, "_run", return_value=completed):
+                    observed, _result = scenario._m3_read_status_mode()
+                self.assertIsNone(observed)
+
+    def test_m3_guest_memory_allocation_matches_kernel_memtotal(self):
+        expected_bytes = 768 * 1024 * 1024
+        with mock.patch.object(
+            scenario,
+            "_m3_pressure_snapshot",
+            return_value={"MemTotal_bytes": expected_bytes * 97 // 100},
+        ):
+            matches, detail = scenario._m3_memory_allocation_evidence(768)
+
+        self.assertTrue(matches, detail)
+        self.assertEqual(detail["requested_memory_mib"], 768)
+        self.assertEqual(detail["MemTotal_bytes"], expected_bytes * 97 // 100)
+
+    def test_m3_qmp_probe_config_removes_both_idle_graces(self):
+        config = tomllib.loads(scenario._m3_qmp_probe_config())
+        self.assertEqual(config["mode"], "enforce")
+        self.assertEqual(config["timers"]["idle_grace"], 0)
+        self.assertEqual(config["mem"]["idle_reclaim_grace"], 0)
+        self.assertTrue(config["mem"]["reclaim"])
+        self.assertEqual(config["mem"]["pressure_gate"], 0)
+
+    def test_m3_earlyoom_phase_can_disable_only_adopt_guard_freezing(self):
+        config = (
+            '[guard]\nenabled = true\nfreeze_in_adopt = true\n\n'
+            '[mem]\nreclaim = true\n'
+        )
+        disabled = scenario._m3_pressure_freeze_config(config, False)
+        self.assertIn("enabled = true\nfreeze_in_adopt = false", disabled)
+        self.assertIn("[mem]\nreclaim = true", disabled)
+
+    def test_m3_pressure_snapshot_records_available_bytes_percent_and_psi(self):
+        with open(os.path.join(self.procroot, "meminfo"), "w") as source:
+            source.write("MemTotal: 1000 kB\nMemAvailable: 400 kB\n")
+        pressure_dir = os.path.join(self.procroot, "pressure")
+        os.makedirs(pressure_dir)
+        with open(os.path.join(pressure_dir, "memory"), "w") as source:
+            source.write("some avg10=0.10 avg60=0.20 avg300=0.30 total=42\n")
+        user_pressure = os.path.join(
+            self.cgroot, "user", str(os.getuid()), "memory.pressure"
+        )
+        os.makedirs(os.path.dirname(user_pressure))
+        with open(user_pressure, "w") as source:
+            source.write("full avg10=0.05 avg60=0.06 avg300=0.07 total=24\n")
+
+        with (
+            mock.patch.object(scenario, "PROCROOT", self.procroot),
+            mock.patch.object(scenario, "CGROOT", self.cgroot),
+        ):
+            sample = scenario._m3_pressure_snapshot()
+
+        self.assertEqual(sample["MemTotal_bytes"], 1000 * 1024)
+        self.assertEqual(sample["MemAvailable_bytes"], 400 * 1024)
+        self.assertEqual(sample["MemAvailable_percent"], 40.0)
+        self.assertIn("some avg10=0.10", sample["global_memory_pressure"][0])
+        self.assertIn("full avg10=0.05", sample["user_cgroup_memory_pressure"][0])
 
     def test_wait_for_event_returns_matching_line(self):
         log = os.path.join(self.tmp, "decisions.log")

@@ -475,17 +475,84 @@ class GuardDaemonTests(unittest.TestCase):
             self.assertEqual(self.daemon._guard_floor(), (50, None))
 
     def test_missing_pressure_trigger_files_are_reported_once(self):
-        self.daemon._sync_pressure_monitor()
+        sources = (
+            ("delegated-cgroup", "/missing/cgroup/memory.pressure"),
+            ("host-proc", "/missing/proc/pressure/memory"),
+        )
+        with mock.patch.object(
+            service.pressure_guard, "psi_trigger_sources", return_value=sources
+        ):
+            self.daemon._sync_pressure_monitor()
         self.assertIsNone(self.daemon.pressure_monitor)
-        self.assertEqual(len(self.daemon.pressure_watch_failures), 2)
+        self.assertGreaterEqual(len(self.daemon.pressure_watch_failures), 2)
         first = self.daemon.pressure_watch_signature
-        self.daemon._sync_pressure_monitor()
+        with mock.patch.object(
+            service.pressure_guard, "psi_trigger_sources", return_value=sources
+        ):
+            self.daemon._sync_pressure_monitor()
         self.assertEqual(self.daemon.pressure_watch_signature, first)
         with open(self.daemon.store.log_path, encoding="utf-8") as source:
             events = [json.loads(line) for line in source]
         self.assertEqual(
             sum(item.get("event") == "guard_trigger_unavailable" for item in events), 2
         )
+
+    def test_pressure_monitor_falls_back_to_host_psi_when_cgroup_write_fails(self):
+        read_fds, write_fds = zip(*(os.pipe() for _ in range(2)))
+        self.addCleanup(lambda: [os.close(fd) for fd in write_fds])
+        cgroup_path = "/delegated/memory.pressure"
+        host_path = "/proc/pressure/memory"
+        sources = (("delegated-cgroup", cgroup_path), ("host-proc", host_path))
+        read_fds_remaining = iter(read_fds)
+        trigger_fds = set()
+        original_open = os.open
+        original_write = os.write
+
+        def fake_open(path, *args, **kwargs):
+            if path == cgroup_path:
+                raise PermissionError("delegated PSI trigger is not writable")
+            if path == host_path:
+                fd = next(read_fds_remaining)
+                trigger_fds.add(fd)
+                return fd
+            return original_open(path, *args, **kwargs)
+
+        def fake_write(fd, payload):
+            return len(payload) if fd in trigger_fds else original_write(fd, payload)
+
+        with (
+            mock.patch.object(
+                service.pressure_guard,
+                "psi_trigger_sources",
+                return_value=sources,
+            ),
+            mock.patch.object(guard.os, "open", side_effect=fake_open),
+            mock.patch.object(guard.os, "write", side_effect=fake_write),
+        ):
+            self.daemon._sync_pressure_monitor()
+            self.assertEqual(self.daemon.pressure_watch_source, "host-proc")
+            self.assertEqual(self.daemon.pressure_watch_path, host_path)
+            self.assertEqual(
+                set(self.daemon.pressure_watch_metrics), {"some", "full"}
+            )
+            status = self.daemon.guard_status()
+            self.assertTrue(status["psi_trigger_writable"])
+            self.assertEqual(status["psi_trigger_source"], "host-proc")
+            self.assertTrue(
+                any("delegated PSI trigger is not writable" in row
+                    for row in status["psi_trigger_failures"])
+            )
+            with (
+                mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 20)),
+                mock.patch.object(
+                    service.memory,
+                    "pressure",
+                    return_value={"some_avg10": 8.0, "full_avg10": 0.0},
+                ) as read_pressure,
+            ):
+                self.assertTrue(self.daemon._guard_pressure_now_high())
+            read_pressure.assert_called_once_with(host_path)
+        self.daemon._close_pressure_monitor()
 
     def test_pressure_monitor_registers_collects_and_closes_with_guard(self):
         read_fd, write_fd = os.pipe()

@@ -129,6 +129,7 @@ Built-in scenarios:
   earlyoom floor. Verify a leftover has `oom_score_adj=500`, record earlyoom's selected
   process when it fires, then measure daemon RSS, CPU, sampling, and pressure triggers for
   610 seconds. The two-libc run therefore takes at least 20 minutes plus guest setup.
+  earlyoom is installed only inside the disposable guest.
 - **graphical** — start a disposable headless graphical session (private
   dbus-daemon, `weston --backend=headless` as the outer root, niri nested
   inside it) under a test-owned `XDG_RUNTIME_DIR`, run a scripted

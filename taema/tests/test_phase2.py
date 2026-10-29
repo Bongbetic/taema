@@ -284,6 +284,35 @@ class LineageTests(ProcCase):
         self.assertEqual([x["key"] for x in left], ["worker"])
         self.assertEqual(left[0]["root_key"], "app")
 
+    def test_same_executable_survivor_is_rerooted_instead_of_becoming_leftover(self):
+        l = lin()
+        self.shell()
+        self.fp.add(
+            21,
+            20,
+            comm="python3",
+            exe="/usr/bin/python3",
+            argv=["python3", "/tmp/app_root.py"],
+            born=9000.0,
+        )
+        self.fp.add(
+            22,
+            21,
+            comm="python3",
+            exe="/usr/bin/python3",
+            argv=["python3", "-c", "import time; time.sleep(3600)"],
+            born=9001.0,
+        )
+        self.obs(l)
+        self.obs(l, 10020.0)
+        self.fp.remove(21)
+        self.obs(l, 10040.0)
+
+        self.assertEqual(l.closed, [])
+        self.assertEqual(len(l.reroots), 1)
+        self.assertEqual(l.root_for(22), 22)
+        self.assertEqual(l.leftovers_of(21), [])
+
     def test_self_update_relaunch_reroots_not_leftover(self):
         l = lin()
         self.shell()

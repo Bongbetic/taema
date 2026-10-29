@@ -1159,7 +1159,8 @@ fn fallback_to_python() -> i32 {
         }
         let _ = tried;
     }
-    for cand in ["/usr/bin/taema"] {
+    {
+        let cand = "/usr/bin/taema";
         if std::path::Path::new(cand).is_file() {
             if let Ok(status) = std::process::Command::new(cand).args(rest).status() {
                 return status.code().unwrap_or(1);
@@ -1308,7 +1309,7 @@ fn move_self(scope: &str, pid: i64) -> Result<(), String> {
     match direct_move(scope, pid) {
         Ok(()) => Ok(()),
         Err(e) => match e.raw_os_error() {
-            Some(code) if code == libc::EACCES as i32 || code == libc::EPERM as i32 => {
+            Some(code) if code == libc::EACCES || code == libc::EPERM => {
                 sudo_move(scope, pid)
             }
             _ => {
@@ -1491,7 +1492,7 @@ fn exec_cmd(cmd: &[String]) -> i32 {
     let mut ptrs: Vec<*const libc::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
     unsafe {
-        libc::execvp(prog.as_ptr(), ptrs.as_ptr() as *const *const libc::c_char);
+        libc::execvp(prog.as_ptr(), ptrs.as_ptr());
         let err = std::io::Error::last_os_error();
         let msg = errno_message(&err);
         // exec failed: match Python's die-on-OSError path.

@@ -255,7 +255,7 @@ class LaunchDryRunParity(unittest.TestCase):
         import types
         from tests.test_phase0 import FakeCg, make_cfg, tmp
 
-        with FakeCg():
+        with FakeCg() as fake:
             cfg = make_cfg(tmp())
             args = types.SimpleNamespace(
                 app="x",
@@ -274,7 +274,15 @@ class LaunchDryRunParity(unittest.TestCase):
                 with redirect_stdout(out):
                     py_rc = cli.cmd_launch(args)
                 py_out = out.getvalue()
-        rs = run_rs("launch", "--dry-run", "--app", "x", "--", "true")
+            rs = run_rs(
+                "launch",
+                "--dry-run",
+                "--app",
+                "x",
+                "--",
+                "true",
+                extra={"TAEMA_CGROOT": fake.root},
+            )
         self.assertEqual(rs.returncode, py_rc)
         self.assertEqual(rs.stdout, py_out)
 

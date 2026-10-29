@@ -6848,8 +6848,298 @@ def scenario_m5(rec, args, tree_holder):
     return all(step["ok"] for step in rec.steps)
 
 
+def _eventd_db_instance(state_dir, app):
+    path = os.path.join(state_dir, "state.db")
+    with sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5) as db:
+        return db.execute(
+            "SELECT pid, start, born, exited FROM instances WHERE app = ? "
+            "ORDER BY coalesce(born, 0) DESC, id DESC LIMIT 1",
+            (app,),
+        ).fetchone()
+
+
+def _eventd_user_config_set(value):
+    """Set [experimental] eventd in the user config; return an undo closure."""
+    path = os.path.join(os.path.expanduser("~"), ".config", "taema", "taema.toml")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    original = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            original = handle.read()
+
+    def render(text):
+        lines = text.splitlines() if text else []
+        out = []
+        in_exp = False
+        exp_seen = False
+        done = False
+        for line in lines:
+            stripped = line.split("#", 1)[0].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                if in_exp and not done:
+                    out.append("eventd = %s" % value)
+                    done = True
+                in_exp = stripped[1:-1].strip() == "experimental"
+                exp_seen = exp_seen or in_exp
+            elif in_exp and re.match(r"eventd\s*=", stripped):
+                if not done:
+                    out.append("eventd = %s" % value)
+                    done = True
+                continue
+            out.append(line)
+        if not done:
+            if not exp_seen:
+                out.append("[experimental]")
+            out.append("eventd = %s" % value)
+        return "\n".join(out) + "\n"
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(render(original))
+
+    def undo():
+        if original is None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        else:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(original)
+
+    return undo
+
+
+def _eventd_stage_conf(tmpdir, conf, enable):
+    """Install or remove the TAEMA_EVENTD service conf override as root."""
+    original = None
+    if os.path.exists(conf):
+        with open(conf, encoding="utf-8") as handle:
+            original = handle.read()
+    if enable:
+        kept = [
+            line
+            for line in (original or "").splitlines()
+            if not line.strip().startswith("TAEMA_EVENTD")
+        ]
+        body = "\n".join(kept)
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += "TAEMA_EVENTD=1\n"
+        staged = os.path.join(tmpdir, "taema-eventd-conf")
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        installed = run_privileged(
+            ["install", "-m", "644", "-o", "root", "-g", "root", staged, conf]
+        )
+        if installed.returncode != 0:
+            raise ScenarioError("conf install: %s" % installed.stderr.strip()[:200])
+    elif original is None:
+        run_privileged(["rm", "-f", conf])
+    else:
+        staged = os.path.join(tmpdir, "taema-eventd-conf")
+        with open(staged, "w", encoding="utf-8") as handle:
+            handle.write(original)
+        installed = run_privileged(
+            ["install", "-m", "644", "-o", "root", "-g", "root", staged, conf]
+        )
+        if installed.returncode != 0:
+            raise ScenarioError("conf restore: %s" % installed.stderr.strip()[:200])
+    return original
+
+
+def _eventd_spawn_probe(sleep, tag):
+    """Copy sleep to a unique path and run it for 0.3 s; return (path, pid, life).
+
+    The basename stays under 15 characters: the ledger identity prefers the
+    kernel comm, which truncates there, so the queried app key must match.
+    """
+    del tag
+    dest = "/tmp/evdb%07d" % (int(time.time_ns() // 1000) % 10000000)
+    shutil.copy(sleep, dest)
+    os.chmod(dest, 0o755)
+    start = time.monotonic()
+    proc = subprocess.Popen([dest, "0.3"])
+    pid = proc.pid
+    proc.wait(timeout=30)
+    return dest, pid, time.monotonic() - start
+
+
+def _eventd_wait_row(state_dir, app, pid, timeout=150):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            last = _eventd_db_instance(state_dir, app)
+        except sqlite3.OperationalError:
+            last = None
+        if (
+            last is not None
+            and last[0] == pid
+            and last[2] is not None
+            and last[3] is not None
+        ):
+            return last
+        time.sleep(2)
+    return last
+
+
+def scenario_eventd(rec, args, tree_holder):
+    """M6 gate (#74): a sub-second process is recorded with eventd enabled.
+
+    Phase A runs with the stock config (forwarder off): the daemon must stay
+    healthy, proving behaviour is unchanged with eventd disabled. Phase B
+    enables the forwarder and the collector, restarts the service, and
+    requires a 0.3 s probe to land in the instance ledger with a sub-second
+    born-to-exit span. Everything is restored afterwards.
+    """
+    del tree_holder
+    uid = os.getuid()
+    sock = "/run/taema/events/%d.sock" % uid
+    conf = "/etc/sv/taema/conf"
+    tmpdir = tempfile.mkdtemp(prefix="taema-eventd-")
+    probes = []
+    undo_config = None
+
+    def cleanup_probes():
+        for path in probes:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except OSError:
+            pass
+
+    try:
+        status, _attempts = wait_for_auto_status(timeout=60)
+        rec.step(
+            "daemon-ready",
+            status.returncode == 0,
+            (status.stdout + status.stderr)[:200],
+        )
+        if status.returncode != 0:
+            return False
+
+        sleep = next(
+            (p for p in ("/bin/sleep", "/usr/bin/sleep") if os.path.isfile(p)),
+            "",
+        )
+        rec.step("sleep-present", bool(sleep), sleep or "no sleep binary")
+        if not sleep:
+            return False
+
+        # Phase A: stock config, forwarder off.
+        rec.step("forwarder-off-by-default", not os.path.exists(sock), sock)
+        dest_a, _pid_a, life_a = _eventd_spawn_probe(sleep, "evdprobe-a")
+        probes.append(dest_a)
+        healthy_a = _run(["/usr/bin/taema", "status"], timeout=30)
+        rec.step(
+            "disabled-healthy",
+            healthy_a.returncode == 0,
+            "probe_life=%.2fs rc=%d" % (life_a, healthy_a.returncode),
+        )
+
+        # Phase B: enable forwarder and collector, restart the service.
+        # The forwarder ships in the optional taema-eventd subpackage,
+        # which provisioning deliberately leaves out (off by default).
+        installed = run_privileged(
+            [
+                "xbps-install",
+                "-y",
+                "-i",
+                "--repository=/tmp/taema-vm/repo",
+                "taema-eventd",
+            ]
+        )
+        rec.step(
+            "forwarder-installed",
+            installed.returncode == 0,
+            (installed.stdout + installed.stderr).strip()[:200],
+        )
+        if installed.returncode != 0:
+            return False
+        undo_config = _eventd_user_config_set("true")
+        _eventd_stage_conf(tmpdir, conf, True)
+        restarted = run_privileged(["sv", "restart", "/var/service/taema"])
+        rec.step(
+            "service-restart",
+            restarted.returncode == 0,
+            (restarted.stdout + restarted.stderr).strip()[:200],
+        )
+        status_b, _ = wait_for_auto_status(timeout=90)
+        rec.step(
+            "daemon-ready-eventd",
+            status_b.returncode == 0,
+            (status_b.stdout + status_b.stderr)[:200],
+        )
+        if status_b.returncode != 0:
+            return False
+
+        # One throwaway ensures the forwarder created our listener.
+        dest_w, _, _ = _eventd_spawn_probe(sleep, "evdprobe-warm")
+        probes.append(dest_w)
+        sock_found = False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if os.path.exists(sock):
+                sock_found = True
+                break
+            time.sleep(1)
+        detail = sock
+        if sock_found:
+            try:
+                st = os.stat(sock)
+                detail = "%s mode=%04o uid=%d" % (
+                    sock,
+                    st.st_mode & 0o777,
+                    st.st_uid,
+                )
+                sock_found = (st.st_mode & 0o777) == 0o600 and st.st_uid == uid
+            except OSError as error:
+                detail = str(error)
+                sock_found = False
+        rec.step("socket-created-0600", sock_found, detail)
+        if not sock_found:
+            return False
+
+        dest_b, pid_b, life_b = _eventd_spawn_probe(sleep, "evdprobe-b")
+        probes.append(dest_b)
+        app_b = "exe:%s" % os.path.basename(dest_b)
+        row = _eventd_wait_row(args.state_dir, app_b, pid_b, timeout=150)
+        if row is None:
+            rec.step("subsecond-recorded", False, "no ledger row for %s" % app_b)
+            return False
+        span = row[3] - row[2]
+        rec.step(
+            "subsecond-recorded",
+            row[0] == pid_b and span < 1.0,
+            "app=%s pid=%d life=%.2fs span=%.3fs" % (app_b, row[0], life_b, span),
+        )
+        return all(step["ok"] for step in rec.steps)
+    except ScenarioError as error:
+        rec.step("fatal", False, str(error))
+        return False
+    finally:
+        try:
+            _eventd_stage_conf(tmpdir, conf, False)
+        except ScenarioError as error:
+            rec.step("conf-restore", False, str(error))
+        if undo_config is not None:
+            undo_config()
+        run_privileged(["sv", "restart", "/var/service/taema"])
+        status_c, _ = wait_for_auto_status(timeout=90)
+        rec.step(
+            "restored-healthy",
+            status_c.returncode == 0,
+            (status_c.stdout + status_c.stderr)[:200],
+        )
+        cleanup_probes()
+
+
 SCENARIOS = {
     "smoke": scenario_smoke,
+    "eventd": scenario_eventd,
     "m0": scenario_m0,
     "setup": scenario_setup,
     "m1": scenario_m1,

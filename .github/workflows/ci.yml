@@ -33,7 +33,7 @@ jobs:
       - name: Install tools
         run: |
           xbps-install -Syu xbps
-          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow cargo tar gzip
+          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow cargo tar gzip tzdata findutils
       - uses: actions/checkout@v4
       - name: Test as an unprivileged user
         run: |

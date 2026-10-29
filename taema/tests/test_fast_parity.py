@@ -407,6 +407,16 @@ class PerfGate(unittest.TestCase):
         med = self.p50([self.bin, "prompt"], env)
         self.assertLess(med, 5.0, "prompt p50 %.2f ms" % med)
 
+    def test_launch_dry_run_p50_under_30ms(self):
+        cgr = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cgr, True)
+        os.makedirs(
+            os.path.join(cgr, "user", str(os.getuid())), exist_ok=True
+        )
+        env = dict(os.environ, TAEMA_CGROOT=cgr)
+        med = self.p50([self.bin, "launch", "--dry-run", "--", "true"], env)
+        self.assertLess(med, 30.0, "launch p50 %.2f ms" % med)
+
     def test_done_down_p50_under_5ms(self):
         home = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, home, True)

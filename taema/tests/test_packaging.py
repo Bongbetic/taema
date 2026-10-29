@@ -106,7 +106,8 @@ class TemplateLayoutTest(unittest.TestCase):
         self.assertIn("cargo", fields["hostmakedepends"].split())
         self.assertIn("scdoc", fields["hostmakedepends"].split())
         self.assertEqual(
-            fields["depends"], "python3>=3.11 iproute2 util-linux sudo runit shadow"
+            fields["depends"],
+            "python3>=3.11 iproute2 util-linux sudo runit shadow tzdata",
         )
 
     def test_vendor_distfile_is_listed_with_its_checksum(self):

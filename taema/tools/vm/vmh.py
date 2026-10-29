@@ -50,6 +50,7 @@ GUEST_TMP = "/tmp/taema-vm"
 LIBCS = ("glibc", "musl")
 SCENARIOS = (
     "smoke",
+    "eventd",
     "m0",
     "m1",
     "m2",

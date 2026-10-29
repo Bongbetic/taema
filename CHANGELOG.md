@@ -1,3 +1,43 @@
+# 0.8.0
+
+## Behaviour changes
+
+### Native components: helper, fast client, eventd
+
+The privileged helper now ships as a Rust binary (`taema-attach.rs`) with
+the Python implementation kept as an exact fallback: 100% parity over the
+request corpus including every refusal case, plus `oom-restore` with
+pidfd-anchored identity checks. `cargo fuzz` targets cover the argument
+vector, the rules file, and the OOM record; the aggregate campaign totalled
+1,449 minutes (24.2 h) of libFuzzer time with zero crashes and about 2.17B
+executions (argv ~1.61B, oom_record ~448M, rules ~116M; per-run counts
+in `docs/security-review-0.8.0.md`).
+
+`taema-fast` carries the hook, prompt, launch, and bar paths: prompt answers
+in 0.82 ms p50 (gate: under 5 ms) and launch adds 0.80 ms overhead p50
+(gate: under 30 ms), measured over 100 runs. The `taema` wrapper dispatches
+launch and bar to the fast client when present.
+
+`taema-eventd` is a new optional root forwarder for kernel process events:
+per-uid `0600` sockets, a bounded 4,096-record ring per consumer with counted
+drops, and a backlog ring so freshly connected daemons catch up. The daemon
+collects from it behind `[experimental] eventd` (off by default); a new `eventd`
+VM scenario proves a 0.3 s probe lands in the instance ledger with eventd on,
+and that behaviour is unchanged with it off, on both glibc and musl.
+
+### Packaging and CI
+
+The forwarder ships in the split `taema-eventd` subpackage. The runtime and
+test dependencies now include `tzdata` (zoneinfo) and the CI image installs
+`findutils` to match the release image. Clippy is clean under `-D warnings`.
+
+### Security review
+
+`docs/security-review-0.8.0.md` covers helper parsing, identity checks,
+`oom-restore`, eventd socket permissions, and resource bounds. Review fixes
+in this release: fast-client lints, the launch parity test's cgroup root,
+and the CI/test dependencies above. No privilege-boundary bypass was found.
+
 # 0.7.0
 
 ## Behaviour changes

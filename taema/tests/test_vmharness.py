@@ -814,6 +814,7 @@ class HarnessCliParsingTest(VmTestCase):
             vmh.parse_scenarios("all"),
             [
                 "smoke",
+                "eventd",
                 "m0",
                 "m1",
                 "m2",
@@ -865,6 +866,16 @@ class HarnessCliParsingTest(VmTestCase):
             item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:m5"
         )
         self.assertIn("scenario.py m5", step["argv"][-1])
+
+    def test_eventd_is_a_registered_guest_scenario(self):
+        self.assertIn("eventd", vmh.SCENARIOS)
+        self.assertIn("eventd", scenario.SCENARIOS)
+        cfg = vmh.load_config(self.write_config(libcs=["glibc"], scenarios=["eventd"]))
+        plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["eventd"], kvm=False)
+        step = next(
+            item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:eventd"
+        )
+        self.assertIn("scenario.py eventd", step["argv"][-1])
 
     def test_graphical_is_a_registered_guest_scenario(self):
         self.assertIn("graphical", vmh.SCENARIOS)
@@ -937,7 +948,7 @@ class HarnessSurfacesTest(unittest.TestCase):
 
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
-        self.assertEqual(vmh.read_version(ROOT), "0.7.0")
+        self.assertEqual(vmh.read_version(ROOT), "0.8.0")
 
     def test_release_notes_document_0_5_0_resource_governor(self):
         notes = read_text(os.path.join(REPO, "CHANGELOG.md"))

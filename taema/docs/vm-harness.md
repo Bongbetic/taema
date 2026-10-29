@@ -105,6 +105,11 @@ Built-in scenarios:
   is contained in an `app-*` scope → wait for the matching `adopt` audit event
   → close the root → assert both survivors are members of the same
   `leftover/*` scope → capture daemon logs.
+- **eventd** — the 0.8.0 forwarder gate (issue #74): with the stock
+  config the forwarder stays off and the daemon stays healthy; with
+  `TAEMA_EVENTD=1` and `[experimental] eventd = true` a 0.3 s probe lands in
+  the instance ledger with a sub-second born-to-exit span, on a per-uid
+  `0600` socket. Service and user config are restored afterwards.
 - **m0** — exercise GUI survivor containment and review in `adopt`, manual-stop
   vetoes, `taema run --bind` owner exit, runtime-directory GC in `auto`, and
   observe-mode no-mutation plus deduplicated would-stop audit records. It waits

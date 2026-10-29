@@ -45,7 +45,7 @@ mkdir -p "$eventd_stage/usr/bin"
 mv "$stage/usr/bin/taema-eventd" "$eventd_stage/usr/bin/taema-eventd"
 (cd "$repo" && xbps-create -A "$arch" -n "$pkg" \
     -s "Dependency-aware, self-managing cgroup v2 process scopes" \
-    -D "python3>=3.11_1 iproute2>=0 util-linux>=0 sudo>=0 runit>=0 shadow>=0" \
+    -D "python3>=3.11_1 iproute2>=0 util-linux>=0 sudo>=0 runit>=0 shadow>=0 tzdata>=0" \
     -l custom:PolyForm-Noncommercial-1.0.0 -H https://github.com/Bongbetic/taema \
     -m "soubarnak <soubarna@live.in>" \
     --config-files "/etc/taema/taema.toml /etc/taema/units/*.toml" \

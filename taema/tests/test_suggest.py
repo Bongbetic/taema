@@ -1,7 +1,6 @@
 """Ranked, user-confirmed improvement suggestions (issue #79)."""
 
 import io
-import json
 import os
 import tempfile
 import unittest
@@ -94,8 +93,6 @@ class SuggestTests(unittest.TestCase):
         )
 
     def test_suggest_lists_ranked_suggestions(self):
-        from taema import suggest
-
         review = self.make_review()
         self.age_review(review, 4)
         self.store.save()
@@ -149,8 +146,6 @@ class SuggestTests(unittest.TestCase):
         self.assertEqual(check.data["vetoes"], [])
 
     def stable_signature(self, owner="browser", member="worker", closes=5):
-        from taema.store import db as db_mod
-
         signature = {
             "id": "sig-%s" % owner,
             "owner": owner,
@@ -466,8 +461,6 @@ class SuggestTests(unittest.TestCase):
         self.assertTrue(trailer)
 
     def test_bare_taema_shows_one_suggestion(self):
-        import tempfile as _tempfile
-
         from tests.test_phase0 import make_cfg
 
         state_dir = os.path.join(self.temp.name, "bare-state")

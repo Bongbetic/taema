@@ -86,8 +86,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # $RUNNER_TEMP (container path), not the runner.temp context
+          # (host path): the package was built into the container mount.
           gh release upload "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
-            --clobber "${{ runner.temp }}/repo/"*
+            --clobber "$RUNNER_TEMP/repo/"*
 
   sign:
     needs: build

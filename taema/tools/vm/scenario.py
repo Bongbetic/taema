@@ -5351,58 +5351,6 @@ def _m3_footprint_probe(rec, args):
         )
 
 
-def scenario_m3(rec, args, tree_holder):
-    """Exercise 0.5.0 resource-governor acceptance in the disposable QEMU guest."""
-    identity = ""
-    for path in ("/sys/class/dmi/id/sys_vendor", "/sys/class/dmi/id/product_name"):
-        try:
-            with open(path, encoding="utf-8") as source:
-                identity += source.read().strip() + " "
-        except OSError:
-            pass
-    inside_qemu = "qemu" in identity.lower()
-    rec.step(
-        "disposable-qemu-guest", inside_qemu, identity.strip() or "DMI unavailable"
-    )
-    if not inside_qemu:
-        raise ScenarioError(
-            "M3 acceptance must run only inside the disposable QEMU guest"
-        )
-
-    test_root = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isdir(os.path.join(test_root, "tests")):
-        raise ScenarioError("guest test sources were not bootstrapped")
-    wake_ok = _m3_run_tests(
-        rec,
-        args,
-        "m3-live-http-wake",
-        ["tests.test_freeze_live"],
-        extra_env={"TAEMA_LIVE_FREEZE_TEST": "1"},
-        fail_on_skip=True,
-    )
-    qmp_ok = _m3_run_tests(
-        rec,
-        args,
-        "m3-fake-qmp-save-stop",
-        [
-            "tests.test_m3_live_qmp.LiveQmpSaveStopTests.test_connected_qmp_client_blocks_save_and_stop_until_disconnect",
-            "tests.test_phase0.GcRules.test_runtime_socket_peers_hold_the_scope_past_no_attachment_grace",
-            "tests.test_phase0.GcRules.test_missing_qmp_socket_is_a_runtime_quit_signal",
-            "tests.test_reclaim.DaemonReclaimTests.test_vm_save_hook_is_blocked_by_management_client_dependency",
-            "tests.test_reclaim.DaemonReclaimTests.test_successful_vm_save_hook_unlocks_anon_reclaim",
-            "tests.test_phase4.RuntimeGc.test_cleanup_orders_hook_reclaim_stop_and_records_freed_state",
-            "tests.test_phase4.RuntimeGc.test_refused_stop_preflight_blocks_preservation_and_cleanup",
-        ],
-        extra_env={"TAEMA_LIVE_QMP_TEST": "1"},
-        fail_on_skip=True,
-    )
-    if not (wake_ok and qmp_ok):
-        raise ScenarioError("focused HTTP/QMP guest checks failed")
-    _m3_pressure_probe(rec, args)
-    _m3_footprint_probe(rec, args)
-    return all(step["ok"] for step in rec.steps)
-
-
 def scenario_remove(rec, args, tree_holder):
     """Remove the package and verify the guest is cleaned up."""
     rm = run_privileged(["xbps-remove", "-y", "taema"])

@@ -63,7 +63,9 @@ def psi_threshold_percent(setting: str, metric: str) -> float:
     return amount * 100.0 / window
 
 
-def psi_trigger_sources(cgroup_path: str, proc_root: str | None = None):
+def psi_trigger_sources(
+    cgroup_path: str, proc_root: str | None = None
+) -> tuple[tuple[str, str], tuple[str, str]]:
     """Return delegated PSI first, then host PSI as a labeled fallback."""
     proc_root = proc_root or os.environ.get("TAEMA_PROCROOT", "/proc")
     return (

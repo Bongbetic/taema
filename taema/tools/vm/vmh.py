@@ -970,6 +970,10 @@ def build_package(cfg, libcs=None):
 def ensure_ssh_key(cfg):
     key, pub = ssh_key_paths(cfg)
     if os.path.isfile(key) and os.path.isfile(pub):
+        # ssh ignores a private key readable by anyone else; enforce 0600
+        # on every run, not just at creation (a loose key fails closed as
+        # "ssh not ready" with no hint).
+        os.chmod(key, 0o600)
         return key, pub
     os.makedirs(os.path.dirname(key), exist_ok=True)
     r = subprocess.run(

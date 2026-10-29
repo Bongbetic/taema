@@ -2250,6 +2250,18 @@ def cmd_explain(a):
                 "comm": inspect.comm(pid),
                 "cgroup": cgroup.proc_cgroup(pid) or "",
             }
+            if store is not None:
+                # Same bridge as the app-key branch below: the launch
+                # record lives under the scope while a pid resolves to
+                # its executable identity.
+                launch_apps = store.data.get("launch_apps")
+                if isinstance(launch_apps, dict):
+                    leaf = scope.rsplit("/", 1)[-1] if scope else ""
+                    for candidate in (scope, leaf):
+                        launch = launch_apps.get(candidate) if candidate else None
+                        if isinstance(launch, dict) and launch.get("launched_by"):
+                            provenance["launched_by"] = launch["launched_by"]
+                            break
             explanation = _why_report(
                 cfg,
                 store,
@@ -2273,6 +2285,21 @@ def cmd_explain(a):
             info = store.explain(key)
             persisted = store.latest_app_instance(key) or {}
             scope = selected.scope or persisted.get("scope") or ""
+            if not persisted.get("launched_by") and store is not None:
+                # The launch record lives under the app name while a pid
+                # resolves to its executable identity; bridge the two so
+                # `why PID` shows how a launched app arrived (as scope
+                # explanations already do via launch_apps).
+                launch_apps = store.data.get("launch_apps")
+                if isinstance(launch_apps, dict):
+                    leaf = scope.rsplit("/", 1)[-1] if scope else ""
+                    for candidate in (scope, leaf):
+                        launch = launch_apps.get(candidate) if candidate else None
+                        if isinstance(launch, dict) and launch.get("launched_by"):
+                            persisted = dict(
+                                persisted, launched_by=launch["launched_by"]
+                            )
+                            break
             live_scope = bool(selected.scope and cgroup.resolve(selected.scope))
             live_identity = None
             members = [{"apps": [key]}]

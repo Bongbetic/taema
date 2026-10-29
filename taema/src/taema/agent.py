@@ -83,18 +83,9 @@ def ensure_leaf(pid, ask):
         dest = cgroup.mkleaf(policy.AGENT_LEAF)
         cgroup.move(pid, dest)
         return True
-    except OSError as error:  # [DEBUG-m5agent] temporary gate diagnosis
-        import sys
-
-        print(
-            "[DEBUG-m5agent] direct join failed: %r dest=%s"
-            % (error, cgroup.base() + "/agent"),
-            file=sys.stderr,
-        )
+    except OSError:
+        pass
     reply = ask({"cmd": "attach", "scope": policy.AGENT_LEAF, "pids": [pid]})
-    import sys as _sys  # [DEBUG-m5agent] temporary gate diagnosis
-
-    print("[DEBUG-m5agent] attach reply: %r" % (reply,), file=_sys.stderr)
     return isinstance(reply, dict) and reply.get("ok") is True
 
 

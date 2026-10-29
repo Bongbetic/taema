@@ -747,9 +747,15 @@ class HarnessCliParsingTest(VmTestCase):
     def test_m5_fast_config_disables_batching_and_grace(self):
         text = scenario._m5_fast_config_text()
         self.assertIn("batch_seconds = 0", text)
-        self.assertIn("windowless_grace = 3", text)
+        self.assertIn("windowless_grace = 0", text)
+        self.assertIn("windowless_interval = 1", text)
         self.assertIn("launch_wrap = true", text)
         self.assertTrue(scenario._m5_dropin_path().endswith("taema.d/99-m5-fast.toml"))
+
+    def test_m5_quit_config_restores_grace_with_slow_sweep(self):
+        text = scenario._m5_fast_config_text(3, 10)
+        self.assertIn("windowless_grace = 3", text)
+        self.assertIn("windowless_interval = 10", text)
 
     def test_m0_acceptance_is_a_registered_guest_scenario(self):
         self.assertIn("m0", vmh.SCENARIOS)

@@ -4396,19 +4396,25 @@ def _m5_dropin_path():
     return os.path.join(_m5_config_home(), "taema", "taema.d", _M5_DROPIN_NAME)
 
 
-def _m5_fast_config_text():
-    """Test-only delays: no batching, short grace, fast adopt, wrap enabled."""
+def _m5_fast_config_text(grace=0, interval=1):
+    """Test-only delays: no batching, wrap enabled, fast adopt.
+
+    Bullet 1 (#67) runs with batching and grace disabled and a 1 s
+    windowless sweep so the last-window question lands within 3 s of
+    the close. Bullet 2 needs a real grace, so it rewrites this dropin
+    with grace 3 and a 10 s sweep (stop lands inside 48 s; reopen at
+    ~2 s with the ~5 s agent feed still cancels it).
+    """
     return (
         "# taema-vm-m5: fast delays for the M5 gate; removed on teardown.\n"
         "[notify]\n"
         "batch_seconds = 0\n"
         "\n"
         "[agent]\n"
-        "windowless_grace = 3\n"
-        "\n"
+        "windowless_grace = %d\n" % grace + "\n"
         "[timers]\n"
         "adopt_interval = 2\n"
-        "\n"
+        "windowless_interval = %d\n" % interval + "\n"
         "[experimental]\n"
         "launch_wrap = true\n"
     )
@@ -4429,11 +4435,11 @@ def _m5_snapshot():
     return snapshot
 
 
-def _m5_write_fast():
+def _m5_write_fast(grace=0, interval=1):
     dropin = _m5_dropin_path()
     os.makedirs(os.path.dirname(dropin), exist_ok=True)
     with open(dropin, "w") as handle:
-        handle.write(_m5_fast_config_text())
+        handle.write(_m5_fast_config_text(grace, interval))
     reloaded = _run(["taema", "reload"], timeout=30)
     if reloaded.returncode != 0:
         raise ScenarioError(
@@ -4477,19 +4483,6 @@ def _m5_review_ids(timeout=30):
         if isinstance(item, dict) and item.get("id") is not None:
             ids.append(item["id"])
     return ids
-
-
-def _m5_wait_new_review(before, timeout=30):
-    """Poll until a review id appears that was not in `before`; return it."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        ids = _m5_review_ids()
-        if ids is not None:
-            fresh = [item for item in ids if item not in before]
-            if fresh:
-                return fresh[0]
-        time.sleep(0.25)
-    raise ScenarioError("no new review appeared within %ss" % timeout)
 
 
 def _m5_popen_launch(niri_env, artifacts, tag, app, cmd, logs):
@@ -4658,8 +4651,13 @@ def scenario_m5(rec, args, tree_holder):
         if default_root.poll() is None:
             default_root.terminate()
 
-        _m5_write_fast()
-        rec.step("fast-delays", True, "batch 0 s, grace 3 s, adopt 2 s")
+        # Ticket #67 bullet 1 runs with batching and grace disabled.
+        _m5_write_fast(0, 1)
+        rec.step(
+            "fast-delays",
+            True,
+            "batch 0 s, grace disabled, sweep 1 s, adopt 2 s",
+        )
 
         agent, agent_log = _m5_popen_agent(niri_env, args.artifacts, "1", launch_logs)
         try:
@@ -4676,14 +4674,28 @@ def scenario_m5(rec, args, tree_holder):
             return False
 
         # Bullet 1: last-window close with a surviving child reviews fast.
-        before = _m5_review_ids() or []
+        # Detection reads the daemon's audit event, not `taema review`:
+        # the CLI sees the store file, which the daemon flushes on its
+        # own schedule, while the audit event fires in the same call
+        # that queues the review and its notification job.
+        # The cursor precedes the launch: with grace disabled the
+        # question can be queued on the first windowless observation,
+        # which may land just before the close when the agent's window
+        # feed has not reported the fresh window yet.
         close_app = "m5close"
+        try:
+            audit_offset = os.stat(log_path).st_size
+        except OSError:
+            audit_offset = 0
         foot, foot_log = _m5_popen_launch(
             niri_env,
             args.artifacts,
             "close",
             close_app,
-            ["foot", "sh", "-c", "setsid sleep 300 & wait"],
+            # tail (not sleep): the survivor needs an attributable,
+            # answerable identity, and sleep is a trivial command that
+            # the identity policy marks invalid.
+            ["foot", "sh", "-c", "setsid tail -f /dev/null & wait"],
             launch_logs,
         )
         launched.append(foot)
@@ -4706,11 +4718,21 @@ def scenario_m5(rec, args, tree_holder):
         except ScenarioError as error:
             rec.step("close-last-window", False, str(error))
         try:
-            review_id = _m5_wait_new_review(before, timeout=30)
+            # close_scope is a full relative path (user/1001/app-m5close)
+            # while the audit event carries the leaf (app-m5close).
+            close_leaf = close_scope.rsplit("/", 1)[-1]
+            created = wait_for_audit_event_after(
+                log_path,
+                audit_offset,
+                "review_created",
+                predicate=lambda event: event.get("scope") == close_leaf,
+                timeout=30,
+            )
+            review_id = created.get("id")
             elapsed = time.monotonic() - closed_at
             rec.step(
                 "review-within-3s",
-                elapsed < 3.0,
+                review_id is not None and elapsed < 3.0,
                 "review %s after %.1fs" % (review_id, elapsed),
             )
         except ScenarioError as error:
@@ -4732,7 +4754,7 @@ def scenario_m5(rec, args, tree_holder):
             if helper_gone:
                 break
             time.sleep(0.25)
-        rec.step("stop-reaps-survivor", helper_gone, "sleep helper exited")
+        rec.step("stop-reaps-survivor", helper_gone, "tail helper exited")
         rec.step(
             "stop-removes-scope",
             wait_for_scope_gone(close_scope, timeout=20),
@@ -4740,6 +4762,10 @@ def scenario_m5(rec, args, tree_holder):
         )
 
         # Bullet 2: on_last_window=quit stops after grace; reopen cancels.
+        # Bullet 2 needs a real grace, so rewrite the dropin: grace 3 s
+        # with a 10 s sweep (stop lands inside 48 s; a reopen at ~2 s,
+        # visible to the daemon inside ~7 s via the agent feed, cancels it).
+        _m5_write_fast(3, 10)
         unit_path = os.path.join(_m5_config_home(), "taema", "units", "m5quit.toml")
         os.makedirs(os.path.dirname(unit_path), exist_ok=True)
         with open(unit_path, "w") as handle:
@@ -4751,8 +4777,15 @@ def scenario_m5(rec, args, tree_holder):
         reloaded = _run(["taema", "reload"], timeout=30)
         rec.step("quit-unit-reloads", reloaded.returncode == 0, "m5quit unit")
         quit_app = "m5quit"
+        # The quit target needs a surviving child: a bare foot exits with
+        # its window, leaving an empty scope with nothing to stop.
         quit_foot, quit_log = _m5_popen_launch(
-            niri_env, args.artifacts, "quit", quit_app, ["foot"], launch_logs
+            niri_env,
+            args.artifacts,
+            "quit",
+            quit_app,
+            ["foot", "sh", "-c", "setsid tail -f /dev/null & wait"],
+            launch_logs,
         )
         launched.append(quit_foot)
         quit_scope = _m5_wait_launch_scope(
@@ -4802,16 +4835,32 @@ def scenario_m5(rec, args, tree_holder):
                 proc.terminate()
 
         # Bullet 3: a wrapped desktop entry launches in its scope with proof.
+        # wrap only consults system entries, so install the fixture entry
+        # to /usr/local/share/applications (this VM is disposable).
+        system_entry = "/usr/local/share/applications/m5wrap.desktop"
+        staged = os.path.join(args.artifacts, "m5wrap.desktop")
+        with open(staged, "w") as handle:
+            handle.write(
+                "[Desktop Entry]\nType=Application\nName=M5Wrap\n"
+                # tail (not sleep): the launch record needs an attributable,
+                # answerable owner identity, and sleep is a trivial command
+                # the identity policy marks invalid.
+                "Exec=tail -f /dev/null\nNoDisplay=true\n"
+            )
+        made_dir = run_privileged(
+            ["mkdir", "-p", "/usr/local/share/applications"], timeout=30
+        )
+        installed = run_privileged(["cp", staged, system_entry], timeout=30)
+        rec.step(
+            "desktop-entry-installed",
+            made_dir.returncode == 0
+            and installed.returncode == 0
+            and os.path.isfile(system_entry),
+            (installed.stdout + installed.stderr)[:200],
+        )
         apps_dir = os.path.join(
             os.path.expanduser("~"), ".local", "share", "applications"
         )
-        os.makedirs(apps_dir, exist_ok=True)
-        entry = os.path.join(apps_dir, "m5wrap.desktop")
-        with open(entry, "w") as handle:
-            handle.write(
-                "[Desktop Entry]\nType=Application\nName=M5Wrap\n"
-                "Exec=sleep 300\nNoDisplay=true\n"
-            )
         wrapped = _run(["taema", "desktop", "wrap", "m5wrap.desktop"], timeout=30)
         rec.step(
             "desktop-wrap",

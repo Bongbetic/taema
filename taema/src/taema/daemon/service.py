@@ -8,6 +8,7 @@ a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re
 
 import collections
 from dataclasses import dataclass, replace
+import errno
 from types import SimpleNamespace
 import json
 import os
@@ -234,6 +235,7 @@ class Daemon:
         }
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.iv_windowless = policy.timer(cfg, "windowless_interval", 30)
         self.iv_memory = 60.0
         self.iv_reclaim = max(
             1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
@@ -1464,10 +1466,14 @@ class Daemon:
         authority=None,
         trigger=authorization.GC_STOP,
         _countdown_approved=False,
+        _user_approved=False,
     ):
         """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
         decided stop); otherwise only the idle checks (known CPU, no edges, no pty host, not protected) apply.
-        SIGKILL only when every pair was answered explicitly. Returns True when the scope was removed."""
+        _user_approved (an explicit user stop order) waives the CPU-freshness
+        heuristic -- unknown CPU no longer refuses -- while edges, pty host,
+        and protected members still do. SIGKILL only when every pair was
+        answered explicitly. Returns True when the scope was removed."""
         leaf = cgroup.rel(path)
         infos = self._infos(cgroup.tree_procs(path))
         if not infos:
@@ -1527,8 +1533,8 @@ class Daemon:
                     or i["edges"]
                     or i["protected"]
                     or i["ptmx"]
-                    or cpu is None
-                    or cpu > engine.AUTO_MAX_CPU
+                    or (cpu is None and not _user_approved)
+                    or (cpu is not None and cpu > engine.AUTO_MAX_CPU)
                 )
                 if i["edges"] is None:
                     w = "edges unknown"
@@ -4902,6 +4908,10 @@ class Daemon:
         }
         while len(launch_apps) > 256:
             launch_apps.pop(next(iter(launch_apps)))
+        # Flush now: `why` and other CLI readers load the store from disk in
+        # their own process, so the provenance must be durable before we
+        # report the claim as done (not whenever the next periodic save lands).
+        self.store.save()
         del self.launch_reservations[scope]
         owner = reservation.get("owner")
         watching = self.watch_owner(scope, owner) if owner else False
@@ -4950,18 +4960,32 @@ class Daemon:
                     del launch_apps[scope]
 
     def attach_agent(self, pids):
-        """Move same-uid pids into the agent leaf with a direct write, no helper."""
+        """Move same-uid pids into the agent leaf (helper for cross-cgroup)."""
         try:
             dest = cgroup.mkleaf(policy.AGENT_LEAF)
         except OSError as error:
             return {"error": "agent leaf unavailable: %s" % error}
         done = []
+        refused = []
         for p in dict.fromkeys(pids):
+            # Fast path: moves inside the delegated subtree work directly.
             try:
                 cgroup.move(p, dest)
             except OSError as error:
+                if getattr(error, "errno", None) in (errno.EACCES, errno.EPERM):
+                    refused.append(p)
+                    continue
                 return {"error": "attach failed: %s" % error, "attached": done}
             done.append(p)
+        if refused:
+            # A login-session cgroup cannot write outside its subtree (the
+            # kernel's common-ancestor rule), so cross-boundary moves go
+            # through the privileged helper like launch moves do.
+            try:
+                engine.helper_move(self.cfg, policy.AGENT_LEAF, refused)
+            except engine.Refused as error:
+                return {"error": "attach failed: %s" % error, "attached": done}
+            done.extend(refused)
         self.store.log(event="attach", scope=policy.AGENT_LEAF, pids=done[:8])
         return {"ok": True, "attached": done}
 
@@ -5592,6 +5616,38 @@ class Daemon:
                     (reviews.get(review_id) or {}).get("state") == "open"
                     for review_id in asked_ids
                 ):
+                    continue
+                # An answered stop is an order, not a lapse: keep trying
+                # to stop the scope instead of re-asking about it. The
+                # first attempts can hit idle gates (no CPU sample yet),
+                # so the pending question stays until the stop lands.
+                answered_stop = [
+                    review_id
+                    for review_id in asked_ids
+                    if (reviews.get(review_id) or {}).get("state") == "answered"
+                    and (reviews.get(review_id) or {}).get("answer") == "stop"
+                ]
+                if answered_stop:
+                    stopped = self.guarded(
+                        lambda: self.auto_stop_path(
+                            path,
+                            "windowless answer stop",
+                            False,
+                            authority=self.effective_authority["value"],
+                            trigger=authorization.GC_STOP,
+                            _user_approved=True,
+                        )
+                    )
+                    if stopped:
+                        for review_id in asked_ids:
+                            self._windowless_ask.pop(review_id, None)
+                        self.store.log(
+                            event="windowless_close",
+                            scope=scope,
+                            app=app_key,
+                            why="answered stop",
+                        )
+                        self._windowless_since.pop(scope, None)
                     continue
                 # The question lapsed unanswered: remember the keep
                 # evidence, widen this app's grace, and restart it.
@@ -7250,6 +7306,7 @@ class Daemon:
         self.lineage.identity_sink = self.store.record_identities
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.iv_windowless = policy.timer(cfg, "windowless_interval", 30)
         self.mem_enabled = memory.enabled(cfg)
         self.iv_reclaim = max(
             1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
@@ -8046,7 +8103,7 @@ class Daemon:
             if now - self.last.get("freeze", 0.0) >= 60.0:
                 self.last["freeze"] = now
                 self.guarded(self.freeze_pass)
-            if now - self.last.get("windowless", 0.0) >= 30.0:
+            if now - self.last.get("windowless", 0.0) >= self.iv_windowless:
                 self.last["windowless"] = now
                 self.guarded(lambda: self.windowless_pass(now=now))
             if now - self.last.get("launch", 0.0) >= 1.0:

@@ -24,6 +24,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = json.loads((ROOT / "schema" / "cli" / "read-v1.json").read_text())
 
 
+def cgroup_scope_line(cg, scope):
+    """The /proc cgroup line for a fixture scope (the kernel disagrees)."""
+    from taema.core import cgroup
+
+    path = cgroup.resolve(scope)
+    assert path is not None
+    return path[len(cg.root) :]
+
+
 class CliRegistry(unittest.TestCase):
     def test_legacy_commands_and_requested_aliases_are_registered(self):
         parser = framework._parser()
@@ -331,6 +340,39 @@ class CliViews(unittest.TestCase):
                 commands._status_store(fast_cfg, pending_only=True), knowledge.Store
             )
 
+    def test_explain_pid_shows_launch_provenance(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            store = knowledge.Store(state_dir, {})
+            store.data["launch_apps"] = {
+                "app-test": {"app": "test", "launched_by": "launch"}
+            }
+            cfg = make_cfg(state_dir)
+            with FakeCg() as cg:
+                cg.leaf("app-test", [os.getpid()])
+                args = SimpleNamespace(
+                    target=str(os.getpid()),
+                    pair=None,
+                    pick=False,
+                    json=False,
+                    jsonl=False,
+                )
+                # The fixture lists our pid in the scope but the host kernel
+                # disagrees; bridge that one un-fakeable fact so the pid
+                # branch runs its real scope check.
+                scope_line = cgroup_scope_line(cg, "app-test")
+                with (
+                    mock.patch.object(commands, "_load", return_value=(cfg, store, {})),
+                    mock.patch(
+                        "taema.core.cgroup.proc_cgroup",
+                        return_value=scope_line,
+                    ),
+                ):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = commands.cmd_explain(args)
+            self.assertEqual(result, 0)
+            self.assertIn("launched_by=launch", output.getvalue())
+
     def test_status_and_ls_emit_schema_valid_shared_snapshots(self):
         with tempfile.TemporaryDirectory() as state_dir:
             store = knowledge.Store(state_dir, {})
@@ -340,6 +382,7 @@ class CliViews(unittest.TestCase):
             with (
                 mock.patch.object(commands, "_load_status", return_value=(cfg, store)),
                 mock.patch.object(commands, "ask", return_value=None),
+                mock.patch.object(commands, "_fast_status_probe", return_value=None),
                 mock.patch.object(
                     commands.cgroup, "base", return_value="/missing/cgroup"
                 ),

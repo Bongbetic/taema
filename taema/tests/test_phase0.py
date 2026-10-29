@@ -452,7 +452,9 @@ class MatchesAndNames(unittest.TestCase):
         ]
         self.assertIs(engine.unit_for_leaf(units, "claude-desktop"), units[0])
         self.assertIs(engine.unit_for_leaf(units, "claude-desktop-ab12cd34"), units[0])
+        self.assertIs(engine.unit_for_leaf(units, "app-claude-desktop"), units[0])
         self.assertIsNone(engine.unit_for_leaf(units, "vm-1"))
+        self.assertIsNone(engine.unit_for_leaf(units, "app-vm"))
         self.assertIsNone(engine.unit_for_leaf(units, "claude-desktopx"))
 
     def test_leaf_slug_always_valid(self):

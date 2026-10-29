@@ -139,11 +139,16 @@ def self_guard(path):
 
 
 def unit_for_leaf(units, leaf):
-    """The unit for a top-level leaf: exact name, or '<unit name>-<suffix>' for app units."""
+    """The unit for a top-level leaf: exact name, '<unit name>-<suffix>', or
+    'app-<unit name>' for app units (`taema launch --app NAME` scopes)."""
     for u in units:
         n = u.get("unit", {}).get("name")
-        if n and (
-            leaf == n or (u["unit"].get("kind") == "app" and leaf.startswith(n + "-"))
+        if not n:
+            continue
+        if leaf == n:
+            return u
+        if u["unit"].get("kind") == "app" and (
+            leaf.startswith(n + "-") or leaf == "app-" + n
         ):
             return u
     return None

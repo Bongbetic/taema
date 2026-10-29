@@ -1214,6 +1214,117 @@ class WindowlessPolicyTests(unittest.TestCase):
         )
         self.assertNotIn(7, daemon._windowless_ask)
 
+    def test_answered_stop_stops_instead_of_reasking(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        daemon.store.data.setdefault("reviews", []).append(
+            {
+                "id": 7,
+                "kind": "close",
+                "owner": "exe:x:1:2",
+                "scope": "app-x",
+                "state": "answered",
+                "answer": "stop",
+                "created": 1000.0,
+                "expires": 1000.0 + 3600,
+            }
+        )
+        daemon._windowless_ask = {7: ("app-x", "x")}
+        with mock.patch.object(daemon, "auto_stop_path", return_value=True) as stopper:
+            daemon.windowless_pass(now=1000.0 + 3600)
+        stopper.assert_called_once()
+        self.assertNotIn(7, daemon._windowless_ask)
+
+    def test_answered_stop_retries_until_it_lands(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        daemon.store.data.setdefault("reviews", []).append(
+            {
+                "id": 7,
+                "kind": "close",
+                "owner": "exe:x:1:2",
+                "scope": "app-x",
+                "state": "answered",
+                "answer": "stop",
+                "created": 1000.0,
+                "expires": 1000.0 + 3600,
+            }
+        )
+        daemon._windowless_ask = {7: ("app-x", "x")}
+        with mock.patch.object(
+            daemon, "auto_stop_path", side_effect=[False, True]
+        ) as stopper:
+            daemon.windowless_pass(now=1000.0 + 3600)
+            self.assertIn(7, daemon._windowless_ask)
+            daemon.windowless_pass(now=1000.0 + 3601)
+            self.assertNotIn(7, daemon._windowless_ask)
+        self.assertEqual(stopper.call_count, 2)
+
+    def test_user_approved_stop_skips_unknown_cpu(self):
+        from taema.governor import engine as gov_engine
+
+        _cg, daemon = self._daemon()
+        info = {
+            "pid": 4242,
+            "start": 1000,
+            "key": "exe:x",
+            "origin": "exe:x",
+            "edges": [],
+            "protected": None,
+            "ptmx": False,
+            "cpu": None,
+        }
+        with (
+            mock.patch.object(daemon, "_infos", return_value=[info]),
+            mock.patch.object(gov_engine, "stop", return_value={"removed": True}),
+        ):
+            refused = daemon.auto_stop_path("app-x", "test", False)
+            self.assertFalse(refused)
+            approved = daemon.auto_stop_path(
+                "app-x", "test", False, _user_approved=True
+            )
+            self.assertTrue(approved)
+
+    def test_launch_claim_persists_launch_apps(self):
+        from tests.test_phase0 import FakeCg
+
+        cg = FakeCg().__enter__()
+        self.addCleanup(cg.__exit__)
+        daemon = make_daemon()
+        scope = "app-test"
+        cg.leaf(scope, [os.getpid()])
+        daemon.launch_reservations[scope] = {
+            "app": "test",
+            "expires": daemon.store.now() + 5.0,
+        }
+        reply = daemon.launch_claim({"scope": scope, "pid": os.getpid(), "app": "test"})
+        self.assertEqual(reply.get("ok"), True)
+        fresh = {"exes": {}, "pairs": {}}
+        daemon.store.db.load_state(fresh)
+        launch = fresh.get("launch_apps", {}).get(scope)
+        self.assertIsNotNone(launch)
+        self.assertEqual(launch.get("launched_by"), "launch")
+
+    def test_answered_keep_does_not_stop(self):
+        _cg, daemon = self._daemon()
+        daemon._windowless_since = {"app-x": 1000.0}
+        daemon.store.data.setdefault("reviews", []).append(
+            {
+                "id": 7,
+                "kind": "close",
+                "owner": "exe:x:1:2",
+                "scope": "app-x",
+                "state": "answered",
+                "answer": "keep",
+                "created": 1000.0,
+                "expires": 1000.0 + 3600,
+            }
+        )
+        daemon._windowless_ask = {7: ("app-x", "x")}
+        with mock.patch.object(daemon, "auto_stop_path") as stopper:
+            daemon.windowless_pass(now=1000.0 + 3600)
+        stopper.assert_not_called()
+
     def test_unit_desktop_policy_is_validated(self):
         from taema.config import policy as cfg_policy
 

@@ -253,8 +253,20 @@ class StatusMemoryTest(unittest.TestCase):
     def test_host_only_snapshot_skips_scope_walk(self):
         from taema.core import memory
 
-        full = memory.snapshot()
-        host_only = memory.snapshot(include_scopes=False)
+        # Freeze one live host sample across both calls: host memory moves
+        # under concurrent allocation, so two wall-clock samples race and
+        # flake. Both paths must still report the same host source.
+        real_host = memory._host
+        samples = []
+
+        def _frozen(*args, **kwargs):
+            if not samples:
+                samples.append(real_host(*args, **kwargs))
+            return samples[0]
+
+        with mock.patch.object(memory, "_host", side_effect=_frozen):
+            full = memory.snapshot()
+            host_only = memory.snapshot(include_scopes=False)
         self.assertEqual(host_only["host"], full["host"])
         self.assertEqual(host_only["scopes"], [])
         self.assertEqual(host_only["schema"], "taema.memory.v1")

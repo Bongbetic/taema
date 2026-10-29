@@ -100,6 +100,8 @@ jobs:
         run: |
           xbps-install -Syu xbps
           xbps-install -Sy libstdc++ github-cli git
+      # Checkout first: its default clean would wipe downloaded assets.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: repo-*
@@ -113,7 +115,6 @@ jobs:
           # download-artifact action lands files in the container path.
           gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
             --pattern "*musl*" --dir "$GITHUB_WORKSPACE/assets" --clobber
-      - uses: actions/checkout@v4
       - name: Sign repository and publish release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -96,10 +96,10 @@ jobs:
     runs-on: ubuntu-latest
     container: ghcr.io/void-linux/void-glibc:latest
     steps:
-      - name: Install Node runtime libraries
+      - name: Install sign tools
         run: |
           xbps-install -Syu xbps
-          xbps-install -Sy libstdc++
+          xbps-install -Sy libstdc++ github-cli git
       - uses: actions/download-artifact@v4
         with:
           pattern: repo-*

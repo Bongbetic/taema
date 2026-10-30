@@ -176,7 +176,9 @@ def _rooted(root, path):
 def autostart_source(system_root="/"):
     """The packaged agent autostart snippet, or None when not installed."""
     candidates = [
-        _rooted(system_root, "/usr/share/examples/taema/autostart/" + AUTOSTART_FILENAME),
+        _rooted(
+            system_root, "/usr/share/examples/taema/autostart/" + AUTOSTART_FILENAME
+        ),
         os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "..",

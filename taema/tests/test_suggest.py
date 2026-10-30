@@ -32,9 +32,7 @@ def run_cli(root, *argv):
     dead_socket = os.path.join(root, "dead.sock")
     output = io.StringIO()
     with redirect_stdout(output):
-        code = commands.main(
-            ["--config", override, "--socket", dead_socket, *argv]
-        )
+        code = commands.main(["--config", override, "--socket", dead_socket, *argv])
     return code, output.getvalue()
 
 
@@ -88,9 +86,7 @@ class SuggestTests(unittest.TestCase):
 
         self.make_review()
         ranked = suggest.rank(self.store, {}, now=self.clock())
-        self.assertFalse(
-            [item for item in ranked if item["kind"] == "stale-review"]
-        )
+        self.assertFalse([item for item in ranked if item["kind"] == "stale-review"])
 
     def test_suggest_lists_ranked_suggestions(self):
         review = self.make_review()
@@ -107,9 +103,7 @@ class SuggestTests(unittest.TestCase):
         identifier = "stale-review-%s" % review["id"]
         with mock.patch.object(commands, "_confirm_bulk", return_value=True):
             with mock.patch("builtins.input", return_value="keep"):
-                code, _output = run_cli(
-                    self.root, "suggest", "apply", identifier
-                )
+                code, _output = run_cli(self.root, "suggest", "apply", identifier)
         self.assertEqual(code, 0)
         check = Store(self.state_dir, {}, self.clock, read_only=True)
         self.assertEqual(check.data["reviews"][0]["state"], "answered")
@@ -453,9 +447,7 @@ class SuggestTests(unittest.TestCase):
         code, output = run_cli(self.root, "report", "--day")
         self.assertEqual(code, 0)
         trailer = [
-            line
-            for line in output.splitlines()
-            if line.startswith("suggestion: ")
+            line for line in output.splitlines() if line.startswith("suggestion: ")
         ]
         self.assertLessEqual(len(trailer), 3)
         self.assertTrue(trailer)
@@ -475,9 +467,7 @@ class SuggestTests(unittest.TestCase):
             mock.patch.object(commands, "_fast_status_probe", return_value=None),
             mock.patch.object(commands, "ask", return_value=None),
             mock.patch.dict(os.environ, {"TAEMA_MEM": "0"}),
-            mock.patch.object(
-                commands.cgroup, "base", return_value="/missing/cgroup"
-            ),
+            mock.patch.object(commands.cgroup, "base", return_value="/missing/cgroup"),
             redirect_stdout(output),
         ):
             result = commands.main([])

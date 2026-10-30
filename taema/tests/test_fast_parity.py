@@ -34,18 +34,14 @@ FAST_BIN = os.environ.get(
 
 def run_py(*args, sock):
     env = dict(os.environ, TAEMA_SOCKET=sock)
-    return subprocess.run(
-        [HOOK, *args], env=env, capture_output=True, timeout=20
-    )
+    return subprocess.run([HOOK, *args], env=env, capture_output=True, timeout=20)
 
 
 def run_rs(*args, sock, extra=None):
     env = dict(os.environ, TAEMA_SOCKET=sock)
     if extra:
         env.update(extra)
-    return subprocess.run(
-        [FAST_BIN, *args], env=env, capture_output=True, timeout=20
-    )
+    return subprocess.run([FAST_BIN, *args], env=env, capture_output=True, timeout=20)
 
 
 THREE_CANDIDATES = json.loads(json.dumps(QUESTION))
@@ -136,7 +132,9 @@ class SendParity(unittest.TestCase):
                     (r_rs.returncode, r_rs.stdout, r_rs.stderr),
                     args,
                 )
-                self.assertEqual((r_rs.returncode, r_rs.stdout, r_rs.stderr), (0, b"", b""))
+                self.assertEqual(
+                    (r_rs.returncode, r_rs.stdout, r_rs.stderr), (0, b"", b"")
+                )
 
 
 class PtySession:
@@ -148,6 +146,7 @@ class PtySession:
         attrs[3] &= ~termios.ECHO
         termios.tcsetattr(slave, termios.TCSANOW, attrs)
         env = dict(os.environ, TAEMA_SOCKET=sock, XDG_RUNTIME_DIR=rdir)
+
         def pre():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
@@ -222,12 +221,8 @@ class AskParity(unittest.TestCase):
         self.rs = FakeDaemon(replies=replies_for(question))
         self.addCleanup(self.py.close)
         self.addCleanup(self.rs.close)
-        code_py, out_py = ask_transcript(
-            [HOOK, "ask", "20"], self.py, keys
-        )
-        code_rs, out_rs = ask_transcript(
-            [FAST_BIN, "ask", "20"], self.rs, keys
-        )
+        code_py, out_py = ask_transcript([HOOK, "ask", "20"], self.py, keys)
+        code_rs, out_rs = ask_transcript([FAST_BIN, "ask", "20"], self.rs, keys)
         self.assertEqual(self.py.got, self.rs.got)
         return (code_py, out_py), (code_rs, out_rs)
 
@@ -277,7 +272,10 @@ class AskParity(unittest.TestCase):
         self.rs = FakeDaemon(replies=lambda body: {})
         self.addCleanup(self.py.close)
         self.addCleanup(self.rs.close)
-        for argv, daemon in (([HOOK, "ask", "20"], self.py), ([FAST_BIN, "ask", "20"], self.rs)):
+        for argv, daemon in (
+            ([HOOK, "ask", "20"], self.py),
+            ([FAST_BIN, "ask", "20"], self.rs),
+        ):
             rdir = tempfile.mkdtemp()
             self.addCleanup(shutil.rmtree, rdir, True)
             session = PtySession(argv, daemon.path, rdir)
@@ -390,9 +388,7 @@ class PerfGate(unittest.TestCase):
         times = []
         for _ in range(runs):
             t = time.monotonic()
-            r = subprocess.run(
-                argv, env=env, capture_output=True, timeout=20
-            )
+            r = subprocess.run(argv, env=env, capture_output=True, timeout=20)
             times.append((time.monotonic() - t) * 1000.0)
             self.assertEqual(r.returncode, 0)
         return statistics.median(times)
@@ -410,9 +406,7 @@ class PerfGate(unittest.TestCase):
     def test_launch_dry_run_p50_under_30ms(self):
         cgr = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, cgr, True)
-        os.makedirs(
-            os.path.join(cgr, "user", str(os.getuid())), exist_ok=True
-        )
+        os.makedirs(os.path.join(cgr, "user", str(os.getuid())), exist_ok=True)
         env = dict(os.environ, TAEMA_CGROOT=cgr)
         med = self.p50([self.bin, "launch", "--dry-run", "--", "true"], env)
         self.assertLess(med, 30.0, "launch p50 %.2f ms" % med)

@@ -44,12 +44,13 @@ class SetupTests(unittest.TestCase):
         from taema import setup as setup_mod
 
         first = setup_mod.run_setup(
-            self.cfg, None, system_root=self.system_root, yes=True,
+            self.cfg,
+            None,
+            system_root=self.system_root,
+            yes=True,
             backend=NullNotifier(),
         )
-        dropin = os.path.join(
-            self.home, ".config", "taema", "taema.d", "40-setup.toml"
-        )
+        dropin = os.path.join(self.home, ".config", "taema", "taema.d", "40-setup.toml")
         self.assertTrue(os.path.isfile(dropin))
         with open(dropin) as stream:
             self.assertIn('mode = "adopt"', stream.read())
@@ -58,7 +59,10 @@ class SetupTests(unittest.TestCase):
         self.assertIn(dropin, first["wrote"])
 
         second = setup_mod.run_setup(
-            self.cfg, None, system_root=self.system_root, yes=True,
+            self.cfg,
+            None,
+            system_root=self.system_root,
+            yes=True,
             backend=NullNotifier(),
         )
         mode = next(item for item in second["steps"] if item["name"] == "mode")
@@ -122,9 +126,7 @@ class SetupTests(unittest.TestCase):
             input_fn=lambda prompt: "auto",
             backend=NullNotifier(),
         )
-        dropin = os.path.join(
-            self.home, ".config", "taema", "taema.d", "40-setup.toml"
-        )
+        dropin = os.path.join(self.home, ".config", "taema", "taema.d", "40-setup.toml")
         with open(dropin) as stream:
             self.assertIn('mode = "auto"', stream.read())
 
@@ -149,22 +151,22 @@ class SetupTests(unittest.TestCase):
             stream.write("[Desktop Entry]\nName=Code\nExec=/usr/bin/code\n")
         which = lambda name: "/usr/bin/" + name if name == "quickshell" else None
         with (
-            mock.patch.object(
-                desktop_mod, "system_dirs", return_value=[applications]
-            ),
+            mock.patch.object(desktop_mod, "system_dirs", return_value=[applications]),
             mock.patch.object(desktop_mod, "user_dir", return_value=user_apps),
             mock.patch.object(desktop_mod, "list_wraps", return_value=[]),
             mock.patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "niri"}),
         ):
             report = setup_mod.run_setup(
-                self.cfg, store, system_root=self.system_root, yes=True, which=which,
-            backend=NullNotifier(),
+                self.cfg,
+                store,
+                system_root=self.system_root,
+                yes=True,
+                which=which,
+                backend=NullNotifier(),
             )
         self.assertTrue(
             os.path.isfile(
-                os.path.join(
-                    self.home, ".config", "autostart", "taema-agent.desktop"
-                )
+                os.path.join(self.home, ".config", "autostart", "taema-agent.desktop")
             )
         )
         self.assertFalse(
@@ -179,9 +181,7 @@ class SetupTests(unittest.TestCase):
         self.assertIn("cp ", widget["message"])
 
         with (
-            mock.patch.object(
-                desktop_mod, "system_dirs", return_value=[applications]
-            ),
+            mock.patch.object(desktop_mod, "system_dirs", return_value=[applications]),
             mock.patch.object(desktop_mod, "user_dir", return_value=user_apps),
             mock.patch.object(
                 desktop_mod,
@@ -191,8 +191,12 @@ class SetupTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "niri"}),
         ):
             again = setup_mod.run_setup(
-                self.cfg, store, system_root=self.system_root, yes=True, which=which,
-            backend=NullNotifier(),
+                self.cfg,
+                store,
+                system_root=self.system_root,
+                yes=True,
+                which=which,
+                backend=NullNotifier(),
             )
         self.assertEqual(again["wrote"], [])
 
@@ -205,7 +209,9 @@ class SetupTests(unittest.TestCase):
             stream.write("MemTotal:        8000000 kB\nMemAvailable:    4000000 kB\n")
         os.makedirs(os.path.join(self.system_root, "proc"))
         with open(os.path.join(self.system_root, "proc/swaps"), "w") as stream:
-            stream.write("Filename\tType\tSize\tUsed\tPriority\n/swap\tfile\t1\t0\t-2\n")
+            stream.write(
+                "Filename\tType\tSize\tUsed\tPriority\n/swap\tfile\t1\t0\t-2\n"
+            )
         os.makedirs(os.path.join(self.system_root, "sys/module/zswap/parameters"))
         with open(
             os.path.join(self.system_root, "sys/module/zswap/parameters/enabled"), "w"
@@ -265,7 +271,10 @@ class SetupTests(unittest.TestCase):
         from taema import setup as setup_mod
 
         report = setup_mod.run_setup(
-            self.cfg, None, system_root=self.system_root, yes=True,
+            self.cfg,
+            None,
+            system_root=self.system_root,
+            yes=True,
             backend=NullNotifier(),
         )
         step = next(item for item in report["steps"] if item["name"] == "hooks")
@@ -283,7 +292,10 @@ class SetupTests(unittest.TestCase):
             with open(full, "w") as stream:
                 stream.write("x")
         report = setup_mod.run_setup(
-            self.cfg, None, system_root=self.system_root, yes=True,
+            self.cfg,
+            None,
+            system_root=self.system_root,
+            yes=True,
             backend=NullNotifier(),
         )
         step = next(item for item in report["steps"] if item["name"] == "hooks")
@@ -348,9 +360,7 @@ class SetupTests(unittest.TestCase):
     def test_cli_setup_yes_reports_steps(self):
         from taema.notify import NullNotifier
 
-        with mock.patch(
-            "taema.notify.select_backend", return_value=NullNotifier()
-        ):
+        with mock.patch("taema.notify.select_backend", return_value=NullNotifier()):
             code, output = run_cli(self.temp.name, "setup", "--yes")
         self.assertEqual(code, 0)
         self.assertIn("doctor", output)

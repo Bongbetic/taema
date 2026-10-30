@@ -62,7 +62,17 @@ class BugReportRedaction(unittest.TestCase):
     def test_redact_event_strips_sensitive_keys(self):
         event = bugreport.redact_event(sensitive_events(1)[0])
         blob = json.dumps(event)
-        for key in ("argv", "cwd", "title", "titles", "env", "environment", "cmdline", "TOKEN", "secret"):
+        for key in (
+            "argv",
+            "cwd",
+            "title",
+            "titles",
+            "env",
+            "environment",
+            "cmdline",
+            "TOKEN",
+            "secret",
+        ):
             self.assertNotIn(key, blob)
         self.assertEqual(event["data"]["scope"], "scope-x")
 
@@ -98,7 +108,15 @@ class BugReportRedaction(unittest.TestCase):
                 blob = b"".join(
                     archive.extractfile(name).read() for name in names
                 ).decode("utf-8", "replace")
-            for key in ("secret.txt", "Secret Window", "TOKEN", '"argv"', '"cwd"', '"titles"', '"env"'):
+            for key in (
+                "secret.txt",
+                "Secret Window",
+                "TOKEN",
+                '"argv"',
+                '"cwd"',
+                '"titles"',
+                '"env"',
+            ):
                 self.assertNotIn(key, blob)
             with tarfile.open(target, "r:gz") as archive:
                 units = json.loads(archive.extractfile("units.json").read())

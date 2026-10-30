@@ -365,6 +365,7 @@ class DoctorChecks(unittest.TestCase):
         os.unlink(self.base + "/memory.zswap.current")
         report = self.report()
         self.assertIn("swap use", self.check(report, "zswap accounting")["message"])
+
     def test_missing_memory_breakdown_low_high_events_and_oom_restore_are_named(self):
         self.write(self.base + "/memory.stat", "anon 0\nfile 0\n")
         os.unlink(self.base + "/memory.low")
@@ -374,7 +375,9 @@ class DoctorChecks(unittest.TestCase):
         self.write(self.system_root + policy.HELPER, "#!/bin/sh\nexit 0\n")
         report = self.report()
         self.assertEqual(self.check(report, "memory.stat breakdown")["status"], "warn")
-        self.assertIn("inactive_file", self.check(report, "memory.stat breakdown")["message"])
+        self.assertIn(
+            "inactive_file", self.check(report, "memory.stat breakdown")["message"]
+        )
         self.assertEqual(self.check(report, "memory low protection")["status"], "warn")
         self.assertEqual(self.check(report, "memory high events")["status"], "warn")
         self.assertEqual(self.check(report, "memory max events")["status"], "warn")
@@ -382,7 +385,6 @@ class DoctorChecks(unittest.TestCase):
         self.assertEqual(self.check(report, "OOM score adjustment")["status"], "warn")
         self.assertEqual(self.check(report, "OOM restore helper")["status"], "warn")
         self.assertNotEqual(report["status"], "fail")
-
 
     def test_process_oom_score_adjustment_is_read_only_and_validated(self):
         path = self.system_root + "/proc/self/oom_score_adj"
@@ -491,9 +493,7 @@ class DoctorChecks(unittest.TestCase):
             def close(self):
                 self.metrics = ()
 
-        with mock.patch.object(
-            doctor.pressure_guard, "PsiTriggerMonitor", FakeMonitor
-        ):
+        with mock.patch.object(doctor.pressure_guard, "PsiTriggerMonitor", FakeMonitor):
             check = doctor._guard_psi_trigger_check(
                 self.cfg, self.base, self.system_root
             )
@@ -811,9 +811,7 @@ class DoctorFix(DoctorChecks):
         self.assertEqual(by_name["store migration"]["status"], "fixed")
         self.assertTrue(os.path.isfile(os.path.join(fresh, "state.db")))
         remaining = sorted(
-            name
-            for name in os.listdir(fresh)
-            if name.startswith("state-export-")
+            name for name in os.listdir(fresh) if name.startswith("state-export-")
         )
         self.assertEqual(
             remaining,
@@ -837,9 +835,7 @@ class DoctorFix(DoctorChecks):
                 os.environ,
                 {"XDG_CONFIG_HOME": config_home, "XDG_RUNTIME_DIR": runtime},
             ),
-            mock.patch.object(
-                policy, "user_config_dir", return_value=config_home
-            ),
+            mock.patch.object(policy, "user_config_dir", return_value=config_home),
         ):
             first = doctor.repair(self.cfg, self.store, system_root=self.system_root)
             second = doctor.repair(self.cfg, self.store, system_root=self.system_root)
@@ -868,9 +864,7 @@ class DoctorFix(DoctorChecks):
                 os.environ,
                 {"XDG_CONFIG_HOME": config_home, "XDG_RUNTIME_DIR": runtime},
             ),
-            mock.patch.object(
-                policy, "user_config_dir", return_value=config_home
-            ),
+            mock.patch.object(policy, "user_config_dir", return_value=config_home),
             mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
             mock.patch.object(commands, "ask", return_value=None),
             mock.patch.object(commands.knowledge, "Store", return_value=self.store),
@@ -905,8 +899,7 @@ class DoctorFix(DoctorChecks):
 
     def test_fix_installs_agent_autostart(self):
         source = (
-            self.system_root
-            + "/usr/share/examples/taema/autostart/taema-agent.desktop"
+            self.system_root + "/usr/share/examples/taema/autostart/taema-agent.desktop"
         )
         body = "[Desktop Entry]\nName=taema session agent\nExec=taema agent\n"
         self.write(source, body)
@@ -914,9 +907,7 @@ class DoctorFix(DoctorChecks):
         dest = os.path.join(config_home, "autostart", "taema-agent.desktop")
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home}):
             fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
-            again = doctor.repair(
-                self.cfg, self.store, system_root=self.system_root
-            )
+            again = doctor.repair(self.cfg, self.store, system_root=self.system_root)
         by_name = {item["name"]: item for item in fixes}
         self.assertEqual(by_name["agent autostart"]["status"], "fixed")
         self.assertEqual(Path(dest).read_text(), body)

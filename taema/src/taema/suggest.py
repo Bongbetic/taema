@@ -277,8 +277,7 @@ def _wraps(store, cfg):
                 "id": "wrap-%s" % _slug(app),
                 "kind": "wrap",
                 "title": "wrap %s for launch-time scoping" % app,
-                "detail": "%d recorded instances and no wrapper yet"
-                % launches,
+                "detail": "%d recorded instances and no wrapper yet" % launches,
                 "payload": {"app": app, "file": filename, "launches": launches},
             }
         )
@@ -300,11 +299,7 @@ def _zswap(store, cfg, system_root):
     )
     if swaps is None:
         return []
-    active = [
-        line.split()[0]
-        for line in swaps.splitlines()[1:]
-        if line.split()
-    ]
+    active = [line.split()[0] for line in swaps.splitlines()[1:] if line.split()]
     if not active:
         return []
     enabled = None
@@ -449,9 +444,7 @@ def rank(store, cfg, *, system_root="/", proc_root=None, now=None):
 
 def trailing(store, cfg, limit=3, *, system_root="/", proc_root=None, now=None):
     """At most ``limit`` one-line suggestions for the end of a report."""
-    ranked = rank(
-        store, cfg, system_root=system_root, proc_root=proc_root, now=now
-    )
+    ranked = rank(store, cfg, system_root=system_root, proc_root=proc_root, now=now)
     return [
         "suggestion: %s [%s]" % (item["title"], item["id"])
         for item in ranked[: max(0, limit)]

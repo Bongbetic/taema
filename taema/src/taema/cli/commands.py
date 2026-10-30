@@ -4289,7 +4289,11 @@ def cmd_suggest_apply(a):
     if match is None:
         return die(
             "no such suggestion: %s" % a.identifier
-            + (" (available: %s)" % ", ".join(item["id"] for item in ranked) if ranked else ""),
+            + (
+                " (available: %s)" % ", ".join(item["id"] for item in ranked)
+                if ranked
+                else ""
+            ),
             2,
         )
     if not _confirm_bulk("apply suggestion", [match["title"]], a):
@@ -5312,7 +5316,9 @@ def cmd_bug_report(a):
         return die("could not write bug report: %s" % error)
     if getattr(a, "json", False):
         print(
-            json.dumps(view.record("bug-report", {"path": path}), indent=2, sort_keys=True)
+            json.dumps(
+                view.record("bug-report", {"path": path}), indent=2, sort_keys=True
+            )
         )
         return 0
     print(path)

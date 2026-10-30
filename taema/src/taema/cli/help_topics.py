@@ -96,7 +96,9 @@ def text(topic):
 def listing():
     lines = ["Topics:"]
     for name in ORDER:
-        first = TOPICS[name].splitlines()[1] if len(TOPICS[name].splitlines()) > 1 else ""
+        first = (
+            TOPICS[name].splitlines()[1] if len(TOPICS[name].splitlines()) > 1 else ""
+        )
         lines.append("  %-10s %s" % (name, first[:72]))
     lines.append("Run `taema help TOPIC` for details.")
     return "\n".join(lines) + "\n"

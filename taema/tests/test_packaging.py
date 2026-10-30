@@ -182,25 +182,17 @@ class ArchDetectTest(unittest.TestCase):
         if env is None:
             # Scrub ambient overrides: the probe tests detection, not inheritance.
             env = {
-                key: value
-                for key, value in os.environ.items()
-                if key != "XBPS_ARCH"
+                key: value for key, value in os.environ.items() if key != "XBPS_ARCH"
             }
-        r = subprocess.run(
-            ["sh", "-c", probe], capture_output=True, text=True, env=env
-        )
+        r = subprocess.run(["sh", "-c", probe], capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.strip()
 
     def test_musl_host_gets_musl_arch(self):
-        self.assertEqual(
-            self.detect("x86_64", "musl libc (x86_64)"), "x86_64-musl"
-        )
+        self.assertEqual(self.detect("x86_64", "musl libc (x86_64)"), "x86_64-musl")
 
     def test_glibc_host_keeps_uname_arch(self):
-        self.assertEqual(
-            self.detect("x86_64", "ldd (GNU libc) 2.40"), "x86_64"
-        )
+        self.assertEqual(self.detect("x86_64", "ldd (GNU libc) 2.40"), "x86_64")
 
     def test_explicit_arch_wins_over_detection(self):
         env = dict(os.environ, XBPS_ARCH="x86_64-musl")

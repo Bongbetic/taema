@@ -14,8 +14,9 @@ allow = [
     "Zlib",
 ]
 exceptions = [
-    # The workspace's own crate carries the project's license.
+    # The workspace's own crates carry the project's license.
     { allow = ["PolyForm-Noncommercial-1.0.0"], crate = "taema-attach" },
+    { allow = ["PolyForm-Noncommercial-1.0.0"], crate = "taema-fast" },
 ]
 
 [bans]

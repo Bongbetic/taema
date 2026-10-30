@@ -532,15 +532,15 @@ class GuardDaemonTests(unittest.TestCase):
             self.daemon._sync_pressure_monitor()
             self.assertEqual(self.daemon.pressure_watch_source, "host-proc")
             self.assertEqual(self.daemon.pressure_watch_path, host_path)
-            self.assertEqual(
-                set(self.daemon.pressure_watch_metrics), {"some", "full"}
-            )
+            self.assertEqual(set(self.daemon.pressure_watch_metrics), {"some", "full"})
             status = self.daemon.guard_status()
             self.assertTrue(status["psi_trigger_writable"])
             self.assertEqual(status["psi_trigger_source"], "host-proc")
             self.assertTrue(
-                any("delegated PSI trigger is not writable" in row
-                    for row in status["psi_trigger_failures"])
+                any(
+                    "delegated PSI trigger is not writable" in row
+                    for row in status["psi_trigger_failures"]
+                )
             )
             with (
                 mock.patch.object(self.daemon, "_guard_floor", return_value=(100, 20)),

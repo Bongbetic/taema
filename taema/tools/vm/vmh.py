@@ -1111,9 +1111,7 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     known = os.path.join(run_dir, "known_hosts")
     run_dir_abs = run_dir
     qemu_cfg = qemu_config_for_scenarios(cfg, scenarios)
-    qemu = qemu_argv(
-        qemu_cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs
-    )
+    qemu = qemu_argv(qemu_cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs)
     overlay = os.path.join(run_dir, "disk.qcow2")
     ovr = overlay_argv(
         cache_paths(cfg, libc)["base"], overlay, qemu_img=cfg["tools"]["qemu_img"]
@@ -1284,8 +1282,7 @@ def cmd_run(cfg, args, out, err):
         ]
         if missing:
             raise HarnessError(
-                "package not built: %s (run without --no-build)"
-                % ", ".join(missing)
+                "package not built: %s (run without --no-build)" % ", ".join(missing)
             )
     else:
         err.write("vmh: building package from the working tree\n")

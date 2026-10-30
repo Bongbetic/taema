@@ -643,12 +643,8 @@ def _guard_psi_trigger_check(cfg, base, system_root):
     if not isinstance(guard_cfg, dict):
         guard_cfg = {}
     settings = {
-        "some": guard_cfg.get(
-            "psi_some", policy._DEFAULTS["guard"]["psi_some"]
-        ),
-        "full": guard_cfg.get(
-            "psi_full", policy._DEFAULTS["guard"]["psi_full"]
-        ),
+        "some": guard_cfg.get("psi_some", policy._DEFAULTS["guard"]["psi_some"]),
+        "full": guard_cfg.get("psi_full", policy._DEFAULTS["guard"]["psi_full"]),
     }
     sources = pressure_guard.psi_trigger_sources(
         os.path.join(base, "memory.pressure"),
@@ -680,9 +676,10 @@ def _guard_psi_trigger_check(cfg, base, system_root):
             required = set(settings)
             writable = required.issubset(metrics)
             failed_sources = attempts[:-1]
-            message = (
-                "writable PSI trigger source=%s path=%s metrics=%s"
-                % (source, path, ",".join(metrics))
+            message = "writable PSI trigger source=%s path=%s metrics=%s" % (
+                source,
+                path,
+                ",".join(metrics),
             )
             if failed_sources:
                 message += "; delegated trigger unavailable, using host PSI fallback"
@@ -1055,7 +1052,9 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
     )
 
     paths = cfg.get("paths", {})
-    helper_value = paths.get("helper", policy.HELPER) if isinstance(paths, dict) else None
+    helper_value = (
+        paths.get("helper", policy.HELPER) if isinstance(paths, dict) else None
+    )
     helper_path = (
         _rooted(system_root, policy.expand(helper_value))
         if isinstance(helper_value, str)
@@ -1610,9 +1609,7 @@ def _repair_dirs(cfg, fixes):
                     }
                 )
         except OSError as error:
-            fixes.append(
-                {"name": name, "status": "fail", "message": str(error)}
-            )
+            fixes.append({"name": name, "status": "fail", "message": str(error)})
 
 
 _DESIRED_CONTROLLERS = ("cpu", "io", "memory", "pids")
@@ -1755,7 +1752,9 @@ def _repair_stale_flags(state_dir, store, fixes):
             claimed = json.loads(marker_value) if marker_value else {}
         except ValueError:
             claimed = {}
-        active_claim = claimed.get("held") is True if isinstance(claimed, dict) else True
+        active_claim = (
+            claimed.get("held") is True if isinstance(claimed, dict) else True
+        )
         if isinstance(claimed, dict):
             snooze = claimed.get("snooze_until")
             if (
@@ -1837,9 +1836,7 @@ def _repair_controllers(uid, fixes, sudo, runner):
     control = os.path.join(cgroup_mod.base(resolved), "cgroup.subtree_control")
     try:
         with open(control, encoding="utf-8") as stream:
-            enabled = {
-                token.lstrip("+") for token in stream.read().split() if token
-            }
+            enabled = {token.lstrip("+") for token in stream.read().split() if token}
     except OSError:
         fixes.append(
             {
@@ -1866,8 +1863,7 @@ def _repair_controllers(uid, fixes, sudo, runner):
         with open(control, "w", encoding="utf-8") as stream:
             stream.write(
                 " ".join(
-                    "+" + name
-                    for name in sorted(enabled | set(missing), key=str.lower)
+                    "+" + name for name in sorted(enabled | set(missing), key=str.lower)
                 )
                 + "\n"
             )

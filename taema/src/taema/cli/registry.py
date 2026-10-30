@@ -921,9 +921,7 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         "aliases": (),
         "help": "show a topic: modes, learning, veto, ladder, memory, units, agent, profiles, privacy, safety",
         "handler": "cmd_help",
-        "arguments": (
-            (("topic",), {"nargs": "?", "metavar": "TOPIC"}),
-        ),
+        "arguments": ((("topic",), {"nargs": "?", "metavar": "TOPIC"}),),
     },
     {
         "name": "bug-report",
@@ -932,7 +930,13 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
         "handler": "cmd_bug_report",
         "read": True,
         "arguments": (
-            (("--to",), {"metavar": "PATH", "help": "write to PATH instead of the state directory"}),
+            (
+                ("--to",),
+                {
+                    "metavar": "PATH",
+                    "help": "write to PATH instead of the state directory",
+                },
+            ),
         ),
     },
     {
@@ -955,7 +959,10 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
 # to the generic pair below.
 EXAMPLES = {
     "run": ("taema run editor -- code .", "taema run --owner 4242 shell -- bash"),
-    "launch": ("taema launch --app firefox -- firefox", "taema launch --bind -- ./app --serve"),
+    "launch": (
+        "taema launch --app firefox -- firefox",
+        "taema launch --bind -- ./app --serve",
+    ),
     "desktop": ("taema desktop wrap firefox.desktop", "taema desktop list"),
     "bar": ("taema bar --format waybar", "taema bar --format plain --follow"),
     "kill": ("taema kill scope-editor", "taema kill scope-editor --dry-run"),
@@ -963,7 +970,10 @@ EXAMPLES = {
     "explain": ("taema why scope-firefox", "taema explain app:firefox"),
     "keep": ("taema keep firefox", "taema keep --pair npm vite"),
     "forget": ("taema forget firefox", "taema forget --veto scope-x"),
-    "do-not-kill": ("taema do-not-kill scope-x", "taema do-not-kill app:firefox --for 2h"),
+    "do-not-kill": (
+        "taema do-not-kill scope-x",
+        "taema do-not-kill app:firefox --for 2h",
+    ),
     "mute": ("taema mute firefox", "taema mute"),
     "unmute": ("taema unmute firefox", "taema mute"),
     "undo": ("taema undo", "taema undo --restore"),

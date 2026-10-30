@@ -4,7 +4,9 @@ import os
 import shutil
 
 SETUP_DROPIN_NAME = "40-setup.toml"
-SETUP_HEADER = "# managed by taema setup; edit with `taema config` to keep changes validated\n"
+SETUP_HEADER = (
+    "# managed by taema setup; edit with `taema config` to keep changes validated\n"
+)
 
 AUTO_BLURB = (
     "auto cleans up idle leftovers on its own once learning has answered pairs. "
@@ -56,8 +58,17 @@ RUNTIME_PACKS = (
 )
 
 
-def run_setup(cfg, store, *, system_root="/", proc_root=None, yes=False, input_fn=None,
-              which=None, backend=None):
+def run_setup(
+    cfg,
+    store,
+    *,
+    system_root="/",
+    proc_root=None,
+    yes=False,
+    input_fn=None,
+    which=None,
+    backend=None,
+):
     """Walk a new user to a working setup; return a step report.
 
     Writes only the setup drop-in, user units, and autostart entries.
@@ -109,16 +120,23 @@ def _step_memory(cfg, report, system_root, proc_root):
             break
     parts = []
     if total:
-        parts.append("RAM total %d GiB, available %d GiB" % (total // 2**30, (available or 0) // 2**30))
+        parts.append(
+            "RAM total %d GiB, available %d GiB"
+            % (total // 2**30, (available or 0) // 2**30)
+        )
     else:
         parts.append("RAM size unreadable")
     parts.append("swap: %s" % (", ".join(swaps) if swaps else "none"))
-    parts.append("zswap: %s" % ("on" if zswap else "off" if zswap is False else "unknown"))
+    parts.append(
+        "zswap: %s" % ("on" if zswap else "off" if zswap is False else "unknown")
+    )
     if swaps and zswap is False:
         report["root_commands"].append(
             "sudo sh -c 'echo Y > /sys/module/zswap/parameters/enabled'"
         )
-        parts.append("enable zswap to compress swap before it hits disk (see root command)")
+        parts.append(
+            "enable zswap to compress swap before it hits disk (see root command)"
+        )
     report["steps"].append(
         {"name": "memory", "status": "ok", "message": "; ".join(parts)}
     )
@@ -146,15 +164,14 @@ def _step_oom(cfg, report, proc_root):
                 handler.pid,
                 handler.option("-m") or "?",
                 (
-                    "; --prefer %s keeps pressure kills off everything else" % handler.option("--prefer")
+                    "; --prefer %s keeps pressure kills off everything else"
+                    % handler.option("--prefer")
                     if handler.option("--prefer")
                     else "; add --prefer for managed hogs to keep pressure kills narrow"
                 ),
             )
         )
-    report["steps"].append(
-        {"name": "oom", "status": "ok", "message": " ".join(lines)}
-    )
+    report["steps"].append({"name": "oom", "status": "ok", "message": " ".join(lines)})
 
 
 def _rooted(root, path):
@@ -299,14 +316,20 @@ def _step_desktop(cfg, store, report, yes, input_fn, policy_mod, which):
         input_fn,
     ):
         status, message = desktop_mod.ensure_agent_autostart(config_home=config_home)
-        report["steps"].append({"name": "autostart", "status": status, "message": message})
+        report["steps"].append(
+            {"name": "autostart", "status": status, "message": message}
+        )
         if status == "fixed":
             report["wrote"].append(
                 os.path.join(config_home, "autostart", desktop_mod.AUTOSTART_FILENAME)
             )
     else:
         report["steps"].append(
-            {"name": "autostart", "status": "skipped", "message": "declined autostart install"}
+            {
+                "name": "autostart",
+                "status": "skipped",
+                "message": "declined autostart install",
+            }
         )
     if desktop.lower() == "niri":
         report["steps"].append(
@@ -321,8 +344,10 @@ def _step_desktop(cfg, store, report, yes, input_fn, policy_mod, which):
     except Exception:
         quickshell = False
     source = _widget_source()
-    if quickshell and source is not None and _ask_yes_no(
-        "show how to install the taema bar widget", True, yes, input_fn
+    if (
+        quickshell
+        and source is not None
+        and _ask_yes_no("show how to install the taema bar widget", True, yes, input_fn)
     ):
         target_dir = os.path.join(config_home, "quickshell", "taema")
         report["steps"].append(
@@ -344,9 +369,7 @@ def _step_desktop(cfg, store, report, yes, input_fn, policy_mod, which):
         )
     try:
         candidates = [
-            item
-            for item in suggest_mod.rank(store, cfg)
-            if item["kind"] == "wrap"
+            item for item in suggest_mod.rank(store, cfg) if item["kind"] == "wrap"
         ]
     except Exception:
         candidates = []
@@ -394,7 +417,11 @@ def _step_runtimes(cfg, report, yes, input_fn, policy_mod, which):
             wanted.append(pack)
     if not wanted:
         report["steps"].append(
-            {"name": "runtimes", "status": "skipped", "message": "no supported runtimes found"}
+            {
+                "name": "runtimes",
+                "status": "skipped",
+                "message": "no supported runtimes found",
+            }
         )
         return
     if not _ask_yes_no(
@@ -404,7 +431,11 @@ def _step_runtimes(cfg, report, yes, input_fn, policy_mod, which):
         input_fn,
     ):
         report["steps"].append(
-            {"name": "runtimes", "status": "skipped", "message": "declined pack install"}
+            {
+                "name": "runtimes",
+                "status": "skipped",
+                "message": "declined pack install",
+            }
         )
         return
     units_dir = os.path.join(policy_mod.user_config_dir(), "units")
@@ -413,7 +444,11 @@ def _step_runtimes(cfg, report, yes, input_fn, policy_mod, which):
         source = policy_mod.pack_source(pack)
         if source is None:
             report["steps"].append(
-                {"name": "runtimes", "status": "fail", "message": "pack missing: %s" % pack}
+                {
+                    "name": "runtimes",
+                    "status": "fail",
+                    "message": "pack missing: %s" % pack,
+                }
             )
             continue
         ok, message, target = policy_mod.install_pack_file(source, units_dir, pack)
@@ -461,7 +496,8 @@ def _step_doctor(cfg, report, system_root):
         )
         return
     lines = "; ".join(
-        "%s: %s (fix: %s)" % (item["name"], item["message"], item["fix"]) for item in bad
+        "%s: %s (fix: %s)" % (item["name"], item["message"], item["fix"])
+        for item in bad
     )
     report["steps"].append({"name": "doctor", "status": "warn", "message": lines})
 

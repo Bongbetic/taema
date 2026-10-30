@@ -21,9 +21,7 @@ def read(path):
 class DispatchTests(unittest.TestCase):
     def setUp(self):
         self.lib = tempfile.mkdtemp()
-        self.addCleanup(
-            lambda: subprocess.run(["rm", "-rf", self.lib], check=False)
-        )
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.lib], check=False))
 
     def select_bash(self, lib, hook=None):
         script = "TAEMA_HOOK=%s\n_taema_hook=${TAEMA_HOOK:-}\n" % (
@@ -88,13 +86,9 @@ class DispatchTests(unittest.TestCase):
 
     def test_fish_matches_the_shipped_file(self):
         body = read("shell/taema.fish")
-        self.assertIn(
-            "set -g __taema_hook /usr/libexec/taema/taema-fast", body
-        )
+        self.assertIn("set -g __taema_hook /usr/libexec/taema/taema-fast", body)
         self.assertIn("set __taema_hook /usr/libexec/taema/taema-hook", body)
-        self.assertIn(
-            "set -q TAEMA_HOOK; and set __taema_hook $TAEMA_HOOK", body
-        )
+        self.assertIn("set -q TAEMA_HOOK; and set __taema_hook $TAEMA_HOOK", body)
         # the explicit override stays last so it always wins
         self.assertGreater(
             body.index("set -q TAEMA_HOOK"),
@@ -112,9 +106,7 @@ class DispatchTests(unittest.TestCase):
         if os.environ.get("WITHOUT_RUST"):
             raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust install")
         dest = tempfile.mkdtemp()
-        self.addCleanup(
-            lambda: subprocess.run(["rm", "-rf", dest], check=False)
-        )
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", dest], check=False))
         r = subprocess.run(
             ["make", "-n", "install", "XBPS_ARCH=", "DESTDIR=" + dest],
             capture_output=True,

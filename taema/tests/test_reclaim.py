@@ -367,18 +367,10 @@ class DaemonReclaimTests(unittest.TestCase):
         # A single unreadable cpu.stat must not restart the stability
         # window: the next readable sample still pairs with the first.
         samples = [1_000_000, None, 1_000_000]
-        with mock.patch.object(
-            service.engine, "_cpu_usage", side_effect=samples
-        ):
-            first = self.daemon._reclaim_idle(
-                self.scope, self.path, 1000.0, False, 0
-            )
-            missed = self.daemon._reclaim_idle(
-                self.scope, self.path, 1002.0, False, 0
-            )
-            verdict = self.daemon._reclaim_idle(
-                self.scope, self.path, 1010.0, False, 0
-            )
+        with mock.patch.object(service.engine, "_cpu_usage", side_effect=samples):
+            first = self.daemon._reclaim_idle(self.scope, self.path, 1000.0, False, 0)
+            missed = self.daemon._reclaim_idle(self.scope, self.path, 1002.0, False, 0)
+            verdict = self.daemon._reclaim_idle(self.scope, self.path, 1010.0, False, 0)
         self.assertEqual(first, (False, "waiting for a second idle sample"))
         self.assertEqual(missed, (False, "CPU usage is unavailable"))
         self.assertEqual(verdict, (True, "idle for 10s"))
@@ -388,15 +380,9 @@ class DaemonReclaimTests(unittest.TestCase):
         # stable sample must still see the idle verdict while the scope
         # consumed no CPU, not a restarted stability window.
         samples = [1_000_000, 1_000_000, 1_001_000]
-        with mock.patch.object(
-            service.engine, "_cpu_usage", side_effect=samples
-        ):
-            first = self.daemon._reclaim_idle(
-                self.scope, self.path, 1000.0, False, 0
-            )
-            verdict = self.daemon._reclaim_idle(
-                self.scope, self.path, 1010.0, False, 0
-            )
+        with mock.patch.object(service.engine, "_cpu_usage", side_effect=samples):
+            first = self.daemon._reclaim_idle(self.scope, self.path, 1000.0, False, 0)
+            verdict = self.daemon._reclaim_idle(self.scope, self.path, 1010.0, False, 0)
             interleaved = self.daemon._reclaim_idle(
                 self.scope, self.path, 1011.0, False, 0
             )

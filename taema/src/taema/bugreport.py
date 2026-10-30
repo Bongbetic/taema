@@ -23,7 +23,9 @@ import time
 from taema import __version__
 from taema.store import transfer
 
-EXTRA_REDACT_KEYS = frozenset({"socket", "state_dir", "helper", "hooks_dir", "units_dir"})
+EXTRA_REDACT_KEYS = frozenset(
+    {"socket", "state_dir", "helper", "hooks_dir", "units_dir"}
+)
 
 
 def _redact_node(node):
@@ -106,7 +108,11 @@ def collect_unit_names(units):
     names = []
     for unit in units or []:
         if isinstance(unit, dict):
-            name = unit.get("unit", {}).get("name") if isinstance(unit.get("unit"), dict) else None
+            name = (
+                unit.get("unit", {}).get("name")
+                if isinstance(unit.get("unit"), dict)
+                else None
+            )
             if name:
                 names.append(name)
     return sorted(set(names))
@@ -124,7 +130,11 @@ def collect_metrics(cfg, store):
     metrics = {}
     if store is not None:
         try:
-            metrics["decisions"] = len(store.data.get("decisions", [])) if isinstance(store.data.get("decisions"), list) else 0
+            metrics["decisions"] = (
+                len(store.data.get("decisions", []))
+                if isinstance(store.data.get("decisions"), list)
+                else 0
+            )
         except Exception:
             pass
         try:
@@ -163,7 +173,9 @@ def create_bundle(cfg, store, units, target=None):
             state_dir = policy.state_dir(cfg)
         except Exception:
             pass
-        name = "taema-bug-report-%s.tar.gz" % time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        name = "taema-bug-report-%s.tar.gz" % time.strftime(
+            "%Y%m%dT%H%M%SZ", time.gmtime()
+        )
         target = os.path.join(state_dir, name)
     else:
         target = os.path.abspath(os.path.expanduser(target))
@@ -175,7 +187,8 @@ def create_bundle(cfg, store, units, target=None):
             "versions.json": json.dumps(versions, indent=2, sort_keys=True) + "\n",
             "doctor.json": json.dumps(doctor_report, indent=2, sort_keys=True) + "\n",
             "config.redacted.toml": config_text,
-            "units.json": json.dumps({"units": unit_names}, indent=2, sort_keys=True) + "\n",
+            "units.json": json.dumps({"units": unit_names}, indent=2, sort_keys=True)
+            + "\n",
             "metrics.json": json.dumps(metrics, indent=2, sort_keys=True) + "\n",
             "events.json": json.dumps(events, indent=2, sort_keys=True) + "\n",
         }
@@ -185,7 +198,9 @@ def create_bundle(cfg, store, units, target=None):
             with open(path, "w", encoding="utf-8") as stream:
                 stream.write(text)
             staged.append((arcname, path))
-        fd, temporary = tempfile.mkstemp(prefix=".taema-bug-report-", suffix=".tar.gz", dir=directory or None)
+        fd, temporary = tempfile.mkstemp(
+            prefix=".taema-bug-report-", suffix=".tar.gz", dir=directory or None
+        )
         try:
             os.close(fd)
             with tarfile.open(temporary, "w:gz") as archive:

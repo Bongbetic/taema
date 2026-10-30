@@ -201,7 +201,9 @@ class ConfigTest(VmTestCase):
     def test_non_m3_config_ignores_m3_only_memory_value(self):
         path = self.write_config()
         with open(path, encoding="utf-8") as source:
-            config_text = source.read().replace("m3_memory_mb = 768", 'm3_memory_mb = "fast"')
+            config_text = source.read().replace(
+                "m3_memory_mb = 768", 'm3_memory_mb = "fast"'
+            )
         with open(path, "w", encoding="utf-8") as target:
             target.write(config_text)
 
@@ -289,9 +291,7 @@ class QemuPlanTest(VmTestCase):
         self.assertIn(vmh.cache_paths(self.cfg, "musl")["initrd"], joined)
 
     def test_run_vm_uses_the_m3_memory_override_from_its_scenario_plan(self):
-        plan = vmh.build_plan(
-            self.cfg, libcs=["glibc"], scenarios=["m3"], kvm=False
-        )
+        plan = vmh.build_plan(self.cfg, libcs=["glibc"], scenarios=["m3"], kvm=False)
         run_dir = os.path.join(self.state, "runs", "live-m3")
         os.makedirs(run_dir)
         proc = mock.Mock()
@@ -572,7 +572,9 @@ class PackageBuildTest(VmTestCase):
     def test_previous_version_accepts_arch_suffixes(self):
         cfg = vmh.load_config(self.write_config())
         self.assertEqual(vmh.previous_version(cfg), "0.3.0")
-        cfg["images"]["previous_url"] = "https://example.com/taema-1.2.3_1.x86_64-musl.xbps"
+        cfg["images"]["previous_url"] = (
+            "https://example.com/taema-1.2.3_1.x86_64-musl.xbps"
+        )
         self.assertEqual(vmh.previous_version(cfg), "1.2.3")
 
 
@@ -874,7 +876,9 @@ class HarnessCliParsingTest(VmTestCase):
         cfg = vmh.load_config(self.write_config(libcs=["glibc"], scenarios=["eventd"]))
         plan = vmh.build_plan(cfg, libcs=["glibc"], scenarios=["eventd"], kvm=False)
         step = next(
-            item for item in plan["vms"][0]["steps"] if item["name"] == "scenario:eventd"
+            item
+            for item in plan["vms"][0]["steps"]
+            if item["name"] == "scenario:eventd"
         )
         self.assertIn("scenario.py eventd", step["argv"][-1])
 
@@ -1025,11 +1029,13 @@ class HarnessSurfacesTest(unittest.TestCase):
 
     def test_package_builder_indexes_per_arch(self):
         script = read_text(os.path.join(ROOT, "tools", "build-xbps.sh"))
-        self.assertIn('arch=${XBPS_ARCH:-$(default_arch)}', script)
+        self.assertIn("arch=${XBPS_ARCH:-$(default_arch)}", script)
         self.assertIn('pkg="taema-${version}_${revision}"', script)
         self.assertIn('xbps-create -A "$arch" -n "$pkg"', script)
         self.assertIn('"$repo/$pkg.$arch.xbps"', script)
-        self.assertIn('XBPS_ARCH=$arch xbps-rindex -f -a "$repo/$pkg.$arch.xbps"', script)
+        self.assertIn(
+            'XBPS_ARCH=$arch xbps-rindex -f -a "$repo/$pkg.$arch.xbps"', script
+        )
         self.assertNotIn("noarch", script)
 
     def test_workflow_is_opt_in_kvm_only_and_uploads_artifacts(self):
@@ -1746,9 +1752,7 @@ class ScenarioApiTest(unittest.TestCase):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             try:
-                current_root_exe = os.path.realpath(
-                    "/proc/%d/exe" % self.tree["root"]
-                )
+                current_root_exe = os.path.realpath("/proc/%d/exe" % self.tree["root"])
             except OSError:
                 current_root_exe = ""
             if current_root_exe == root_exe:
@@ -1809,7 +1813,9 @@ class ScenarioApiTest(unittest.TestCase):
             with open(os.path.join(proc_dir, "cmdline"), "wb") as target:
                 target.write(b"/usr/bin/python3\0-P\0-m\0taema\0daemon\0")
             with open(os.path.join(proc_dir, "status"), "w") as target:
-                target.write("Uid:\t%d\t%d\t%d\t%d\nVmRSS:\t%d kB\n" % ((uid,) * 4 + (rss,)))
+                target.write(
+                    "Uid:\t%d\t%d\t%d\t%d\nVmRSS:\t%d kB\n" % ((uid,) * 4 + (rss,))
+                )
             stat_fields = ["S"] + ["0"] * 12
             stat_fields[11] = "17"
             stat_fields[12] = "23"
@@ -1858,9 +1864,7 @@ class ScenarioApiTest(unittest.TestCase):
         self.assertEqual(profiles[0]["rss_kib"], 24576)
         self.assertEqual(profiles[0]["smaps_rollup"]["rss_kib"], 24000)
         self.assertEqual(profiles[0]["smaps_rollup"]["anonymous_kib"], 12000)
-        self.assertEqual(
-            profiles[0]["smaps_rollup"]["file_or_shmem_kib"], 12000
-        )
+        self.assertEqual(profiles[0]["smaps_rollup"]["file_or_shmem_kib"], 12000)
         self.assertEqual(profiles[0]["smaps_rollup"]["pss_file_kib"], 8000)
 
     def test_m3_idle_footprint_artifact_includes_start_and_end_profiles(self):
@@ -1869,7 +1873,7 @@ class ScenarioApiTest(unittest.TestCase):
         with open(config_path, "w") as target:
             target.write(
                 'mode = "enforce"\n[guard]\navailable_floor = 18\n'
-                '[experimental]\nguard = true\n[freeze]\nenabled = true\n'
+                "[experimental]\nguard = true\n[freeze]\nenabled = true\n"
             )
         profile = {
             "pid": 731,
@@ -1917,7 +1921,9 @@ class ScenarioApiTest(unittest.TestCase):
             scenario._m3_idle_footprint(recorder, self.tmp, duration=0)
 
         detail = json.loads(recorder.steps[-1][2])
-        self.assertEqual(detail["daemon_profiles_start"], [profile, other_daemon_profile])
+        self.assertEqual(
+            detail["daemon_profiles_start"], [profile, other_daemon_profile]
+        )
         self.assertEqual(detail["daemon_profiles_end"], [profile, other_daemon_profile])
         self.assertEqual(detail["max_rss_kib"], 24576)
 
@@ -1930,7 +1936,10 @@ class ScenarioApiTest(unittest.TestCase):
                 "result": {
                     "candidates": [[daemon_scope, "no attachment for 0s"]],
                     "memory": [
-                        {"scope": daemon_scope, "reason": "waiting for a stable CPU sample"}
+                        {
+                            "scope": daemon_scope,
+                            "reason": "waiting for a stable CPU sample",
+                        }
                     ],
                 }
             },
@@ -1950,7 +1959,11 @@ class ScenarioApiTest(unittest.TestCase):
                 with open(saved, "w") as target:
                     target.write("saved\n")
             payload = responses.pop(0)
-            return type("Result", (), {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""})()
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+            )()
 
         gc_calls = []
 
@@ -1960,7 +1973,9 @@ class ScenarioApiTest(unittest.TestCase):
 
         with (
             mock.patch.object(scenario, "_run", side_effect=record_gc),
-            mock.patch.object(scenario, "_process_running", side_effect=[True, True, False]),
+            mock.patch.object(
+                scenario, "_process_running", side_effect=[True, True, False]
+            ),
             mock.patch.object(scenario.time, "sleep"),
         ):
             evidence = scenario._m3_qmp_release_probe(731, scope, saved, timeout=10)
@@ -1976,15 +1991,25 @@ class ScenarioApiTest(unittest.TestCase):
         unavailable = type(
             "Result",
             (),
-            {"returncode": 3, "stdout": json.dumps({"status": {"daemon": "unavailable"}}), "stderr": ""},
+            {
+                "returncode": 3,
+                "stdout": json.dumps({"status": {"daemon": "unavailable"}}),
+                "stderr": "",
+            },
         )()
         running = type(
             "Result",
             (),
-            {"returncode": 0, "stdout": json.dumps({"status": {"daemon": "running"}}), "stderr": ""},
+            {
+                "returncode": 0,
+                "stdout": json.dumps({"status": {"daemon": "running"}}),
+                "stderr": "",
+            },
         )()
         with (
-            mock.patch.object(scenario, "_run", side_effect=[unavailable, running]) as run,
+            mock.patch.object(
+                scenario, "_run", side_effect=[unavailable, running]
+            ) as run,
             mock.patch.object(scenario.time, "sleep"),
         ):
             ready, detail = scenario._m3_wait_for_daemon(timeout=1, poll=0)
@@ -2013,7 +2038,9 @@ class ScenarioApiTest(unittest.TestCase):
         budget = scenario._m3_bounded_worker_cap(total, available)
         self.assertLessEqual(budget, total // 2)
         self.assertGreaterEqual(available - budget, total * 38 // 100)
-        with self.assertRaisesRegex(scenario.ScenarioError, "insufficient MemAvailable"):
+        with self.assertRaisesRegex(
+            scenario.ScenarioError, "insufficient MemAvailable"
+        ):
             scenario._m3_bounded_worker_cap(total, total // 3)
 
     def test_m3_pressure_preflight_records_live_scope_and_memory_high(self):
@@ -2067,12 +2094,8 @@ class ScenarioApiTest(unittest.TestCase):
         paths = scenario._m3_cache_fixture_paths(artifacts, home=home)
 
         self.assertEqual(os.path.getsize(paths["cache_file"]), 0)
-        self.assertEqual(
-            os.path.commonpath((home, paths["cache_file"])), home
-        )
-        self.assertEqual(
-            os.path.commonpath((artifacts, paths["ready"])), artifacts
-        )
+        self.assertEqual(os.path.commonpath((home, paths["cache_file"])), home)
+        self.assertEqual(os.path.commonpath((artifacts, paths["ready"])), artifacts)
         self.assertNotEqual(
             os.path.commonpath((artifacts, paths["cache_file"])), artifacts
         )
@@ -2096,7 +2119,9 @@ class ScenarioApiTest(unittest.TestCase):
             "",
         )
         with (
-            mock.patch.object(scenario.shutil, "which", return_value="/usr/bin/findmnt"),
+            mock.patch.object(
+                scenario.shutil, "which", return_value="/usr/bin/findmnt"
+            ),
             mock.patch.object(scenario, "_run", return_value=result) as findmnt,
         ):
             evidence = scenario._m3_cache_mount_info("/home/test/.cache/m3/cache.bin")
@@ -2110,9 +2135,7 @@ class ScenarioApiTest(unittest.TestCase):
         cg_dir = os.path.join(self.cgroot, scope)
         os.makedirs(cg_dir)
         with open(os.path.join(cg_dir, "memory.stat"), "w") as target:
-            target.write(
-                "file 16777216\ninactive_file 8388608\nshmem 1048576\n"
-            )
+            target.write("file 16777216\ninactive_file 8388608\nshmem 1048576\n")
 
         with mock.patch.object(scenario, "CGROOT", self.cgroot):
             counters = scenario._m3_cache_scope_counters(scope)
@@ -2207,7 +2230,9 @@ class ScenarioApiTest(unittest.TestCase):
         )
         try:
             time.sleep(0.2)
-            self.assertIsNone(worker.poll(), "cache worker must wait at the population gate")
+            self.assertIsNone(
+                worker.poll(), "cache worker must wait at the population gate"
+            )
             self.assertFalse(os.path.exists(cache_file))
             self.assertFalse(os.path.exists(ready_file))
             with open(gate_file, "w") as target:
@@ -2298,7 +2323,9 @@ class ScenarioApiTest(unittest.TestCase):
         self.assertEqual(config["guard"]["psi_full"], "1us/2s")
         self.assertEqual(config["freeze"]["after"], 0)
 
-    def test_m3_prepressure_evidence_reads_appended_events_and_targets_cache_scope(self):
+    def test_m3_prepressure_evidence_reads_appended_events_and_targets_cache_scope(
+        self,
+    ):
         path = os.path.join(self.tmp, "decisions.log")
         before = '{"event":"memory_reclaimed","scope":"leftover/old"}\n'
         with open(path, "w", encoding="utf-8") as target:
@@ -2358,9 +2385,7 @@ class ScenarioApiTest(unittest.TestCase):
                     '{"status": {"mode": "%s"}}' % mode,
                     "",
                 )
-                with mock.patch.object(
-                    scenario, "_run", return_value=completed
-                ) as run:
+                with mock.patch.object(scenario, "_run", return_value=completed) as run:
                     observed, result = scenario._m3_read_status_mode()
 
                 self.assertEqual(observed, mode)
@@ -2405,8 +2430,7 @@ class ScenarioApiTest(unittest.TestCase):
 
     def test_m3_earlyoom_phase_can_disable_only_adopt_guard_freezing(self):
         config = (
-            '[guard]\nenabled = true\nfreeze_in_adopt = true\n\n'
-            '[mem]\nreclaim = true\n'
+            "[guard]\nenabled = true\nfreeze_in_adopt = true\n\n[mem]\nreclaim = true\n"
         )
         disabled = scenario._m3_pressure_freeze_config(config, False)
         self.assertIn("enabled = true\nfreeze_in_adopt = false", disabled)

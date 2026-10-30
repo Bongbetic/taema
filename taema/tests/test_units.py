@@ -621,9 +621,7 @@ class UnitManageTests(unittest.TestCase):
         self.write(self.user, "ghost.toml.disabled", "")
         code, _output = run_cli(self.root, "unit", "enable", "ghost")
         self.assertEqual(code, 0)
-        self.assertFalse(
-            os.path.exists(os.path.join(self.user, "ghost.toml.disabled"))
-        )
+        self.assertFalse(os.path.exists(os.path.join(self.user, "ghost.toml.disabled")))
 
     def test_install_from_pack(self):
         code, _output = run_cli(self.root, "unit", "install", "vscode")

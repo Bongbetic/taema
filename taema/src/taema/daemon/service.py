@@ -306,6 +306,12 @@ class Daemon:
         self.collector_events = collections.deque()
         self._collector_event_set = set()
         self.collector_event_drops = 0
+        self._collector_enqueue_times: collections.deque = collections.deque()
+        self._pass_times: dict = {
+            "memory": collections.deque(maxlen=120),
+            "gc": collections.deque(maxlen=120),
+            "tick": collections.deque(maxlen=120),
+        }
         self.eventd_sock = None
         self.eventd_buffer = bytearray()
         self.eventd_pending = {}
@@ -578,6 +584,7 @@ class Daemon:
             return False
         self.collector_events.append(event)
         self._collector_event_set.add(event)
+        self._collector_enqueue_times.append(time.monotonic())
         return True
 
     def drain_collector_events(self):
@@ -585,6 +592,8 @@ class Daemon:
         while self.collector_events:
             event = self.collector_events.popleft()
             self._collector_event_set.discard(event)
+            if self._collector_enqueue_times:
+                self._collector_enqueue_times.popleft()
             self.guarded(lambda event=event: self._dispatch_collector_event(event))
 
     def _dispatch_collector_event(self, event):
@@ -3111,6 +3120,13 @@ class Daemon:
         return self.survivor_signature(next(iter(owners)), infos)["id"]
 
     def gc_pass(self, dry_run=False):
+        started = time.perf_counter()
+        try:
+            return self._gc_pass_impl(dry_run=dry_run)
+        finally:
+            self._record_pass("gc", (time.perf_counter() - started) * 1000.0)
+
+    def _gc_pass_impl(self, dry_run=False):
         self.store.prune_vetoes(trigger="gc")
         self.store.expire_reviews()
         self._save_if_idle()
@@ -4755,6 +4771,7 @@ class Daemon:
                 "agents": self.agent_report(),
                 "windows": self.window_summary(),
                 "mem_enabled": memory.config_enabled(self.cfg),
+                "self_metrics": self.self_metrics(),
             }
             self._status_cache = (self._state_gen, now_mono, reply)
             return reply
@@ -4951,6 +4968,105 @@ class Daemon:
             ),
             "psi_trigger_metrics": list(self.pressure_watch_metrics),
             "psi_trigger_failures": list(self.pressure_watch_failures),
+        }
+
+    def _record_pass(self, name, duration_ms):
+        """Append one pass duration in milliseconds for the self-metrics p50/p95."""
+        try:
+            queue = self._pass_times.get(name)
+            if queue is None:
+                queue = collections.deque(maxlen=120)
+                self._pass_times[name] = queue
+            queue.append(float(duration_ms))
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _pass_percentile(values, quantile):
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = min(
+            len(ordered) - 1, int(__import__("math").ceil(quantile * len(ordered))) - 1
+        )
+        return float(ordered[max(0, index)])
+
+    def _pass_stats(self, name):
+        values = list(self._pass_times.get(name, []))
+        if not values:
+            return {"p50_ms": 0.0, "p95_ms": 0.0, "samples": 0}
+        return {
+            "p50_ms": self._pass_percentile(values, 0.5),
+            "p95_ms": self._pass_percentile(values, 0.95),
+            "samples": len(values),
+        }
+
+    @staticmethod
+    def _rss_bytes():
+        try:
+            with open("/proc/self/statm", encoding="utf-8") as source:
+                pages = int(source.read().split()[1])
+            return pages * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            import resource as _resource
+
+            return int(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss * 1024)
+        except (OSError, ValueError):
+            return 0
+
+    @staticmethod
+    def _cpu_seconds():
+        try:
+            times = os.times()
+            return float(times.user + times.system)
+        except (OSError, ValueError):
+            return 0.0
+
+    def _event_lag(self, now_mono=None):
+        """Seconds since the oldest queued collector event was enqueued, else 0."""
+        if not self.collector_events or not self._collector_enqueue_times:
+            return 0.0
+        if now_mono is None:
+            now_mono = time.monotonic()
+        try:
+            oldest = self._collector_enqueue_times[0]
+            return max(0.0, float(now_mono - oldest))
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    def self_metrics(self, now=None, now_mono=None):
+        """JSON-safe daemon footprint and latency gauges for status --verbose."""
+        now = time.time() if now is None else float(now)
+        now_mono = time.monotonic() if now_mono is None else float(now_mono)
+        try:
+            sqlite_stats = self.store.db.write_stats()
+        except AttributeError:
+            sqlite_stats = {"write_seconds": 0.0, "write_count": 0}
+        try:
+            ss_per_minute = float(inspect.ss_calls_per_minute(now_mono))
+        except AttributeError:
+            ss_per_minute = 0.0
+        memory_stats = self._pass_stats("memory")
+        gc_stats = self._pass_stats("gc")
+        tick_stats = self._pass_stats("tick")
+        return {
+            "rss_bytes": int(self._rss_bytes()),
+            "cpu_seconds": float(self._cpu_seconds()),
+            "pass_p50_ms": float(tick_stats["p50_ms"]),
+            "pass_p95_ms": float(tick_stats["p95_ms"]),
+            "pass_samples": int(tick_stats["samples"]),
+            "memory_p50_ms": float(memory_stats["p50_ms"]),
+            "memory_p95_ms": float(memory_stats["p95_ms"]),
+            "gc_p50_ms": float(gc_stats["p50_ms"]),
+            "gc_p95_ms": float(gc_stats["p95_ms"]),
+            "ss_calls_per_minute": float(ss_per_minute),
+            "sqlite_write_seconds": float(sqlite_stats.get("write_seconds", 0.0)),
+            "sqlite_writes": int(sqlite_stats.get("write_count", 0)),
+            "event_lag_seconds": float(self._event_lag(now_mono)),
+            "event_queue_depth": int(len(self.collector_events)),
+            "event_drops": int(self.collector_event_drops),
         }
 
     def attach(self, msg):
@@ -7751,8 +7867,7 @@ class Daemon:
             }
             attempts.append(attempt)
             failures.extend(
-                "%s %s: %s" % (source, path, failure)
-                for failure in attempt_failures
+                "%s %s: %s" % (source, path, failure) for failure in attempt_failures
             )
             if not monitor.metrics:
                 monitor.close()
@@ -7773,7 +7888,9 @@ class Daemon:
                     error,
                 )
                 failures.append(failure)
-                attempts[-1]["failures"] += ("selector registration failed: %s" % error,)
+                attempts[-1]["failures"] += (
+                    "selector registration failed: %s" % error,
+                )
                 continue
             selected = (source, path, monitor)
             break
@@ -7795,7 +7912,11 @@ class Daemon:
                     reason=failure,
                 )
         if selected is not None:
-            self.pressure_watch_source, self.pressure_watch_path, self.pressure_monitor = selected
+            (
+                self.pressure_watch_source,
+                self.pressure_watch_path,
+                self.pressure_monitor,
+            ) = selected
             self.pressure_watch_metrics = tuple(self.pressure_monitor.metrics)
             if self.pressure_watch_source != "delegated-cgroup":
                 fallback = {
@@ -8342,6 +8463,13 @@ class Daemon:
 
     def tick(self):
         """Run what is due, skipping the pass when SQLite's writer slot is busy."""
+        started = time.perf_counter()
+        try:
+            return self._tick_impl()
+        finally:
+            self._record_pass("tick", (time.perf_counter() - started) * 1000.0)
+
+    def _tick_impl(self):
         self._in_tick = True
         self.store.defer_writes = True
         skip_pass = False
@@ -9159,6 +9287,13 @@ class Daemon:
 
     def memory_pass(self, now=None):
         """Sample live cgroups and persist only material changes or the 10-minute heartbeat."""
+        started = time.perf_counter()
+        try:
+            return self._memory_pass_impl(now=now)
+        finally:
+            self._record_pass("memory", (time.perf_counter() - started) * 1000.0)
+
+    def _memory_pass_impl(self, now=None):
         if not memory.enabled(self.cfg):
             self.memory_governor_pass(now=now, force_restore=True)
             return 0

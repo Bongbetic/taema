@@ -1103,6 +1103,8 @@ class StateDB:
         self.deny = tuple(deny)
         self.available = os.path.isfile(self.path)
         self.recovery = None
+        self.write_seconds = 0.0
+        self.write_count = 0
         if read_only:
             return
         self._secure_dir()
@@ -1314,10 +1316,37 @@ class StateDB:
             ).fetchall()
         return {row["scope_key"]: dict(row) for row in rows}
 
+    def _record_write(self, seconds):
+        """Accumulate one SQLite write batch for the self-metrics write-time gauge."""
+        try:
+            self.write_seconds += float(seconds)
+            self.write_count += 1
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    def write_stats(self):
+        """JSON-safe SQLite write counters for status --verbose."""
+        try:
+            seconds = float(getattr(self, "write_seconds", 0.0))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        try:
+            count = int(getattr(self, "write_count", 0))
+        except (TypeError, ValueError):
+            count = 0
+        return {"write_seconds": seconds, "write_count": count}
+
     def save_memory_samples(self, samples, now=None):
         """Persist changed scope samples and update daily p50/peak rollups atomically."""
         if self.read_only or not self.available:
             return 0
+        started = time.perf_counter()
+        try:
+            return self._save_memory_samples(samples, now=now)
+        finally:
+            self._record_write(time.perf_counter() - started)
+
+    def _save_memory_samples(self, samples, now=None):
         now = time.time() if now is None else float(now)
         day = int(now // DAY)
         day_start = day * DAY
@@ -2728,6 +2757,28 @@ class StateDB:
     ):
         if self.read_only:
             return
+        started = time.perf_counter()
+        try:
+            return self._save_state(
+                data,
+                now=now,
+                decisions=decisions,
+                events=events,
+                decision_seq=decision_seq,
+                event_seq=event_seq,
+            )
+        finally:
+            self._record_write(time.perf_counter() - started)
+
+    def _save_state(
+        self,
+        data,
+        now=None,
+        decisions=(),
+        events=(),
+        decision_seq=None,
+        event_seq=None,
+    ):
         now = time.time() if now is None else now
         self._secure_dir()
         optional_meta_defaults = {

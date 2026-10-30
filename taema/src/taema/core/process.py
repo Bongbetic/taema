@@ -4,7 +4,7 @@ An edge means an OUTSIDE process depends on a MEMBER (member is the server side)
 Clients of things outside the set, shared stdio, ptys and pipes are never edges.
 """
 
-from collections import namedtuple
+from collections import deque, namedtuple
 import os
 import re
 
@@ -463,8 +463,36 @@ def _host(addr):
     return addr.rsplit(":", 1)[0].strip("[]")
 
 
+_SS_CALL_TIMES: deque = deque(maxlen=1024)
+
+
+def _record_ss_call(now=None):
+    """Record one `ss` invocation for the self-metrics calls-per-minute rate."""
+    if now is None:
+        import time as _time
+
+        now = _time.monotonic()
+    _SS_CALL_TIMES.append(now)
+
+
+def ss_call_count():
+    """Total `ss` invocations recorded in this process (bounded window)."""
+    return len(_SS_CALL_TIMES)
+
+
+def ss_calls_per_minute(now=None):
+    """Number of recorded `ss` calls in the trailing 60 seconds."""
+    if now is None:
+        import time as _time
+
+        now = _time.monotonic()
+    cutoff = now - 60.0
+    return float(sum(1 for item in _SS_CALL_TIMES if item >= cutoff))
+
+
 def _ss(*args):
     """ss output, or None when ss failed (unknown: callers must not read it as "no sockets")."""
+    _record_ss_call()
     try:
         r = subprocess.run(
             ["ss", "-H"] + list(args), capture_output=True, text=True, timeout=10

@@ -509,7 +509,7 @@ def render_status(model, args, summary=False):
                 max(12, width - 18),
             )
         )
-    if summary:
+    if summary and not getattr(args, "verbose", False):
         return "\n".join(lines[:9]) + "\n"
     if status.get("config"):
         lines.append(
@@ -566,6 +566,68 @@ def render_status(model, args, summary=False):
                         _clip(", ".join(stop.get("pairs", [])), 32),
                     )
                 )
+        if getattr(args, "verbose", False):
+            metrics = details.get("self_metrics") or {}
+            if metrics:
+                try:
+                    rss_mb = float(metrics.get("rss_bytes", 0)) / (1024 * 1024)
+                except (TypeError, ValueError):
+                    rss_mb = 0.0
+                lines.append(
+                    "RSS: %.1f MB (%s bytes)" % (rss_mb, metrics.get("rss_bytes", 0))
+                )
+                lines.append("CPU seconds: %s" % metrics.get("cpu_seconds", 0))
+                lines.append(
+                    "pass p50/p95: %.2f/%.2f ms (%s samples)"
+                    % (
+                        metrics.get("pass_p50_ms", 0.0),
+                        metrics.get("pass_p95_ms", 0.0),
+                        metrics.get("pass_samples", 0),
+                    )
+                )
+                lines.append(
+                    "memory pass p50/p95: %.2f/%.2f ms; gc pass p50/p95: %.2f/%.2f ms"
+                    % (
+                        metrics.get("memory_p50_ms", 0.0),
+                        metrics.get("memory_p95_ms", 0.0),
+                        metrics.get("gc_p50_ms", 0.0),
+                        metrics.get("gc_p95_ms", 0.0),
+                    )
+                )
+                lines.append(
+                    "ss calls per minute: %s" % metrics.get("ss_calls_per_minute", 0)
+                )
+                lines.append(
+                    "SQLite write time: %s seconds over %s writes"
+                    % (
+                        metrics.get("sqlite_write_seconds", 0.0),
+                        metrics.get("sqlite_writes", 0),
+                    )
+                )
+                lines.append(
+                    "event lag: %s seconds (depth %s, drops %s)"
+                    % (
+                        metrics.get("event_lag_seconds", 0.0),
+                        metrics.get("event_queue_depth", 0),
+                        metrics.get("event_drops", 0),
+                    )
+                )
+            else:
+                lines.append("self metrics: unavailable (daemon down)")
+            if isinstance(agents, dict) and agents:
+                for session in sorted(agents):
+                    info = agents[session] or {}
+                    lines.append(
+                        "agent detail: session %s state %s pid %s capabilities %s last_beat_age_s %s compositor %s"
+                        % (
+                            session,
+                            info.get("state", "?"),
+                            info.get("pid", "?"),
+                            ",".join(info.get("capabilities", []) or []),
+                            info.get("last_beat_age_s", "?"),
+                            info.get("compositor", "?"),
+                        )
+                    )
     return "\n".join(lines) + "\n"
 
 

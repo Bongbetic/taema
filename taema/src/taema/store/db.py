@@ -2740,7 +2740,7 @@ class StateDB:
             cursor = connection.execute(
                 "UPDATE decisions SET undo = json_remove(undo, '$.payload.restored_at') "
                 "WHERE id = ? AND json_valid(undo) "
-                "AND json_extract(undo, '$.payload.restored_at') = ?",
+                "AND ABS(json_extract(undo, '$.payload.restored_at') - ?) < 0.001",
                 (identifier, at),
             )
             connection.commit()

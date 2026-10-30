@@ -167,6 +167,14 @@ class AppKey(ProcCase):
         self.assertEqual(
             self.key("firefox", "/usr/lib/firefox/firefox", ["firefox"]), "firefox"
         )
+        # exe_key re-resolves from /proc facts; the exe target must
+        # exist for the identity to validate, so point pid 50 at a
+        # real file inside the fake root instead of a host path.
+        target = os.path.join(self.fp.root, "exe-target", "firefox")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as f:
+            f.write("")
+        self.fp.add(50, 1, comm="firefox", exe=target, argv=["firefox"])
         self.assertEqual(policy.exe_key(50), policy.app_key(50))
         self.fp.add(51, 1, comm="node", exe="/usr/bin/node", argv=["node", "vite.js"])
         self.assertEqual(policy.exe_key(51), policy.app_key(51))

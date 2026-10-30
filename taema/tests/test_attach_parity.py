@@ -562,24 +562,6 @@ class ParityTests(unittest.TestCase):
         )
 
     @staticmethod
-    def oom_lower_write_fails():
-        """True when lowering an oom_score_adj is refused here.
-
-        The restore-write refusal is only reachable when the kernel
-        denies the write; privileged runners succeed instead.
-        """
-        pid = os.fork()
-        if pid == 0:
-            try:
-                with open("/proc/self/oom_score_adj", "w") as target:
-                    target.write("-1000")
-                os._exit(1)
-            except OSError:
-                os._exit(0)
-        _, status = os.waitpid(pid, 0)
-        return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-
-    @staticmethod
     def own_cgroup_is_session():
         cg = cgroup_of(os.getpid())
         return bool(re.fullmatch(r"/[0-9]+(/.*)?", cg)) or cg.startswith(
@@ -1106,10 +1088,10 @@ class ParityTests(unittest.TestCase):
         # kernels hide every foreign environ.
         if self.foreign_readable_pid() is not None:
             catalog.append("is not owned by uid ")
-        # The restore-write refusal needs the kernel to deny lowering an
-        # oom_score_adj; privileged runners write it successfully.
-        if self.oom_lower_write_fails():
-            catalog.append("could not restore OOM priority: ")
+        # "could not restore OOM priority: " is not catalogued: whether
+        # the restore write is refused depends on runner privileges, but
+        # the restore-write-path check above exercises that case against
+        # both helpers and compares their behaviour in every env.
         missing = [
             template
             for template in catalog

@@ -1539,7 +1539,9 @@ class Store:
         decision = self.decision(decision_id) if decision_id is not None else None
         if not decision or not isinstance(decision.get("undo"), dict):
             return False
-        if decision["undo"].get("restored_at") != at:
+        restored_at = decision["undo"].get("restored_at")
+        # SQLite JSON roundtrips can lose float precision; compare loosely.
+        if not isinstance(restored_at, (int, float)) or abs(restored_at - at) >= 0.001:
             return False
         pending = next(
             (item for item in self._pending_decisions if item["id"] == decision_id),

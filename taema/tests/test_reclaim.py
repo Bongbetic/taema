@@ -363,6 +363,47 @@ class DaemonReclaimTests(unittest.TestCase):
         self.assertEqual(event["current_before"], result["current_before"])
         self.assertEqual(event["current_after"], result["current_after"])
 
+    def test_reclaim_idle_survives_transient_cpu_sample_miss(self):
+        # A single unreadable cpu.stat must not restart the stability
+        # window: the next readable sample still pairs with the first.
+        samples = [1_000_000, None, 1_000_000]
+        with mock.patch.object(
+            service.engine, "_cpu_usage", side_effect=samples
+        ):
+            first = self.daemon._reclaim_idle(
+                self.scope, self.path, 1000.0, False, 0
+            )
+            missed = self.daemon._reclaim_idle(
+                self.scope, self.path, 1002.0, False, 0
+            )
+            verdict = self.daemon._reclaim_idle(
+                self.scope, self.path, 1010.0, False, 0
+            )
+        self.assertEqual(first, (False, "waiting for a second idle sample"))
+        self.assertEqual(missed, (False, "CPU usage is unavailable"))
+        self.assertEqual(verdict, (True, "idle for 10s"))
+
+    def test_reclaim_idle_verdict_survives_interleaved_callers(self):
+        # A caller that lands just after another caller consumed the
+        # stable sample must still see the idle verdict while the scope
+        # consumed no CPU, not a restarted stability window.
+        samples = [1_000_000, 1_000_000, 1_001_000]
+        with mock.patch.object(
+            service.engine, "_cpu_usage", side_effect=samples
+        ):
+            first = self.daemon._reclaim_idle(
+                self.scope, self.path, 1000.0, False, 0
+            )
+            verdict = self.daemon._reclaim_idle(
+                self.scope, self.path, 1010.0, False, 0
+            )
+            interleaved = self.daemon._reclaim_idle(
+                self.scope, self.path, 1011.0, False, 0
+            )
+        self.assertEqual(first, (False, "waiting for a second idle sample"))
+        self.assertEqual(verdict, (True, "idle for 10s"))
+        self.assertEqual(interleaved, (True, "idle for 11s"))
+
     def test_frozen_scope_reclaims_anon_and_reports_swap_destinations(self):
         write(self.path + "/cgroup.freeze", "1\n")
         self.daemon.store.data["frozen_scopes"] = {self.scope: {"source": "test"}}

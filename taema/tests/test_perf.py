@@ -145,13 +145,39 @@ class IdleBudgets(unittest.TestCase):
     def test_idle_rss_regression_gate(self):
         # Target is 30 MB; Python misses it (see module docstring for the
         # G-Core datum). Pin a 70 MB regression gate so CI fails on drift.
+        # Measure a fresh subprocess daemon: this process carries the
+        # whole suite's debris, which made the gate flaky near 70 MB.
         import resource
 
-        with tempfile.TemporaryDirectory() as root:
-            daemon = self._loaded_daemon(root)
-            metrics = daemon.self_metrics()
-            rss_mb = metrics["rss_bytes"] / (1024 * 1024)
-            del daemon
+        probe = (
+            "import sys, tempfile, time\n"
+            "from tests.test_perf import _write_50k_rows\n"
+            "from tests.test_phase0 import make_cfg\n"
+            "from taema.store import knowledge\n"
+            "from taema.daemon import service\n"
+            "root = tempfile.mkdtemp()\n"
+            "store = knowledge.Store(root)\n"
+            "_write_50k_rows(store, time.time())\n"
+            "store.save()\n"
+            "del store\n"
+            "daemon = service.Daemon(make_cfg(root))\n"
+            "daemon.tick()\n"
+            "daemon.tick()\n"
+            "print(daemon.self_metrics()['rss_bytes'])\n"
+        )
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [os.path.join(ROOT, "src"), ROOT, env.get("PYTHONPATH", "")]
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-500:])
+        rss_mb = int(result.stdout.strip()) / (1024 * 1024)
         peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
         self.assertLess(rss_mb, 70.0, "idle RSS regressed to %.1f MB" % rss_mb)
         self.assertLess(peak_mb, 120.0, "test peak RSS regressed to %.1f MB" % peak_mb)

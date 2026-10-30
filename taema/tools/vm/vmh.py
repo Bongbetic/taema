@@ -343,6 +343,8 @@ def scenario_command(name, cfg, repo_name, previous):
     )
     if name == "m3":
         remote += " --expected-memory-mb %s" % cfg.get("m3_memory_mb", 768)
+    if name == "m5":
+        remote += " --current-version %s" % read_version()
     if name in ("upgrade", "m1"):
         remote += (
             " --package-dir %s/%s --previous %s/%s"

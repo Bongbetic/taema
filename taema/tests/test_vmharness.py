@@ -555,6 +555,7 @@ class PackageBuildTest(VmTestCase):
 
     def test_build_single_libc_runs_the_suite(self):
         cfg = vmh.load_config(self.write_config(libcs=["musl"]))
+        cfg["paths"]["package_repo"] = os.path.join(self.tmp, "package-repo")
 
         def fake_run(argv, **kwargs):
             self.assertNotIn("SKIP_TESTS", kwargs["env"])
@@ -948,7 +949,7 @@ class HarnessSurfacesTest(unittest.TestCase):
 
         workflow = read_text(os.path.join(REPO, ".github", "workflows", "release.yml"))
         self.assertIn('cat CHANGELOG.md >> "$RUNNER_TEMP/notes.md"', workflow)
-        self.assertEqual(vmh.read_version(ROOT), "0.8.0")
+        self.assertEqual(vmh.read_version(ROOT), "1.0.0")
 
     def test_release_notes_document_0_5_0_resource_governor(self):
         notes = read_text(os.path.join(REPO, "CHANGELOG.md"))

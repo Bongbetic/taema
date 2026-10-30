@@ -266,6 +266,7 @@ class Daemon:
         self.memory_scope_allocations = {}
         self.last_memory_prune = 0.0
         self.reclaim_usage = {}  # scope -> aggregate cpu usage_usec and sample time
+        self.reclaim_idle_proof = {}  # scope -> (usage_usec, verified_at) idle verdict
         self.reclaim_idle_since = {}
         self.reclaim_state = {}  # scope -> cooldown/refault state
         self.saved_vm_scopes = set()  # VM save success, until the guest resumes
@@ -9636,8 +9637,8 @@ class Daemon:
         usage = engine._cpu_usage(path)
         previous = self.reclaim_usage.get(scope)
         if usage is None:
-            self.reclaim_usage.pop(scope, None)
-            self.reclaim_idle_since.pop(scope, None)
+            # Keep the previous sample: one unreadable cpu.stat must not
+            # restart the stability window and starve idle detection.
             return False, "CPU usage is unavailable"
         if previous is None or now <= previous[1]:
             self.reclaim_usage[scope] = (usage, now)
@@ -9645,16 +9646,31 @@ class Daemon:
             return False, "waiting for a second idle sample"
         elapsed = now - previous[1]
         if elapsed < qos.BACKGROUND_SAMPLE_SECONDS:
+            # Another caller may have consumed the stable sample just
+            # before us; a recent verdict with unchanged CPU usage is
+            # still valid instead of restarting the window.
+            proof = self.reclaim_idle_proof.get(scope)
+            if (
+                proof is not None
+                and usage >= proof[0]
+                and 0 < now - proof[1] < 2 * qos.BACKGROUND_SAMPLE_SECONDS
+                and 100.0 * (usage - proof[0]) / ((now - proof[1]) * 1_000_000)
+                <= RECLAIM_CPU_PERCENT
+            ):
+                idle_since = self.reclaim_idle_since.setdefault(scope, previous[1])
+                return True, "idle for %ds" % int(now - idle_since)
             return False, "waiting for a stable CPU sample"
         self.reclaim_usage[scope] = (usage, now)
         if usage < previous[0]:
             self.reclaim_usage[scope] = (usage, now)
             self.reclaim_idle_since[scope] = now
+            self.reclaim_idle_proof.pop(scope, None)
             return False, "CPU counter changed"
         cpu_percent = 100.0 * (usage - previous[0]) / (elapsed * 1_000_000)
         self.reclaim_usage[scope] = (usage, now)
         if cpu_percent > RECLAIM_CPU_PERCENT:
             self.reclaim_idle_since[scope] = now
+            self.reclaim_idle_proof.pop(scope, None)
             return False, "scope is active (%.2f%% CPU)" % cpu_percent
         idle_since = self.reclaim_idle_since.setdefault(scope, previous[1])
         effective_grace = grace * (2 if warm else 1)
@@ -9668,6 +9684,7 @@ class Daemon:
                     " (warm scope)" if warm else "",
                 ),
             )
+        self.reclaim_idle_proof[scope] = (usage, now)
         return True, "idle for %ds" % int(now - idle_since)
 
     def _reclaim_one(
@@ -10213,11 +10230,13 @@ class Daemon:
         tracked_scopes = (
             set(self.reclaim_state)
             | set(self.reclaim_usage)
+            | set(self.reclaim_idle_proof)
             | set(self.reclaim_idle_since)
         )
         for scope in tracked_scopes - scope_names:
             self.reclaim_state.pop(scope, None)
             self.reclaim_usage.pop(scope, None)
+            self.reclaim_idle_proof.pop(scope, None)
             self.reclaim_idle_since.pop(scope, None)
 
         candidates = []

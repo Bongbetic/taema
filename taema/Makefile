@@ -119,7 +119,7 @@ endif
 	install -m644 examples/autostart/* $(EXAMPLES)/autostart/
 	install -m644 examples/packs/*.toml $(EXAMPLES)/packs/
 	install -m644 widgets/taema-bar/*.qml $(EXAMPLES)/widgets/
-	install -m644 README.md docs/design.md ../docs/identity-resolution.md ../docs/legacy-state-migration.md ../docs/state-schema.md $(DOCDIR)/
+	install -m644 README.md docs/design.md ../docs/identity-resolution.md ../docs/legacy-state-migration.md ../docs/state-schema.md ../docs/upgrading-to-1.0.0.md $(DOCDIR)/
 	install -m644 docs/taema-learning.7 $(MANDIR)/taema-learning.7
 	install -m644 docs/taema.1 $(MAN1DIR)/taema.1
 	install -m644 docs/taema-agent.1 $(MAN1DIR)/taema-agent.1

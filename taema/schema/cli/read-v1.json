@@ -470,6 +470,33 @@
         "null"
        ],
        "minimum": 0
+      },
+      "psi_trigger_source": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "psi_trigger_path": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "psi_trigger_writable": {
+       "type": "boolean"
+      },
+      "psi_trigger_metrics": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "psi_trigger_failures": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
       }
      },
      "additionalProperties": false

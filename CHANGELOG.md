@@ -1,3 +1,44 @@
+# 1.0.0
+
+## Behaviour changes
+
+### v2 complete: governance, desktop integration, native edges
+
+1.0.0 completes the v2 spec. Every eligible app receives a scope; closes
+enter one action ladder (contain, deprioritize, freeze, reclaim, stop) with
+reversible actions first and unlearned leftovers reviewed rather than
+stopped. Memory, CPU, and IO are accounted per scope, with conservative
+soft shares by default and hard caps only by explicit opt-in. The optional
+session agent adds niri window awareness, last-window-close reviews,
+notifications, and launch-time scoping; the core works headless without it.
+The privileged helper and latency-critical clients are Rust binaries with a
+Python fallback, proven by differential parity tests and a 24-hour fuzz
+campaign. Upgrading from 0.2.1 imports legacy JSON learning into SQLite,
+preserves valid pairs, turns invalid legacy answers into reviews, and stops
+nothing during migration; see `docs/upgrading-to-1.0.0.md`.
+
+### G-Core decision: no Rust port of the daemon core
+
+The M7 gate review (ADR-0008) measured the Python daemon against the
+ADR-0003 criteria. Idle CPU (0.00%) and 300-scope pass p95 (~48 ms) pass;
+no type-preventable defect trend and no static-binary requirement were
+found. Idle RSS (~45 MB) exceeds the 30 MB budget, so the gate stays open
+on that criterion, with a 70 MB CI regression gate as the tripwire. The
+core stays Python; any port remains a gated follow-on in strangler order.
+
+### Idle reclaim no longer starves on a missed CPU sample
+
+One unreadable `cpu.stat` sample no longer discards the previous sample
+and restarts the idle-stability window. Under frequent sampling that
+cycle could block page-cache reclaim indefinitely; the scope now pairs
+the next readable sample with the retained one.
+
+### Status JSON schema completed
+
+`status --json` output validates against `schema/cli/read-v1.json` again:
+the pressure guard's `psi_trigger_*` fields, emitted since 0.5.0, are now
+declared in the schema.
+
 # 0.8.0
 
 ## Behaviour changes

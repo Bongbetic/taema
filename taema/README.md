@@ -708,6 +708,8 @@ These rules are fixed. Learning and unit files cannot change them:
 The first daemon startup imports legacy 0.2 learning into SQLite and keeps a private
 30-day backup. To export state before a downgrade, use `taema learn export --format v2`.
 See the [state migration guide](../docs/legacy-state-migration.md) for the full sequence.
+Upgrading to 1.0.0 from 0.2.1 or any 0.3–0.8 release is covered in the
+[1.0.0 upgrade guide](../docs/upgrading-to-1.0.0.md).
 
 ## Uninstall
 

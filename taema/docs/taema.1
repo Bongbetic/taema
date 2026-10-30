@@ -60,6 +60,10 @@ Record an explicit pair answer without waiting for a review.
 .B taema learn show|apps|pairs|signatures
 Inspect learned state.
 .TP
+.B taema help TOPIC
+Show a topic: modes, learning, veto, ladder, memory, units, agent,
+profiles, privacy, safety.
+.TP
 .B taema history TARGET
 Show the timeline of one app or scope.
 .TP
@@ -151,6 +155,10 @@ Print live changes as plain lines.
 .B taema doctor
 Check system support and report setup problems.
 .TP
+.B taema bug-report [--to FILE]
+Write a sanitized support bundle: versions, doctor JSON, redacted config,
+unit names, self-metrics, and the last 500 events.
+.TP
 .B taema backup [--to FILE]
 Write a tarball with the database, user config, and user units.
 .TP
@@ -206,6 +214,7 @@ Start firefox inside its own reserved app scope.
 Explain what tæma would do to the scope and why.
 .SH SEE ALSO
 .BR taema.toml (5),
+.BR taema.unit (5),
 .BR taema-learning (7)
 .SH AUTHORS
 soubarnak.

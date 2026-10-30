@@ -24,11 +24,41 @@ MAN5DIR   = $(DESTDIR)/usr/share/man/man5
 BASHCOMP  = $(DESTDIR)/usr/share/bash-completion/completions
 ZSHCOMP   = $(DESTDIR)/usr/share/zsh/site-functions
 FISHCOMP  = $(DESTDIR)/usr/share/fish/vendor_completions.d
+SCDOC     ?= scdoc
+MAN1      = docs/taema.1 docs/taema-agent.1
+MAN5      = docs/taema.toml.5 docs/taema.unit.5
+MAN7      = docs/taema-learning.7
 
-.PHONY: all test check install vm-test vm-dry-run vm-doctor rust-helper rust-helper-release
+.PHONY: all test check install man vm-test vm-dry-run vm-doctor rust-helper rust-helper-release
 
 all:
 	@:
+
+# Man pages are authored as scdoc and checked in built: `make man`
+# rebuilds them when scdoc is available, otherwise keeps the
+# checked-in roff so a checkout without scdoc still installs.
+man: $(MAN1) $(MAN5) $(MAN7)
+
+docs/%.1: docs/%.scd
+	@if command -v $(SCDOC) >/dev/null 2>&1; then \
+		$(SCDOC) < $< > $@; \
+	else \
+		echo "man: $(SCDOC) not found; keeping checked-in $@"; \
+	fi
+
+docs/%.5: docs/%.scd
+	@if command -v $(SCDOC) >/dev/null 2>&1; then \
+		$(SCDOC) < $< > $@; \
+	else \
+		echo "man: $(SCDOC) not found; keeping checked-in $@"; \
+	fi
+
+docs/%.7: docs/%.scd
+	@if command -v $(SCDOC) >/dev/null 2>&1; then \
+		$(SCDOC) < $< > $@; \
+	else \
+		echo "man: $(SCDOC) not found; keeping checked-in $@"; \
+	fi
 
 # The Rust helper builds offline from the vendored crates. WITHOUT_RUST=1
 # skips it: tests skip the parity corpus and install ships Python only.
@@ -51,6 +81,9 @@ ifndef WITHOUT_RUST
 test check: rust-helper
 install: rust-helper-release
 endif
+
+# The scdoc man pages build before they install (issue #83).
+install: man
 
 test check:
 	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests -t .
@@ -91,6 +124,7 @@ endif
 	install -m644 docs/taema.1 $(MAN1DIR)/taema.1
 	install -m644 docs/taema-agent.1 $(MAN1DIR)/taema-agent.1
 	install -m644 docs/taema.toml.5 $(MAN5DIR)/taema.toml.5
+	install -m644 docs/taema.unit.5 $(MAN5DIR)/taema.unit.5
 	install -m644 shell/taema.bash shell/taema.zsh shell/taema.fish $(SHELLDIR)/
 	install -m644 shell/completion.bash $(BASHCOMP)/taema
 	install -m644 shell/_taema $(ZSHCOMP)/_taema

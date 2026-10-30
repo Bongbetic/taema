@@ -279,6 +279,36 @@ taema forget adb                  # reset what was learned about adb
 configuration, safety rules and installed files are in
 **[taema/README.md](taema/README.md)**.
 
+## v2 behaviour
+
+Modes, weakest first: `observe` logs, `adopt` scopes and asks, `enforce` stops
+with learned authority, `auto` learns always and stops only decided, idle,
+eligible scopes. Switch live with `taema mode MODE`.
+
+Every stop climbs one ladder: skip protected, share what outsiders still use
+(moved to `shared/`, never killed), freeze idle leftovers, SIGTERM then wait
+the learned grace, SIGKILL what remains, GC empty leaves. Dry-run any step
+with `--dry-run`; explain any decision with `taema why TARGET`.
+
+Memory is per-scope: current, peak, reclaimable, PSI pressure
+(`taema memory`, `taema memory top|pressure|budget|watch`). The guard reclaims
+and freezes reversibly before authorized stops. Configure in `[mem]`; units
+set `[mem]` class and background.
+
+The session agent (`taema agent`, see `taema-agent(1)`) relays window focus,
+launches, and notification actions from each graphical session. Without it the
+daemon decides on process data only.
+
+Profiles switch config as a set: `default`, `focus`, `battery`, `game`,
+`quiet`, `server`, or `auto` selection (`taema profile NAME`, back with
+`taema profile auto`). Overrides live in `[profile.NAME]`.
+
+Upgrades migrate state forward without stopping processes; the 0.3 JSON store
+imports once into SQLite with a mode-0600 backup. For a 0.2 downgrade, export
+first: `taema learn export --format v2`. Details in
+**[taema/docs/design.md](taema/docs/design.md)** and the migration guides
+under `docs/`.
+
 ## Uninstall
 
 ```sh

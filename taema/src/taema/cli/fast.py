@@ -27,7 +27,10 @@ def help_text():
     return (
         "usage: taema [OPTIONS] COMMAND [ARGS]...\n\n"
         "Dependency-aware cgroup v2 process scopes\n\n"
-        "Commands:\n%s\n\nOptions:\n%s\n" % ("\n".join(commands), "\n".join(options))
+        "Commands:\n%s\n\nOptions:\n%s\n\nExamples:\n"
+        "  taema run editor -- code .\n"
+        "  taema status\n"
+        "  taema help modes\n" % ("\n".join(commands), "\n".join(options))
     )
 
 

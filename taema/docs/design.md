@@ -237,6 +237,45 @@ goes to `decisions.log` as JSON lines.
 The learner is never consulted for the protected list, the uid rules or the configured
 exclusions.
 
+## Stop ladder
+
+Every stop climbs the same ladder, weakest first: skip hard-protected members
+(logged as errors, since they should never be scoped), share members with
+outside edges (subtree moves to `shared/<comm>-<pid>`, GC decides later),
+freeze idle leftovers reversibly, SIGTERM then wait the learned grace
+(max(5 s, p95 x 1.5), cap 30 s), SIGKILL what remains, GC empty leaves.
+Descendants of a shared process move with it. `kill --dry-run`, `gc --dry-run`
+and `unit test` walk the ladder without changing anything.
+
+## Session agent
+
+One agent runs per graphical session (`taema agent`, see `taema-agent(1)`):
+it joins the protected `agent` leaf, registers capabilities, streams window
+open/change/close/focus facts, launch requests and notification actions, and
+beats every 30 s. The daemon accepts facts only from the same uid, marks
+agents down after 3 missed beats (`agent_up`/`agent_down` audit events), and
+refuses stale facts so it decides on process data only. Without an agent the
+daemon degrades to process-only mode; reviews wait for the shell hint and
+`taema review`.
+
+## Profiles
+
+`[profile]` selects a named configuration overlay (`default`, `focus`,
+`battery`, `game`, `quiet`, `server`) or `auto` selection. `taema profile NAME`
+applies an overlay; `taema profile auto` returns to automatic selection.
+`status` reports the active profile and its reason. `profile.runtime_mode`
+overrides the base mode; unsetting it returns to the profile mode. The
+`server` profile disables the agent, notifications and window-close handling.
+
+## Migration
+
+State moves forward only. The first 0.4.0 start imports valid 0.3.0 JSON
+learning transactionally into SQLite (`state.db`), quarantines invalid-owner
+answers as reviews, and keeps a mode-0600 `knowledge.json.backup-*` for 30
+days. Migration never stops processes. A 0.2 downgrade needs a prior
+`taema learn export --format v2`. See `docs/legacy-state-migration.md` and
+`docs/state-schema.md` for the sequence and the schema.
+
 ## Testing
 
 `make test` runs the unit tests. They use fake `/proc` worlds and captured `ss` output,

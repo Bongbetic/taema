@@ -5280,6 +5280,45 @@ def cmd_agent(a):
         agent_mod.release_lock(lock)
 
 
+def cmd_help(a):
+    """Show a topic, or list topics when none is given."""
+    from . import help_topics
+
+    topic = getattr(a, "topic", None)
+    if not topic:
+        print(help_topics.listing(), end="")
+        return 0
+    body = help_topics.text(topic)
+    if body is None:
+        return die(
+            "unknown topic %r" % topic,
+            hint="Run `taema help` to list topics.",
+        )
+    print(body, end="" if body.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_bug_report(a):
+    """Write a sanitized support tarball (issue #83)."""
+    from .. import bugreport
+    from . import view
+
+    _cfg, store, units = _load(a)
+    try:
+        path = bugreport.create_bundle(
+            _cfg, store, units, target=getattr(a, "to", None)
+        )
+    except OSError as error:
+        return die("could not write bug report: %s" % error)
+    if getattr(a, "json", False):
+        print(
+            json.dumps(view.record("bug-report", {"path": path}), indent=2, sort_keys=True)
+        )
+        return 0
+    print(path)
+    return 0
+
+
 def main(argv):
     from .framework import main as framework_main
 

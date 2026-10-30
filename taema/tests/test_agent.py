@@ -255,7 +255,7 @@ class FakeDaemon(threading.Thread):
         super().__init__()
         self.path = path
         self.seen = []
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         if os.path.exists(self.path):
             os.unlink(self.path)
         self._srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -265,7 +265,7 @@ class FakeDaemon(threading.Thread):
 
     def run(self):
         srv = self._srv
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 conn, _ = srv.accept()
             except socket.timeout:
@@ -292,7 +292,7 @@ class FakeDaemon(threading.Thread):
         srv.close()
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=5)
 
 

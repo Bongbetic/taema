@@ -55,15 +55,18 @@ class AttachTests(unittest.TestCase):
             self.assertEqual(self.h.load_rules(p), {"comm": ["x"]})
 
     def test_main_refuses_without_config(self):
-        dest = os.path.join(self.tmp.name, "user", "1000", "scope-x")
+        uid = str(os.getuid() or 1000)
+        dest = os.path.join(self.tmp.name, "user", uid, "scope-x")
         os.makedirs(dest)
+        if os.getuid() == 0:
+            os.chown(dest, 1000, -1)
         with (
             mock.patch.object(self.h, "CG", self.tmp.name),
             mock.patch.object(
                 self.h, "CONFIG", os.path.join(self.tmp.name, "nope.toml")
             ),
             mock.patch.object(self.h.os, "geteuid", return_value=0),
-            mock.patch.dict(os.environ, {"SUDO_UID": "1000"}),
+            mock.patch.dict(os.environ, {"SUDO_UID": uid}),
             mock.patch.object(self.h.os, "stat", wraps=os.stat),
         ):
             with self.assertRaises(self.h.Refused) as cm:

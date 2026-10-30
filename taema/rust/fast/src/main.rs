@@ -1309,9 +1309,7 @@ fn move_self(scope: &str, pid: i64) -> Result<(), String> {
     match direct_move(scope, pid) {
         Ok(()) => Ok(()),
         Err(e) => match e.raw_os_error() {
-            Some(code) if code == libc::EACCES || code == libc::EPERM => {
-                sudo_move(scope, pid)
-            }
+            Some(code) if code == libc::EACCES || code == libc::EPERM => sudo_move(scope, pid),
             _ => {
                 // Direct write failed for another reason (missing leaf,
                 // gone pid): still try the helper once, matching the daemon

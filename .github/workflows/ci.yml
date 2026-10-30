@@ -35,6 +35,14 @@ jobs:
           xbps-install -Syu xbps
           xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow cargo tar gzip tzdata findutils
       - uses: actions/checkout@v4
+        if: matrix.libc != 'musl'
+      - name: Check out source without Node
+        if: matrix.libc == 'musl'
+        run: |
+          # Node-based actions cannot run on musl (no glibc Node binary).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git clone "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" checkout "$GITHUB_SHA"
       - name: Test as an unprivileged user
         run: |
           # The tests assume a normal user, so run them as one.

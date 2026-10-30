@@ -149,8 +149,6 @@ def collect_events(store, limit=500):
 
 def create_bundle(cfg, store, units, target=None):
     """Write the tarball. Returns the absolute path."""
-    from taema.store.transfer import default_backup_path
-
     versions = collect_versions()
     doctor_report = collect_doctor(cfg, store, units)
     config_text = collect_redacted_config(cfg)

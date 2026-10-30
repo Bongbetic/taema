@@ -1,6 +1,6 @@
 # Template file for 'taema'
 pkgname=taema
-version=0.7.0
+version=0.8.0
 revision=1
 build_wrksrc=taema
 build_style=gnu-makefile
@@ -14,7 +14,7 @@ maintainer="soubarnak <soubarna@live.in>"
 license="custom:PolyForm-Noncommercial-1.0.0"
 homepage="https://github.com/Bongbetic/taema"
 distfiles="https://github.com/Bongbetic/taema/archive/refs/tags/taema-v${version}.tar.gz https://github.com/Bongbetic/taema/releases/download/taema-v${version}/taema-vendor-${version}.tar.gz"
-checksum="5f6c9f42ca9a3239a2f6b6c032ff31f9b050594f91b42566d722d719c2adeae7 47994676302ed154ca39ca4b6950abef207e151830b6272386a530bab16cade3"
+checksum="7661390b027702103e42e2d758c59f3b8ae4ecde00917a875b549c92f6bb2059 47994676302ed154ca39ca4b6950abef207e151830b6272386a530bab16cade3"
 system_groups="taema"
 conf_files="/etc/taema/taema.toml /etc/taema/units/*.toml"
 

@@ -950,7 +950,7 @@ COMMANDS: "tuple[dict[str, object], ...]" = (
     },
 )
 
-# Two to three real examples per command (issue #83). Keys are the
+# Two real examples per command (issue #83). Keys are the
 # `_command` value ("learn export" for children); missing keys fall back
 # to the generic pair below.
 EXAMPLES = {

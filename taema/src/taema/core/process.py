@@ -231,6 +231,60 @@ def unix_socket_paths(pid, limit=1024):
     return sorted(found)
 
 
+def _stat_fields(pid, count):
+    rest = read(pid, "stat").rsplit(b")", 1)[-1].split()
+    if len(rest) < count:
+        return None
+    try:
+        return [int(x) for x in rest[1:count]]
+    except ValueError:
+        return None
+
+
+def rss_bytes(pid):
+    """Resident bytes from /proc/PID/stat, or None when the pid is gone."""
+    fields = _stat_fields(pid, 22)
+    if fields is None:
+        return None
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        page = 4096
+    return fields[20] * page
+
+
+def thread_count(pid):
+    """Thread count from /proc/PID/stat, or None when the pid is gone."""
+    fields = _stat_fields(pid, 18)
+    if fields is None:
+        return None
+    return fields[16]
+
+
+def mem_total_bytes():
+    """MemTotal from /proc/meminfo, or None when unreadable."""
+    try:
+        with open(PROC + "/meminfo", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def username(uid):
+    """Login name for a uid, or the decimal id when unknown."""
+    if uid is None:
+        return "?"
+    try:
+        import pwd
+
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, OSError):
+        return str(uid)
+
+
 def starttime(pid):
     """Field 22 of /proc/PID/stat (clock ticks since boot), or None when the pid is gone."""
     data = read(pid, "stat")
@@ -279,11 +333,11 @@ class ProcTable:
         self._kids = None
 
     @classmethod
-    def scan(cls):
+    def scan(cls, include_zombies=False):
         rows = {}
         for pid in all_pids():
             r = _parse_stat(read(pid, "stat"))
-            if r is not None and r.state != "Z":
+            if r is not None and (include_zombies or r.state != "Z"):
                 rows[pid] = r
         return cls(rows)
 

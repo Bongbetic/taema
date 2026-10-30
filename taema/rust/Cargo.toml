@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["attach", "fast"]
+# The fuzz crate is its own workspace (nightly + libFuzzer, networked
+# dependencies): it stays out of the locked offline build.
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"

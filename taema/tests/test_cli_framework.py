@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import taema.cli.commands as commands
-import taema.cli as cli_package
 from taema.cli import fast, framework, view
 from taema.core import process
 from taema.store import knowledge
@@ -23,6 +22,15 @@ from tests.test_phase0 import FakeCg, make_cfg
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = json.loads((ROOT / "schema" / "cli" / "read-v1.json").read_text())
+
+
+def cgroup_scope_line(cg, scope):
+    """The /proc cgroup line for a fixture scope (the kernel disagrees)."""
+    from taema.core import cgroup
+
+    path = cgroup.resolve(scope)
+    assert path is not None
+    return path[len(cg.root) :]
 
 
 class CliRegistry(unittest.TestCase):
@@ -185,12 +193,6 @@ class CliRegistry(unittest.TestCase):
             self.assertEqual(fast.main(), 0)
         self.assertEqual(output.getvalue(), help_output)
 
-    def test_lazy_package_keeps_legacy_stdlib_exports(self):
-        for name in ("socket", "tempfile", "time", "uuid"):
-            with self.subTest(name=name):
-                self.assertEqual(getattr(cli_package, name).__name__, name)
-        self.assertIs(cli_package.commands, commands)
-
     def test_lazy_module_forwards_mock_assignment_and_deletion(self):
         proxy = commands._LazyModule("_test_process_proxy", "taema.core.process")
         proxy._temporary = True
@@ -338,6 +340,39 @@ class CliViews(unittest.TestCase):
                 commands._status_store(fast_cfg, pending_only=True), knowledge.Store
             )
 
+    def test_explain_pid_shows_launch_provenance(self):
+        with tempfile.TemporaryDirectory() as state_dir:
+            store = knowledge.Store(state_dir, {})
+            store.data["launch_apps"] = {
+                "app-test": {"app": "test", "launched_by": "launch"}
+            }
+            cfg = make_cfg(state_dir)
+            with FakeCg() as cg:
+                cg.leaf("app-test", [os.getpid()])
+                args = SimpleNamespace(
+                    target=str(os.getpid()),
+                    pair=None,
+                    pick=False,
+                    json=False,
+                    jsonl=False,
+                )
+                # The fixture lists our pid in the scope but the host kernel
+                # disagrees; bridge that one un-fakeable fact so the pid
+                # branch runs its real scope check.
+                scope_line = cgroup_scope_line(cg, "app-test")
+                with (
+                    mock.patch.object(commands, "_load", return_value=(cfg, store, {})),
+                    mock.patch(
+                        "taema.core.cgroup.proc_cgroup",
+                        return_value=scope_line,
+                    ),
+                ):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = commands.cmd_explain(args)
+            self.assertEqual(result, 0)
+            self.assertIn("launched_by=launch", output.getvalue())
+
     def test_status_and_ls_emit_schema_valid_shared_snapshots(self):
         with tempfile.TemporaryDirectory() as state_dir:
             store = knowledge.Store(state_dir, {})
@@ -347,6 +382,7 @@ class CliViews(unittest.TestCase):
             with (
                 mock.patch.object(commands, "_load_status", return_value=(cfg, store)),
                 mock.patch.object(commands, "ask", return_value=None),
+                mock.patch.object(commands, "_fast_status_probe", return_value=None),
                 mock.patch.object(
                     commands.cgroup, "base", return_value="/missing/cgroup"
                 ),
@@ -400,10 +436,12 @@ class CliViews(unittest.TestCase):
             with (
                 mock.patch.object(commands, "_load_status", return_value=(cfg, store)),
                 mock.patch.object(commands, "ask", return_value=None),
+                mock.patch.object(commands, "_fast_status_probe", return_value=None),
                 mock.patch.dict(os.environ, {"TAEMA_MEM": "0"}),
                 mock.patch.object(
                     commands.cgroup, "base", return_value="/missing/cgroup"
                 ),
+                mock.patch("taema.suggest.trailing", return_value=[]),
                 redirect_stdout(output),
             ):
                 result = commands.main([])

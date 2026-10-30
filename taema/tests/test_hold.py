@@ -188,6 +188,7 @@ class HoldCli(unittest.TestCase):
                 mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime_dir}),
                 mock.patch.object(commands, "_load_status", return_value=(cfg, store)),
                 mock.patch.object(commands, "ask", return_value=None),
+                mock.patch.object(commands, "_fast_status_probe", return_value=None),
                 mock.patch.object(
                     commands.cgroup, "base", return_value="/missing/cgroup"
                 ),

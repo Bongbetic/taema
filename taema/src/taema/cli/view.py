@@ -77,6 +77,196 @@ def _clip(value, width, wide=False):
     return value[: width - 1] + "…"
 
 
+_TOP_SORTS = {
+    "cpu": lambda row: (-row["cpu"], -row["mem"], -row["pid"]),
+    "mem": lambda row: (-row["mem"], -row["pid"]),
+    "delta": lambda row: (-row["delta_per_min"], -row["pid"]),
+    "psi": lambda row: (-(row["psi"] or 0.0), -row["pid"]),
+    "scope": lambda row: (row["scope"], -row["cpu"], -row["pid"]),
+    "pid": lambda row: (row["pid"],),
+}
+
+
+def top_model(
+    previous, current, interval_s, hz, details, previous_details=None, sort="cpu"
+):
+    """Sorted rows from two snapshots. details maps pid to scope/user/mem."""
+    rows = []
+    span = max(interval_s * hz, 1)
+    total = details.get("__total__", 0) or 0
+    previous_details = previous_details or {}
+    for pid, proc in current.items():
+        old = previous.get(pid)
+        before = old.cpu if old is not None else proc.cpu
+        cpu = max(0.0, (proc.cpu - before)) * 100.0 / span
+        info = details.get(pid, {})
+        mem = info.get("mem", 0)
+        prev_mem = previous_details.get(pid, {}).get("mem")
+        if prev_mem is None or interval_s <= 0:
+            delta_per_min = 0.0
+        else:
+            delta_per_min = (mem - prev_mem) * 60.0 / interval_s
+        rows.append(
+            {
+                "pid": pid,
+                "scope": info.get("scope", "?"),
+                "user": info.get("user", "?"),
+                "cpu": cpu,
+                "mem_pct": (100.0 * mem / total) if total else 0.0,
+                "mem": mem,
+                "delta_per_min": delta_per_min,
+                "psi": info.get("psi"),
+                "decision": info.get("decision", ""),
+                "threads": info.get("threads", 0),
+                "state": proc.state,
+                "window": info.get("window", ""),
+                "cmd": info.get("cmd", ""),
+            }
+        )
+    rows.sort(key=_TOP_SORTS.get(sort, _TOP_SORTS["cpu"]))
+    return rows
+
+
+def render_top(model, args):
+    """Fixed-column top table that fits the terminal width."""
+    width = getattr(args, "_width", 80)
+    wide = getattr(args, "wide", False)
+    lines = [
+        _clip("PID SCOPE   USER %CPU %MEM RSS  D/MIN PSI S W DEC CMD", width, wide)
+    ]
+    for row in model:
+        cmd_width = 0 if wide or width <= 0 else max(1, width - 60)
+        delta = row.get("delta_per_min") or 0.0
+        delta_text = "%s%s" % ("+" if delta >= 0 else "-", _format_memory(abs(delta)))
+        psi = row.get("psi")
+        psi_text = "-" if psi is None else "%.2f" % psi
+        lines.append(
+            _clip(
+                "%-3d %-7s %-4s %5.1f %4.1f %-4s %6s %5s %s %s %-4s %s"
+                % (
+                    row["pid"],
+                    _clip(row["scope"], 7, wide),
+                    _clip(row["user"], 4, wide),
+                    row["cpu"],
+                    row["mem_pct"],
+                    _clip(_format_memory(row["mem"]), 4, wide),
+                    delta_text,
+                    psi_text,
+                    row["state"],
+                    row.get("window", ""),
+                    _clip(row.get("decision", ""), 4, wide),
+                    _clip(row["cmd"], cmd_width, wide),
+                ),
+                width,
+                wide,
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def tree_model(table, scope_of, windows=None, target=None, parents=None, edges=None):
+    """Process trees grouped by scope.
+
+    Returns [(scope, nodes, edge_lines)]. target keeps only scopes whose
+    name contains it; parents maps outside pids to launcher names shown
+    as provenance arrows on roots; edges maps a scope to (peer, detail)
+    dependency lines.
+    """
+    window_pids = windows if isinstance(windows, dict) else {}
+    parents = parents if isinstance(parents, dict) else {}
+    edges = edges if isinstance(edges, dict) else {}
+    kids = {}
+    for pid, proc in table.rows.items():
+        kids.setdefault(proc.ppid, []).append(pid)
+    for pids in kids.values():
+        pids.sort()
+    zombies = {pid for pid, proc in table.rows.items() if proc.state == "Z"}
+    reaped = {}
+    for pid in table.rows:
+        count = sum(1 for kid in kids.get(pid, []) if kid in zombies)
+        if count:
+            reaped[pid] = count
+    groups = {}
+    for pid in table.rows:
+        groups.setdefault(scope_of(pid), []).append(pid)
+    model = []
+    for scope in sorted(groups):
+        if target and target not in scope:
+            continue
+        members = set(groups[scope])
+        roots = sorted(pid for pid in members if table.rows[pid].ppid not in members)
+        nodes = []
+        stack = [(pid, 0, True) for pid in reversed(roots)]
+        while stack:
+            pid, depth, _last = stack.pop()
+            marker = window_pids.get(str(pid))
+            nodes.append(
+                {
+                    "pid": pid,
+                    "depth": depth,
+                    "state": table.rows[pid].state,
+                    "zombies": reaped.get(pid, 0),
+                    "parent": (
+                        parents.get(table.rows[pid].ppid) if depth == 0 else None
+                    ),
+                    "window": (
+                        "F"
+                        if isinstance(marker, dict) and marker.get("focused")
+                        else "w"
+                        if marker is not None
+                        else ""
+                    ),
+                }
+            )
+            young = [kid for kid in kids.get(pid, []) if kid in members]
+            for kid in reversed(young):
+                stack.append((kid, depth + 1, True))
+        model.append((scope, nodes, list(edges.get(scope, ()))))
+    return model
+
+
+def render_tree(model, args):
+    """Scope-grouped process trees with zombie reapers marked."""
+    width = getattr(args, "_width", 80)
+    wide = getattr(args, "wide", False)
+    limit = 0 if wide or width <= 0 else width
+    lines = []
+    for entry in model:
+        scope, nodes = entry[0], entry[1]
+        edge_lines = entry[2] if len(entry) > 2 else ()
+        lines.append(_clip(scope, limit, wide))
+        for peer, detail in edge_lines:
+            lines.append(_clip("  ⇠ %s: %s" % (peer, detail), limit, wide))
+        for index, node in enumerate(nodes):
+            depth = node["depth"]
+            if depth == 0:
+                prefix = "└─ "
+            else:
+                siblings_after = any(
+                    other["depth"] == depth
+                    for other in nodes[index + 1 :]
+                    if other["depth"] <= depth
+                )
+                branch = "├─ " if siblings_after else "└─ "
+                prefix = "   " * depth + branch
+            text = "%s%d" % (prefix, node["pid"])
+            if depth > 0:
+                text += " %s" % node["state"]
+            if node.get("parent"):
+                text += " ← %s" % node["parent"]
+            if node.get("window") == "F":
+                text += " ◉"
+            elif node.get("window"):
+                text += " ●"
+            if node["zombies"]:
+                text += " (reaps %d zombie%s)" % (
+                    node["zombies"],
+                    "s" if node["zombies"] != 1 else "",
+                )
+            lines.append(_clip(text, limit, wide))
+    return "\n".join(lines) + "\n"
+
+
 def render_scopes(scopes, args):
     if not scopes:
         return "no scopes\n"
@@ -84,13 +274,14 @@ def render_scopes(scopes, args):
     wide = getattr(args, "wide", False)
     color = getattr(args, "_color", False)
     name_width = 28 if wide or width <= 0 else max(12, min(28, width - 39))
-    fixed = name_width + 4 + 2 + 8 + 1 + 6 + 2
+    fixed = name_width + 4 + 2 + 8 + 1 + 6 + 1 + 2 + 2
     command_width = 80 if wide or width <= 0 else max(8, width - fixed)
-    header = "%s %4s  %8s %6s  %s" % (
+    header = "%s %4s  %8s %6s %2s  %s" % (
         "%-*s" % (name_width, "name"),
         "procs",
         "MEM",
         "PSI",
+        "W",
         "comms",
     )
     lines = [_styled(header, "1", color)]
@@ -109,8 +300,13 @@ def render_scopes(scopes, args):
         memory_text = "-" if memory is None else _format_memory(memory)
         pressure = scope["psi_avg10"]
         pressure_text = "-" if pressure is None else "%.2f" % pressure
+        windows = scope.get("windows")
+        if isinstance(windows, dict) and windows.get("count"):
+            window_text = "F" if windows.get("focused") else "%d" % windows["count"]
+        else:
+            window_text = ""
         lines.append(
-            "%s%-*s %4d  %8s %6s  %s"
+            "%s%-*s %4d  %8s %6s %2s  %s"
             % (
                 indent,
                 max(1, name_width - len(indent)),
@@ -118,10 +314,77 @@ def render_scopes(scopes, args):
                 scope["processes"],
                 memory_text,
                 pressure_text,
+                window_text,
                 commands,
             )
         )
     return "\n".join(lines) + "\n"
+
+
+def render_dash(model, args):
+    """Deterministic dashboard text shared by --once and the live screen."""
+    width = getattr(args, "_width", 80)
+    wide = getattr(args, "wide", False)
+    learned = model.get("learned") or {}
+    pairs = learned.get("pairs") or []
+    signatures = learned.get("signatures") or []
+    apps = learned.get("apps") or []
+    host = (model.get("memory") or {}).get("host") or {}
+    budget = model.get("budget")
+    if budget is None:
+        budget_text = "unavailable"
+    elif budget.get("enabled"):
+        budget_text = "ceiling %s" % _format_memory(budget.get("budget_bytes") or 0)
+    else:
+        budget_text = "disabled"
+    lines = ["scopes (%d)" % len(model.get("scopes") or [])]
+    for row in model.get("scopes") or []:
+        memory = row.get("memory_bytes")
+        text = "  %s procs=%s mem=%s" % (
+            row.get("name", "?"),
+            row.get("procs", row.get("processes", 0)),
+            "-" if memory is None else _format_memory(memory),
+        )
+        if row.get("frozen"):
+            text += " frozen"
+        lines.append(text)
+    lines.append(
+        "learned apps=%d pairs=%d signatures=%d"
+        % (len(apps), len(pairs), len(signatures))
+    )
+    for pair in pairs[:5]:
+        lines.append(
+            "  pair %s -> %s %s"
+            % (
+                pair.get("owner", "?"),
+                pair.get("leftover", "?"),
+                pair.get("decision", pair.get("action", "ask")),
+            )
+        )
+    for signature in signatures[:5]:
+        lines.append(
+            "  signature %s %s"
+            % (signature.get("id", "?"), signature.get("decision", "ask"))
+        )
+    lines.append("memory")
+    lines.append(
+        "  host total %s  budget %s"
+        % (_format_memory(host.get("total_bytes") or 0), budget_text)
+    )
+    reviews = model.get("reviews") or []
+    lines.append("reviews (%d)" % len(reviews))
+    for review in reviews[:5]:
+        lines.append(
+            "  #%s owner=%s" % (review.get("id", "?"), review.get("owner", "?"))
+        )
+    lines.append("events")
+    for item in model.get("events") or []:
+        parts = ["#%s" % item.get("seq", "?"), str(item.get("event", "unknown"))]
+        scope = item.get("scope") or (item.get("data") or {}).get("scope", "")
+        if scope:
+            parts.append(str(scope))
+        lines.append("  " + " ".join(parts))
+    return "\n".join(_clip(line, width, wide) for line in lines) + "\n"
 
 
 def _format_memory(value):
@@ -168,6 +431,19 @@ def render_status(model, args, summary=False):
         "reviews: %s" % details.get("reviews", "unknown"),
         "feedback_invalid: %s" % status.get("feedback_invalid", 0),
     ]
+    muted = details.get("muted")
+    if muted:
+        lines.append("muted: %s" % ", ".join(sorted(muted)))
+    agents = details.get("agents")
+    if isinstance(agents, dict):
+        if not agents:
+            lines.append("agent: none registered")
+        for session in sorted(agents):
+            info = agents[session] or {}
+            lines.append(
+                "agent: %s (session %s, pid %s)"
+                % (info.get("state", "?"), session, info.get("pid", "?"))
+            )
     guard = status.get("guard") or details.get("guard") or {}
     if guard.get("active") is True:
         lines.append(
@@ -401,11 +677,14 @@ def render_explanation(target, explanation):
     lines = ["explain: %s" % target]
     if identity:
         lines.append(
-            "identity: %s (%s; %s)"
+            "identity: %s (%s; %s%s)"
             % (
                 identity.get("key", "unknown"),
                 identity.get("display", "unknown"),
                 "validated" if identity.get("validated") else "unvalidated",
+                "; desktop=%s" % identity["desktop_id"]
+                if identity.get("desktop_id")
+                else "",
             )
         )
         if identity.get("reason"):
@@ -465,6 +744,8 @@ def render_explanation(target, explanation):
                     confidence_text,
                 )
             )
+    if provenance.get("launched_by"):
+        lines.append("launched_by=%s" % provenance["launched_by"])
     lines.append(
         "protection: %s%s"
         % (

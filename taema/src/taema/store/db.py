@@ -1420,6 +1420,40 @@ class StateDB:
         """Persist one identity and pid/start instance."""
         return self.record_app_identities(((identity, instance),), now=now)
 
+    def set_app_desktop(self, key, desktop_id, display, now=None):
+        """Point one app row at its window app id; 0 rows when unknown."""
+        if self.read_only or not self.available or not isinstance(key, str) or not key:
+            return 0
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE apps SET desktop_id = ?, display = ?, last_seen = ? "
+                "WHERE key = ?",
+                (
+                    (desktop_id or "")[:256] or None,
+                    (display or key)[:256],
+                    now,
+                    key,
+                ),
+            )
+            connection.commit()
+        return cursor.rowcount
+
+    def set_app_last_window(self, key, value, now=None):
+        """Record the learned last-window policy for one app; 0 rows when unknown."""
+        if self.read_only or not self.available or not isinstance(key, str) or not key:
+            return 0
+        if value not in ("ask", "quit", "keep"):
+            return 0
+        now = time.time() if now is None else now
+        with self.connection() as connection:
+            cursor = connection.execute(
+                "UPDATE apps SET on_last_window = ?, last_seen = ? WHERE key = ?",
+                (value, now, key),
+            )
+            connection.commit()
+        return cursor.rowcount
+
     def app_identity(self, key):
         """Read the bounded presentation and executable evidence for one app key."""
         if not self.available or not isinstance(key, str) or not key:
@@ -1427,7 +1461,8 @@ class StateDB:
         with self.connection() as connection:
             row = connection.execute(
                 "SELECT key, kind, display, exe, dev, ino, desktop_id, unit, "
-                "first_seen, last_seen, instances, confidence FROM apps WHERE key = ?",
+                "on_last_window, first_seen, last_seen, instances, confidence "
+                "FROM apps WHERE key = ?",
                 (key,),
             ).fetchone()
         return dict(row) if row else None
@@ -1996,6 +2031,339 @@ class StateDB:
                 raise
         return identifiers
 
+    def history_timeline(self, owner=None, scope=None, since=None, limit=500):
+        """Decisions, linked events, and launches for one owner or scope."""
+        if not self.available:
+            return {"decisions": [], "events": [], "launches": []}
+        since = since if isinstance(since, (int, float)) else 0
+        bare = owner is not None and owner == scope
+        clauses, params = ["ts >= ?"], [since]
+        if bare:
+            clauses.append("(owner = ? OR scope = ? OR scope = ?)")
+            params.extend([owner, scope, "scope-" + owner])
+        elif owner is not None and scope is not None:
+            clauses.append("(owner = ? OR scope = ?)")
+            params.extend([owner, scope])
+        elif owner is not None:
+            clauses.append("owner = ?")
+            params.append(owner)
+        else:
+            clauses.append("scope = ?")
+            params.append(scope)
+        where = " AND ".join(clauses)
+        with self.connection() as connection:
+            decisions = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id, ts, kind, scope, owner, authority, why, undone "
+                    "FROM decisions WHERE %s ORDER BY ts DESC, id DESC LIMIT ?" % where,
+                    (*params, limit),
+                )
+            ]
+            ids = [row["id"] for row in decisions if isinstance(row["id"], int)]
+            events = []
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                events = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT seq, ts, event, decision_id, data FROM events "
+                        "WHERE decision_id IN (%s) ORDER BY seq" % placeholders,
+                        ids,
+                    )
+                ]
+            seen = {row["seq"] for row in events}
+            extra_clauses, extra_params = ["ts >= ?"], [since]
+            if bare:
+                extra_clauses.append(
+                    "(json_extract(data, '$.owner') = ? "
+                    "OR json_extract(data, '$.scope') = ? "
+                    "OR json_extract(data, '$.scope') = ?)"
+                )
+                extra_params.extend([owner, scope, "scope-" + owner])
+            elif owner is not None and scope is not None:
+                extra_clauses.append(
+                    "(json_extract(data, '$.owner') = ? "
+                    "OR json_extract(data, '$.scope') = ?)"
+                )
+                extra_params.extend([owner, scope])
+            elif owner is not None:
+                extra_clauses.append("json_extract(data, '$.owner') = ?")
+                extra_params.append(owner)
+            else:
+                extra_clauses.append("json_extract(data, '$.scope') = ?")
+                extra_params.append(scope)
+            for row in connection.execute(
+                "SELECT seq, ts, event, decision_id, data FROM events WHERE %s "
+                "ORDER BY seq LIMIT ?" % " AND ".join(extra_clauses),
+                (*extra_params, limit * 4),
+            ):
+                if row["seq"] not in seen:
+                    seen.add(row["seq"])
+                    events.append(dict(row))
+            launches = []
+            if owner is not None:
+                launches = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT app, pid, start, born, scope FROM instances "
+                        "WHERE app = ? AND born >= ? ORDER BY born DESC LIMIT 100",
+                        (owner, since),
+                    )
+                ]
+            elif scope is not None:
+                launches = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT app, pid, start, born, scope FROM instances "
+                        "WHERE scope = ? AND born >= ? ORDER BY born DESC LIMIT 100",
+                        (scope, since),
+                    )
+                ]
+        events.sort(key=lambda row: row["seq"])
+        return {"decisions": decisions, "events": events, "launches": launches}
+
+    def recent_auto_actions(self, limit=50):
+        """Newest automatic actions with freed bytes and restore possibility."""
+        if not self.available:
+            return []
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT id, seq, ts, scope, payload FROM auto_actions "
+                "ORDER BY seq DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            actions = []
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload"] or "{}")
+                except ValueError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                actions.append(
+                    {
+                        "id": row["id"],
+                        "ts": row["ts"],
+                        "scope": row["scope"],
+                        "why": payload.get("why", ""),
+                        "pairs": payload.get("pairs", []),
+                        "decision_id": payload.get("decision_id"),
+                    }
+                )
+            ids = [
+                action["decision_id"]
+                for action in actions
+                if isinstance(action["decision_id"], int)
+            ]
+            restore, freed = {}, {}
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                for row in connection.execute(
+                    "SELECT id, argv, cwd FROM decisions WHERE id IN (%s)"
+                    % placeholders,
+                    ids,
+                ):
+                    try:
+                        argv = json.loads(row["argv"]) if row["argv"] else None
+                    except ValueError:
+                        argv = None
+                    restore[row["id"]] = bool(argv and row["cwd"])
+                for row in connection.execute(
+                    "SELECT decision_id, "
+                    "SUM(CAST(json_extract(data, '$.freed_bytes') AS INTEGER)) "
+                    "FROM events WHERE event = 'freed' AND decision_id IN (%s) "
+                    "GROUP BY decision_id" % placeholders,
+                    ids,
+                ):
+                    freed[row["decision_id"]] = row[1] or 0
+        for action in actions:
+            decision_id = action["decision_id"]
+            action["freed_bytes"] = freed.get(decision_id, 0)
+            action["restore_possible"] = restore.get(decision_id, False)
+        return actions
+
+    def report_window(self, start, end, guard_events):
+        """Aggregate decisions, events, reviews, and rollups for one window."""
+        empty = {
+            "stops": {"automatic": 0, "answered": 0},
+            "memory_freed_bytes": {"stop": 0, "reclaim": 0},
+            "undos": 0,
+            "regrets": 0,
+            "reviews": {"answered": 0, "expired": 0},
+            "guard_events": {"total": 0, "by_event": {}},
+            "top_leftovers": [],
+            "frozen": {
+                "frozen_seconds": 0,
+                "thaws": 0,
+                "connection_thaws": 0,
+                "frozen_now": 0,
+            },
+            "rollups": [],
+        }
+        if not self.available:
+            return empty
+        with self.connection() as connection:
+            kinds = dict(
+                connection.execute(
+                    "SELECT kind, COUNT(*) FROM decisions "
+                    "WHERE ts >= ? AND ts < ? AND kind IN "
+                    "('auto_stop', 'stop', 'undo') GROUP BY kind",
+                    (start, end),
+                ).fetchall()
+            )
+            empty["stops"]["automatic"] = kinds.get("auto_stop", 0)
+            empty["stops"]["answered"] = kinds.get("stop", 0)
+            empty["undos"] = kinds.get("undo", 0)
+            stop_bytes = connection.execute(
+                "SELECT SUM(CAST(json_extract(data, '$.freed_bytes') AS INTEGER)) "
+                "FROM events WHERE event = 'freed' AND ts >= ? AND ts < ?",
+                (start, end),
+            ).fetchone()[0]
+            reclaim_bytes = connection.execute(
+                "SELECT SUM(CAST(json_extract(data, '$.reclaim.reclaimed_bytes') "
+                "AS INTEGER)) FROM events WHERE event = 'gc_quit' "
+                "AND ts >= ? AND ts < ?",
+                (start, end),
+            ).fetchone()[0]
+            empty["memory_freed_bytes"]["stop"] = stop_bytes or 0
+            empty["memory_freed_bytes"]["reclaim"] = reclaim_bytes or 0
+            empty["regrets"] = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE event = 'regret' "
+                "AND ts >= ? AND ts < ?",
+                (start, end),
+            ).fetchone()[0]
+            empty["reviews"]["answered"] = connection.execute(
+                "SELECT COUNT(*) FROM reviews WHERE state = 'answered' "
+                "AND shown >= ? AND shown < ?",
+                (start, end),
+            ).fetchone()[0]
+            empty["reviews"]["expired"] = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE event = 'review_expired' "
+                "AND ts >= ? AND ts < ?",
+                (start, end),
+            ).fetchone()[0]
+            if guard_events:
+                placeholders = ",".join("?" for _ in guard_events)
+                by_event = dict(
+                    connection.execute(
+                        "SELECT event, COUNT(*) FROM events WHERE event IN (%s) "
+                        "AND ts >= ? AND ts < ? GROUP BY event" % placeholders,
+                        (*sorted(guard_events), start, end),
+                    ).fetchall()
+                )
+                empty["guard_events"]["by_event"] = by_event
+                empty["guard_events"]["total"] = sum(by_event.values())
+            empty["top_leftovers"] = [
+                {
+                    "leftover": row["leftover"],
+                    "launches": row["launches"],
+                    "closes": row["closes"],
+                    "kills": row["kills"],
+                }
+                for row in connection.execute(
+                    "SELECT leftover, launches, closes, kills FROM pairs "
+                    "ORDER BY launches + closes + kills DESC LIMIT 10"
+                )
+            ]
+            freeze_thaw = connection.execute(
+                "SELECT ts, event, json_extract(data, '$.scope') AS scope, "
+                "json_extract(data, '$.reason') AS reason FROM events "
+                "WHERE event IN ('freeze', 'thaw') AND ts >= ? AND ts < ? "
+                "ORDER BY ts",
+                (start, end),
+            ).fetchall()
+            frozen_since = {}
+            frozen_seconds = 0
+            thaws = 0
+            connection_thaws = 0
+            for row in freeze_thaw:
+                scope = row["scope"] or ""
+                if row["event"] == "freeze":
+                    frozen_since.setdefault(scope, row["ts"])
+                else:
+                    thaws += 1
+                    if (row["reason"] or "") == "connect":
+                        connection_thaws += 1
+                    began = frozen_since.pop(scope, None)
+                    if began is not None:
+                        frozen_seconds += max(0, row["ts"] - began)
+            for began in frozen_since.values():
+                frozen_seconds += max(0, end - began)
+            empty["frozen"]["frozen_seconds"] = int(frozen_seconds)
+            empty["frozen"]["thaws"] = thaws
+            empty["frozen"]["connection_thaws"] = connection_thaws
+            try:
+                empty["frozen"]["frozen_now"] = connection.execute(
+                    "SELECT COUNT(*) FROM frozen"
+                ).fetchone()[0]
+            except Exception:
+                pass
+            start_day = int(start // 86400)
+            end_day = int(end // 86400)
+            empty["rollups"] = [
+                {
+                    "app": row["app"],
+                    "peak": row["peak"],
+                    "current_p50": row["current_p50"],
+                }
+                for row in connection.execute(
+                    "SELECT app, MAX(peak) AS peak, MAX(current_p50) AS current_p50 "
+                    "FROM mem_rollup WHERE day >= ? AND day <= ? GROUP BY app "
+                    "ORDER BY peak DESC LIMIT 5",
+                    (start_day, end_day),
+                )
+            ]
+        return empty
+
+    def reset_counts(self):
+        """Row counts for the reset plan display."""
+        if not self.available:
+            return {"signatures": 0, "decisions": 0, "events": 0}
+        with self.connection() as connection:
+            return {
+                table: connection.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[
+                    0
+                ]
+                for table in ("signatures", "decisions", "events")
+            }
+
+    def clear_decisions_events(self):
+        """Delete all decision and event rows. Returns (decisions, events)."""
+        if self.read_only or not self.available:
+            return (0, 0)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                decisions = connection.execute(
+                    "SELECT COUNT(*) FROM decisions"
+                ).fetchone()[0]
+                events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                connection.execute("DELETE FROM events")
+                connection.execute("DELETE FROM decisions")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return (decisions, events)
+
+    def clear_signatures(self):
+        """Delete all signature rows. Returns the removed count."""
+        if self.read_only or not self.available:
+            return 0
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM signatures"
+                ).fetchone()[0]
+                connection.execute("DELETE FROM signatures")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return count
+
     def answer_signature(self, identifier, choice, weight, now=None):
         """Add no-decay explicit answer weight to a signature."""
         if self.read_only or not self.available or choice not in ("stop", "keep"):
@@ -2374,6 +2742,8 @@ class StateDB:
             "qos_exempt": {},
             "memory_scopes": {},
             "frozen_scopes": {},
+            "windowless_grace": {},
+            "launch_apps": {},
         }
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -2394,6 +2764,8 @@ class StateDB:
                     "qos_scopes",
                     "qos_exempt",
                     "memory_scopes",
+                    "windowless_grace",
+                    "launch_apps",
                 ):
                     value = data.get(key, optional_meta_defaults.get(key))
                     if key not in optional_meta_defaults:

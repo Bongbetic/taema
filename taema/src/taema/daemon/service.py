@@ -8,6 +8,8 @@ a learned pair or matched survivor signature authorises (engine.auto_stop_ok, re
 
 import collections
 from dataclasses import dataclass, replace
+import errno
+from types import SimpleNamespace
 import json
 import os
 import re
@@ -174,6 +176,27 @@ class PressureHigh:
     trigger: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProcBorn:
+    pid: int
+    ppid: int
+    start: int
+    born: float
+    exe: str
+    comm: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProcExited:
+    pid: int
+    ppid: int
+    start: int
+    born: float
+    exited: float
+    exe: str
+    comm: str
+
+
 class Daemon:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -197,6 +220,21 @@ class Daemon:
         self._config_watch_paths = policy.config_watch_paths(cfg)
         self._config_fingerprint = policy.file_fingerprint(self._config_watch_paths)
         self.sel = selectors.DefaultSelector()
+        self.agents = {}  # session -> {pid, capabilities, compositor, last_beat, state, facts}
+        self.notify_queues = {}  # session -> [jobs]; drained by notify_poll
+        self.notify_seq = 0
+        self.countdowns = {}  # nonce -> learned-stop countdown awaiting objection
+        self.review_nonces = {}  # nonce -> review awaiting a toast answer
+        self.window_state = {}  # session -> {windows, focused, pids, updated}
+        self._window_rates = {}  # session -> [recent window event timestamps]
+        self._windowless_since = {}  # scope -> when it was last seen windowed
+        self._windowless_ask = {}  # review id -> (scope, app key) awaiting an answer
+        self.launch_reservations = {}  # scope -> {app, unit, pid, expires, owner}
+        self._state_gen = 0  # bumped by every state-changing command
+        self._status_cache = None  # (gen, monotonic ts, reply); 1s TTL backstop
+        self._recovery_notified = set()  # sessions told about store recovery
+        self._digest_at = {}  # session -> last digest job timestamp
+        self._close_history = {}  # app -> [close timestamps, last hour]
         self.owners = {}  # pidfd -> (scope leaf name, owner pid, owner starttime)
         self.idle_since = {}
         self.gc_usage = {}  # rel -> cpu usage_usec when the idle window started
@@ -218,6 +256,7 @@ class Daemon:
         }
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.iv_windowless = policy.timer(cfg, "windowless_interval", 30)
         self.iv_memory = 60.0
         self.iv_reclaim = max(
             1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
@@ -260,10 +299,16 @@ class Daemon:
         )  # leaves that could not be watched: the GC pass checks them
         self.pressure_monitor = None
         self.pressure_watch_signature = None
+        self.pressure_watch_source = None
+        self.pressure_watch_path = None
+        self.pressure_watch_metrics = ()
         self.pressure_watch_failures = ()
         self.collector_events = collections.deque()
         self._collector_event_set = set()
         self.collector_event_drops = 0
+        self.eventd_sock = None
+        self.eventd_buffer = bytearray()
+        self.eventd_pending = {}
         self.last_guard_check = 0.0
         self.guard_last_steps = {}
         self.guard_state = pressure_guard.empty_status()
@@ -348,7 +393,7 @@ class Daemon:
 
     # ---- mode gates ----
     # Predicates for code and tests that ask what a mode means; the decision points themselves
-    # ask the authorization ladder via self.authorize() (taema.authorization).
+    # ask the authorization ladder via self.authorize() (taema.model.authorization).
     @property
     def mode(self):
         return self.cfg["mode"]
@@ -400,7 +445,7 @@ class Daemon:
                 self.store.log(event=event, scope=scope, why=why, mode=self.mode)
 
     def authorize(self, trigger, facts=None):
-        """Ask the one authorization ladder (taema.authorization) for `trigger` in the current
+        """Ask the one authorization ladder (taema.model.authorization) for `trigger` in the current
         mode; every lifecycle decision point below routes through it instead of checking the mode."""
         f = facts if facts is not None else authorization.Facts()
         suppress_stops = bool(self.cfg.get("_profile_suppress_stops"))
@@ -521,6 +566,8 @@ class Daemon:
                 MemoryReconcile,
                 ReclaimReconcile,
                 PressureHigh,
+                ProcBorn,
+                ProcExited,
             ),
         ):
             raise TypeError("unsupported collector event: %s" % type(event).__name__)
@@ -561,6 +608,10 @@ class Daemon:
             self.guarded(self.reclaim_pass)
         elif isinstance(event, PressureHigh):
             self.guarded(lambda: self.guard_pass(event.trigger))
+        elif isinstance(event, ProcBorn):
+            self._on_proc_born(event)
+        elif isinstance(event, ProcExited):
+            self._on_proc_exited(event)
 
     def watch_owner(self, leaf, pid):
         if any(l == leaf for l, _p, _s in self.owners.values()):
@@ -605,6 +656,191 @@ class Daemon:
         self.stop_leaf(leaf, "owner %d exited" % pid, owner=pid)
         return True
 
+    # ---- eventd collector (optional; off by default per D13) ----
+    def eventd_enabled(self):
+        """True when the service opted into the root process-event forwarder."""
+        if os.environ.get("TAEMA_EVENTD") == "1":
+            return True
+        experimental = self.cfg.get("experimental") or {}
+        return bool(experimental.get("eventd"))
+
+    def eventd_socket_path(self):
+        """Per-user forwarder socket; overridable for tests via TAEMA_EVENTD_SOCKET."""
+        override = os.environ.get("TAEMA_EVENTD_SOCKET")
+        if override:
+            return override
+        from .. import eventd as eventd_source
+
+        return "%s/%d.sock" % (
+            os.environ.get("TAEMA_EVENTD_DIR", eventd_source.DEFAULT_RUN_DIR),
+            os.getuid(),
+        )
+
+    def _open_eventd(self):
+        """Connect to the forwarder when enabled; stay silent when it is absent."""
+        if not self.eventd_enabled() or self.eventd_sock is not None:
+            return
+        path = self.eventd_socket_path()
+        try:
+            if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                return
+        except OSError:
+            return
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            sock.connect(path)
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        self.eventd_sock = sock
+        self.sel.register(sock, selectors.EVENT_READ, "eventd")
+
+    def _close_eventd(self):
+        sock, self.eventd_sock = self.eventd_sock, None
+        if sock is None:
+            return
+        try:
+            self.sel.unregister(sock)
+        except (OSError, ValueError, KeyError):
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def poll_eventd(self):
+        """Drain available forwarder records into the collector queue; return count."""
+        if not self.eventd_enabled():
+            return 0
+        if self.eventd_sock is None:
+            self._open_eventd()
+            if self.eventd_sock is None:
+                return 0
+        count = 0
+        while True:
+            try:
+                chunk = self.eventd_sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                self._close_eventd()
+                break
+            if not chunk:
+                self._close_eventd()
+                break
+            self.eventd_buffer += chunk
+        if self.eventd_buffer:
+            from .. import eventd as eventd_source
+
+            records, rest = eventd_source.decode_records(bytes(self.eventd_buffer))
+            self.eventd_buffer = bytearray(rest)
+            count = self.ingest_eventd_records(records)
+        return count
+
+    def ingest_eventd_records(self, records):
+        """Queue validated forwarder records; drop other uids (isolation)."""
+        mine = os.getuid()
+        count = 0
+        for record in records:
+            if record.uid != mine:
+                continue
+            born = record.ts_ns / 1e9
+            if record.kind == "exit":
+                self.queue_collector_event(
+                    ProcExited(
+                        record.pid,
+                        record.ppid,
+                        record.start,
+                        born,
+                        born,
+                        record.exe,
+                        record.comm,
+                    )
+                )
+            else:
+                self.queue_collector_event(
+                    ProcBorn(
+                        record.pid,
+                        record.ppid,
+                        record.start,
+                        born,
+                        record.exe,
+                        record.comm,
+                    )
+                )
+            count += 1
+        return count
+
+    def _eventd_identity(self, exe, comm, ppid):
+        name = comm or (os.path.basename(exe) if exe else "")
+        if not name:
+            name = "unknown"
+        parent_app = None
+        if ppid:
+            entry = self.lineage.entry(ppid)
+            if entry is not None:
+                parent_app = entry.get("key")
+        identity = SimpleNamespace(
+            key="exe:" + name,
+            display=name,
+            exe=exe,
+            kind="eventd",
+            desktop_id=None,
+            unit=None,
+            validated=False,
+            device=None,
+            inode=None,
+        )
+        return identity, parent_app
+
+    def _on_proc_born(self, event):
+        if len(self.eventd_pending) >= MAX_COLLECTOR_EVENTS:
+            oldest = next(iter(self.eventd_pending))
+            del self.eventd_pending[oldest]
+        self.eventd_pending[event.pid] = event
+        identity, parent_app = self._eventd_identity(event.exe, event.comm, event.ppid)
+        self.store.record_identity(
+            identity,
+            {
+                "pid": event.pid,
+                "start": event.start,
+                "born": event.born,
+                "exited": None,
+                "parent_app": parent_app,
+                "scope": None,
+                "terminal": 0,
+                "class": "eventd",
+                "runtime": None,
+                "launched_by": "eventd",
+                "parent_evidence": [],
+            },
+        )
+
+    def _on_proc_exited(self, event):
+        born = self.eventd_pending.pop(event.pid, None)
+        born_time = born.born if born is not None else event.born
+        identity, parent_app = self._eventd_identity(event.exe, event.comm, event.ppid)
+        self.store.record_identity(
+            identity,
+            {
+                "pid": event.pid,
+                "start": event.start,
+                "born": born_time,
+                "exited": event.exited,
+                "parent_app": parent_app,
+                "scope": None,
+                "terminal": 0,
+                "class": "eventd",
+                "runtime": None,
+                "launched_by": "eventd",
+                "parent_evidence": [],
+            },
+        )
+
     def stop_leaf(self, leaf, why, owner=None):
         path = "%s/%s" % (cgroup.base(), leaf)
         dec = self.authorize(authorization.OWNER_EXIT, authorization.Facts(scope=leaf))
@@ -616,6 +852,7 @@ class Daemon:
             # observed in observe mode when a unit's binds_to=root is only a projected carve.
             return
         unit = engine.unit_for_leaf(self.units, os.path.basename(leaf))
+        pre_stop_bytes = self._scope_bytes(path)
         try:
             with self.store.decision_context(
                 "stop",
@@ -645,6 +882,18 @@ class Daemon:
                         apps=stopped,
                         decision=decision,
                         restore=rep.get("restore"),
+                        freed_bytes=pre_stop_bytes,
+                    )
+                else:
+                    app = os.path.basename(leaf.rstrip("/")) or leaf
+                    self.notify_agents(
+                        {
+                            "kind": "close",
+                            "app": app,
+                            "scope": leaf,
+                            "mem_bytes": pre_stop_bytes,
+                            "sig_repeats": self._note_close(app),
+                        }
                     )
                 self.store.log(event="stopped", scope=leaf, why=why)
         except engine.Refused as e:
@@ -1004,6 +1253,7 @@ class Daemon:
         owner=None,
         signature_id=None,
         restore=None,
+        freed_bytes=0,
     ):
         """Remember an auto stop: knowledge, undo history, status ring, and decisions.log."""
         now = time.time()
@@ -1038,6 +1288,17 @@ class Daemon:
             restore=restore,
         )
         self._save_if_idle()
+        if (decision or {}).get("id") is not None:
+            self.notify_agents(
+                {
+                    "kind": "undo",
+                    "action": "stop",
+                    "decision_id": decision["id"],
+                    "scope": scope,
+                    "apps": sorted(set(apps)),
+                    "freed_bytes": freed_bytes,
+                }
+            )
         self.auto_stops.append(
             {
                 "ts": int(now),
@@ -1291,6 +1552,14 @@ class Daemon:
                 else self._provenance_scope(rid)
             )
             try:
+                # The delegated leftover parent can exist without the memory controller
+                # enabled for children. Enable it before creating the leaf so the newly
+                # contained process can be accounted and reclaimed like other scopes.
+                cgroup.mkleaf(engine.LEFTOVER)
+                if memory.enabled(self.cfg):
+                    self._enable_memory_controllers(
+                        name, os.path.join(cgroup.base(), name)
+                    )
                 ops = engine.run_ops(
                     self.cfg,
                     self.store,
@@ -1340,6 +1609,7 @@ class Daemon:
                             survivors=review["survivors"],
                             pids=review["pids"],
                         )
+                        self._emit_review_job(review)
                         self._save_if_idle()
             except engine.Refused as e:
                 self.store.log(event="leftover_move_refused", scope=name, error=str(e))
@@ -1400,12 +1670,18 @@ class Daemon:
             denied = next(item for item in decisions if item[0] != "stop")
             action, reason, explicit = denied[0], denied[2], False
         scope = cgroup.rel(path)
+        unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+        table = (unit or {}).get("window", {})
+        if not isinstance(table, dict):
+            table = {}
         return authorization.Facts(
             scope=scope,
             leftover=scope.startswith(engine.LEFTOVER + "/"),
             pair_action=action,
             pair_reason=reason,
             pair_explicit=explicit,
+            require_window=table.get("requires_window", True) is True,
+            windowed=scope in self.live_window_scopes(),
         )
 
     def auto_stop_path(
@@ -1415,10 +1691,15 @@ class Daemon:
         require_pair,
         authority=None,
         trigger=authorization.GC_STOP,
+        _countdown_approved=False,
+        _user_approved=False,
     ):
         """Stop one scope on auto authority. require_pair: every member must pass auto_stop_ok (a pair
         decided stop); otherwise only the idle checks (known CPU, no edges, no pty host, not protected) apply.
-        SIGKILL only when every pair was answered explicitly. Returns True when the scope was removed."""
+        _user_approved (an explicit user stop order) waives the CPU-freshness
+        heuristic -- unknown CPU no longer refuses -- while edges, pty host,
+        and protected members still do. SIGKILL only when every pair was
+        answered explicitly. Returns True when the scope was removed."""
         leaf = cgroup.rel(path)
         infos = self._infos(cgroup.tree_procs(path))
         if not infos:
@@ -1478,8 +1759,8 @@ class Daemon:
                     or i["edges"]
                     or i["protected"]
                     or i["ptmx"]
-                    or cpu is None
-                    or cpu > engine.AUTO_MAX_CPU
+                    or (cpu is None and not _user_approved)
+                    or (cpu is not None and cpu > engine.AUTO_MAX_CPU)
                 )
                 if i["edges"] is None:
                     w = "edges unknown"
@@ -1520,7 +1801,17 @@ class Daemon:
         probationary = require_pair and any(
             self.store.stop_in_probation(o, k) for o, k in pairs
         )
+        if (
+            require_pair
+            and not explicit
+            and not _countdown_approved
+            and self._countdown_wait(
+                leaf, path, pairs, stop_owner, signature_id, why, authority, trigger
+            )
+        ):
+            return False
         grace = engine.auto_grace(self.store, {i["key"] for i in infos})
+        pre_stop_bytes = self._scope_bytes(path)
         with self.store.decision_context(
             "stop",
             scope=leaf,
@@ -1560,6 +1851,7 @@ class Daemon:
                     decision=decision,
                     owner=decision["owner"],
                     restore=rep.get("restore"),
+                    freed_bytes=pre_stop_bytes,
                 )
             return rep["removed"]
 
@@ -1792,6 +2084,8 @@ class Daemon:
                 self.guarded(lambda: self.decide_kill(arg))
             elif kind == "expire":
                 self.guarded(lambda: self.expire_question(arg))
+            elif kind == "countdown":
+                self.guarded(lambda: self._countdown_expired(arg))
 
     def job_done(self, msg):
         shell, tag, status, word = (
@@ -2502,6 +2796,7 @@ class Daemon:
                         pids=review["pids"],
                         source="gc",
                     )
+                    self._emit_review_job(review)
                     before = review["id"]
         else:
             review = self.store.add_scope_review(leaf, why, memory=memory_bytes)
@@ -3455,7 +3750,7 @@ class Daemon:
             return False
         observing = decision.verdict == authorization.WOULD_ACT
         if observing:
-            plan = qos.plan(path, resource_class)
+            plan = qos.plan(path, resource_class, self._focus_weight())
             oom_candidates = self._qos_oom_candidates(
                 path, resource_class, previous.get("oom_score_adj", [])
             )
@@ -3500,7 +3795,7 @@ class Daemon:
                 self.store.log(event="qos_refused", scope=scope, reason=decision.reason)
             return False
         controllers_ready = self._enable_qos_controllers(scope, path)
-        plan = qos.plan(path, resource_class)
+        plan = qos.plan(path, resource_class, self._focus_weight())
         if only_controls is not None:
             previously_available = set(previous.get("available", []))
             # Controller enablement can expose controls between the preflight plan
@@ -3702,6 +3997,7 @@ class Daemon:
 
         config = self.cfg.get("qos", policy._DEFAULTS["qos"])
         enabled = isinstance(config, dict) and config.get("enabled", True) is True
+        window_scopes = self.live_window_scopes()
         background_scopes = [
             (scope, path, cgroup.tree_procs(path))
             for scope, path in paths.items()
@@ -3750,6 +4046,11 @@ class Daemon:
                 if unit_class == "normal"
                 else unit_class or qos.classify(scope, idle_times, now)
             )
+            window_class = self._window_qos_class(scope, window_scopes)
+            if window_class == "foreground" and self._focus_boost_on():
+                resource_class = "foreground"
+            elif window_class is not None:
+                resource_class = None
             if record and record.get("active"):
                 decision = self._qos_authorization(scope, path)
                 if decision.verdict == authorization.KEEP:
@@ -3782,7 +4083,7 @@ class Daemon:
                 and record.get("class") == resource_class
                 and record.get("active") is (self.mode != "observe")
             ):
-                plan = qos.plan(path, resource_class)
+                plan = qos.plan(path, resource_class, self._focus_weight())
                 if self.mode == "observe":
                     self.qos_pending.pop(scope, None)
                     oom_candidates = self._qos_oom_candidates(
@@ -3902,7 +4203,7 @@ class Daemon:
                 d for d in top if os.path.basename(d) != engine.LEFTOVER
             ] + cgroup.subdirs(cgroup.base() + "/" + engine.LEFTOVER)
         for d in top:
-            if os.path.basename(d) == "manager":
+            if os.path.basename(d) == "manager" or policy.is_agent_scope(cgroup.rel(d)):
                 continue
             unit = engine.unit_for_leaf(self.units, os.path.basename(d))
             scope = cgroup.rel(d)
@@ -3998,7 +4299,11 @@ class Daemon:
         scope = payload.get("scope") or decision.get("scope")
         if not isinstance(scope, str) or not cgroup.valid_rel(scope):
             return {"ok": False, "error": "undo scope is invalid"}
-        if scope == "manager" or scope.startswith("manager/"):
+        if (
+            scope == "manager"
+            or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
+        ):
             return {"ok": False, "error": "managed service scope cannot be undone"}
         path = os.path.join(cgroup.base(), scope)
 
@@ -4320,21 +4625,32 @@ class Daemon:
         return {"restored": True, "pid": child.pid, "scope": "scope-" + scope}
 
     # ---- socket API ----
+    #: Commands that never change status-visible state; every other command
+    #: bumps the state generation so the cached status reply is rebuilt.
+    _STATUS_PURE_COMMANDS = frozenset(
+        {"status", "doctor", "memory_budget", "notify_poll", "agent_beat", "subscribe"}
+    )
+
     def handle(self, msg):
         if not isinstance(msg, dict):
             return {"error": "bad request"}
         c = msg.get("cmd")
+        if c not in self._STATUS_PURE_COMMANDS:
+            self._state_gen += 1
         if c == "doctor":
             from ..doctor import diagnose
 
+            agent_state = self.agent_report()
+            agent_kwarg = {"agents": agent_state} if agent_state else {}
             if self.config_error:
                 return diagnose(
                     self.cfg,
                     self.store,
                     self.units,
                     config_error=self.config_error,
+                    **agent_kwarg,
                 )
-            return diagnose(self.cfg, self.store, self.units)
+            return diagnose(self.cfg, self.store, self.units, **agent_kwarg)
         if c == "reload":
             reason = msg.get("reason", "reload command")
             if not isinstance(reason, str) or len(reason) > 256:
@@ -4350,6 +4666,7 @@ class Daemon:
                 or not cgroup.valid_rel(scope)
                 or scope == "manager"
                 or scope.startswith("manager/")
+                or policy.is_agent_scope(scope)
             ):
                 return {"error": "invalid freeze scope", "code": "invalid_request"}
             result = self.freeze_scope(scope, manual=True, reason="manual freeze")
@@ -4373,6 +4690,7 @@ class Daemon:
                 or not cgroup.valid_rel(scope)
                 or scope == "manager"
                 or scope.startswith("manager/")
+                or policy.is_agent_scope(scope)
             ):
                 return {"error": "invalid thaw scope", "code": "invalid_request"}
             result = self._thaw_scope(
@@ -4382,10 +4700,15 @@ class Daemon:
                 return {"error": result.get("error", "thaw refused")}
             return result
         if c == "status":
+            now_mono = time.monotonic()
+            if self._status_cache is not None:
+                cached_gen, cached_at, cached = self._status_cache
+                if cached_gen == self._state_gen and now_mono - cached_at < 1.0:
+                    return cached
             self.store.expire_reviews()
             self._save_if_idle()
             effective_authority = self.effective_authority
-            return {
+            reply = {
                 "mode": self.mode,
                 "authority": effective_authority["value"],
                 "authority_source": effective_authority["source"],
@@ -4408,6 +4731,7 @@ class Daemon:
                     "jobs": len(self.lineage.jobs),
                 },
                 "pending_questions": len(self.pending),
+                "muted": sorted(self.store.data.get("muted_apps", [])),
                 "reviews": self.store.review_count,
                 "recovery": self.store.recovery,
                 "latest_decision": self.store.latest_decision(),
@@ -4421,12 +4745,19 @@ class Daemon:
                     )
                     if isinstance(record, dict)
                 ],
+                "deprioritized": self._deprioritized_count(),
+                "freed_today_bytes": self._freed_today_bytes(),
                 "config_error": self.config_error,
                 "config": list(self.cfg.get("_sources", [])),
                 "unit_errors": list(self.cfg.get("_unit_errors", [])),
                 "auto": self.auto_status(),
                 "guard": self.guard_status(),
+                "agents": self.agent_report(),
+                "windows": self.window_summary(),
+                "mem_enabled": memory.config_enabled(self.cfg),
             }
+            self._status_cache = (self._state_gen, now_mono, reply)
+            return reply
         if c == "review":
             self.store.expire_reviews()
             self._save_if_idle()
@@ -4445,6 +4776,22 @@ class Daemon:
             return {"watching": self.watch_owner(leaf, owner)}
         if c == "attach":
             return self.attach(msg)
+        if c == "launch_prepare":
+            return self.launch_prepare(msg)
+        if c == "launch_claim":
+            return self.launch_claim(msg)
+        if c == "launch_release":
+            return self.launch_release(msg)
+        if c == "register_agent":
+            return self.register_agent(msg)
+        if c == "agent_beat":
+            return self.agent_beat(msg)
+        if c == "notify_poll":
+            return self.notify_poll(msg)
+        if c == "notify_result":
+            return self.notify_result(msg)
+        if c == "window_event":
+            return self.window_event(msg)
         if c == "job_done":
             return self.job_done(msg)
         if c == "kill_done":
@@ -4526,6 +4873,17 @@ class Daemon:
                         )
                 if msg.get("op") in ("veto", "undo") and not result.get("duplicate"):
                     self.thaw_held_scopes()
+                if msg.get("op") == "veto" and not result.get("duplicate"):
+                    self._cancel_countdowns_for_target(result.get("target"))
+                if (
+                    msg.get("op") == "restore_backup"
+                    and result.get("ok")
+                    and not result.get("duplicate")
+                ):
+                    reloaded = self.reload_config("backup restore")
+                    result["config_reloaded"] = bool(
+                        isinstance(reloaded, dict) and reloaded.get("reloaded")
+                    )
                 return result
             if not self.store.apply_op(msg.get("op"), msg.get("key")):
                 return {"error": "bad request"}
@@ -4541,6 +4899,38 @@ class Daemon:
             "auto_stops": list(self.auto_stops),
         }
 
+    def _deprioritized_count(self):
+        states = self.store.data.get("qos_scopes", {})
+        if not isinstance(states, dict):
+            return 0
+        return sum(
+            1
+            for state in states.values()
+            if isinstance(state, dict) and state.get("deprioritized") is True
+        )
+
+    def _freed_today_bytes(self):
+        try:
+            now = time.time()
+            midnight = (
+                now
+                - (time.localtime(now).tm_hour * 3600)
+                - (time.localtime(now).tm_min * 60)
+                - time.localtime(now).tm_sec
+            )
+            window = self.store.db.report_window(midnight, now, ())
+        except Exception:
+            return 0
+        freed = window.get("memory_freed_bytes", {})
+        if not isinstance(freed, dict):
+            return 0
+        total = 0
+        for key in ("stop", "reclaim"):
+            value = freed.get(key, 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                total += value
+        return total
+
     def guard_status(self):
         """Return only the guard state intended for the status view model."""
         state = self.guard_state
@@ -4554,6 +4944,13 @@ class Daemon:
             "last_trigger": state.get("last_trigger"),
             "last_bytes_freed": int(state.get("last_bytes_freed", 0)),
             "last_duration_ms": state.get("last_duration_ms"),
+            "psi_trigger_source": self.pressure_watch_source,
+            "psi_trigger_path": self.pressure_watch_path,
+            "psi_trigger_writable": bool(
+                self.pressure_monitor and self.pressure_watch_metrics
+            ),
+            "psi_trigger_metrics": list(self.pressure_watch_metrics),
+            "psi_trigger_failures": list(self.pressure_watch_failures),
         }
 
     def attach(self, msg):
@@ -4580,6 +4977,10 @@ class Daemon:
         me = os.getuid()
         if any(inspect.uid_of(p) != me for p in pids):
             return {"error": "pid gone or not yours"}
+        if scope == policy.AGENT_LEAF:
+            return self.attach_agent(pids)
+        if scope.startswith("app-"):
+            return self.attach_app(scope, pids)
         done = []
         with self.store.decision_context(
             "containment",
@@ -4598,6 +4999,1369 @@ class Daemon:
                 done.append(p)
             self.store.log(event="attach", scope="scope-" + name, pids=done[:8])
         return {"ok": True, "attached": done}
+
+    def attach_app(self, scope, pids):
+        """Move same-uid pids into an app-NAME leaf through the root helper's move."""
+        done = []
+        with self.store.decision_context(
+            "containment",
+            scope=scope,
+            owner=pids[0] if pids else None,
+            authority="user",
+            mode=self.mode,
+            why="attach launched processes to their reserved app scope",
+        ):
+            try:
+                engine.helper_move(self.cfg, scope, list(dict.fromkeys(pids)))
+            except engine.Refused as e:
+                self.store.log(event="refusal", scope=scope, why=str(e))
+                return {"error": "attach failed: %s" % e, "attached": done}
+            done.extend(dict.fromkeys(pids))
+            self.store.log(event="attach", scope=scope, pids=done[:8])
+        return {"ok": True, "attached": done}
+
+    def launch_prepare(self, msg):
+        """Reserve an app scope for `taema launch`: create the leaf, hold it 5 seconds."""
+        app, pid = msg.get("app"), msg.get("pid")
+        session, unit, owner = msg.get("session"), msg.get("unit"), msg.get("owner")
+        if (
+            not isinstance(app, str)
+            or not app
+            or not cgroup.valid_rel(app)
+            or "/" in app
+            or len(app) > 32
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or (unit is not None and not isinstance(unit, str))
+            or (
+                owner is not None
+                and (not isinstance(owner, int) or isinstance(owner, bool))
+            )
+        ):
+            return {"error": "bad request"}
+        if inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        if owner is not None and (owner <= 1 or inspect.uid_of(owner) != os.getuid()):
+            return {"error": "owner gone or not yours"}
+        base = "app-" + app
+        scope = ""
+        for suffix in range(0, 100):
+            candidate = base if suffix == 0 else "%s-%d" % (base, suffix + 1)
+            path = os.path.join(cgroup.base(), candidate)
+            try:
+                live = bool(os.path.isdir(path) and cgroup.tree_procs(path))
+            except OSError:
+                live = True
+            if not live:
+                scope = candidate
+                break
+        if not scope:
+            return {"error": "no free launch scope"}
+        try:
+            cgroup.mkleaf(scope)
+        except OSError as error:
+            return {"error": "scope unavailable: %s" % error}
+        now = time.time()
+        self.launch_reservations[scope] = {
+            "app": app,
+            "unit": unit,
+            "pid": pid,
+            "session": session,
+            "owner": owner,
+            "expires": now + 5.0,
+        }
+        while len(self.launch_reservations) > 64:
+            oldest = min(
+                self.launch_reservations,
+                key=lambda name: self.launch_reservations[name]["expires"],
+            )
+            del self.launch_reservations[oldest]
+        via = (
+            "agent"
+            if isinstance(session, str)
+            and self.agents.get(session, {}).get("state") == "up"
+            else "helper"
+        )
+        return {"ok": True, "scope": scope, "via": via, "expires": now + 5.0}
+
+    def launch_claim(self, msg):
+        """Register the launched instance once its pid has arrived in the scope."""
+        scope, pid, app = msg.get("scope"), msg.get("pid"), msg.get("app")
+        if (
+            not isinstance(scope, str)
+            or not isinstance(app, str)
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+        ):
+            return {"error": "bad request"}
+        reservation = self.launch_reservations.get(scope)
+        if reservation is None or reservation.get("app") != app:
+            return {"error": "no reservation for scope"}
+        if inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        try:
+            members = cgroup.tree_procs(os.path.join(cgroup.base(), scope))
+        except OSError:
+            members = []
+        if pid not in members:
+            return {"error": "pid never arrived in scope"}
+        start = inspect.starttime(pid)
+        if start is None:
+            return {"error": "pid gone"}
+        now = time.time()
+        identity = SimpleNamespace(
+            key=app,
+            display=app,
+            exe="",
+            kind="launch",
+            desktop_id=app,
+            unit=reservation.get("unit"),
+            validated=False,
+            device=None,
+            inode=None,
+        )
+        self.store.record_identity(
+            identity,
+            {
+                "pid": pid,
+                "start": start,
+                "born": now,
+                "scope": scope,
+                "launched_by": "launch",
+            },
+        )
+        launch_apps = self.store.data.get("launch_apps")
+        if not isinstance(launch_apps, dict):
+            launch_apps = {}
+            self.store.data["launch_apps"] = launch_apps
+        launch_apps[scope] = {
+            "app": app,
+            "unit": reservation.get("unit"),
+            "launched_by": "launch",
+        }
+        while len(launch_apps) > 256:
+            launch_apps.pop(next(iter(launch_apps)))
+        # Flush now: `why` and other CLI readers load the store from disk in
+        # their own process, so the provenance must be durable before we
+        # report the claim as done (not whenever the next periodic save lands).
+        self.store.save()
+        del self.launch_reservations[scope]
+        owner = reservation.get("owner")
+        watching = self.watch_owner(scope, owner) if owner else False
+        self.store.log(event="launch", scope=scope, pids=[pid])
+        return {"ok": True, "scope": scope, "watching": watching}
+
+    def launch_release(self, msg):
+        """Drop a launch reservation; remove the leaf when it stayed empty."""
+        scope = msg.get("scope")
+        if not isinstance(scope, str) or not cgroup.valid_rel(scope):
+            return {"error": "bad request"}
+        self.launch_reservations.pop(scope, None)
+        try:
+            members = cgroup.tree_procs(os.path.join(cgroup.base(), scope))
+        except OSError:
+            members = []
+        if not members:
+            try:
+                os.rmdir(os.path.join(cgroup.base(), scope))
+            except OSError:
+                pass
+        return {"ok": True}
+
+    def launch_sweep(self, now=None):
+        """Reap expired launch reservations and prune the launch mapping."""
+        now = time.time() if now is None else now
+        for scope, reservation in list(self.launch_reservations.items()):
+            if reservation["expires"] > now:
+                continue
+            del self.launch_reservations[scope]
+            path = os.path.join(cgroup.base(), scope)
+            try:
+                members = cgroup.tree_procs(path)
+            except OSError:
+                members = []
+            if not members:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
+            self.store.log(event="launch_expired", scope=scope)
+        launch_apps = self.store.data.get("launch_apps")
+        if isinstance(launch_apps, dict):
+            for scope in list(launch_apps):
+                if not os.path.isdir(os.path.join(cgroup.base(), scope)):
+                    del launch_apps[scope]
+
+    def attach_agent(self, pids):
+        """Move same-uid pids into the agent leaf (helper for cross-cgroup)."""
+        try:
+            dest = cgroup.mkleaf(policy.AGENT_LEAF)
+        except OSError as error:
+            return {"error": "agent leaf unavailable: %s" % error}
+        done = []
+        refused = []
+        for p in dict.fromkeys(pids):
+            # Fast path: moves inside the delegated subtree work directly.
+            try:
+                cgroup.move(p, dest)
+            except OSError as error:
+                if getattr(error, "errno", None) in (errno.EACCES, errno.EPERM):
+                    refused.append(p)
+                    continue
+                return {"error": "attach failed: %s" % error, "attached": done}
+            done.append(p)
+        if refused:
+            # A login-session cgroup cannot write outside its subtree (the
+            # kernel's common-ancestor rule), so cross-boundary moves go
+            # through the privileged helper like launch moves do.
+            try:
+                engine.helper_move(self.cfg, policy.AGENT_LEAF, refused)
+            except engine.Refused as error:
+                return {"error": "attach failed: %s" % error, "attached": done}
+            done.extend(refused)
+        self.store.log(event="attach", scope=policy.AGENT_LEAF, pids=done[:8])
+        return {"ok": True, "attached": done}
+
+    def register_agent(self, msg):
+        """Record one session's agent; same uid only, capabilities announced."""
+        session, pid = msg.get("session"), msg.get("pid")
+        capabilities, compositor = (
+            msg.get("capabilities", []),
+            msg.get("compositor", ""),
+        )
+        if (
+            not isinstance(session, str)
+            or not session
+            or len(session) > 64
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+            or not isinstance(capabilities, list)
+            or any(not isinstance(cap, str) for cap in capabilities)
+            or not isinstance(compositor, str)
+        ):
+            return {"error": "bad request"}
+        if inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        previous = self.agents.get(session)
+        self.agents[session] = {
+            "pid": pid,
+            "capabilities": capabilities,
+            "compositor": compositor,
+            "last_beat": time.time(),
+            "state": "up",
+            "facts": {},
+        }
+        if previous is None or previous.get("state") != "up":
+            self.store.log(event="agent_up", scope=session, target=str(pid))
+        if self.store.recovery and session not in self._recovery_notified:
+            self._recovery_notified.add(session)
+            recovery = self.store.recovery
+            source = (
+                recovery.get("source", "backup")
+                if isinstance(recovery, dict)
+                else "backup"
+            )
+            self.notify_agents(
+                {
+                    "kind": "error",
+                    "error_kind": "store-recovery",
+                    "detail": "state was rebuilt from %s at startup" % source,
+                }
+            )
+        return {"ok": True}
+
+    def _agent_session(self, msg):
+        """Validate a message on a registered agent connection.
+
+        Returns (session, record) or (None, error reply): the session must
+        be registered and the pid must be the registered agent, alive and
+        same-uid.
+        """
+        session, pid = msg.get("session"), msg.get("pid")
+        if (
+            not isinstance(session, str)
+            or not session
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+        ):
+            return None, {"error": "bad request"}
+        record = self.agents.get(session)
+        if record is None:
+            return None, {"error": "unknown agent session; register first"}
+        if pid != record["pid"] or inspect.uid_of(pid) != os.getuid():
+            return None, {"error": "pid gone or not yours"}
+        return session, record
+
+    def notify_agents(self, job):
+        """Queue one notification job for every up session agent.
+
+        Off when notifications are disabled: headless and opted-out
+        installs never queue, and agents show nothing.
+        """
+        if not self.cfg.get("notify", {}).get("enabled", True):
+            return 0
+        self.notify_seq += 1
+        body = dict(job)
+        envelope = {
+            "seq": self.notify_seq,
+            "created": time.time(),
+            "ttl": body.pop("ttl", None) or self.cfg.get("notify", {}).get("ttl", 600),
+            **body,
+        }
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            self._queue_job(session, envelope)
+        return envelope["seq"]
+
+    def _queue_job(self, session, envelope):
+        queue = self.notify_queues.setdefault(session, [])
+        queue.append(dict(envelope))
+        while len(queue) > 64:
+            del queue[0]
+
+    def _scope_bytes(self, path):
+        """Last-known current bytes for a scope; 0 when unreadable."""
+        try:
+            counters = memory.scope_counters(path)
+        except OSError:
+            return 0
+        if not isinstance(counters, dict):
+            return 0
+        current = counters.get("current_bytes")
+        return current if isinstance(current, int) and current > 0 else 0
+
+    def _note_close(self, app):
+        """Count an app's closes in the last hour for the repeat override."""
+        now = time.time()
+        history = [ts for ts in self._close_history.get(app, []) if now - ts < 3600]
+        history.append(now)
+        self._close_history[app] = history[-16:]
+        return len(history)
+
+    def _maybe_digest(self, session, now):
+        """Queue one digest a day per session while digests are enabled."""
+        if self.cfg.get("notify", {}).get("digest", "off") in ("off", "", None):
+            return
+        if now - self._digest_at.get(session, 0) < 86400:
+            return
+        self._digest_at[session] = now
+        self.notify_seq += 1
+        stops_24h = sum(
+            1 for item in self.auto_stops if now - item.get("ts", 0) < 86400
+        )
+        self._queue_job(
+            session,
+            {
+                "seq": self.notify_seq,
+                "created": now,
+                "ttl": 86400,
+                "kind": "digest",
+                "stops_24h": stops_24h,
+                "frozen": len(self.store.data.get("frozen_scopes", {})),
+                "guard_bytes": int(self.guard_state.get("last_bytes_freed", 0)),
+                "reviews": self.store.review_count,
+            },
+        )
+
+    def window_event(self, msg):
+        """Ingest one agent-forwarded window event, at most 50 per second."""
+        session, record = self._agent_session(msg)
+        if session is None:
+            return record
+        kind = msg.get("kind")
+        if kind not in ("snapshot", "opened", "changed", "closed", "focus"):
+            return {"error": "bad request"}
+        now = time.time()
+        recent = [ts for ts in self._window_rates.get(session, []) if now - ts < 1.0]
+        if len(recent) >= self._max_window_events():
+            self._window_rates[session] = recent
+            return {"ok": True, "dropped": True}
+        recent.append(now)
+        self._window_rates[session] = recent
+        state = self.window_state.setdefault(
+            session,
+            {"windows": {}, "focused": None, "pids": {}, "updated": 0, "backend": None},
+        )
+        backend = msg.get("backend")
+        if isinstance(backend, str) and backend and len(backend) <= 32:
+            state["backend"] = backend
+        if kind == "snapshot":
+            return self._window_snapshot(state, msg)
+        parsed = self._parse_window_fields(msg)
+        if parsed is None:
+            return {"error": "bad request"}
+        window_id, app_id, pid, focus, title = parsed
+        if kind == "closed":
+            state["windows"].pop(window_id, None)
+            if state["focused"] == window_id:
+                state["focused"] = None
+        elif kind == "focus":
+            state["focused"] = window_id
+            for known_id, known in state["windows"].items():
+                known["focus"] = known_id == window_id
+            if window_id is not None:
+                self._window_note_pid(state, window_id, app_id, pid, title)
+                state["windows"][window_id]["focus"] = True
+                noted = state["windows"][window_id]
+                self._note_window_instance(
+                    noted.get("app_id"), noted.get("pid"), noted.get("start")
+                )
+                self._window_maybe_thaw(noted)
+        else:
+            self._window_note_pid(state, window_id, app_id, pid, title)
+            noted = state["windows"][window_id]
+            noted["focus"] = focus
+            self._note_window_instance(
+                noted.get("app_id"), noted.get("pid"), noted.get("start")
+            )
+            if focus:
+                state["focused"] = window_id
+                for known_id, known in state["windows"].items():
+                    known["focus"] = known_id == window_id
+                self._window_maybe_thaw(noted)
+        state["updated"] = now
+        if len(state["windows"]) > 512:
+            oldest = sorted(state["windows"])[: len(state["windows"]) - 512]
+            for gone in oldest:
+                del state["windows"][gone]
+        return {"ok": True}
+
+    def _parse_window_fields(self, msg):
+        """Validate one window event's fields; None when malformed."""
+        window_id = msg.get("window_id")
+        if msg.get("kind") == "focus" and window_id is None:
+            pass
+        elif (
+            not isinstance(window_id, int)
+            or isinstance(window_id, bool)
+            or window_id < 0
+        ):
+            return None
+        app_id = msg.get("app_id")
+        if app_id is not None and (
+            not isinstance(app_id, str) or not app_id or len(app_id) > 256
+        ):
+            return None
+        pid = msg.get("window_pid")
+        if pid is not None and (
+            not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+        ):
+            return None
+        focus = msg.get("focus", False)
+        if not isinstance(focus, bool):
+            return None
+        title = msg.get("title")
+        if title is not None and (not isinstance(title, str) or len(title) > 512):
+            return None
+        if title is not None and not self.cfg.get("agent", {}).get(
+            "store_titles", False
+        ):
+            title = None
+        return (window_id, app_id, pid, focus, title)
+
+    def _window_snapshot(self, state, msg):
+        entries = msg.get("windows")
+        if not isinstance(entries, list) or len(entries) > 512:
+            return {"error": "bad request"}
+        fresh = {}
+        focused = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return {"error": "bad request"}
+            parsed = self._parse_window_fields({**entry, "kind": "opened"})
+            if parsed is None or parsed[0] is None:
+                return {"error": "bad request"}
+            window_id, app_id, pid, focus, title = parsed
+            fresh[window_id] = self._window_record(state, window_id, app_id, pid, title)
+            fresh[window_id]["focus"] = focus
+            self._note_window_instance(
+                fresh[window_id].get("app_id"),
+                fresh[window_id].get("pid"),
+                fresh[window_id].get("start"),
+            )
+            if focus:
+                focused = window_id
+        state["windows"] = fresh
+        state["focused"] = focused
+        state["updated"] = time.time()
+        return {"ok": True}
+
+    def _window_pid_start(self, state, pid):
+        """Validate a window pid is alive and same-uid; cache its start time."""
+        if pid is None:
+            return None
+        start = inspect.starttime(pid)
+        if start is None:
+            state["pids"].pop(pid, None)
+            return None
+        if state["pids"].get(pid) != start:
+            if inspect.uid_of(pid) != os.getuid():
+                state["pids"].pop(pid, None)
+                return None
+            state["pids"][pid] = start
+        return start
+
+    def _window_record(self, state, window_id, app_id, pid, title):
+        start = self._window_pid_start(state, pid)
+        record = {
+            "app_id": app_id,
+            "pid": pid if start is not None else None,
+            "start": start,
+            "focus": False,
+        }
+        if title is not None:
+            record["title"] = title
+        return record
+
+    def _window_note_pid(self, state, window_id, app_id, pid, title):
+        record = self._window_record(state, window_id, app_id, pid, title)
+        previous = state["windows"].get(window_id, {})
+        if record["pid"] is None and previous.get("pid") is not None:
+            rechecked = self._window_pid_start(state, previous["pid"])
+            if rechecked == previous.get("start"):
+                record["pid"] = previous["pid"]
+                record["start"] = rechecked
+        if record["app_id"] is None:
+            record["app_id"] = previous.get("app_id")
+        state["windows"][window_id] = record
+
+    def _window_scope(self, pid):
+        """The daemon scope holding a pid, or None outside the tree."""
+        line = cgroup.proc_cgroup(pid)
+        if not line:
+            return None
+        prefix = cgroup.base()[len(cgroup.CG) :]
+        if line == prefix:
+            return ""
+        if not line.startswith(prefix + "/"):
+            return None
+        return line[len(prefix) + 1 :]
+
+    def _note_window_instance(self, app_id, pid, start):
+        """Point the pid's app row at its window app id (desktop evidence)."""
+        if not app_id or pid is None or start != inspect.starttime(pid):
+            return False
+        try:
+            key = policy.app_key(pid, units=self.units)
+        except (OSError, ValueError):
+            return False
+        if not key:
+            return False
+        row = self.store.db.app_identity(key)
+        if row is None:
+            return False
+        if row.get("desktop_id") == app_id and row.get("display") == app_id:
+            return True
+        return bool(self.store.db.set_app_desktop(key, app_id, app_id))
+
+    def _window_maybe_thaw(self, record):
+        """A window opening or focusing in a frozen scope thaws it at once."""
+        pid = record.get("pid")
+        if pid is None or record.get("start") != inspect.starttime(pid):
+            return False
+        scope = self._window_scope(pid)
+        if not scope or scope not in self.store.data.get("frozen_scopes", {}):
+            return False
+        result = self._thaw_scope(scope, "window opened or focused")
+        if result.get("ok"):
+            self.store.log(event="focus_thaw", scope=scope)
+            return True
+        return False
+
+    def window_summary(self):
+        """Window facts for views: per-scope counts plus per-pid markers."""
+        pids = {}
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            state = self.window_state.get(session)
+            if not state:
+                continue
+            for window_id, known in state["windows"].items():
+                pid = known.get("pid")
+                if pid is None or known.get("start") != inspect.starttime(pid):
+                    continue
+                marker = pids.setdefault(
+                    str(pid), {"focused": False, "app_id": known.get("app_id")}
+                )
+                if state.get("focused") == window_id:
+                    marker["focused"] = True
+                if known.get("app_id"):
+                    marker["app_id"] = known["app_id"]
+        scopes = self.live_window_scopes()
+        return {
+            "connected": bool(pids),
+            "scopes": scopes,
+            "pids": pids,
+        }
+
+    def _window_qos_class(self, scope, live=None):
+        """Foreground for the focused scope, interactive for windowed ones."""
+        entry = (live if live is not None else self.live_window_scopes()).get(scope)
+        if entry is None:
+            return None
+        return "foreground" if entry.get("focused") else "interactive"
+
+    def _focus_boost_on(self):
+        """Focus boost applies only in the focus profile (D18)."""
+        config = self.cfg.get("qos", {})
+        if not isinstance(config, dict) or config.get("focus_boost") is not True:
+            return False
+        return self.cfg.get("_profile_name", "auto") == "focus"
+
+    def _focus_weight(self):
+        weight = self.cfg.get("qos", {}).get("focus_cpu_weight", 300)
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            return 300
+        return min(10000, max(1, weight))
+
+    def _window_close_enabled(self):
+        """Window-close lifecycle is on unless [experimental] turns it off."""
+        experimental = self.cfg.get("experimental", {})
+        return not (
+            isinstance(experimental, dict) and experimental.get("window_close") is False
+        )
+
+    def _windowless_app_key(self, scope, unit, path):
+        """App identity key for a windowless scope.
+
+        The identity key of a member process when one is known, else
+        the unit name with its app- prefix stripped, else the scope.
+        """
+        try:
+            members = cgroup.tree_procs(path)
+        except OSError:
+            members = []
+        for pid in members:
+            try:
+                key = policy.app_key(pid, units=self.units)
+            except (OSError, ValueError):
+                continue
+            if key:
+                return key
+        if isinstance(unit, dict):
+            name = (unit.get("unit") or {}).get("name")
+            if isinstance(name, str) and name:
+                return name[4:] if name.startswith("app-") else name
+        return os.path.basename(scope.rstrip("/")) or scope
+
+    def _last_window_policy(self, scope, unit, path):
+        """ask, quit, or keep for a scope whose last window closed.
+
+        A unit's [desktop] on_last_window wins, then the learned app
+        identity, then the default: ask.
+        """
+        if isinstance(unit, dict):
+            chosen = (unit.get("desktop") or {}).get("on_last_window")
+            if chosen in ("ask", "quit", "keep"):
+                return chosen
+        key = self._windowless_app_key(scope, unit, path)
+        identity = self.store.db.app_identity(key)
+        if isinstance(identity, dict) and identity.get("on_last_window") in (
+            "ask",
+            "quit",
+            "keep",
+        ):
+            return identity["on_last_window"]
+        return "ask"
+
+    def _windowless_grace_for(self, app_key):
+        """Per-app windowless grace: base grace, widened by keep evidence."""
+        base = self.cfg.get("agent", {}).get("windowless_grace", 30)
+        if isinstance(base, bool) or not isinstance(base, (int, float)):
+            base = 30
+        learned = self.store.data.get("windowless_grace", {})
+        if isinstance(learned, dict) and isinstance(learned.get(app_key), (int, float)):
+            return max(0.0, float(learned[app_key]))
+        return max(0.0, float(base))
+
+    def _widen_windowless_grace(self, app_key):
+        learned = self.store.data.setdefault("windowless_grace", {})
+        if not isinstance(learned, dict):
+            learned = {}
+            self.store.data["windowless_grace"] = learned
+        current = learned.get(app_key)
+        if not isinstance(current, (int, float)):
+            current = self._windowless_grace_for(app_key)
+        learned[app_key] = min(600.0, max(30.0, float(current) * 2))
+        self.store.dirty = True
+
+    def _queue_windowless_review(self, scope, path, app_key):
+        """Ask what to do with a windowless scope: review plus notification."""
+        pids = cgroup.tree_procs(path)
+        infos = self._infos(pids)
+        owners = {}
+        for info in infos:
+            owner = info.get("origin") or info.get("key")
+            if owner:
+                owners.setdefault(owner, []).append(
+                    {"pid": info["pid"], "key": info["key"]}
+                )
+        before = self.store.data.get("review_seq", 0)
+        review = None
+        if owners:
+            for owner, members in owners.items():
+                candidate = self.store.add_review(
+                    owner,
+                    members,
+                    scope,
+                    memory=self._review_memory(scope),
+                    provenance=self._review_provenance(owner, members),
+                )
+                if candidate and candidate["id"] > before:
+                    review = candidate
+        if review is None:
+            candidate = self.store.add_scope_review(scope, "last window closed")
+            if candidate and candidate["id"] > before:
+                review = candidate
+        if review is None:
+            return None
+        self._windowless_ask[review["id"]] = (scope, app_key)
+        if owners and review.get("kind") != "scope":
+            self.store.log(
+                event="review_created",
+                id=review["id"],
+                owner=review.get("owner"),
+                scope=scope,
+                survivors=review["survivors"],
+                pids=review["pids"],
+                source="windowless",
+            )
+            self._emit_review_job(review)
+        else:
+            self.store.log(
+                event="gc_review_created",
+                id=review["id"],
+                scope=scope,
+                why="last window closed",
+            )
+        self._save_if_idle()
+        return review
+
+    def windowless_pass(self, now=None):
+        """Run the last-window lifecycle for app scopes without windows.
+
+        Windowed scopes reset their clock (and record keep evidence
+        when a question was pending); frozen scopes and units that do
+        not require windows are left alone. Past the per-app grace,
+        the scope's on_last_window policy decides: ask queues a review
+        and holds, quit stops as if the root had exited, keep leaves
+        the app running. Behind [experimental] window_close.
+        """
+        if not self._window_close_enabled():
+            return
+        now = time.time() if now is None else now
+        live = self.live_window_scopes()
+        try:
+            base = cgroup.base()
+            top = sorted(cgroup.subdirs(base)) if os.path.isdir(base) else []
+        except OSError:
+            top = []
+        frozen = self.store.data.get("frozen_scopes", {})
+        if not isinstance(frozen, dict):
+            frozen = {}
+        visited = set()
+        for path in top:
+            scope = cgroup.rel(path)
+            visited.add(scope)
+            first = scope.split("/", 1)[0]
+            if not first.startswith(("app-", "scope-")):
+                continue
+            if scope in live:
+                asked = [
+                    review_id
+                    for review_id, (asked_scope, _key) in list(
+                        self._windowless_ask.items()
+                    )
+                    if asked_scope == scope
+                ]
+                for review_id in asked:
+                    _scope, app_key = self._windowless_ask.pop(review_id)
+                    self.store.log(
+                        event="windowless_keep",
+                        scope=scope,
+                        app=app_key,
+                        why="window reopened while a close was pending",
+                    )
+                    self._widen_windowless_grace(app_key)
+                self._windowless_since.pop(scope, None)
+                continue
+            try:
+                members = cgroup.tree_procs(path)
+            except OSError:
+                members = []
+            if not members:
+                self._windowless_since.pop(scope, None)
+                continue
+            since = self._windowless_since.setdefault(scope, now)
+            if len(self._windowless_since) > 512:
+                oldest = min(
+                    self._windowless_since,
+                    key=lambda name: self._windowless_since[name],
+                )
+                del self._windowless_since[oldest]
+            if scope in frozen:
+                continue
+            unit = engine.unit_for_leaf(self.units, os.path.basename(path))
+            if not self._unit_wants_windowless(unit):
+                continue
+            app_key = self._windowless_app_key(scope, unit, path)
+            if now - since < self._windowless_grace_for(app_key):
+                continue
+            chosen = self._last_window_policy(scope, unit, path)
+            if chosen == "keep":
+                continue
+            if chosen == "quit":
+                # A recorded quit needs no pair answers: stop as if
+                # the root had exited.
+                stopped = self.guarded(
+                    lambda: self.auto_stop_path(
+                        path,
+                        "windowless last-window close",
+                        False,
+                        authority=self.effective_authority["value"],
+                        trigger=authorization.GC_STOP,
+                    )
+                )
+                if stopped:
+                    self.store.log(
+                        event="windowless_close",
+                        scope=scope,
+                        app=app_key,
+                        why="last window closed; policy quit",
+                    )
+                continue
+            asked_ids = [
+                review_id
+                for review_id, (asked_scope, _key) in self._windowless_ask.items()
+                if asked_scope == scope
+            ]
+            if asked_ids:
+                reviews = {
+                    review.get("id"): review
+                    for review in self.store.data.get("reviews", [])
+                    if isinstance(review, dict)
+                }
+                if any(
+                    (reviews.get(review_id) or {}).get("state") == "open"
+                    for review_id in asked_ids
+                ):
+                    continue
+                # An answered stop is an order, not a lapse: keep trying
+                # to stop the scope instead of re-asking about it. The
+                # first attempts can hit idle gates (no CPU sample yet),
+                # so the pending question stays until the stop lands.
+                answered_stop = [
+                    review_id
+                    for review_id in asked_ids
+                    if (reviews.get(review_id) or {}).get("state") == "answered"
+                    and (reviews.get(review_id) or {}).get("answer") == "stop"
+                ]
+                if answered_stop:
+                    stopped = self.guarded(
+                        lambda: self.auto_stop_path(
+                            path,
+                            "windowless answer stop",
+                            False,
+                            authority=self.effective_authority["value"],
+                            trigger=authorization.GC_STOP,
+                            _user_approved=True,
+                        )
+                    )
+                    if stopped:
+                        for review_id in asked_ids:
+                            self._windowless_ask.pop(review_id, None)
+                        self.store.log(
+                            event="windowless_close",
+                            scope=scope,
+                            app=app_key,
+                            why="answered stop",
+                        )
+                        self._windowless_since.pop(scope, None)
+                    continue
+                # The question lapsed unanswered: remember the keep
+                # evidence, widen this app's grace, and restart it.
+                for review_id in asked_ids:
+                    self._windowless_ask.pop(review_id, None)
+                self._widen_windowless_grace(app_key)
+                self._windowless_since[scope] = now
+                continue
+            facts = self._pair_scope_facts(path)
+            decision = self.authorize(authorization.GC_STOP, facts)
+            if decision.verdict == authorization.WOULD_ACT:
+                if self.mode == "observe":
+                    self.log_would_stop("windowless_would_stop", scope, "past grace")
+                else:
+                    self._queue_windowless_review(scope, path, app_key)
+                continue
+            if decision.verdict != authorization.ACT:
+                # A pair that still needs an answer is the ask case:
+                # queue the windowless review. Vetoes, holds, and
+                # non-explicit stops stay silent.
+                if (
+                    decision.slot == authorization.AUTHORITY
+                    and facts.pair_action != "stop"
+                    and self.mode != "observe"
+                ):
+                    self._queue_windowless_review(scope, path, app_key)
+                continue
+            stopped = self.guarded(
+                lambda: self.auto_stop_path(
+                    path,
+                    "windowless last-window close",
+                    True,
+                    authority=self.effective_authority["value"],
+                    trigger=authorization.GC_STOP,
+                )
+            )
+            if stopped:
+                self.store.log(
+                    event="windowless_close",
+                    scope=scope,
+                    app=app_key,
+                    why="last window closed",
+                )
+        for scope in list(self._windowless_since):
+            if scope in live:
+                del self._windowless_since[scope]
+                continue
+            if scope in visited:
+                continue
+            try:
+                members = cgroup.tree_procs(os.path.join(base, scope))
+            except OSError:
+                members = []
+            if not members:
+                del self._windowless_since[scope]
+
+    def live_window_scopes(self):
+        """Scope -> {count, focused} from up agents with revalidated pids."""
+        scopes = {}
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            state = self.window_state.get(session)
+            if not state:
+                continue
+            for window_id, known in state["windows"].items():
+                pid = known.get("pid")
+                if pid is None or known.get("start") != inspect.starttime(pid):
+                    continue
+                scope = self._window_scope(pid)
+                if not scope:
+                    continue
+                entry = scopes.setdefault(scope, {"count": 0, "focused": False})
+                entry["count"] += 1
+                if state.get("focused") == window_id:
+                    entry["focused"] = True
+        return scopes
+
+    def _unit_wants_windowless(self, unit):
+        """Whether a unit joins the windowless lifecycle.
+
+        The unit must require a window (the default), and its backend
+        must be feeding data: without evidence, windowlessness is
+        unprovable and the scope is left alone.
+        """
+        unit = unit or {}
+        table = unit.get("window", {})
+        if not isinstance(table, dict):
+            table = {}
+        if table.get("requires_window", True) is not True:
+            return False
+        want = table.get("backend", "auto")
+        for session, record in self.agents.items():
+            if record.get("state") != "up":
+                continue
+            if session not in self.window_state:
+                continue
+            if want in ("auto", None, ""):
+                return True
+            if self.window_state[session].get("backend") == want:
+                return True
+        return False
+
+    def _max_window_events(self):
+        limit = self.cfg.get("agent", {}).get("max_events_per_s", 50)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            return 50
+        return min(1000, max(1, limit))
+
+    def _notify_capable_agents(self):
+        """Up sessions whose agent can show actions."""
+        return [
+            session
+            for session, record in self.agents.items()
+            if record.get("state") == "up"
+            and "notify-actions" in (record.get("capabilities") or [])
+        ]
+
+    def notify_poll(self, msg):
+        """Drain one session's notification jobs, with profile and mutes."""
+        session, record = self._agent_session(msg)
+        if session is None:
+            return record
+        since = msg.get("since_seq", 0)
+        if not isinstance(since, int) or isinstance(since, bool) or since < 0:
+            return {"error": "bad request"}
+        now = time.time()
+        self._maybe_digest(session, now)
+        queue = self.notify_queues.get(session, [])
+        live = [job for job in queue if job["created"] + job["ttl"] > now]
+        self.notify_queues[session] = live
+        return {
+            "jobs": [job for job in live if job["seq"] > since],
+            "profile": self.cfg.get("_profile_name", "auto"),
+            "mutes": sorted(self.store.data.get("muted_apps", [])),
+        }
+
+    def notify_result(self, msg):
+        """Apply one agent-reported notification outcome."""
+        session, record = self._agent_session(msg)
+        if session is None:
+            return record
+        kind = msg.get("kind")
+        if kind == "countdown":
+            return self._countdown_answer(msg)
+        if kind == "undo":
+            return self._toast_undo(msg)
+        if kind == "review":
+            return self._review_answer(msg)
+        return {"error": "unknown notification result kind"}
+
+    def _emit_review_job(self, review):
+        """Queue one actionable notification for a new answerable review."""
+        if (
+            not isinstance(review, dict)
+            or review.get("kind") == "scope"
+            or review.get("state") != "open"
+        ):
+            return None
+        while len(self.review_nonces) >= 128:
+            oldest = min(
+                self.review_nonces, key=lambda n: self.review_nonces[n]["created"]
+            )
+            del self.review_nonces[oldest]
+        nonce = _secure_token_hex(8)
+        self.review_nonces[nonce] = {
+            "review_id": review["id"],
+            "created": time.time(),
+        }
+        survivors = ", ".join(review.get("survivors", [])) or "leftovers"
+        detail = "%s in %s" % (survivors, review.get("scope", "?"))
+        if isinstance(review.get("mem"), int):
+            detail += " · %d MB" % (review["mem"] // (1024 * 1024))
+        self.notify_agents(
+            {
+                "kind": "review",
+                "nonce": nonce,
+                "review_id": review["id"],
+                "app": review.get("owner") or "?",
+                "detail": detail,
+                "ttl": 600,
+            }
+        )
+        return nonce
+
+    def _review_answer(self, msg):
+        """Answer a review from a toast through the `taema answer` path."""
+        nonce, choice = msg.get("nonce"), msg.get("choice")
+        if not isinstance(nonce, str) or not nonce or choice not in knowledge.CHOICES:
+            return {"error": "bad request"}
+        mapping = self.review_nonces.pop(nonce, None)
+        if mapping is None:
+            return {"error": "review is missing, expired, or not answerable"}
+        reply = self.handle(
+            {
+                "cmd": "feedback",
+                "v": 2,
+                "id": "review-notify-%s" % nonce,
+                "op": "review_answer",
+                "review_id": mapping["review_id"],
+                "choice": choice,
+            }
+        )
+        if (
+            not isinstance(reply, dict)
+            or reply.get("error")
+            or not reply.get("ok", True)
+        ):
+            return {"error": "review is missing, expired, or not answerable"}
+        asked = self._windowless_ask.pop(mapping["review_id"], None)
+        if asked is not None:
+            scope, app_key = asked
+            if choice == "stop":
+                self.store.db.set_app_last_window(app_key, "quit")
+                try:
+                    base = cgroup.base()
+                    path = os.path.join(base, scope)
+                except OSError:
+                    path = None
+                if path is not None:
+                    stopped = self.guarded(
+                        lambda: self.auto_stop_path(
+                            path,
+                            "windowless last-window close",
+                            False,
+                            authority=self.effective_authority["value"],
+                            trigger=authorization.GC_STOP,
+                        )
+                    )
+                    if stopped:
+                        self.store.log(
+                            event="windowless_close",
+                            scope=scope,
+                            app=app_key,
+                            why="last window closed; answered quit now",
+                        )
+                self._windowless_since.pop(scope, None)
+            elif choice == "never":
+                self.store.db.set_app_last_window(app_key, "keep")
+                self._widen_windowless_grace(app_key)
+            elif choice == "keep":
+                self._widen_windowless_grace(app_key)
+        return {"ok": True, "review_id": mapping["review_id"], "choice": choice}
+
+    def _countdown_answer(self, msg):
+        nonce, choice = msg.get("nonce"), msg.get("choice")
+        if not isinstance(nonce, str) or not nonce or choice not in ("keep", "stop"):
+            return {"error": "bad request"}
+        record = self.countdowns.get(nonce)
+        if record is None or time.time() >= record["deadline"]:
+            self.countdowns.pop(nonce, None)
+            return {"error": "unknown or expired countdown"}
+        del self.countdowns[nonce]
+        if choice == "keep":
+            now = time.time()
+            for pair in record["pairs"]:
+                owner, leftover = pair
+                self.store.answer(owner, leftover, "keep", source="countdown")
+                entry = self.store._pair(owner, leftover)
+                entry["suspended_until"] = now + self.store.regret_suspend
+                self.store.dirty = True
+            if record.get("signature"):
+                self.store.db.suspend_signature(
+                    record["signature"],
+                    now + self.store.regret_suspend,
+                    now=now,
+                    outcome="countdown-keep",
+                )
+            self.store.log(
+                event="countdown_answered",
+                scope=record["scope"],
+                choice="keep",
+            )
+            self.store.save()
+            return {"ok": True, "choice": "keep"}
+        self.store.log(event="countdown_answered", scope=record["scope"], choice="stop")
+        stopped = self.auto_stop_path(
+            record["path"],
+            record["why"],
+            record["require_pair"],
+            authority=record["authority"],
+            trigger=record["trigger"],
+            _countdown_approved=True,
+        )
+        return {"ok": True, "choice": "stop", "stopped": bool(stopped)}
+
+    def _toast_undo(self, msg):
+        decision_id = msg.get("decision_id")
+        if (
+            not isinstance(decision_id, int)
+            or isinstance(decision_id, bool)
+            or decision_id <= 0
+        ):
+            return {"error": "bad request"}
+        candidate = self.store.undo_candidate(decision_id)
+        if candidate is None or candidate.get("undone") is not None:
+            return {"error": "nothing retained to undo"}
+        action = self.store._action_for_decision(
+            candidate,
+            [a for a in self.store.data.get("auto_actions", []) if isinstance(a, dict)],
+        )
+        pairs = [
+            pair
+            for pair in (action or {}).get("pairs", [])
+            if isinstance(pair, list) and len(pair) == 2
+        ]
+        for owner, leftover in pairs:
+            self.store.regret(owner, leftover)
+        reply = self.handle(
+            {
+                "cmd": "feedback",
+                "v": 2,
+                "id": "toast-undo-%d" % decision_id,
+                "op": "undo",
+                "action_id": str(decision_id),
+            }
+        )
+        if (
+            not isinstance(reply, dict)
+            or reply.get("error")
+            or not reply.get("ok", True)
+        ):
+            return {"error": (reply or {}).get("error", "undo failed")}
+        return {"ok": True, "undone": decision_id}
+
+    def _countdown_wait(
+        self, leaf, path, pairs, owner, signature_id, why, authority, trigger
+    ):
+        """Hold a learned stop for objection; True when the stop must wait.
+
+        No wait without an action-capable agent and enabled notifications:
+        headless and quiet installs keep stopping immediately.
+        """
+        now = time.time()
+        for nonce, record in list(self.countdowns.items()):
+            if record.get("scope") != leaf:
+                continue
+            if record.get("deadline", 0) > now:
+                return True
+            # Expired but the deadline has not fired yet: this pass proceeds
+            # and the pending firing finds no record and does nothing.
+            del self.countdowns[nonce]
+        if not self.cfg.get("notify", {}).get("enabled", True):
+            return False
+        if not self._notify_capable_agents():
+            return False
+        while len(self.countdowns) >= 32:
+            oldest = min(self.countdowns, key=lambda n: self.countdowns[n]["created"])
+            del self.countdowns[oldest]
+        seconds = int(self.cfg.get("notify", {}).get("countdown_seconds", 30))
+        nonce = _secure_token_hex(8)
+        self.countdowns[nonce] = {
+            "nonce": nonce,
+            "scope": leaf,
+            "path": path,
+            "app": owner,
+            "pairs": [list(pair) for pair in pairs],
+            "signature": signature_id,
+            "why": why,
+            "require_pair": True,
+            "authority": authority,
+            "trigger": trigger,
+            "deadline": now + seconds,
+            "created": now,
+        }
+        self.add_deadline(now + seconds, "countdown", nonce)
+        self.notify_agents(
+            {
+                "kind": "countdown",
+                "nonce": nonce,
+                "scope": leaf,
+                "app": owner or leaf,
+                "seconds": seconds,
+                "ttl": seconds + 60,
+            }
+        )
+        self.store.log(event="countdown_started", scope=leaf)
+        return True
+
+    def _countdown_expired(self, nonce):
+        """A countdown nobody objected to: run the approved stop."""
+        record = self.countdowns.pop(nonce, None)
+        if record is None:
+            return False
+        self.store.log(event="countdown_expired", scope=record.get("scope"))
+        return bool(
+            self.auto_stop_path(
+                record["path"],
+                record["why"],
+                record["require_pair"],
+                authority=record["authority"],
+                trigger=record["trigger"],
+                _countdown_approved=True,
+            )
+        )
+
+    def _cancel_countdowns_for_target(self, target):
+        """A veto cancels pending countdowns on the same app, scope, or signature."""
+        if not isinstance(target, dict):
+            return 0
+        values = {target.get("value"), target.get("owner"), target.get("leftover")}
+        values = {value for value in values if value}
+        if not values:
+            return 0
+        cancelled = 0
+        for nonce, record in list(self.countdowns.items()):
+            known = {record.get("scope"), record.get("app"), record.get("signature")}
+            for pair in record.get("pairs", []):
+                known.update(pair)
+            if known & values:
+                del self.countdowns[nonce]
+                self.store.log(event="countdown_cancelled", scope=record.get("scope"))
+                cancelled += 1
+        return cancelled
+
+    def agent_beat(self, msg):
+        """Accept one heartbeat; revive a down agent, store bounded facts."""
+        session, pid = msg.get("session"), msg.get("pid")
+        if (
+            not isinstance(session, str)
+            or not session
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 1
+        ):
+            return {"error": "bad request"}
+        record = self.agents.get(session)
+        if record is None:
+            return {"error": "unknown agent session; register first"}
+        if pid != record["pid"] or inspect.uid_of(pid) != os.getuid():
+            return {"error": "pid gone or not yours"}
+        if "facts" in msg:
+            facts = msg["facts"]
+            if not isinstance(facts, dict):
+                return {"error": "bad request"}
+            if len(json.dumps(facts, sort_keys=True, default=str)) > 8192:
+                return {"error": "agent facts are too large"}
+            record["facts"] = facts
+        record["last_beat"] = time.time()
+        if record["state"] != "up":
+            record["state"] = "up"
+            self.store.log(event="agent_up", scope=session, target=str(pid))
+        return {"ok": True}
+
+    def agent_watch_pass(self, now=None):
+        """Mark agents down after 3 missed beats; stale facts stay refused."""
+        from .. import agent as agent_mod
+
+        now = time.time() if now is None else now
+        limit = agent_mod.BEAT_S * agent_mod.MAX_MISSED
+        for session, record in self.agents.items():
+            if record["state"] == "up" and now - record["last_beat"] > limit:
+                record["state"] = "down"
+                record["facts"] = {}
+                self.store.log(event="agent_down", scope=session)
+
+    def agent_live(self, session):
+        """True only while the session's agent beats; gate for window facts."""
+        record = self.agents.get(session)
+        return record is not None and record["state"] == "up"
+
+    def agent_facts(self, session):
+        """Desktop facts, or {} once the agent is down: decide on process data."""
+        record = self.agents.get(session)
+        if record is None or record["state"] != "up":
+            return {}
+        return dict(record["facts"])
+
+    def agent_report(self):
+        """JSON-safe agent state for status and doctor."""
+        now = time.time()
+        return {
+            session: {
+                "state": record["state"],
+                "pid": record["pid"],
+                "capabilities": list(record["capabilities"]),
+                "compositor": record["compositor"],
+                "last_beat_age_s": max(0, int(now - record["last_beat"])),
+            }
+            for session, record in sorted(self.agents.items())
+        }
 
     def _summary_text(self):
         state = self.store.hold_status()
@@ -4919,8 +6683,8 @@ class Daemon:
             reply = {"error": "%s: %s" % (type(e).__name__, e)}
         if keep_open:
             return
-        if self._summary_dirty and not self._in_tick:
-            self._write_summary_if_dirty()
+        # No file I/O on the request path: the tick at the end of this loop
+        # iteration writes the summary if an event dirtied it.
         try:
             conn.settimeout(0.5)
             conn.sendall((json.dumps(reply) + "\n").encode())
@@ -5047,6 +6811,7 @@ class Daemon:
             not cgroup.valid_rel(scope)
             or scope == "manager"
             or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
             or scope.count("/") != 1
             or not scope.startswith("leftover/")
         ):
@@ -5146,6 +6911,7 @@ class Daemon:
             or not cgroup.valid_rel(scope)
             or scope == "manager"
             or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
         ):
             return {"ok": False, "error": "invalid or managed scope"}
         record = self.store.data.get("frozen_scopes", {}).get(scope)
@@ -5417,6 +7183,12 @@ class Daemon:
         )
         if decision.verdict != authorization.ACT:
             return {"ok": False, "error": decision.reason}
+        windowed = self.live_window_scopes().get(scope)
+        if windowed:
+            return {
+                "ok": False,
+                "error": "scope has %d open window(s)" % windowed["count"],
+            }
         path = os.path.join(cgroup.base(), scope)
         members = tuple(sorted(cgroup.tree_procs(path)))
         self.lineage.observe(inspect.ProcTable.scan())
@@ -5458,6 +7230,7 @@ class Daemon:
             return {"ok": False, "error": "managed freeze limit reached"}
         source = "manual" if manual else "auto"
         why = reason or "eligible idle leftover"
+        audit_id = None
         try:
             with self.store.decision_context(
                 "freeze",
@@ -5465,7 +7238,9 @@ class Daemon:
                 authority=decision.authority or ("manual" if manual else "mode"),
                 mode=self.mode,
                 why=why,
+                undo={"operation": "thaw", "scope": scope},
             ) as audit:
+                audit_id = audit["id"]
                 self.store.set_frozen_scope(
                     scope,
                     time.time(),
@@ -5517,6 +7292,17 @@ class Daemon:
         # thaw path, including one initiated by the stop engine, must begin afresh.
         self._clear_freeze_samples(scope)
         self._save_if_idle()
+        if not manual and audit_id is not None:
+            self.notify_agents(
+                {
+                    "kind": "undo",
+                    "action": "freeze",
+                    "decision_id": audit_id,
+                    "scope": scope,
+                    "apps": [],
+                    "freed_bytes": 0,
+                }
+            )
         return {"ok": True, "scope": scope, "frozen": True}
 
     def freeze_pass(self, now=None, guard=False):
@@ -5680,12 +7466,15 @@ class Daemon:
         else:
             self.stopping = True
 
-    def reload_config(self, reason="configuration reload"):
+    def reload_config(self, reason="configuration reload", _preloaded=None):
         """Install a validated config and units snapshot, retaining the current one on error."""
         old_cfg, old_units, old_store = self.cfg, self.units, self.store
         try:
-            cfg = policy.load_config()
-            units = policy.load_units(cfg)
+            if _preloaded is not None:
+                cfg, units = _preloaded
+            else:
+                cfg = policy.load_config()
+                units = policy.load_units(cfg)
             old_state_dir = old_cfg.get("paths", {}).get("state_dir")
             new_state_dir = cfg.get("paths", {}).get("state_dir")
             if policy.expand(old_state_dir) != policy.expand(new_state_dir):
@@ -5750,6 +7539,7 @@ class Daemon:
         self.lineage.identity_sink = self.store.record_identities
         self.iv_adopt = policy.timer(cfg, "adopt_interval", 15)
         self.iv_gc = policy.timer(cfg, "gc_interval", 60)
+        self.iv_windowless = policy.timer(cfg, "windowless_interval", 30)
         self.mem_enabled = memory.enabled(cfg)
         self.iv_reclaim = max(
             1.0, float(cfg.get("mem", {}).get("reclaim_interval", 60))
@@ -5795,7 +7585,46 @@ class Daemon:
         except Exception as error:
             self.store.log(event="memory_budget_failed", reason=str(error))
         self._save_if_idle()
+        self._state_gen += 1
         return {"reloaded": True, "sources": list(cfg.get("_sources", []))}
+
+    def _running_comms(self):
+        """Comms of all visible processes, best effort."""
+        try:
+            return {
+                comm
+                for pid in inspect.all_pids()
+                for comm in [inspect.comm(pid)]
+                if comm
+            }
+        except OSError:
+            return set()
+
+    def auto_profile_pass(self, now=None):
+        """Apply the selected automatic profile; None when manual or failed."""
+        if self.cfg.get("profile", {}).get("active", "auto") != "auto":
+            return None
+        now = time.time() if now is None else now
+        power_dir = policy.expand(
+            self.cfg.get("paths", {}).get("power_supply", "/sys/class/power_supply")
+        )
+        selected = policy.select_auto_profile(
+            self.cfg,
+            on_battery=policy.read_power_supply(power_dir),
+            comms=self._running_comms(),
+            now=now,
+        )
+        if selected is None:
+            return None
+        name, why = selected
+        if self.cfg.get("_profile_name", "auto") == name:
+            return name
+        reason = "automatic: " + why
+        cfg = policy.with_profile(policy.load_config(), name, reason)
+        result = self.reload_config(reason, _preloaded=(cfg, policy.load_units(cfg)))
+        if not isinstance(result, dict) or not result.get("reloaded"):
+            return None
+        return name
 
     def poll_config_reload(self):
         """Reload on SIGHUP or a changed config, drop-in, unit, or watched directory mtime."""
@@ -5875,6 +7704,10 @@ class Daemon:
         monitor = self.pressure_monitor
         if monitor is None:
             self.pressure_watch_signature = None
+            self.pressure_watch_source = None
+            self.pressure_watch_path = None
+            self.pressure_watch_metrics = ()
+            self.pressure_watch_failures = ()
             return
         try:
             self.sel.unregister(monitor.fileno())
@@ -5883,52 +7716,107 @@ class Daemon:
         monitor.close()
         self.pressure_monitor = None
         self.pressure_watch_signature = None
+        self.pressure_watch_source = None
+        self.pressure_watch_path = None
+        self.pressure_watch_metrics = ()
+        self.pressure_watch_failures = ()
 
     def _sync_pressure_monitor(self):
-        """Watch user-cgroup PSI trigger fds, keeping unsupported kernels on floor sampling."""
+        """Watch delegated PSI, falling back to a process-local host PSI trigger."""
         if not self._guard_enabled():
             self._close_pressure_monitor()
             return
         config = self.cfg.get("guard", {})
-        path = os.path.join(cgroup.base(), "memory.pressure")
+        cgroup_path = os.path.join(cgroup.base(), "memory.pressure")
         settings = {
             "some": config.get("psi_some", policy._DEFAULTS["guard"]["psi_some"]),
             "full": config.get("psi_full", policy._DEFAULTS["guard"]["psi_full"]),
         }
-        signature = (path, tuple(sorted(settings.items())))
+        sources = pressure_guard.psi_trigger_sources(cgroup_path)
+        signature = (tuple(sources), tuple(sorted(settings.items())))
         if self.pressure_watch_signature == signature:
             return
         self._close_pressure_monitor()
-        monitor = pressure_guard.PsiTriggerMonitor()
-        failures = monitor.open_triggers(path, settings)
+        failures = []
+        attempts = []
+        selected = None
+        for source, path in sources:
+            monitor = pressure_guard.PsiTriggerMonitor()
+            attempt_failures = monitor.open_triggers(path, settings)
+            attempt = {
+                "source": source,
+                "path": path,
+                "metrics": tuple(monitor.metrics),
+                "failures": tuple(attempt_failures),
+            }
+            attempts.append(attempt)
+            failures.extend(
+                "%s %s: %s" % (source, path, failure)
+                for failure in attempt_failures
+            )
+            if not monitor.metrics:
+                monitor.close()
+                failure = "%s %s: no configured PSI triggers are writable" % (
+                    source,
+                    path,
+                )
+                failures.append(failure)
+                attempts[-1]["failures"] += ("no configured PSI triggers are writable",)
+                continue
+            try:
+                self.sel.register(monitor.fileno(), selectors.EVENT_READ, "pressure")
+            except (KeyError, OSError, ValueError) as error:
+                monitor.close()
+                failure = "%s %s: selector registration failed: %s" % (
+                    source,
+                    path,
+                    error,
+                )
+                failures.append(failure)
+                attempts[-1]["failures"] += ("selector registration failed: %s" % error,)
+                continue
+            selected = (source, path, monitor)
+            break
         self.pressure_watch_failures = tuple(failures)
-        for failure in failures:
+        for attempt in attempts:
+            if attempt["metrics"] and not attempt["failures"]:
+                continue
+            failure = "%s %s: %s" % (
+                attempt["source"],
+                attempt["path"],
+                "; ".join(attempt["failures"])
+                or "no configured PSI triggers are writable",
+            )
             if self.store.changed("guard_trigger_unavailable:" + failure, failure):
                 self.store.log(
                     event="guard_trigger_unavailable",
-                    source="memory.pressure",
+                    source=attempt["source"],
+                    path=attempt["path"],
                     reason=failure,
                 )
-        if not monitor.metrics:
-            monitor.close()
-            self.pressure_watch_signature = signature
-            return
-        try:
-            self.sel.register(monitor.fileno(), selectors.EVENT_READ, "pressure")
-        except (KeyError, OSError, ValueError) as error:
-            monitor.close()
-            failure = "memory.pressure: selector registration failed: %s" % error
-            self.pressure_watch_failures = self.pressure_watch_failures + (failure,)
-            if self.store.changed("guard_trigger_unavailable:" + failure, failure):
-                self.store.log(
-                    event="guard_trigger_unavailable",
-                    source="memory.pressure",
-                    reason=failure,
-                )
-            self.pressure_watch_signature = signature
-            return
-        self.pressure_monitor = monitor
+        if selected is not None:
+            self.pressure_watch_source, self.pressure_watch_path, self.pressure_monitor = selected
+            self.pressure_watch_metrics = tuple(self.pressure_monitor.metrics)
+            if self.pressure_watch_source != "delegated-cgroup":
+                fallback = {
+                    "source": self.pressure_watch_source,
+                    "path": self.pressure_watch_path,
+                    "metrics": list(self.pressure_watch_metrics),
+                    "failed_sources": [
+                        {key: value for key, value in attempt.items()}
+                        for attempt in attempts[:-1]
+                    ],
+                }
+                key = "guard_trigger_fallback:" + repr(fallback)
+                if self.store.changed(key, fallback):
+                    self.store.log(event="guard_trigger_fallback", **fallback)
         self.pressure_watch_signature = signature
+
+    def _guard_psi_path(self):
+        """Read the same PSI source whose trigger fd was registered, if available."""
+        return self.pressure_watch_path or os.path.join(
+            cgroup.base(), "memory.pressure"
+        )
 
     def _collect_pressure_events(self):
         if self.pressure_monitor is None:
@@ -5957,8 +7845,7 @@ class Daemon:
         if available is not None and floor is not None and available < floor:
             return True
         config = self.cfg.get("guard", {})
-        psi_path = os.path.join(cgroup.base(), "memory.pressure")
-        psi = memory.pressure(psi_path)
+        psi = memory.pressure(self._guard_psi_path())
         for metric, key in (("some", "psi_some"), ("full", "psi_full")):
             value = psi.get(metric + "_avg10")
             setting = config.get(key, policy._DEFAULTS["guard"][key])
@@ -5993,6 +7880,8 @@ class Daemon:
     def _guard_reclaim_step(self, stage):
         managed = self.store.data.get("frozen_scopes", {})
         managed = managed if isinstance(managed, dict) else {}
+        live = self.live_window_scopes()
+        focused = {scope for scope, entry in live.items() if entry.get("focused")}
         candidates = []
         for scope, path in self._memory_paths().items():
             resource_class = self._reclaim_class(scope, path)
@@ -6005,7 +7894,7 @@ class Daemon:
                 ):
                     continue
             elif stage == "anonymous":
-                if not frozen:
+                if not frozen or scope in focused:
                     continue
             else:
                 continue
@@ -6049,7 +7938,7 @@ class Daemon:
                 scope,
                 path,
                 time.time(),
-                memory.pressure(os.path.join(cgroup.base(), "memory.pressure")),
+                memory.pressure(self._guard_psi_path()),
                 resource_class=resource_class,
                 guard=True,
                 stage=stage,
@@ -6252,6 +8141,14 @@ class Daemon:
             duration_ms=duration_ms,
             outcome=outcome,
         )
+        if bytes_freed > 0:
+            self.notify_agents(
+                {
+                    "kind": "guard",
+                    "trigger": trigger_name,
+                    "bytes_freed": bytes_freed,
+                }
+            )
         return state
 
     def guard_pass(self, trigger="retry"):
@@ -6451,6 +8348,10 @@ class Daemon:
         try:
             self._expire_subscribers()
             self.guarded(self.poll_config_reload)
+            profile_now = time.time()
+            if profile_now - self.last.get("profile", 0.0) >= 15.0:
+                self.last["profile"] = profile_now
+                self.guarded(self.auto_profile_pass)
             if not self.store.db.write_available():
                 skip_pass = True
                 self.guarded(self.thaw_held_scopes)
@@ -6493,8 +8394,16 @@ class Daemon:
             if now - self.last.get("freeze", 0.0) >= 60.0:
                 self.last["freeze"] = now
                 self.guarded(self.freeze_pass)
+            if now - self.last.get("windowless", 0.0) >= self.iv_windowless:
+                self.last["windowless"] = now
+                self.guarded(lambda: self.windowless_pass(now=now))
+            if now - self.last.get("launch", 0.0) >= 1.0:
+                self.last["launch"] = now
+                self.guarded(lambda: self.launch_sweep(now=now))
             self._run_listener_wake_if_due(now)
+            self.guarded(self.poll_eventd)
             self.drain_collector_events()
+            self.guarded(self.agent_watch_pass)
             self.guarded(self.qos_pass)
         finally:
             self._in_tick = False
@@ -7476,7 +9385,11 @@ class Daemon:
 
     def _reclaim_class(self, scope, path):
         """Resolve the deliberately small set of scope classes eligible for idle reclaim."""
-        if scope == "manager" or scope.startswith("manager/"):
+        if (
+            scope == "manager"
+            or scope.startswith("manager/")
+            or policy.is_agent_scope(scope)
+        ):
             return None
         if scope.startswith("leftover/"):
             return "leftover"
@@ -7510,6 +9423,8 @@ class Daemon:
     def _reclaim_safety_reason(self, scope, path, pids):
         if scope == "manager" or scope.startswith("manager/"):
             return "manager scope is never reclaimed"
+        if policy.is_agent_scope(scope):
+            return "agent leaf is never reclaimed"
         if os.getpid() in pids or cgroup.is_prefix(path, cgroup.own_cgroup()):
             return "scope contains the daemon"
         if not pids:
@@ -7598,9 +9513,11 @@ class Daemon:
             return False, "waiting for a stable CPU sample"
         self.reclaim_usage[scope] = (usage, now)
         if usage < previous[0]:
+            self.reclaim_usage[scope] = (usage, now)
             self.reclaim_idle_since[scope] = now
             return False, "CPU counter changed"
         cpu_percent = 100.0 * (usage - previous[0]) / (elapsed * 1_000_000)
+        self.reclaim_usage[scope] = (usage, now)
         if cpu_percent > RECLAIM_CPU_PERCENT:
             self.reclaim_idle_since[scope] = now
             return False, "scope is active (%.2f%% CPU)" % cpu_percent
@@ -8213,6 +10130,7 @@ class Daemon:
             pass
         self.guarded(self.check_socket)
         self.guarded(self._sync_pressure_monitor)
+        self.guarded(self._open_eventd)
         self.store.log(
             event="daemon_start", mode=self.mode, units=[u["_file"] for u in self.units]
         )
@@ -8230,6 +10148,8 @@ class Daemon:
                     self.guarded(self.collect_leaf_events)
                 elif key.data == "pressure":
                     self.guarded(self._collect_pressure_events)
+                elif key.data == "eventd":
+                    self.guarded(self.poll_eventd)
                 elif isinstance(key.data, tuple) and key.data[0] == "subscriber":
                     conn = key.data[1]
                     if mask & selectors.EVENT_READ:
@@ -8248,6 +10168,7 @@ class Daemon:
         for qid in list(self.pending):
             self.drop_question(qid)
         self._close_pressure_monitor()
+        self.guarded(self._close_eventd)
         self.guarded(lambda: self.thaw_all_managed_scopes("daemon shutdown"))
         self.guarded(lambda: self.memory_governor_pass(force_restore=True))
         self.store.log(event="daemon_stop")

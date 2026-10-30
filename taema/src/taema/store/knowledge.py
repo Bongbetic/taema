@@ -16,9 +16,12 @@ import time
 
 from ..config import policy
 from .. import protocol
+from ..core import process as _inspect
 from ..core import signature as survivor_signature
+from ..governor import engine as _engine
 from ..model import learning as pair_learning
 from . import db
+from . import transfer
 
 DECAY_DAYS = 7
 DECAY_FACTOR = 0.9
@@ -1961,6 +1964,57 @@ class Store:
                     reason=reason,
                 )
             result = {"until": self.data["snooze_until"]}
+        elif msg["v"] == 2 and op == "import_learning":
+            with self.decision_context(
+                "import",
+                authority="user",
+                why="user imported learning (%s)" % msg["mode"],
+            ):
+                summary = self.import_learning_document(
+                    msg["document"], mode=msg["mode"]
+                )
+                self.log(
+                    event="import",
+                    mode=msg["mode"],
+                    added=bool(summary),
+                )
+            if summary is None:
+                return None
+            result = {"mode": msg["mode"], **summary}
+        elif msg["v"] == 2 and op == "reset_scope":
+            with self.decision_context(
+                "reset",
+                authority="user",
+                why="user reset %s" % msg["scope"],
+            ):
+                summary = self.reset_scope(msg["scope"])
+                self.log(event="reset", scope=msg["scope"])
+            if summary is None:
+                return None
+            result = {"scope": msg["scope"], **summary}
+        elif msg["v"] == 2 and op == "restore_backup":
+            staging = msg["staging"]
+            with self.decision_context(
+                "restore",
+                authority="user",
+                why="user restored a backup",
+            ):
+                summary, error = transfer.apply_staged_backup(staging, self.dir)
+                if error is None:
+                    self.refresh_persisted()
+                self.log(event="restore", staging=staging, error=error)
+            if error is not None:
+                return {"ok": False, "error": error}
+            result = dict(summary)
+        elif msg["v"] == 2 and op == "unit_test":
+            problems = policy.validate_unit(msg["unit"])
+            matched = []
+            if not problems:
+                match = msg["unit"].get("match", {})
+                for pid in msg["pids"]:
+                    if _engine.unit_matches(match, pid):
+                        matched.append({"pid": pid, "comm": _inspect.comm(pid)})
+            result = {"matched": matched, "lint": problems}
         else:
             return None
         ids.append(op_id)
@@ -3060,6 +3114,160 @@ class Store:
         return self.db.answer_signature(
             normalized["id"], choice, W_ANSWER, now=self.now()
         )
+
+    def import_learning_document(self, document, mode="merge"):
+        """Import a validated learn document. Merge adds missing answers only;
+        replace swaps all learning. Imported answers start probationary."""
+        if mode not in ("merge", "replace"):
+            return None
+        if transfer.validate_learn_document(document) is not None:
+            return None
+        summary = {
+            "pairs_added": 0,
+            "pairs_updated": 0,
+            "pairs_skipped": 0,
+            "pairs_removed": 0,
+            "standalone_added": 0,
+            "standalone_removed": 0,
+            "signatures_added": 0,
+            "signatures_skipped": 0,
+            "signatures_removed": 0,
+        }
+        pairs = self.data.setdefault("pairs", {})
+        if mode == "replace":
+            summary["pairs_removed"] = sum(
+                1
+                for record in pairs.values()
+                if isinstance(record, dict)
+                and record.get("ex_last") in transfer.LEARN_CHOICES
+            )
+            pairs.clear()
+            summary["standalone_removed"] = len(self.data.get("standalone", {}))
+            self.data["standalone"] = {}
+            summary["signatures_removed"] = self.db.clear_signatures()
+        for entry in document.get("pairs", []):
+            owner, leftover = entry["owner"], entry["leftover"]
+            if not self._ok(owner, leftover) or policy.bad_owner(owner, self.deny):
+                summary["pairs_skipped"] += 1
+                continue
+            key = self.pkey(owner, leftover)
+            existing = pairs.get(key)
+            if (
+                mode == "merge"
+                and isinstance(existing, dict)
+                and existing.get("ex_last") in transfer.LEARN_CHOICES
+            ):
+                summary["pairs_skipped"] += 1
+                continue
+            had_answer = isinstance(existing, dict) and (
+                existing.get("ex_last") in transfer.LEARN_CHOICES
+            )
+            record = self._pair(owner, leftover)
+            record["ex_stop"] = float(entry.get("ex_stop", 0.0))
+            record["ex_keep"] = float(entry.get("ex_keep", 0.0))
+            record["ex_last"] = entry["ex_last"]
+            record["ex_ts"] = self.now()
+            record["ex_source"] = "import"
+            record["source"] = "import"
+            record["probation"] = 0
+            if entry.get("sig") is not None:
+                record["sig"] = entry["sig"]
+            summary["pairs_updated" if had_answer else "pairs_added"] += 1
+            self.dirty = True
+        standalone = self.data.setdefault("standalone", {})
+        for entry in document.get("standalone", []):
+            if entry["key"] in standalone:
+                continue
+            standalone[entry["key"]] = {"n": int(entry.get("n", 0)), "ts": self.now()}
+            summary["standalone_added"] += 1
+            self.dirty = True
+        for entry in document.get("signatures", []):
+            current = self.db.signature(entry["id"])
+            if (
+                isinstance(current, dict)
+                and current.get("ex_last") in ("stop", "keep")
+                and mode == "merge"
+            ):
+                summary["signatures_skipped"] += 1
+                continue
+            if not self.db.record_signature(
+                {
+                    "id": entry["id"],
+                    "owner": entry["owner"],
+                    "members": entry["members"],
+                    "runtime_class": entry.get("runtime") or "",
+                },
+                now=self.now(),
+            ):
+                summary["signatures_skipped"] += 1
+                continue
+            weight = float(
+                entry.get("ex_stop" if entry["ex_last"] == "stop" else "ex_keep", 0.0)
+            )
+            if not self.db.answer_signature(
+                entry["id"], entry["ex_last"], weight, now=self.now()
+            ):
+                summary["signatures_skipped"] += 1
+                continue
+            summary["signatures_added"] += 1
+            self.dirty = True
+        return summary
+
+    def report_window(self, start, end):
+        """Aggregate one report window. Guard vocabulary comes from events.py."""
+        from .. import events as event_views
+
+        return self.db.report_window(start, end, event_views.guard_event_names())
+
+    def refresh_persisted(self):
+        """Reload persisted collections from the database, dropping memory drift.
+
+        Used after a restore replaces the database file. In-flight pending
+        decisions belong to the pre-restore state and are dropped; feedback
+        ids are unioned so applied operations stay deduplicated.
+        """
+        self._pending_decisions.clear()
+        self._pending_events.clear()
+        keep_ids = list(self.data.get("feedback_ids", []))
+        self.data = self._fresh()
+        self.db.load_state(self.data)
+        merged = self.data.get("feedback_ids", [])
+        self.data["feedback_ids"] = merged + [
+            identifier for identifier in keep_ids if identifier not in merged
+        ]
+        self._decision_seq, self._event_seq = self.db.audit_sequences()
+        self.dirty = False
+
+    def reset_scope(self, scope):
+        """Clear learning, vetoes, history, or all. Returns a summary, None for bad scope."""
+        if scope not in ("learning", "vetoes", "history", "all"):
+            return None
+        summary = {}
+        if scope in ("learning", "all"):
+            pairs = self.data.setdefault("pairs", {})
+            summary["pairs_removed"] = sum(
+                1
+                for record in pairs.values()
+                if isinstance(record, dict)
+                and record.get("ex_last") in transfer.LEARN_CHOICES
+            )
+            pairs.clear()
+            summary["standalone_removed"] = len(self.data.get("standalone", {}))
+            self.data["standalone"] = {}
+            summary["signatures_removed"] = self.db.clear_signatures()
+        if scope in ("vetoes", "all"):
+            summary["vetoes_removed"] = len(self.data.get("vetoes", []))
+            self.data["vetoes"] = []
+        if scope in ("history", "all"):
+            decisions, events = self.db.clear_decisions_events()
+            summary["decisions_removed"] = decisions
+            summary["events_removed"] = events
+            summary["auto_actions_removed"] = len(self.data.get("auto_actions", []))
+            self.data["auto_actions"] = []
+            self._pending_decisions.clear()
+            self._pending_events.clear()
+        self.dirty = True
+        return summary
 
     def match_signature(self, signature):
         """Match exact id, then same-key ±1 counts in the same runtime class."""

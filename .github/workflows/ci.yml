@@ -2,8 +2,9 @@
 # regression fails the commit or pull request instead of surfacing at release time.
 # The Void jobs mirror the tag-triggered release workflow: the distribution Python in
 # the glibc and musl containers, tests and the build as an unprivileged user. The
-# Python job covers 3.11, the supported floor (D17). The local equivalents are in
-# "Checks" of the README.
+# Python job covers 3.11, the supported floor (D17). The Rust job gates the
+# helper workspace (fmt, clippy, tests, audit, deny). The local equivalents
+# are in "Checks" of the README.
 name: ci
 
 on:
@@ -21,12 +22,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        libc: [glibc, musl]
+        include:
+          - libc: glibc
+            arch: x86_64
+          - libc: musl
+            arch: x86_64-musl
+    env:
+      XBPS_ARCH: ${{ matrix.arch }}
     steps:
       - name: Install tools
         run: |
           xbps-install -Syu xbps
-          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow
+          xbps-install -Sy python3 bash iproute2 util-linux sudo make git shadow cargo tar gzip tzdata findutils
       - uses: actions/checkout@v4
       - name: Test as an unprivileged user
         run: |
@@ -70,3 +77,45 @@ jobs:
           coverage json -o "$RUNNER_TEMP/coverage.json"
           python tools/check_coverage.py "$RUNNER_TEMP/coverage.json"
         working-directory: taema
+
+  rust:
+    name: rust helper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Check formatting
+        run: cargo fmt --check
+        working-directory: taema/rust
+      - name: Lint
+        run: cargo clippy --locked --offline -- -D warnings
+        working-directory: taema/rust
+      - name: Test
+        run: cargo test --locked --offline
+        working-directory: taema/rust
+      - name: Audit
+        run: cargo audit --file Cargo.lock
+        working-directory: taema/rust
+      - name: Deny
+        run: cargo deny check
+        working-directory: taema/rust
+
+  fuzz:
+    name: fuzz helper parsers (short)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz each target with a short budget
+        run: |
+          for target in argv rules oom_record; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done
+        working-directory: taema/rust/fuzz

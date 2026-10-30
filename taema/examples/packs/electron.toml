@@ -1,0 +1,5 @@
+[unit]
+name = "electron"
+kind = "app"
+[match]
+cmdline_contains = "electron"

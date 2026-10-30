@@ -84,11 +84,12 @@ fa:d1:00:32:ce:b1:b9:fd:73:05:05:76:75:54:37:25
 and answer `y`. Updates arrive with the rest of your system: `sudo xbps-install -Su`. The
 repository serves glibc and musl builds for x86_64, i686, aarch64, armv7l and armv6l.
 
-**2. From a release file.** Download `taema-0.5.0_1.noarch.xbps` from the
+**2. From a release file.** Download `taema-0.8.0_1.x86_64.xbps` (or the
+`x86_64-musl` build) from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty directory:
 
 ```sh
-xbps-rindex -a taema-*.noarch.xbps
+xbps-rindex -a taema-*.x86_64*.xbps
 sudo xbps-install --repository="$PWD" taema
 ```
 
@@ -278,6 +279,36 @@ taema forget adb                  # reset what was learned about adb
 configuration, safety rules and installed files are in
 **[taema/README.md](taema/README.md)**.
 
+## v2 behaviour
+
+Modes, weakest first: `observe` logs, `adopt` scopes and asks, `enforce` stops
+with learned authority, `auto` learns always and stops only decided, idle,
+eligible scopes. Switch live with `taema mode MODE`.
+
+Every stop climbs one ladder: skip protected, share what outsiders still use
+(moved to `shared/`, never killed), freeze idle leftovers, SIGTERM then wait
+the learned grace, SIGKILL what remains, GC empty leaves. Dry-run any step
+with `--dry-run`; explain any decision with `taema why TARGET`.
+
+Memory is per-scope: current, peak, reclaimable, PSI pressure
+(`taema memory`, `taema memory top|pressure|budget|watch`). The guard reclaims
+and freezes reversibly before authorized stops. Configure in `[mem]`; units
+set `[mem]` class and background.
+
+The session agent (`taema agent`, see `taema-agent(1)`) relays window focus,
+launches, and notification actions from each graphical session. Without it the
+daemon decides on process data only.
+
+Profiles switch config as a set: `default`, `focus`, `battery`, `game`,
+`quiet`, `server`, or `auto` selection (`taema profile NAME`, back with
+`taema profile auto`). Overrides live in `[profile.NAME]`.
+
+Upgrades migrate state forward without stopping processes; the 0.3 JSON store
+imports once into SQLite with a mode-0600 backup. For a 0.2 downgrade, export
+first: `taema learn export --format v2`. Details in
+**[taema/docs/design.md](taema/docs/design.md)** and the migration guides
+under `docs/`.
+
 ## Uninstall
 
 ```sh
@@ -325,8 +356,9 @@ user has to accept the new fingerprint.
 The `ci` workflow runs on every push and pull request: the unit and packaging test
 suites and package build, as an unprivileged user, in the Void glibc and Void musl
 containers with the distribution Python. Its Python 3.11 job also runs Ruff lint and
-format checks, mypy, and the coverage report and gate. Reproduce that quality job from
-the repository root with:
+format checks, mypy, and the coverage report and gate. Its Rust job runs fmt, clippy,
+tests, audit, and deny for the helper workspace from `taema/rust`. Reproduce that
+quality job from the repository root with:
 
 ```sh
 python3 -m venv /tmp/taema-quality-venv
@@ -349,10 +381,21 @@ make -C taema test        # the test suites (unit and packaging)
 taema/tools/build-xbps.sh # the package build; runs the suites first, needs xbps-create/xbps-rindex
 ```
 
-The test suites need only Python 3.11+ and `make`; the package build also needs
-`xbps-create` and `xbps-rindex`. A failing step fails the workflow run, which marks the
-commit and the pull request as failed. The tag-triggered `release` workflow is separate
-and unchanged.
+The test suites need Python 3.11+, `make`, and Cargo (or `WITHOUT_RUST=1` to skip
+the helper build and its parity corpus); the package build also needs `xbps-create`
+and `xbps-rindex`. Reproduce the Rust job from the repository root with:
+
+```sh
+cd taema/rust
+cargo fmt --check
+cargo clippy --locked --offline -- -D warnings
+cargo test --locked --offline
+cargo audit --file Cargo.lock
+cargo deny check
+```
+
+A failing step fails the workflow run, which marks the commit and the pull request as
+failed. The tag-triggered `release` workflow is separate and unchanged.
 
 ## Layout
 

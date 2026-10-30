@@ -4,4 +4,35 @@
 lib=/usr/lib/taema
 here=$(dirname "$(readlink -f "$0")")
 [ -d "$here/../src/taema" ] && lib=$here/../src
-PYTHONPATH="$lib" PYTHONDONTWRITEBYTECODE=1 exec /usr/bin/python3 -P -m taema "$@"
+# Fast paths: launch and bar run in taema-fast (Rust) when available.
+# Python stays the fallback for --help/--version/--config and when the
+# binary is absent, so help text never drifts.
+fast=""
+for cand in /usr/libexec/taema/taema-fast "$here/../rust/target/release/taema-fast" "$here/../rust/target/debug/taema-fast"; do
+    if [ -x "$cand" ]; then fast="$cand"; break; fi
+done
+if [ -n "$fast" ] && [ -z "${TAEMA_CONFIG-}" ]; then
+    skip=""
+    for a in "$@"; do
+        case "$a" in -h|--help|--version|--config|--config=*) skip=1; break;; esac
+    done
+    if [ -z "$skip" ]; then
+        cmd=""
+        expect_value=""
+        for a in "$@"; do
+            if [ -n "$expect_value" ]; then expect_value=""; continue; fi
+            case "$a" in
+                --socket|--config) expect_value=1; continue;;
+                --socket=*|--config=*) continue;;
+                --plain|--wide|--no-color|--quiet|--yes|--pick|--verbose|--json|--jsonl) continue;;
+                -*) continue;;
+                *) cmd="$a"; break;;
+            esac
+        done
+        if [ "$cmd" = "launch" ] || [ "$cmd" = "bar" ]; then
+            exec "$fast" "$@"
+        fi
+    fi
+fi
+# -S skips site-packages (taema is stdlib-only): saves ~5 ms of startup latency.
+PYTHONPATH="$lib" PYTHONDONTWRITEBYTECODE=1 exec /usr/bin/python3 -P -S -m taema "$@"

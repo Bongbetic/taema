@@ -1,617 +1,2695 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://taema.dev/schema/cli/read-v1.json",
-  "title": "tæma CLI read output v1",
-  "oneOf": [
-    { "$ref": "#/$defs/view" },
-    { "$ref": "#/$defs/status-record" },
-    { "$ref": "#/$defs/scope" },
-    { "$ref": "#/$defs/reviews" },
-    { "$ref": "#/$defs/events" },
-    { "$ref": "#/$defs/event" },
-    { "$ref": "#/$defs/review" },
-    { "$ref": "#/$defs/explain" },
-    { "$ref": "#/$defs/gc" },
-    { "$ref": "#/$defs/learn" },
-    { "$ref": "#/$defs/doctor" },
-    { "$ref": "#/$defs/memory-view" },
-    { "$ref": "#/$defs/memory-host-record" },
-    { "$ref": "#/$defs/memory-scope-record" },
-    { "$ref": "#/$defs/memory-watch" },
-    { "$ref": "#/$defs/memory-reclaim" },
-    { "$ref": "#/$defs/memory-budget" }
-  ],
-  "$defs": {
-    "view": {
-      "type": "object",
-      "required": ["schema", "kind", "status", "scopes", "scope_count"],
-      "properties": {
-        "schema": { "const": "taema.view.v1" },
-        "kind": { "enum": ["status", "ls"] },
-        "status": { "anyOf": [{ "$ref": "#/$defs/status-data" }, { "type": "null" }] },
-        "scopes": { "type": "array", "items": { "$ref": "#/$defs/scope-data" } },
-        "scope_count": { "type": "integer", "minimum": 0 },
-        "memory": { "$ref": "#/$defs/memory-view" }
-      },
-      "additionalProperties": false
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://taema.dev/schema/cli/read-v1.json",
+ "title": "tæma CLI read output v1",
+ "oneOf": [
+  {
+   "$ref": "#/$defs/view"
+  },
+  {
+   "$ref": "#/$defs/status-record"
+  },
+  {
+   "$ref": "#/$defs/scope"
+  },
+  {
+   "$ref": "#/$defs/reviews"
+  },
+  {
+   "$ref": "#/$defs/events"
+  },
+  {
+   "$ref": "#/$defs/event"
+  },
+  {
+   "$ref": "#/$defs/review"
+  },
+  {
+   "$ref": "#/$defs/explain"
+  },
+  {
+   "$ref": "#/$defs/gc"
+  },
+  {
+   "$ref": "#/$defs/learn"
+  },
+  {
+   "$ref": "#/$defs/doctor"
+  },
+  {
+   "$ref": "#/$defs/memory-view"
+  },
+  {
+   "$ref": "#/$defs/memory-host-record"
+  },
+  {
+   "$ref": "#/$defs/memory-scope-record"
+  },
+  {
+   "$ref": "#/$defs/memory-watch"
+  },
+  {
+   "$ref": "#/$defs/memory-reclaim"
+  },
+  {
+   "$ref": "#/$defs/memory-budget"
+  },
+  {
+   "$ref": "#/$defs/bar"
+  },
+  {
+   "$ref": "#/$defs/history"
+  },
+  {
+   "$ref": "#/$defs/report"
+  },
+  {
+   "$ref": "#/$defs/recent"
+  },
+  {
+   "$ref": "#/$defs/backup"
+  },
+  {
+   "$ref": "#/$defs/top"
+  },
+  {
+   "$ref": "#/$defs/tree"
+  }
+ ],
+ "$defs": {
+  "view": {
+   "type": "object",
+   "required": [
+    "schema",
+    "kind",
+    "status",
+    "scopes",
+    "scope_count"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.view.v1"
     },
-    "status-record": {
-      "type": "object",
-      "required": ["schema", "status"],
-      "properties": {
-        "schema": { "const": "taema.status.v1" },
-        "status": { "$ref": "#/$defs/status-data" }
-      },
-      "additionalProperties": false
+    "kind": {
+     "enum": [
+      "status",
+      "ls",
+      "dash"
+     ]
     },
-    "scope": {
-      "type": "object",
-      "required": ["schema", "depth", "name", "processes", "memory_bytes", "psi_avg10", "commands", "deprioritized"],
-      "properties": {
-        "schema": { "const": "taema.scope.v1" },
-        "depth": { "type": "integer", "minimum": 0 },
-        "name": { "type": "string", "minLength": 1 },
-        "processes": { "type": "integer", "minimum": 0 },
-        "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
-        "commands": { "type": "array", "items": { "type": "string" } },
-        "deprioritized": { "type": "boolean" },
-        "frozen": { "type": "boolean" },
-        "memory": { "anyOf": [{ "$ref": "#/$defs/memory-scope" }, { "type": "null" }] }
+    "status": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/status-data"
       },
-      "additionalProperties": false
+      {
+       "type": "null"
+      }
+     ]
     },
-    "scope-data": {
-      "type": "object",
-      "required": ["depth", "name", "processes", "memory_bytes", "psi_avg10", "commands", "deprioritized"],
-      "properties": {
-        "depth": { "type": "integer", "minimum": 0 },
-        "name": { "type": "string", "minLength": 1 },
-        "processes": { "type": "integer", "minimum": 0 },
-        "memory_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
-        "commands": { "type": "array", "items": { "type": "string" } },
-        "deprioritized": { "type": "boolean" },
-        "frozen": { "type": "boolean" },
-        "memory": { "anyOf": [{ "$ref": "#/$defs/memory-scope" }, { "type": "null" }] }
-      },
-      "additionalProperties": false
+    "scopes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/scope-data"
+     }
     },
-    "status-data": {
-      "type": "object",
-      "required": ["daemon", "mode", "feedback_invalid", "hold", "hold_state", "config", "details"],
-      "properties": {
-        "daemon": { "enum": ["running", "unavailable"] },
-        "mode": { "type": "string" },
-        "authority": { "type": "string" },
-        "authority_source": { "type": "string" },
-        "profile": { "type": "string" },
-        "profile_reason": { "type": "string" },
-        "feedback_invalid": { "type": "integer", "minimum": 0 },
-        "hold": { "type": "string" },
-        "hold_state": {
-          "type": "object",
-          "required": ["global", "scopes", "snooze_until", "snooze_remaining_s", "reason"],
-          "properties": {
-            "global": { "type": "boolean" },
-            "scopes": { "type": "array", "items": { "type": "string" } },
-            "snooze_until": { "type": ["number", "null"] },
-            "snooze_remaining_s": { "type": "integer", "minimum": 0 },
-            "reason": { "type": "string" }
-          },
-          "additionalProperties": false
-        },
-        "guard": {
-          "type": "object",
-          "required": ["active", "trigger", "triggers", "started_at", "steps", "bytes_freed", "last_trigger", "last_bytes_freed", "last_duration_ms"],
-          "properties": {
-            "active": { "type": "boolean" },
-            "trigger": { "type": ["string", "null"] },
-            "triggers": { "type": "array", "items": { "type": "string" } },
-            "started_at": { "type": ["number", "null"] },
-            "steps": { "type": "array", "items": { "type": "object" } },
-            "bytes_freed": { "type": "integer", "minimum": 0 },
-            "last_trigger": { "type": ["string", "null"] },
-            "last_bytes_freed": { "type": "integer", "minimum": 0 },
-            "last_duration_ms": { "type": ["number", "null"], "minimum": 0 }
-          },
-          "additionalProperties": false
-        },
-        "config": { "type": "array", "items": { "type": "string" } },
-        "config_error": { "type": ["string", "null"] },
-        "details": { "anyOf": [{ "type": "object" }, { "type": "null" }] }
-      },
-      "additionalProperties": false
+    "scope_count": {
+     "type": "integer",
+     "minimum": 0
     },
-    "reviews": {
-      "type": "object",
-      "required": ["schema", "reviews"],
-      "properties": {
-        "schema": { "const": "taema.reviews.v1" },
-        "reviews": { "type": "array", "items": { "type": "object" } }
+    "memory": {
+     "$ref": "#/$defs/memory-view"
+    },
+    "learned": {
+     "type": "object",
+     "required": [
+      "apps",
+      "pairs",
+      "signatures"
+     ],
+     "properties": {
+      "apps": {
+       "type": "array"
       },
-      "additionalProperties": false
+      "pairs": {
+       "type": "array"
+      },
+      "signatures": {
+       "type": "array"
+      }
+     },
+     "additionalProperties": false
+    },
+    "budget": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/memory-budget"
+      },
+      {
+       "type": "null"
+      }
+     ]
     },
     "events": {
-      "type": "object",
-      "required": ["schema", "events", "latest_seq", "has_more"],
-      "properties": {
-        "schema": {"const": "taema.events.v1"},
-        "events": {"type": "array", "items": {"$ref": "#/$defs/event-data"}},
-        "latest_seq": {"type": "integer", "minimum": 0},
-        "has_more": {"type": "boolean"}
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/dash-event"
+     }
+    },
+    "reviews": {
+     "type": "array"
+    },
+    "daemon": {
+     "enum": [
+      "ok",
+      "unavailable"
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "status-record": {
+   "type": "object",
+   "required": [
+    "schema",
+    "status"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.status.v1"
+    },
+    "status": {
+     "$ref": "#/$defs/status-data"
+    }
+   },
+   "additionalProperties": false
+  },
+  "scope": {
+   "type": "object",
+   "required": [
+    "schema",
+    "depth",
+    "name",
+    "processes",
+    "memory_bytes",
+    "psi_avg10",
+    "commands",
+    "deprioritized"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.scope.v1"
+    },
+    "depth": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "name": {
+     "type": "string",
+     "minLength": 1
+    },
+    "processes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "memory_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "psi_avg10": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "commands": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "deprioritized": {
+     "type": "boolean"
+    },
+    "frozen": {
+     "type": "boolean"
+    },
+    "memory": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/memory-scope"
       },
-      "additionalProperties": false
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "windows": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/window-summary"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "scope-data": {
+   "type": "object",
+   "required": [
+    "depth",
+    "name",
+    "processes",
+    "memory_bytes",
+    "psi_avg10",
+    "commands",
+    "deprioritized"
+   ],
+   "properties": {
+    "depth": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "name": {
+     "type": "string",
+     "minLength": 1
+    },
+    "processes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "memory_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "psi_avg10": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "commands": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "deprioritized": {
+     "type": "boolean"
+    },
+    "frozen": {
+     "type": "boolean"
+    },
+    "memory": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/memory-scope"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "windows": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/window-summary"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "status-data": {
+   "type": "object",
+   "required": [
+    "daemon",
+    "mode",
+    "feedback_invalid",
+    "hold",
+    "hold_state",
+    "config",
+    "details"
+   ],
+   "properties": {
+    "daemon": {
+     "enum": [
+      "running",
+      "unavailable"
+     ]
+    },
+    "mode": {
+     "type": "string"
+    },
+    "authority": {
+     "type": "string"
+    },
+    "authority_source": {
+     "type": "string"
+    },
+    "profile": {
+     "type": "string"
+    },
+    "profile_reason": {
+     "type": "string"
+    },
+    "feedback_invalid": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "hold": {
+     "type": "string"
+    },
+    "hold_state": {
+     "type": "object",
+     "required": [
+      "global",
+      "scopes",
+      "snooze_until",
+      "snooze_remaining_s",
+      "reason"
+     ],
+     "properties": {
+      "global": {
+       "type": "boolean"
+      },
+      "scopes": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "snooze_until": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "snooze_remaining_s": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "reason": {
+       "type": "string"
+      }
+     },
+     "additionalProperties": false
+    },
+    "guard": {
+     "type": "object",
+     "required": [
+      "active",
+      "trigger",
+      "triggers",
+      "started_at",
+      "steps",
+      "bytes_freed",
+      "last_trigger",
+      "last_bytes_freed",
+      "last_duration_ms"
+     ],
+     "properties": {
+      "active": {
+       "type": "boolean"
+      },
+      "trigger": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "triggers": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "started_at": {
+       "type": [
+        "number",
+        "null"
+       ]
+      },
+      "steps": {
+       "type": "array",
+       "items": {
+        "type": "object"
+       }
+      },
+      "bytes_freed": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "last_trigger": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "last_bytes_freed": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "last_duration_ms": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "config": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "config_error": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "details": {
+     "anyOf": [
+      {
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "reviews": {
+   "type": "object",
+   "required": [
+    "schema",
+    "reviews"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.reviews.v1"
+    },
+    "reviews": {
+     "type": "array",
+     "items": {
+      "type": "object"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "events": {
+   "type": "object",
+   "required": [
+    "schema",
+    "events",
+    "latest_seq",
+    "has_more"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.events.v1"
+    },
+    "events": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/event-data"
+     }
+    },
+    "latest_seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "has_more": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "event": {
+   "type": "object",
+   "required": [
+    "schema",
+    "seq",
+    "ts",
+    "event",
+    "decision_id",
+    "topics",
+    "data"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.event.v1"
+    },
+    "seq": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "ts": {
+     "type": "number",
+     "minimum": 0
     },
     "event": {
-      "type": "object",
-      "required": ["schema", "seq", "ts", "event", "decision_id", "topics", "data"],
-      "properties": {
-        "schema": {"const": "taema.event.v1"},
-        "seq": {"type": "integer", "minimum": 1},
-        "ts": {"type": "number", "minimum": 0},
-        "event": {"type": "string"},
-        "decision_id": {"type": ["integer", "null"]},
-        "topics": {"type": "array", "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}},
-        "data": {"type": "object"}
-      },
-      "additionalProperties": false
+     "type": "string"
     },
-    "event-data": {
-      "type": "object",
-      "required": ["seq", "ts", "event", "decision_id", "topics", "data"],
-      "properties": {
-        "seq": {"type": "integer", "minimum": 1},
-        "ts": {"type": "number", "minimum": 0},
-        "event": {"type": "string"},
-        "decision_id": {"type": ["integer", "null"]},
-        "topics": {"type": "array", "items": {"enum": ["status", "scope", "review", "decision", "memory", "guard", "profile"]}},
-        "data": {"type": "object"}
-      },
-      "additionalProperties": false
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "topics": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "status",
+       "scope",
+       "review",
+       "decision",
+       "memory",
+       "guard",
+       "profile"
+      ]
+     }
+    },
+    "data": {
+     "type": "object"
+    }
+   },
+   "additionalProperties": false
+  },
+  "event-data": {
+   "type": "object",
+   "required": [
+    "seq",
+    "ts",
+    "event",
+    "decision_id",
+    "topics",
+    "data"
+   ],
+   "properties": {
+    "seq": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "ts": {
+     "type": "number",
+     "minimum": 0
+    },
+    "event": {
+     "type": "string"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "topics": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "status",
+       "scope",
+       "review",
+       "decision",
+       "memory",
+       "guard",
+       "profile"
+      ]
+     }
+    },
+    "data": {
+     "type": "object"
+    }
+   },
+   "additionalProperties": false
+  },
+  "review": {
+   "type": "object",
+   "required": [
+    "schema",
+    "review"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.review.v1"
     },
     "review": {
-      "type": "object",
-      "required": ["schema", "review"],
-      "properties": {
-        "schema": { "const": "taema.review.v1" },
-        "review": { "type": "object" }
-      },
-      "additionalProperties": false
-    },
-    "explain": {
-      "type": "object",
-      "required": ["schema", "target", "explanation"],
-      "properties": {
-        "schema": { "const": "taema.explain.v1" },
-        "target": { "type": "string" },
-        "explanation": { "$ref": "#/$defs/explanation-data" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-data": {
-      "type": "object",
-      "required": ["identity", "scope", "provenance", "current_decision", "authority_source", "vetoes", "hold", "protected", "mode_outcomes", "learning", "plan", "unknown"],
-      "properties": {
-        "identity": { "anyOf": [{ "$ref": "#/$defs/explanation-identity" }, { "type": "null" }] },
-        "scope": { "$ref": "#/$defs/explanation-scope" },
-        "provenance": { "type": "object" },
-        "current_decision": { "$ref": "#/$defs/explanation-decision" },
-        "authority_source": { "type": "string" },
-        "learn_authority": {
-          "type": "object",
-          "required": ["value", "source"],
-          "properties": { "value": { "type": "string" }, "source": { "type": "string" } },
-          "additionalProperties": false
-        },
-        "vetoes": { "type": "array", "items": { "type": "object" } },
-        "hold": { "$ref": "#/$defs/explanation-hold" },
-        "protected": { "$ref": "#/$defs/explanation-protected" },
-        "mode_outcomes": { "$ref": "#/$defs/explanation-outcomes" },
-        "learning": { "type": "object" },
-        "plan": { "type": "array", "items": { "type": "object" } },
-        "unknown": { "type": "array", "items": { "$ref": "#/$defs/explanation-unknown" } }
-      },
-      "additionalProperties": false
-    },
-    "explanation-identity": {
-      "type": "object",
-      "required": ["key", "display", "kind", "validated", "reason"],
-      "properties": {
-        "key": { "type": "string" },
-        "display": { "type": "string" },
-        "kind": { "type": "string" },
-        "validated": { "type": "boolean" },
-        "reason": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-scope": {
-      "type": "object",
-      "required": ["name", "live", "deprioritized"],
-      "properties": {
-        "name": { "type": "string" },
-        "live": { "type": "boolean" },
-        "deprioritized": { "type": "boolean" },
-        "frozen": { "type": "boolean" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-decision": {
-      "type": "object",
-      "required": ["action", "confidence", "reason"],
-      "properties": {
-        "action": { "type": "string" },
-        "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
-        "reason": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-hold": {
-      "type": "object",
-      "required": ["active", "reason"],
-      "properties": {
-        "active": { "type": "boolean" },
-        "reason": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-protected": {
-      "type": "object",
-      "required": ["blocked", "reason"],
-      "properties": {
-        "blocked": { "type": "boolean" },
-        "reason": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-outcomes": {
-      "type": "object",
-      "required": ["trigger", "modes"],
-      "properties": {
-        "trigger": { "type": "string" },
-        "modes": { "type": "array", "items": { "$ref": "#/$defs/explanation-mode" } }
-      },
-      "additionalProperties": false
-    },
-    "explanation-mode": {
-      "type": "object",
-      "required": ["mode", "verdict", "slot", "authority", "reason"],
-      "properties": {
-        "mode": { "enum": ["observe", "adopt", "enforce", "auto"] },
-        "verdict": { "enum": ["act", "would", "keep"] },
-        "slot": { "type": "string" },
-        "authority": { "type": "string" },
-        "reason": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "explanation-unknown": {
-      "type": "object",
-      "required": ["fact", "reason"],
-      "properties": {
-        "fact": { "type": "string" },
-        "reason": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "gc": {
-      "type": "object",
-      "required": ["schema", "result"],
-      "properties": {
-        "schema": { "const": "taema.gc.v1" },
-        "result": { "type": "object" }
-      },
-      "additionalProperties": false
-    },
-    "learn": {
-      "oneOf": [
-        { "$ref": "#/$defs/learn-show" },
-        { "$ref": "#/$defs/learn-legacy" },
-        { "$ref": "#/$defs/learn-apps" },
-        { "$ref": "#/$defs/learn-pairs" },
-        { "$ref": "#/$defs/learn-signatures" }
-      ]
-    },
-    "learn-show": {
-      "type": "object",
-      "required": ["schema", "view", "legacy", "apps", "pairs", "signatures", "counts"],
-      "properties": {
-        "schema": { "const": "taema.learn.v1" },
-        "view": { "const": "show" },
-        "legacy": { "const": false },
-        "apps": { "type": "array", "items": { "$ref": "#/$defs/learn-app-record" } },
-        "pairs": { "type": "array", "items": { "$ref": "#/$defs/learn-pair-record" } },
-        "signatures": { "type": "array", "items": { "$ref": "#/$defs/learn-signature-record" } },
-        "counts": { "$ref": "#/$defs/learn-counts" }
-      },
-      "additionalProperties": false
-    },
-    "learn-legacy": {
-      "type": "object",
-      "required": ["schema", "view", "legacy", "records", "reviews", "count"],
-      "properties": {
-        "schema": { "const": "taema.learn.v1" },
-        "view": { "const": "show" },
-        "legacy": { "const": true },
-        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-pair-record" } },
-        "reviews": { "type": "array", "items": { "type": "object" } },
-        "count": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "learn-apps": {
-      "type": "object",
-      "required": ["schema", "view", "records", "count"],
-      "properties": {
-        "schema": { "const": "taema.learn.v1" },
-        "view": { "const": "apps" },
-        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-app-record" } },
-        "count": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "learn-pairs": {
-      "type": "object",
-      "required": ["schema", "view", "records", "count"],
-      "properties": {
-        "schema": { "const": "taema.learn.v1" },
-        "view": { "const": "pairs" },
-        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-pair-record" } },
-        "count": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "learn-signatures": {
-      "type": "object",
-      "required": ["schema", "view", "records", "count"],
-      "properties": {
-        "schema": { "const": "taema.learn.v1" },
-        "view": { "const": "signatures" },
-        "records": { "type": "array", "items": { "$ref": "#/$defs/learn-signature-record" } },
-        "count": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "learn-counts": {
-      "type": "object",
-      "required": ["apps", "pairs", "signatures"],
-      "properties": {
-        "apps": { "type": "integer", "minimum": 0 },
-        "pairs": { "type": "integer", "minimum": 0 },
-        "signatures": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "learn-app-record": {
-      "type": "object",
-      "required": ["key", "display", "decision", "confidence", "evidence", "last_outcome"],
-      "properties": {
-        "key": { "type": "string", "minLength": 1 },
-        "display": { "type": "string" },
-        "kind": { "type": "string" },
-        "decision": { "type": "string" },
-        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-        "evidence": { "$ref": "#/$defs/learn-evidence" },
-        "last_outcome": { "$ref": "#/$defs/learn-last-outcome" }
-      },
-      "additionalProperties": true
-    },
-    "learn-pair-record": {
-      "type": "object",
-      "required": ["owner", "leftover", "decision", "confidence", "evidence", "last_outcome"],
-      "properties": {
-        "owner": { "type": "string", "minLength": 1 },
-        "leftover": { "type": "string", "minLength": 1 },
-        "decision": { "type": "string" },
-        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-        "evidence": { "$ref": "#/$defs/learn-evidence" },
-        "last_outcome": { "$ref": "#/$defs/learn-last-outcome" }
-      },
-      "additionalProperties": true
-    },
-    "learn-signature-record": {
-      "type": "object",
-      "required": ["id", "owner", "decision", "confidence", "evidence", "last_outcome"],
-      "properties": {
-        "id": { "type": "string", "minLength": 1 },
-        "owner": { "type": "string", "minLength": 1 },
-        "decision": { "type": "string" },
-        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-        "evidence": { "$ref": "#/$defs/learn-evidence" },
-        "last_outcome": { "$ref": "#/$defs/learn-last-outcome" }
-      },
-      "additionalProperties": true
-    },
-    "learn-evidence": {
-      "type": "object",
-      "additionalProperties": { "type": "number", "minimum": 0 }
-    },
-    "learn-last-outcome": {
-      "type": ["object", "null"],
-      "properties": {
-        "decision": { "type": "string" },
-        "outcome": { "type": ["string", "null"] },
-        "at": { "type": ["number", "null"], "minimum": 0 }
-      },
-      "additionalProperties": true
-    },
-    "doctor": {
-      "type": "object",
-      "required": ["schema", "status", "checks"],
-      "properties": {
-        "schema": { "const": "taema.doctor.v1" },
-        "status": { "enum": ["ok", "warn", "fail"] },
-        "checks": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/doctor-check" }
-        }
-      },
-      "additionalProperties": false
-    },
-    "doctor-check": {
-      "type": "object",
-      "required": ["name", "status", "message", "fix"],
-      "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "status": { "enum": ["ok", "warn", "fail"] },
-        "message": { "type": "string" },
-        "fix": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "memory-view": {
-      "type": "object",
-      "required": ["schema", "enabled", "sampled_at", "host", "scopes", "features"],
-      "properties": {
-        "schema": { "const": "taema.memory.v1" },
-        "enabled": { "type": "boolean" },
-        "sampled_at": { "type": "number", "minimum": 0 },
-        "host": { "anyOf": [{ "$ref": "#/$defs/memory-host" }, { "type": "null" }] },
-        "scopes": { "type": "array", "items": { "$ref": "#/$defs/memory-scope" } },
-        "features": { "type": "object", "additionalProperties": { "type": "string" } }
-      },
-      "additionalProperties": false
-    },
-    "memory-host": {
-      "type": "object",
-      "required": ["total_bytes", "available_bytes", "used_bytes", "pressure_avg10", "swap_total_bytes", "swap_free_bytes", "swap_used_bytes", "zswap_bytes", "zswap_source", "delegated_current_bytes"],
-      "properties": {
-        "total_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "available_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "used_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "pressure_avg10": { "type": ["number", "null"], "minimum": 0 },
-        "swap_total_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "swap_free_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "swap_used_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "zswap_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "zswap_source": { "type": ["string", "null"] },
-        "delegated_current_bytes": { "type": ["integer", "null"], "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "memory-scope": {
-      "type": "object",
-      "required": ["name", "class", "current_bytes", "peak_bytes", "peak_source", "anon_bytes", "file_bytes", "swap_bytes", "zswap_bytes", "reclaimable_bytes", "psi_avg10", "psi_source", "features"],
-      "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "class": { "type": "string" },
-        "current_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "peak_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "peak_source": { "type": "string" },
-        "anon_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "file_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "swap_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "zswap_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "reclaimable_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "psi_avg10": { "type": ["number", "null"], "minimum": 0 },
-        "psi_source": { "type": ["string", "null"] },
-        "features": { "type": "object", "additionalProperties": { "type": "string" } }
-      },
-      "additionalProperties": false
-    },
-    "memory-host-record": {
-      "type": "object",
-      "required": ["schema", "sampled_at", "host", "features"],
-      "properties": {
-        "schema": { "const": "taema.memory-host.v1" },
-        "sampled_at": { "type": "number", "minimum": 0 },
-        "host": { "$ref": "#/$defs/memory-host" },
-        "features": { "type": "object", "additionalProperties": { "type": "string" } }
-      },
-      "additionalProperties": false
-    },
-    "memory-scope-record": {
-      "type": "object",
-      "required": ["schema", "scope"],
-      "properties": {
-        "schema": { "const": "taema.memory-scope.v1" },
-        "scope": { "$ref": "#/$defs/memory-scope" }
-      },
-      "additionalProperties": false
-    },
-    "memory-watch": {
-      "type": "object",
-      "required": ["schema", "snapshots"],
-      "properties": {
-        "schema": { "const": "taema.memory-watch.v1" },
-        "snapshots": { "type": "array", "items": { "$ref": "#/$defs/memory-view" } }
-      },
-      "additionalProperties": false
-    },
-    "memory-reclaim": {
-      "type": "object",
-      "required": ["schema", "scope", "status"],
-      "properties": {
-        "schema": { "const": "taema.memory-reclaim.v1" },
-        "scope": { "type": ["string", "null"] },
-        "status": { "enum": ["would", "reclaimed", "skipped", "failed"] },
-        "reason": { "type": "string" },
-        "error": { "type": "string" },
-        "method": { "enum": ["memory.reclaim", "memory.high"] },
-        "methods": { "type": "array", "items": { "enum": ["memory.reclaim", "memory.high"] } },
-        "requested_bytes": { "type": "integer", "minimum": 0 },
-        "page_cache_requested_bytes": { "type": "integer", "minimum": 0 },
-        "anonymous_requested_bytes": { "type": "integer", "minimum": 0 },
-        "anonymous_reclaim_reason": { "type": ["string", "null"] },
-        "reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "anonymous_reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "file_reclaimed_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "swap_delta_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "zswap_delta_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "current_before": { "type": ["integer", "null"], "minimum": 0 },
-        "current_after": { "type": ["integer", "null"], "minimum": 0 },
-        "reclaimable_before": { "type": ["integer", "null"], "minimum": 0 },
-        "reclaimable_after": { "type": ["integer", "null"], "minimum": 0 },
-        "resource_class": { "type": "string" },
-        "elapsed_ms": { "type": "number", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "memory-budget": {
-      "type": "object",
-      "required": ["schema", "enabled", "manage", "budget_bytes", "floor_bytes", "allocatable_bytes", "delegated_max_bytes", "scopes"],
-      "properties": {
-        "schema": { "const": "taema.memory-budget.v1" },
-        "enabled": { "type": "boolean" },
-        "manage": { "enum": ["soft", "hard"] },
-        "budget_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "floor_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "allocatable_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "delegated_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
-        "fraction": { "type": "number", "minimum": 0, "maximum": 1 },
-        "infrastructure_bytes": { "type": "integer", "minimum": 0 },
-        "reserved_bytes": { "type": "integer", "minimum": 0 },
-        "background_bytes": { "type": "integer", "minimum": 0 },
-        "scopes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["name", "class", "background", "current_bytes", "headroom_bytes", "share_bytes", "reservation_bytes", "desired_high_bytes", "desired_low_bytes", "desired_max_bytes", "desired_swap_max_bytes", "high", "low", "max", "swap_max", "owned", "managed"],
-            "properties": {
-              "name": { "type": "string", "minLength": 1 },
-              "class": { "type": "string" },
-              "background": { "type": "boolean" },
-              "current_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "headroom_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "share_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "reservation_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "desired_high_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "desired_low_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "desired_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "desired_swap_max_bytes": { "type": ["integer", "null"], "minimum": 0 },
-              "high": { "type": ["string", "null"] },
-              "low": { "type": ["string", "null"] },
-              "max": { "type": ["string", "null"] },
-              "swap_max": { "type": ["string", "null"] },
-              "owned": { "type": "boolean" },
-              "managed": { "type": "array", "items": { "enum": ["memory.high", "memory.low", "memory.max", "memory.swap.max"] } }
-            },
-            "additionalProperties": false
-          }
-        }
-      },
-      "additionalProperties": false
+     "type": "object"
     }
+   },
+   "additionalProperties": false
+  },
+  "explain": {
+   "type": "object",
+   "required": [
+    "schema",
+    "target",
+    "explanation"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.explain.v1"
+    },
+    "target": {
+     "type": "string"
+    },
+    "explanation": {
+     "$ref": "#/$defs/explanation-data"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-data": {
+   "type": "object",
+   "required": [
+    "identity",
+    "scope",
+    "provenance",
+    "current_decision",
+    "authority_source",
+    "vetoes",
+    "hold",
+    "protected",
+    "mode_outcomes",
+    "learning",
+    "plan",
+    "unknown"
+   ],
+   "properties": {
+    "identity": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/explanation-identity"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "scope": {
+     "$ref": "#/$defs/explanation-scope"
+    },
+    "provenance": {
+     "type": "object"
+    },
+    "current_decision": {
+     "$ref": "#/$defs/explanation-decision"
+    },
+    "authority_source": {
+     "type": "string"
+    },
+    "learn_authority": {
+     "type": "object",
+     "required": [
+      "value",
+      "source"
+     ],
+     "properties": {
+      "value": {
+       "type": "string"
+      },
+      "source": {
+       "type": "string"
+      }
+     },
+     "additionalProperties": false
+    },
+    "vetoes": {
+     "type": "array",
+     "items": {
+      "type": "object"
+     }
+    },
+    "hold": {
+     "$ref": "#/$defs/explanation-hold"
+    },
+    "protected": {
+     "$ref": "#/$defs/explanation-protected"
+    },
+    "mode_outcomes": {
+     "$ref": "#/$defs/explanation-outcomes"
+    },
+    "learning": {
+     "type": "object"
+    },
+    "plan": {
+     "type": "array",
+     "items": {
+      "type": "object"
+     }
+    },
+    "unknown": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/explanation-unknown"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-identity": {
+   "type": "object",
+   "required": [
+    "key",
+    "display",
+    "kind",
+    "validated",
+    "reason"
+   ],
+   "properties": {
+    "key": {
+     "type": "string"
+    },
+    "display": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "validated": {
+     "type": "boolean"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "desktop_id": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-scope": {
+   "type": "object",
+   "required": [
+    "name",
+    "live",
+    "deprioritized"
+   ],
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "live": {
+     "type": "boolean"
+    },
+    "deprioritized": {
+     "type": "boolean"
+    },
+    "frozen": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-decision": {
+   "type": "object",
+   "required": [
+    "action",
+    "confidence",
+    "reason"
+   ],
+   "properties": {
+    "action": {
+     "type": "string"
+    },
+    "confidence": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0,
+     "maximum": 1
+    },
+    "reason": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-hold": {
+   "type": "object",
+   "required": [
+    "active",
+    "reason"
+   ],
+   "properties": {
+    "active": {
+     "type": "boolean"
+    },
+    "reason": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-protected": {
+   "type": "object",
+   "required": [
+    "blocked",
+    "reason"
+   ],
+   "properties": {
+    "blocked": {
+     "type": "boolean"
+    },
+    "reason": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-outcomes": {
+   "type": "object",
+   "required": [
+    "trigger",
+    "modes"
+   ],
+   "properties": {
+    "trigger": {
+     "type": "string"
+    },
+    "modes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/explanation-mode"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-mode": {
+   "type": "object",
+   "required": [
+    "mode",
+    "verdict",
+    "slot",
+    "authority",
+    "reason"
+   ],
+   "properties": {
+    "mode": {
+     "enum": [
+      "observe",
+      "adopt",
+      "enforce",
+      "auto"
+     ]
+    },
+    "verdict": {
+     "enum": [
+      "act",
+      "would",
+      "keep"
+     ]
+    },
+    "slot": {
+     "type": "string"
+    },
+    "authority": {
+     "type": "string"
+    },
+    "reason": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "explanation-unknown": {
+   "type": "object",
+   "required": [
+    "fact",
+    "reason"
+   ],
+   "properties": {
+    "fact": {
+     "type": "string"
+    },
+    "reason": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "gc": {
+   "type": "object",
+   "required": [
+    "schema",
+    "result"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.gc.v1"
+    },
+    "result": {
+     "type": "object"
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn": {
+   "oneOf": [
+    {
+     "$ref": "#/$defs/learn-show"
+    },
+    {
+     "$ref": "#/$defs/learn-legacy"
+    },
+    {
+     "$ref": "#/$defs/learn-apps"
+    },
+    {
+     "$ref": "#/$defs/learn-pairs"
+    },
+    {
+     "$ref": "#/$defs/learn-signatures"
+    }
+   ]
+  },
+  "learn-show": {
+   "type": "object",
+   "required": [
+    "schema",
+    "view",
+    "legacy",
+    "apps",
+    "pairs",
+    "signatures",
+    "counts"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.learn.v1"
+    },
+    "view": {
+     "const": "show"
+    },
+    "legacy": {
+     "const": false
+    },
+    "apps": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-app-record"
+     }
+    },
+    "pairs": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-pair-record"
+     }
+    },
+    "signatures": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-signature-record"
+     }
+    },
+    "counts": {
+     "$ref": "#/$defs/learn-counts"
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn-legacy": {
+   "type": "object",
+   "required": [
+    "schema",
+    "view",
+    "legacy",
+    "records",
+    "reviews",
+    "count"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.learn.v1"
+    },
+    "view": {
+     "const": "show"
+    },
+    "legacy": {
+     "const": true
+    },
+    "records": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-pair-record"
+     }
+    },
+    "reviews": {
+     "type": "array",
+     "items": {
+      "type": "object"
+     }
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn-apps": {
+   "type": "object",
+   "required": [
+    "schema",
+    "view",
+    "records",
+    "count"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.learn.v1"
+    },
+    "view": {
+     "const": "apps"
+    },
+    "records": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-app-record"
+     }
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn-pairs": {
+   "type": "object",
+   "required": [
+    "schema",
+    "view",
+    "records",
+    "count"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.learn.v1"
+    },
+    "view": {
+     "const": "pairs"
+    },
+    "records": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-pair-record"
+     }
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn-signatures": {
+   "type": "object",
+   "required": [
+    "schema",
+    "view",
+    "records",
+    "count"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.learn.v1"
+    },
+    "view": {
+     "const": "signatures"
+    },
+    "records": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/learn-signature-record"
+     }
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn-counts": {
+   "type": "object",
+   "required": [
+    "apps",
+    "pairs",
+    "signatures"
+   ],
+   "properties": {
+    "apps": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "pairs": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "signatures": {
+     "type": "integer",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "learn-app-record": {
+   "type": "object",
+   "required": [
+    "key",
+    "display",
+    "decision",
+    "confidence",
+    "evidence",
+    "last_outcome"
+   ],
+   "properties": {
+    "key": {
+     "type": "string",
+     "minLength": 1
+    },
+    "display": {
+     "type": "string"
+    },
+    "kind": {
+     "type": "string"
+    },
+    "decision": {
+     "type": "string"
+    },
+    "confidence": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "evidence": {
+     "$ref": "#/$defs/learn-evidence"
+    },
+    "last_outcome": {
+     "$ref": "#/$defs/learn-last-outcome"
+    }
+   },
+   "additionalProperties": true
+  },
+  "learn-pair-record": {
+   "type": "object",
+   "required": [
+    "owner",
+    "leftover",
+    "decision",
+    "confidence",
+    "evidence",
+    "last_outcome"
+   ],
+   "properties": {
+    "owner": {
+     "type": "string",
+     "minLength": 1
+    },
+    "leftover": {
+     "type": "string",
+     "minLength": 1
+    },
+    "decision": {
+     "type": "string"
+    },
+    "confidence": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "evidence": {
+     "$ref": "#/$defs/learn-evidence"
+    },
+    "last_outcome": {
+     "$ref": "#/$defs/learn-last-outcome"
+    }
+   },
+   "additionalProperties": true
+  },
+  "learn-signature-record": {
+   "type": "object",
+   "required": [
+    "id",
+    "owner",
+    "decision",
+    "confidence",
+    "evidence",
+    "last_outcome"
+   ],
+   "properties": {
+    "id": {
+     "type": "string",
+     "minLength": 1
+    },
+    "owner": {
+     "type": "string",
+     "minLength": 1
+    },
+    "decision": {
+     "type": "string"
+    },
+    "confidence": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "evidence": {
+     "$ref": "#/$defs/learn-evidence"
+    },
+    "last_outcome": {
+     "$ref": "#/$defs/learn-last-outcome"
+    }
+   },
+   "additionalProperties": true
+  },
+  "learn-evidence": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "number",
+    "minimum": 0
+   }
+  },
+  "learn-last-outcome": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "properties": {
+    "decision": {
+     "type": "string"
+    },
+    "outcome": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "at": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    }
+   },
+   "additionalProperties": true
+  },
+  "doctor": {
+   "type": "object",
+   "required": [
+    "schema",
+    "status",
+    "checks"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.doctor.v1"
+    },
+    "status": {
+     "enum": [
+      "ok",
+      "warn",
+      "fail"
+     ]
+    },
+    "checks": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/doctor-check"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "doctor-check": {
+   "type": "object",
+   "required": [
+    "name",
+    "status",
+    "message",
+    "fix"
+   ],
+   "properties": {
+    "name": {
+     "type": "string",
+     "minLength": 1
+    },
+    "status": {
+     "enum": [
+      "ok",
+      "warn",
+      "fail"
+     ]
+    },
+    "message": {
+     "type": "string"
+    },
+    "fix": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-view": {
+   "type": "object",
+   "required": [
+    "schema",
+    "enabled",
+    "sampled_at",
+    "host",
+    "scopes",
+    "features"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.memory.v1"
+    },
+    "enabled": {
+     "type": "boolean"
+    },
+    "sampled_at": {
+     "type": "number",
+     "minimum": 0
+    },
+    "host": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/memory-host"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "scopes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/memory-scope"
+     }
+    },
+    "features": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-host": {
+   "type": "object",
+   "required": [
+    "total_bytes",
+    "available_bytes",
+    "used_bytes",
+    "pressure_avg10",
+    "swap_total_bytes",
+    "swap_free_bytes",
+    "swap_used_bytes",
+    "zswap_bytes",
+    "zswap_source",
+    "delegated_current_bytes"
+   ],
+   "properties": {
+    "total_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "available_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "used_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "pressure_avg10": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "swap_total_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "swap_free_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "swap_used_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "zswap_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "zswap_source": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "delegated_current_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-scope": {
+   "type": "object",
+   "required": [
+    "name",
+    "class",
+    "current_bytes",
+    "peak_bytes",
+    "peak_source",
+    "anon_bytes",
+    "file_bytes",
+    "swap_bytes",
+    "zswap_bytes",
+    "reclaimable_bytes",
+    "psi_avg10",
+    "psi_source",
+    "features"
+   ],
+   "properties": {
+    "name": {
+     "type": "string",
+     "minLength": 1
+    },
+    "class": {
+     "type": "string"
+    },
+    "current_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "peak_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "peak_source": {
+     "type": "string"
+    },
+    "anon_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "file_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "swap_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "zswap_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "reclaimable_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "psi_avg10": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "psi_source": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "features": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-host-record": {
+   "type": "object",
+   "required": [
+    "schema",
+    "sampled_at",
+    "host",
+    "features"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.memory-host.v1"
+    },
+    "sampled_at": {
+     "type": "number",
+     "minimum": 0
+    },
+    "host": {
+     "$ref": "#/$defs/memory-host"
+    },
+    "features": {
+     "type": "object",
+     "additionalProperties": {
+      "type": "string"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-scope-record": {
+   "type": "object",
+   "required": [
+    "schema",
+    "scope"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.memory-scope.v1"
+    },
+    "scope": {
+     "$ref": "#/$defs/memory-scope"
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-watch": {
+   "type": "object",
+   "required": [
+    "schema",
+    "snapshots"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.memory-watch.v1"
+    },
+    "snapshots": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/memory-view"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-reclaim": {
+   "type": "object",
+   "required": [
+    "schema",
+    "scope",
+    "status"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.memory-reclaim.v1"
+    },
+    "scope": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "status": {
+     "enum": [
+      "would",
+      "reclaimed",
+      "skipped",
+      "failed"
+     ]
+    },
+    "reason": {
+     "type": "string"
+    },
+    "error": {
+     "type": "string"
+    },
+    "method": {
+     "enum": [
+      "memory.reclaim",
+      "memory.high"
+     ]
+    },
+    "methods": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "memory.reclaim",
+       "memory.high"
+      ]
+     }
+    },
+    "requested_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "page_cache_requested_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "anonymous_requested_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "anonymous_reclaim_reason": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "reclaimed_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "anonymous_reclaimed_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "file_reclaimed_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "swap_delta_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "zswap_delta_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "current_before": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "current_after": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "reclaimable_before": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "reclaimable_after": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "resource_class": {
+     "type": "string"
+    },
+    "elapsed_ms": {
+     "type": "number",
+     "minimum": 0
+    }
+   },
+   "additionalProperties": false
+  },
+  "memory-budget": {
+   "type": "object",
+   "required": [
+    "schema",
+    "enabled",
+    "manage",
+    "budget_bytes",
+    "floor_bytes",
+    "allocatable_bytes",
+    "delegated_max_bytes",
+    "scopes"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.memory-budget.v1"
+    },
+    "enabled": {
+     "type": "boolean"
+    },
+    "manage": {
+     "enum": [
+      "soft",
+      "hard"
+     ]
+    },
+    "budget_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "floor_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "allocatable_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "delegated_max_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "fraction": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "infrastructure_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "reserved_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "background_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "scopes": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "name",
+       "class",
+       "background",
+       "current_bytes",
+       "headroom_bytes",
+       "share_bytes",
+       "reservation_bytes",
+       "desired_high_bytes",
+       "desired_low_bytes",
+       "desired_max_bytes",
+       "desired_swap_max_bytes",
+       "high",
+       "low",
+       "max",
+       "swap_max",
+       "owned",
+       "managed"
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "minLength": 1
+       },
+       "class": {
+        "type": "string"
+       },
+       "background": {
+        "type": "boolean"
+       },
+       "current_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "headroom_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "share_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "reservation_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "desired_high_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "desired_low_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "desired_max_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "desired_swap_max_bytes": {
+        "type": [
+         "integer",
+         "null"
+        ],
+        "minimum": 0
+       },
+       "high": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "low": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "max": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "swap_max": {
+        "type": [
+         "string",
+         "null"
+        ]
+       },
+       "owned": {
+        "type": "boolean"
+       },
+       "managed": {
+        "type": "array",
+        "items": {
+         "enum": [
+          "memory.high",
+          "memory.low",
+          "memory.max",
+          "memory.swap.max"
+         ]
+        }
+       }
+      },
+      "additionalProperties": false
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "window-summary": {
+   "type": "object",
+   "required": [
+    "count",
+    "focused"
+   ],
+   "properties": {
+    "count": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "focused": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "bar": {
+   "type": "object",
+   "required": [
+    "schema",
+    "mode",
+    "profile",
+    "reviews",
+    "frozen",
+    "deprioritized",
+    "freed_today_bytes",
+    "hold",
+    "pressure",
+    "agent_running",
+    "class",
+    "text",
+    "tooltip"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.bar.v1"
+    },
+    "mode": {
+     "type": "string"
+    },
+    "profile": {
+     "type": "string"
+    },
+    "reviews": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "frozen": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "deprioritized": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "freed_today_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "hold": {
+     "type": "string"
+    },
+    "pressure": {
+     "type": "boolean"
+    },
+    "agent_running": {
+     "type": "boolean"
+    },
+    "class": {
+     "enum": [
+      "ok",
+      "review",
+      "pressure",
+      "hold",
+      "error"
+     ]
+    },
+    "text": {
+     "type": "string"
+    },
+    "tooltip": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "history": {
+   "type": "object",
+   "required": [
+    "schema",
+    "target",
+    "entries"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.history.v1"
+    },
+    "target": {
+     "type": "string"
+    },
+    "entries": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/history-entry"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "history-entry": {
+   "type": "object",
+   "required": [
+    "ts",
+    "kind",
+    "decision_id",
+    "scope",
+    "owner",
+    "detail"
+   ],
+   "properties": {
+    "ts": {
+     "type": "number",
+     "minimum": 0
+    },
+    "kind": {
+     "type": "string"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "scope": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "owner": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "detail": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "report": {
+   "type": "object",
+   "required": [
+    "schema",
+    "window",
+    "stops",
+    "memory_freed_bytes",
+    "undos",
+    "regrets",
+    "reviews",
+    "guard_events",
+    "top_leftovers",
+    "frozen",
+    "rollups"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.report.v1"
+    },
+    "window": {
+     "enum": [
+      "day",
+      "week",
+      "month"
+     ]
+    },
+    "stops": {
+     "type": "object",
+     "required": [
+      "automatic",
+      "answered"
+     ],
+     "properties": {
+      "automatic": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "answered": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "memory_freed_bytes": {
+     "type": "object",
+     "required": [
+      "stop",
+      "reclaim"
+     ],
+     "properties": {
+      "stop": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "reclaim": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "undos": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "regrets": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "reviews": {
+     "type": "object",
+     "required": [
+      "answered",
+      "expired"
+     ],
+     "properties": {
+      "answered": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "expired": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "guard_events": {
+     "type": "object",
+     "required": [
+      "total",
+      "by_event"
+     ],
+     "properties": {
+      "total": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "by_event": {
+       "type": "object"
+      }
+     },
+     "additionalProperties": false
+    },
+    "top_leftovers": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "leftover",
+       "launches",
+       "closes",
+       "kills"
+      ],
+      "properties": {
+       "leftover": {
+        "type": "string"
+       },
+       "launches": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "closes": {
+        "type": "integer",
+        "minimum": 0
+       },
+       "kills": {
+        "type": "integer",
+        "minimum": 0
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "frozen": {
+     "type": "object",
+     "required": [
+      "frozen_seconds",
+      "thaws",
+      "connection_thaws",
+      "frozen_now"
+     ],
+     "properties": {
+      "frozen_seconds": {
+       "type": "number",
+       "minimum": 0
+      },
+      "thaws": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "connection_thaws": {
+       "type": "integer",
+       "minimum": 0
+      },
+      "frozen_now": {
+       "type": "integer",
+       "minimum": 0
+      }
+     },
+     "additionalProperties": false
+    },
+    "rollups": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "required": [
+       "app",
+       "peak",
+       "current_p50"
+      ],
+      "properties": {
+       "app": {
+        "type": "string"
+       },
+       "peak": {
+        "type": "number",
+        "minimum": 0
+       },
+       "current_p50": {
+        "type": "number",
+        "minimum": 0
+       }
+      },
+      "additionalProperties": false
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "recent": {
+   "type": "object",
+   "required": [
+    "schema",
+    "actions"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.recent.v1"
+    },
+    "actions": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/recent-action"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "recent-action": {
+   "type": "object",
+   "required": [
+    "id",
+    "ts",
+    "scope",
+    "why",
+    "pairs",
+    "decision_id",
+    "freed_bytes",
+    "restore_possible"
+   ],
+   "properties": {
+    "id": {
+     "type": "string"
+    },
+    "ts": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "scope": {
+     "type": "string"
+    },
+    "why": {
+     "type": "string"
+    },
+    "pairs": {
+     "type": "array"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "freed_bytes": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "restore_possible": {
+     "type": "boolean"
+    }
+   },
+   "additionalProperties": false
+  },
+  "backup": {
+   "type": "object",
+   "required": [
+    "schema",
+    "path"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.backup.v1"
+    },
+    "path": {
+     "type": "string",
+     "minLength": 1
+    }
+   },
+   "additionalProperties": false
+  },
+  "top": {
+   "type": "object",
+   "required": [
+    "schema",
+    "rows"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.top.v1"
+    },
+    "rows": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/top-row"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "top-row": {
+   "type": "object",
+   "required": [
+    "pid",
+    "scope",
+    "user",
+    "cpu",
+    "mem_pct",
+    "mem",
+    "delta_per_min",
+    "psi",
+    "decision",
+    "threads",
+    "state",
+    "window",
+    "cmd"
+   ],
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "scope": {
+     "type": "string"
+    },
+    "user": {
+     "type": "string"
+    },
+    "cpu": {
+     "type": "number",
+     "minimum": 0
+    },
+    "mem_pct": {
+     "type": "number",
+     "minimum": 0
+    },
+    "mem": {
+     "type": "number",
+     "minimum": 0
+    },
+    "delta_per_min": {
+     "type": "number"
+    },
+    "psi": {
+     "anyOf": [
+      {
+       "type": "number",
+       "minimum": 0
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "decision": {
+     "type": "string"
+    },
+    "threads": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "state": {
+     "type": "string"
+    },
+    "window": {
+     "type": "string"
+    },
+    "cmd": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree": {
+   "type": "object",
+   "required": [
+    "schema",
+    "groups"
+   ],
+   "properties": {
+    "schema": {
+     "const": "taema.tree.v1"
+    },
+    "groups": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree-group"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree-group": {
+   "type": "object",
+   "required": [
+    "scope",
+    "nodes",
+    "edges"
+   ],
+   "properties": {
+    "scope": {
+     "type": "string"
+    },
+    "nodes": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree-node"
+     }
+    },
+    "edges": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree-edge"
+     }
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree-edge": {
+   "type": "object",
+   "required": [
+    "peer",
+    "detail"
+   ],
+   "properties": {
+    "peer": {
+     "type": "string"
+    },
+    "detail": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "tree-node": {
+   "type": "object",
+   "required": [
+    "pid",
+    "depth",
+    "state",
+    "zombies",
+    "parent",
+    "window"
+   ],
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "depth": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "state": {
+     "type": "string"
+    },
+    "zombies": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "parent": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ]
+    },
+    "window": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
+  },
+  "dash-event": {
+   "type": "object",
+   "required": [
+    "seq",
+    "ts",
+    "event",
+    "decision_id",
+    "topics",
+    "data",
+    "scope",
+    "why"
+   ],
+   "properties": {
+    "seq": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "ts": {
+     "type": "number",
+     "minimum": 0
+    },
+    "event": {
+     "type": "string"
+    },
+    "decision_id": {
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "topics": {
+     "type": "array",
+     "items": {
+      "enum": [
+       "status",
+       "scope",
+       "review",
+       "decision",
+       "memory",
+       "guard",
+       "profile"
+      ]
+     }
+    },
+    "data": {
+     "type": "object"
+    },
+    "scope": {
+     "type": "string"
+    },
+    "why": {
+     "type": "string"
+    }
+   },
+   "additionalProperties": false
   }
+ }
 }

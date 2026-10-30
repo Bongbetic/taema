@@ -8,7 +8,19 @@ import os
 import sys
 from types import SimpleNamespace
 
-from .registry import COMMANDS, GLOBAL_OPTIONS
+from .registry import COMMANDS, EXAMPLES, GENERIC_EXAMPLES, GLOBAL_OPTIONS
+
+
+def _examples_for(command):
+    base = (command or "").split(" ")[0]
+    return EXAMPLES.get(command) or EXAMPLES.get(base) or GENERIC_EXAMPLES
+
+
+def _epilog(command):
+    lines = ["Examples:"]
+    for example in _examples_for(command)[:3]:
+        lines.append("  %s" % example)
+    return "\n".join(lines)
 
 
 class UsageError(ValueError):
@@ -57,6 +69,10 @@ def _parser(selected=None, include_all=True):
     from .. import __version__
 
     class Parser(argparse.ArgumentParser):
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("formatter_class", argparse.RawDescriptionHelpFormatter)
+            super().__init__(*args, **kwargs)
+
         def error(self, message):
             raise UsageError(message)
 
@@ -64,6 +80,7 @@ def _parser(selected=None, include_all=True):
         prog="taema",
         description="Dependency-aware cgroup v2 process scopes",
         allow_abbrev=False,
+        epilog="Examples:\n  taema run editor -- code .\n  taema status\n  taema help modes",
     )
     _add_options(parser, GLOBAL_OPTIONS, defaults=True)
     _add_output_options(parser, defaults=True)
@@ -89,6 +106,8 @@ def _parser(selected=None, include_all=True):
             aliases=list(spec["aliases"]),
             help=argparse.SUPPRESS if spec.get("hidden") else spec["help"],
             allow_abbrev=False,
+            epilog=_epilog(spec["name"]),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
         )
         _add_options(command_parser, GLOBAL_OPTIONS, defaults=False)
         command_parser.add_argument("--version", action="version", version=version)
@@ -102,7 +121,11 @@ def _parser(selected=None, include_all=True):
             )
             for child in children:
                 child_parser = child_parsers.add_parser(
-                    child["name"], help=child["help"], allow_abbrev=False
+                    child["name"],
+                    help=child["help"],
+                    allow_abbrev=False,
+                    epilog=_epilog(spec["name"] + " " + child["name"]),
+                    formatter_class=argparse.RawDescriptionHelpFormatter,
                 )
                 _add_options(child_parser, GLOBAL_OPTIONS, defaults=False)
                 if child.get("read"):

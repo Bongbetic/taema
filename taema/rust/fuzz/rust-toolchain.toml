@@ -1,0 +1,3 @@
+# The fuzz targets run under nightly (libFuzzer).
+[toolchain]
+channel = "nightly"

@@ -86,6 +86,11 @@ _SCOPE = {
 }
 
 
+def guard_event_names():
+    """Event names that count as guard activity in reports."""
+    return frozenset(_GUARD)
+
+
 def event_topics(event):
     """Return stable view topics for a stored audit event."""
     name = event.get("event")

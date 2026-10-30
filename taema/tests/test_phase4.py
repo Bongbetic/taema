@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import os
+import sys
 import time
 import types
 import unittest
@@ -654,10 +655,67 @@ class GuiClose(AutoCase):
     def test_adopt_mode_contains_gui_survivors_in_one_pass(self):
         self.d.cfg["mode"] = "adopt"
         self.close_gui()
-        self.d.after_observe()
+        destination = self.cg.base + "/leftover/firefox-200"
+        with mock.patch.object(
+            self.d,
+            "_enable_memory_controllers",
+            wraps=self.d._enable_memory_controllers,
+        ) as enable_memory:
+            self.d.after_observe()
+        enable_memory.assert_called_once_with("leftover/firefox-200", destination)
         dest = self.cg.base + "/leftover/firefox-200"
         with open(dest + "/cgroup.procs") as f:
             self.assertEqual(f.read().split(), ["201"])
+
+    def test_leftover_parent_enables_memory_controller_before_leaf_creation(self):
+        self.d.cfg["mode"] = "adopt"
+        base = self.cg.base
+        leftover_parent = self.cg.leaf("leftover")
+        for path, value in (
+            (base + "/cgroup.controllers", "memory\n"),
+            (base + "/cgroup.subtree_control", "+memory\n"),
+            (base + "/cgroup.procs", ""),
+            (leftover_parent + "/cgroup.controllers", "memory\n"),
+            (leftover_parent + "/cgroup.subtree_control", ""),
+            (leftover_parent + "/cgroup.procs", ""),
+        ):
+            with open(path, "w", encoding="ascii") as target:
+                target.write(value)
+
+        self.close_gui()
+        self.d.after_observe()
+
+        with open(
+            leftover_parent + "/cgroup.subtree_control", encoding="ascii"
+        ) as source:
+            self.assertEqual(source.read(), "+memory\n")
+
+    def test_leftover_parent_respects_memory_disabled(self):
+        self.d.cfg["mode"] = "adopt"
+        self.d.cfg["mem"] = {"enabled": False}
+        base = self.cg.base
+        leftover_parent = self.cg.leaf("leftover")
+        for path, value in (
+            (base + "/cgroup.controllers", "memory\n"),
+            (base + "/cgroup.subtree_control", ""),
+            (base + "/cgroup.procs", ""),
+            (leftover_parent + "/cgroup.controllers", "memory\n"),
+            (leftover_parent + "/cgroup.subtree_control", ""),
+            (leftover_parent + "/cgroup.procs", ""),
+        ):
+            with open(path, "w", encoding="ascii") as target:
+                target.write(value)
+
+        self.close_gui()
+        self.d.after_observe()
+
+        with open(
+            leftover_parent + "/cgroup.subtree_control", encoding="ascii"
+        ) as source:
+            self.assertEqual(source.read(), "")
+        leaf = base + "/leftover/firefox-200"
+        with open(leaf + "/cgroup.procs", encoding="ascii") as source:
+            self.assertEqual(source.read().split(), ["201"])
 
     def test_adopt_stops_an_explicitly_answered_pair_on_gui_close(self):
         self.d.cfg["mode"] = "adopt"
@@ -2359,6 +2417,209 @@ class StatusAndModes(ProcCase):
             self.assertIn(
                 "mode default" if mode != "enforce" else "unit rules", out.getvalue()
             )
+
+    def test_status_avoids_guard_import_when_daemon_reports_guard(self):
+        cfg = make_cfg(tmp(), mode="auto")
+        d = daemon.Daemon(cfg)
+        reply = d.handle({"cmd": "status"})
+        self.assertIn("guard", reply)
+        saved_module = sys.modules.pop("taema.governor.guard", None)
+        saved_global = cli._pressure_guard
+        cli._pressure_guard = cli._LazyModule("_pressure_guard", "taema.governor.guard")
+        try:
+            out = io.StringIO()
+            with (
+                mock.patch.object(cli, "_load_status", return_value=(cfg, d.store)),
+                mock.patch.object(cli, "ask", return_value=reply),
+                redirect_stdout(out),
+            ):
+                rc = cli.cmd_status(argparse.Namespace())
+            self.assertEqual(rc, 0)
+            self.assertNotIn("taema.governor.guard", sys.modules)
+            self.assertIsInstance(cli._pressure_guard, cli._LazyModule)
+        finally:
+            cli._pressure_guard = saved_global
+            if saved_module is not None:
+                sys.modules["taema.governor.guard"] = saved_module
+
+    def _complete_status_reply(self):
+        cfg = make_cfg(tmp(), mode="auto")
+        d = daemon.Daemon(cfg)
+        reply = d.handle({"cmd": "status"})
+        for key in (
+            "mode",
+            "authority",
+            "authority_source",
+            "profile",
+            "profile_reason",
+            "feedback_invalid",
+            "hold",
+            "hold_state",
+            "guard",
+            "config",
+            "mem_enabled",
+        ):
+            self.assertIn(key, reply)
+        return reply
+
+    def _unload_cli_modules(self, *names):
+        saved_modules = {}
+        saved_globals = {}
+        global_names = {
+            "taema.config.policy": "policy",
+            "taema.store.knowledge": "knowledge",
+            "taema.governor.guard": "_pressure_guard",
+        }
+        for name in names:
+            saved_modules[name] = sys.modules.pop(name, None)
+            global_name = global_names[name]
+            saved_globals[name] = getattr(cli, global_name)
+            setattr(cli, global_name, cli._LazyModule(global_name, name))
+        return saved_modules, saved_globals
+
+    def _restore_cli_modules(self, saved_modules, saved_globals):
+        global_names = {
+            "taema.config.policy": "policy",
+            "taema.store.knowledge": "knowledge",
+            "taema.governor.guard": "_pressure_guard",
+        }
+        for name, module in saved_modules.items():
+            setattr(cli, global_names[name], saved_globals[name])
+            if module is not None:
+                sys.modules[name] = module
+            else:
+                sys.modules.pop(name, None)
+
+    def test_status_fast_path_skips_config_load(self):
+        from taema.cli import framework
+
+        reply = self._complete_status_reply()
+        saved = self._unload_cli_modules(
+            "taema.config.policy", "taema.store.knowledge", "taema.governor.guard"
+        )
+        try:
+            out = io.StringIO()
+            with (
+                mock.patch.object(cli, "_ask_paths", return_value=reply),
+                mock.patch.object(cli, "_load_status") as loader,
+                redirect_stdout(out),
+            ):
+                rc = cli.cmd_status(framework._fast_status_args(["status"]))
+            self.assertEqual(rc, 0)
+            loader.assert_not_called()
+            self.assertNotIn("taema.config.policy", sys.modules)
+            self.assertNotIn("taema.store.knowledge", sys.modules)
+            self.assertNotIn("taema.governor.guard", sys.modules)
+            self.assertIn("auto", out.getvalue())
+        finally:
+            self._restore_cli_modules(*saved)
+
+    def test_status_fast_path_falls_back_when_probe_misses(self):
+        from taema.cli import framework
+
+        reply = self._complete_status_reply()
+        cfg = make_cfg(tmp(), mode="auto")
+        out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_ask_paths", return_value=None),
+            mock.patch.object(cli, "_load_status", return_value=(cfg, None)) as loader,
+            mock.patch.object(cli, "ask", return_value=reply),
+            redirect_stdout(out),
+        ):
+            rc = cli.cmd_status(framework._fast_status_args(["status"]))
+        self.assertEqual(rc, 0)
+        loader.assert_called_once()
+        self.assertIn("auto", out.getvalue())
+
+    def test_status_fast_path_skipped_with_overrides(self):
+        from taema.cli import framework
+
+        reply = self._complete_status_reply()
+        cfg = make_cfg(tmp(), mode="auto")
+        for argv in (
+            ["status", "--socket", "/tmp/x.sock"],
+            ["status", "--config", "/tmp/y.toml"],
+        ):
+            out = io.StringIO()
+            with (
+                mock.patch.object(cli, "_ask_paths") as probe,
+                mock.patch.object(cli, "_load_status", return_value=(cfg, None)),
+                mock.patch.object(cli, "ask", return_value=reply),
+                redirect_stdout(out),
+            ):
+                rc = cli.cmd_status(framework._fast_status_args(argv))
+            self.assertEqual(rc, 0)
+            probe.assert_not_called()
+        with mock.patch.dict(os.environ, {"TAEMA_CONFIG": "/tmp/z.toml"}):
+            out = io.StringIO()
+            with (
+                mock.patch.object(cli, "_ask_paths") as probe,
+                mock.patch.object(cli, "_load_status", return_value=(cfg, None)),
+                mock.patch.object(cli, "ask", return_value=reply),
+                redirect_stdout(out),
+            ):
+                rc = cli.cmd_status(framework._fast_status_args(["status"]))
+            self.assertEqual(rc, 0)
+            probe.assert_not_called()
+
+    def test_status_fast_path_falls_back_on_incomplete_reply(self):
+        from taema.cli import framework
+
+        reply = self._complete_status_reply()
+        del reply["guard"]
+        cfg = make_cfg(tmp(), mode="auto")
+        out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_ask_paths", return_value=reply),
+            mock.patch.object(cli, "_load_status", return_value=(cfg, None)) as loader,
+            mock.patch.object(cli, "ask", return_value=reply),
+            redirect_stdout(out),
+        ):
+            rc = cli.cmd_status(framework._fast_status_args(["status"]))
+        self.assertEqual(rc, 0)
+        loader.assert_called_once()
+
+    def test_status_fast_path_matches_slow_path_output(self):
+        import copy
+        from taema.cli import framework
+
+        reply = self._complete_status_reply()
+        cfg = make_cfg(tmp(), mode="auto")
+        fast_out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_ask_paths", return_value=copy.deepcopy(reply)),
+            mock.patch.object(cli, "_load_status") as loader,
+            redirect_stdout(fast_out),
+        ):
+            fast_rc = cli.cmd_status(framework._fast_status_args(["status"]))
+        loader.assert_not_called()
+        slow_out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_ask_paths", return_value=None),
+            mock.patch.object(cli, "_load_status", return_value=(cfg, None)),
+            mock.patch.object(cli, "ask", return_value=copy.deepcopy(reply)),
+            redirect_stdout(slow_out),
+        ):
+            slow_rc = cli.cmd_status(framework._fast_status_args(["status"]))
+        self.assertEqual((fast_rc, fast_out.getvalue()), (slow_rc, slow_out.getvalue()))
+
+    def test_status_fast_path_honors_mem_disabled(self):
+        from taema.cli import framework
+
+        reply = self._complete_status_reply()
+        reply["mem_enabled"] = False
+        out = io.StringIO()
+        with (
+            mock.patch.object(cli, "_ask_paths", return_value=reply),
+            mock.patch.object(
+                cli, "_memory_snapshot", wraps=cli._memory_snapshot
+            ) as snapshot,
+            redirect_stdout(out),
+        ):
+            rc = cli.cmd_status(framework._fast_status_args(["status"]))
+        self.assertEqual(rc, 0)
+        snapshot.assert_called_once()
+        self.assertEqual(snapshot.call_args[0][0], {"mem": {"enabled": False}})
 
     def test_mode_gates(self):
         want = {

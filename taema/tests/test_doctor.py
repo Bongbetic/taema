@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import socket
 import sqlite3
+import stat
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -50,15 +51,20 @@ class DoctorChecks(unittest.TestCase):
         self.write(self.base + "/cgroup.subtree_control", "+cpu +io +memory +pids\n")
         for name, value in (
             ("memory.current", "0\n"),
-            ("memory.stat", "anon 0\nfile 0\ninactive_file 0\nshmem 0\n"),
+            (
+                "memory.stat",
+                "anon 0\nfile 0\ninactive_file 0\nshmem 0\nslab 0\n",
+            ),
             ("memory.peak", "0\n"),
             ("memory.reclaim", ""),
             ("memory.low", "0\n"),
             ("memory.oom.group", "0\n"),
             ("memory.high", "max\n"),
+            ("memory.low", "0\n"),
             ("memory.max", "max\n"),
             ("memory.events", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"),
             ("memory.events.local", "oom 0\noom_kill 0\n"),
+            ("memory.oom.group", "1\n"),
             ("memory.pressure", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
             ("cgroup.freeze", "0\n"),
             ("cpu.idle", "0\n"),
@@ -83,7 +89,7 @@ class DoctorChecks(unittest.TestCase):
             "taema:x:%d:%s\n" % (self.group_gid, self.user),
         )
         helper = self.system_root + policy.HELPER
-        self.write(helper, "#!/bin/sh\nexit 0\n")
+        self.write(helper, "#!/bin/sh\n# oom-record oom-restore\nexit 0\n")
         os.chmod(helper, 0o755)
         self.write(
             self.system_root + "/etc/sudoers.d/taema",
@@ -97,6 +103,7 @@ class DoctorChecks(unittest.TestCase):
         os.makedirs(active_parent)
         os.symlink("../../etc/sv/taema", active_parent + "/taema")
         self.write(self.system_root + "/sys/module/zswap/parameters/enabled", "Y\n")
+        self.write(self.system_root + "/proc/self/oom_score_adj", "0\n")
         self.write(
             self.system_root + "/proc/swaps",
             "Filename\tType\tSize\tUsed\tPriority\n/swapfile\tfile\t1048576\t0\t-2\n",
@@ -122,6 +129,11 @@ class DoctorChecks(unittest.TestCase):
         store = kwargs.pop("store", self.store)
         units = kwargs.pop("units", [])
         group_ids = kwargs.pop("group_ids", [self.group_gid])
+        # A fixed backend: probing the real one makes the all-ok report
+        # depend on the machine having desktop notification tooling.
+        notify = kwargs.pop(
+            "notify", {"backend": "scripted", "capabilities": ["actions", "body"]}
+        )
         return doctor.diagnose(
             self.cfg,
             store,
@@ -129,6 +141,7 @@ class DoctorChecks(unittest.TestCase):
             system_root=self.system_root,
             uid=self.uid,
             group_ids=group_ids,
+            notify=notify,
             **kwargs,
         )
 
@@ -136,7 +149,21 @@ class DoctorChecks(unittest.TestCase):
         return next(item for item in report["checks"] if item["name"] == name)
 
     def test_complete_report_checks_fake_process_tree_and_has_one_line_fixes(self):
-        report = self.report()
+        class WritableTriggerProbe:
+            metrics = ("some", "full")
+
+            def open_triggers(self, _path, _settings):
+                return []
+
+            def close(self):
+                pass
+
+        with mock.patch.object(
+            doctor.pressure_guard,
+            "PsiTriggerMonitor",
+            return_value=WritableTriggerProbe(),
+        ):
+            report = self.report()
         self.assertEqual(report["schema"], "taema.doctor.v1")
         self.assertEqual(report["status"], "ok")
         self.assertTrue(all(item["status"] == "ok" for item in report["checks"]))
@@ -270,22 +297,39 @@ class DoctorChecks(unittest.TestCase):
         self.assertTrue(
             {
                 "memory accounting",
+                "memory.stat breakdown",
                 "memory peak usage",
                 "memory pressure",
+                "guard PSI triggers",
                 "memory reclaim",
                 "memory low reservation",
                 "memory OOM group kill",
                 "memory soft cap",
+                "memory low protection",
                 "memory hard cap",
+                "memory OOM group",
                 "swap accounting",
                 "zswap accounting",
                 "memory OOM events",
+                "memory high events",
+                "memory max events",
+                "OOM score adjustment",
+                "OOM restore helper",
             }
             <= names
         )
         self.assertEqual(self.check(report, "memory peak usage")["status"], "ok")
         self.assertEqual(self.check(report, "memory low reservation")["status"], "ok")
         self.assertEqual(self.check(report, "memory OOM group kill")["status"], "ok")
+        self.assertEqual(self.check(report, "memory.stat breakdown")["status"], "ok")
+        self.assertEqual(self.check(report, "memory high events")["status"], "ok")
+        self.assertEqual(self.check(report, "memory max events")["status"], "ok")
+        self.assertEqual(self.check(report, "memory OOM group")["status"], "ok")
+        self.assertEqual(self.check(report, "OOM score adjustment")["status"], "ok")
+        self.assertEqual(self.check(report, "OOM restore helper")["status"], "ok")
+        psi_triggers = self.check(report, "guard PSI triggers")
+        self.assertEqual(psi_triggers["status"], "warn")
+        self.assertIn("no writable PSI trigger source", psi_triggers["message"])
 
         os.unlink(self.base + "/memory.peak")
         os.unlink(self.base + "/memory.low")
@@ -321,6 +365,24 @@ class DoctorChecks(unittest.TestCase):
         os.unlink(self.base + "/memory.zswap.current")
         report = self.report()
         self.assertIn("swap use", self.check(report, "zswap accounting")["message"])
+    def test_missing_memory_breakdown_low_high_events_and_oom_restore_are_named(self):
+        self.write(self.base + "/memory.stat", "anon 0\nfile 0\n")
+        os.unlink(self.base + "/memory.low")
+        self.write(self.base + "/memory.events", "oom 0\noom_kill 0\n")
+        os.unlink(self.base + "/memory.oom.group")
+        os.unlink(self.system_root + "/proc/self/oom_score_adj")
+        self.write(self.system_root + policy.HELPER, "#!/bin/sh\nexit 0\n")
+        report = self.report()
+        self.assertEqual(self.check(report, "memory.stat breakdown")["status"], "warn")
+        self.assertIn("inactive_file", self.check(report, "memory.stat breakdown")["message"])
+        self.assertEqual(self.check(report, "memory low protection")["status"], "warn")
+        self.assertEqual(self.check(report, "memory high events")["status"], "warn")
+        self.assertEqual(self.check(report, "memory max events")["status"], "warn")
+        self.assertEqual(self.check(report, "memory OOM group")["status"], "warn")
+        self.assertEqual(self.check(report, "OOM score adjustment")["status"], "warn")
+        self.assertEqual(self.check(report, "OOM restore helper")["status"], "warn")
+        self.assertNotEqual(report["status"], "fail")
+
 
     def test_process_oom_score_adjustment_is_read_only_and_validated(self):
         path = self.system_root + "/proc/self/oom_score_adj"
@@ -394,13 +456,51 @@ class DoctorChecks(unittest.TestCase):
             report = self.report()
         for name in (
             "memory accounting",
+            "memory.stat breakdown",
             "memory peak usage",
             "memory pressure",
             "memory OOM group kill",
+            "guard PSI triggers",
+            "memory low protection",
+            "memory OOM group",
+            "memory OOM events",
+            "memory high events",
+            "memory max events",
         ):
             self.assertIn("disabled", self.check(report, name)["message"])
         self.assertIn("enabled", self.check(report, "zswap")["message"])
         self.assertIn("/swapfile", self.check(report, "swap devices")["message"])
+
+    def test_doctor_reports_writable_host_psi_fallback_after_cgroup_denial(self):
+        cgroup_path = self.base + "/memory.pressure"
+        proc_path = self.system_root + "/proc/pressure/memory"
+
+        class FakeMonitor:
+            def __init__(self):
+                self.metrics = ()
+
+            def open_triggers(self, path, _settings):
+                if path == cgroup_path:
+                    return [
+                        "some: PermissionError: cgroup trigger is not writable",
+                        "full: PermissionError: cgroup trigger is not writable",
+                    ]
+                self.metrics = ("some", "full")
+                return []
+
+            def close(self):
+                self.metrics = ()
+
+        with mock.patch.object(
+            doctor.pressure_guard, "PsiTriggerMonitor", FakeMonitor
+        ):
+            check = doctor._guard_psi_trigger_check(
+                self.cfg, self.base, self.system_root
+            )
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("writable PSI trigger source=host-proc", check["message"])
+        self.assertIn(proc_path, check["message"])
+        self.assertIn("delegated trigger unavailable", check["message"])
 
     def test_foreign_process_and_insecure_socket_fail_safely(self):
         with mock.patch.object(doctor.process, "uid_of", return_value=self.uid + 1):
@@ -541,6 +641,294 @@ class DoctorChecks(unittest.TestCase):
             ) as diagnose:
                 self.assertEqual(daemon.handle({"cmd": "doctor"}), expected)
             diagnose.assert_called_once_with(daemon.cfg, daemon.store, daemon.units)
+
+
+class DoctorFix(DoctorChecks):
+    """`taema doctor --fix` repairs what it safely can (issue #75)."""
+
+    def test_fix_flags_registered(self):
+        from taema.cli import registry
+
+        entry = next(item for item in registry.COMMANDS if item["name"] == "doctor")
+        flags = {names[0] for names, _ in entry.get("arguments", ())}
+        self.assertIn("--fix", flags)
+        self.assertIn("--sudo", flags)
+
+    def test_fix_runs_repair_and_reports(self):
+        fixes = [
+            {"name": "state dir", "status": "fixed", "message": "created it"},
+            {
+                "name": "controllers",
+                "status": "needs-root",
+                "message": "cannot write subtree_control",
+                "command": "sudo sh -c 'echo +memory > /sys/fs/cgroup/subtree'",
+            },
+        ]
+        args = SimpleNamespace(
+            json=False, jsonl=False, quiet=False, config=None, fix=True, sudo=False
+        )
+        with (
+            mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
+            mock.patch.object(commands, "ask", return_value=None),
+            mock.patch.object(commands.knowledge, "Store", return_value=self.store),
+            mock.patch.object(commands.policy, "load_units", return_value=[]),
+            mock.patch.object(
+                doctor,
+                "diagnose",
+                return_value={
+                    "schema": "taema.doctor.v1",
+                    "status": "ok",
+                    "checks": [],
+                },
+            ),
+            mock.patch.object(doctor, "repair", return_value=fixes) as repair,
+            mock.patch.object(view, "emit"),
+        ):
+            self.assertEqual(commands.cmd_doctor(args), 1)
+        repair.assert_called_once()
+        self.assertFalse(repair.call_args.kwargs["sudo"])
+
+        with (
+            mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
+            mock.patch.object(commands, "ask", return_value=None),
+            mock.patch.object(commands.knowledge, "Store", return_value=self.store),
+            mock.patch.object(commands.policy, "load_units", return_value=[]),
+            mock.patch.object(
+                doctor,
+                "diagnose",
+                return_value={
+                    "schema": "taema.doctor.v1",
+                    "status": "ok",
+                    "checks": [],
+                },
+            ),
+            mock.patch.object(
+                doctor,
+                "repair",
+                return_value=[
+                    {"name": "state dir", "status": "fixed", "message": "created it"}
+                ],
+            ),
+            mock.patch.object(view, "emit"),
+        ):
+            self.assertEqual(commands.cmd_doctor(args), 0)
+
+    def test_fix_creates_missing_dirs_and_repairs_perms(self):
+        self.cfg["paths"]["state_dir"] = os.path.join(self.temp.name, "new-state")
+        self.cfg["paths"]["hooks_dir"] = os.path.join(self.temp.name, "new-hooks")
+        config_dir = os.path.join(self.temp.name, "new-config")
+        with mock.patch.object(policy, "user_config_dir", return_value=config_dir):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+            again = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["state dir"]["status"], "fixed")
+        self.assertEqual(by_name["hooks dir"]["status"], "fixed")
+        self.assertEqual(by_name["config dir"]["status"], "fixed")
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.cfg["paths"]["state_dir"]).st_mode), 0o700
+        )
+        self.assertTrue(all(item["status"] == "skipped" for item in again))
+
+        os.chmod(self.cfg["paths"]["state_dir"], 0o755)
+        with mock.patch.object(policy, "user_config_dir", return_value=config_dir):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["state dir"]["status"], "fixed")
+        self.assertIn("0700", by_name["state dir"]["message"])
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.cfg["paths"]["state_dir"]).st_mode), 0o700
+        )
+
+    def test_fix_enables_controllers_or_reports_root(self):
+        from taema.core import cgroup as cgroup_mod
+
+        control = cgroup_mod.base(os.getuid()) + "/cgroup.subtree_control"
+        self.write(control, "+cpu +pids\n")
+        fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["controllers"]["status"], "fixed")
+        content = Path(control).read_text()
+        self.assertIn("+io", content)
+        self.assertIn("+memory", content)
+
+        again = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in again}
+        self.assertEqual(by_name["controllers"]["status"], "skipped")
+
+        self.write(control, "+cpu +pids\n")
+        os.chmod(control, 0o444)
+        try:
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        finally:
+            os.chmod(control, 0o644)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["controllers"]["status"], "needs-root")
+        self.assertIn("subtree_control", " ".join(by_name["controllers"]["command"]))
+
+    def test_fix_sudo_runs_root_commands(self):
+        from taema.core import cgroup as cgroup_mod
+
+        control = cgroup_mod.base(os.getuid()) + "/cgroup.subtree_control"
+        self.write(control, "+cpu +pids\n")
+        os.chmod(control, 0o444)
+        calls = []
+        try:
+            fixes = doctor.repair(
+                self.cfg,
+                self.store,
+                system_root=self.system_root,
+                sudo=True,
+                runner=lambda argv: calls.append(argv) or SimpleNamespace(returncode=0),
+            )
+        finally:
+            os.chmod(control, 0o644)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["controllers"]["status"], "fixed")
+        self.assertTrue(calls)
+        self.assertIn("subtree_control", " ".join(calls[0]))
+
+    def test_fix_migrates_legacy_store_and_prunes_stale(self):
+        fresh = os.path.join(self.temp.name, "mig-state")
+        os.makedirs(fresh)
+        with open(os.path.join(fresh, "knowledge.json"), "w", encoding="utf-8") as out:
+            json.dump({"exes": {}}, out)
+        for day in ("20200101", "20200102", "20200103", "20200104", "20200105"):
+            Path(os.path.join(fresh, "state-export-%s.json" % day)).write_text("{}\n")
+        runtime = os.path.join(self.temp.name, "runtime")
+        os.makedirs(os.path.join(runtime, "taema"))
+        hold_marker = os.path.join(runtime, "taema", "HOLD")
+        Path(hold_marker).write_text(json.dumps({"held": False}))
+        cfg = dict(self.cfg)
+        cfg["paths"] = dict(self.cfg["paths"], state_dir=fresh)
+        config_dir = os.path.join(self.temp.name, "mig-config")
+        with (
+            mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}),
+            mock.patch.object(policy, "user_config_dir", return_value=config_dir),
+        ):
+            fixes = doctor.repair(cfg, None, system_root=self.system_root)
+            again = doctor.repair(cfg, None, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["store migration"]["status"], "fixed")
+        self.assertTrue(os.path.isfile(os.path.join(fresh, "state.db")))
+        remaining = sorted(
+            name
+            for name in os.listdir(fresh)
+            if name.startswith("state-export-")
+        )
+        self.assertEqual(
+            remaining,
+            [
+                "state-export-20200103.json",
+                "state-export-20200104.json",
+                "state-export-20200105.json",
+            ],
+        )
+        self.assertFalse(os.path.exists(hold_marker))
+        by_name = {item["name"]: item for item in again}
+        self.assertEqual(by_name["store migration"]["status"], "skipped")
+        self.assertEqual(by_name["stale flags"]["status"], "skipped")
+
+    def test_fix_second_run_changes_nothing(self):
+        config_home = os.path.join(self.temp.name, "idem-xdg")
+        runtime = os.path.join(self.temp.name, "idem-runtime")
+        os.makedirs(runtime)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": config_home, "XDG_RUNTIME_DIR": runtime},
+            ),
+            mock.patch.object(
+                policy, "user_config_dir", return_value=config_home
+            ),
+        ):
+            first = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+            second = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        self.assertTrue(first)
+        self.assertFalse(
+            [item for item in first if item["status"] in ("fail", "needs-root")]
+        )
+        self.assertTrue(
+            all(item["status"] == "skipped" for item in second),
+            [item for item in second if item["status"] != "skipped"],
+        )
+
+    def test_fix_end_to_end_reports_each_repair(self):
+        config_home = os.path.join(self.temp.name, "e2e-xdg")
+        runtime = os.path.join(self.temp.name, "e2e-runtime")
+        os.makedirs(runtime)
+        # Diagnose against the fixture root: group, helper, service, and
+        # cgroup checks read the live machine, which containers may lack.
+        # Repair keeps running against the same fixtures.
+        real_diagnose = doctor.diagnose
+        args = SimpleNamespace(
+            json=False, jsonl=False, quiet=False, config=None, fix=True, sudo=False
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"XDG_CONFIG_HOME": config_home, "XDG_RUNTIME_DIR": runtime},
+            ),
+            mock.patch.object(
+                policy, "user_config_dir", return_value=config_home
+            ),
+            mock.patch.object(commands.policy, "load_config", return_value=self.cfg),
+            mock.patch.object(commands, "ask", return_value=None),
+            mock.patch.object(commands.knowledge, "Store", return_value=self.store),
+            mock.patch.object(commands.policy, "load_units", return_value=[]),
+            mock.patch.object(view, "emit") as emit,
+            mock.patch.object(
+                doctor,
+                "diagnose",
+                side_effect=lambda cfg, store=None, units=None, **kw: real_diagnose(
+                    cfg, store, units, system_root=self.system_root, **kw
+                ),
+            ),
+        ):
+            self.assertEqual(commands.cmd_doctor(args), 0)
+        models = [call.args[0] for call in emit.call_args_list]
+        repair_report = next(
+            item for item in models if item.get("schema") == "taema.doctor.repair.v1"
+        )
+        names = {item["name"] for item in repair_report["fixes"]}
+        self.assertTrue(
+            {
+                "state dir",
+                "config dir",
+                "hooks dir",
+                "controllers",
+                "agent autostart",
+                "store migration",
+                "stale flags",
+            }
+            <= names
+        )
+
+    def test_fix_installs_agent_autostart(self):
+        source = (
+            self.system_root
+            + "/usr/share/examples/taema/autostart/taema-agent.desktop"
+        )
+        body = "[Desktop Entry]\nName=taema session agent\nExec=taema agent\n"
+        self.write(source, body)
+        config_home = os.path.join(self.temp.name, "xdg")
+        dest = os.path.join(config_home, "autostart", "taema-agent.desktop")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home}):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+            again = doctor.repair(
+                self.cfg, self.store, system_root=self.system_root
+            )
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["agent autostart"]["status"], "fixed")
+        self.assertEqual(Path(dest).read_text(), body)
+        by_name = {item["name"]: item for item in again}
+        self.assertEqual(by_name["agent autostart"]["status"], "skipped")
+
+        self.write(dest, "customized by user\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home}):
+            fixes = doctor.repair(self.cfg, self.store, system_root=self.system_root)
+        by_name = {item["name"]: item for item in fixes}
+        self.assertEqual(by_name["agent autostart"]["status"], "skipped")
+        self.assertEqual(Path(dest).read_text(), "customized by user\n")
 
 
 if __name__ == "__main__":

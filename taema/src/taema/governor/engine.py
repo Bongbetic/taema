@@ -139,11 +139,16 @@ def self_guard(path):
 
 
 def unit_for_leaf(units, leaf):
-    """The unit for a top-level leaf: exact name, or '<unit name>-<suffix>' for app units."""
+    """The unit for a top-level leaf: exact name, '<unit name>-<suffix>', or
+    'app-<unit name>' for app units (`taema launch --app NAME` scopes)."""
     for u in units:
         n = u.get("unit", {}).get("name")
-        if n and (
-            leaf == n or (u["unit"].get("kind") == "app" and leaf.startswith(n + "-"))
+        if not n:
+            continue
+        if leaf == n:
+            return u
+        if u["unit"].get("kind") == "app" and (
+            leaf.startswith(n + "-") or leaf == "app-" + n
         ):
             return u
     return None
@@ -665,6 +670,8 @@ def stop(
     leftover=None,
 ):
     """Trace a stop attempt unless its caller already established the decision context."""
+    if policy.is_agent_scope(cgroup.rel(path)):
+        raise Refused("agent leaf is never stopped")
     if not dry_run:
         thaw_managed_scope_before_stop(path, store)
     context = getattr(store, "decision_context", None)
@@ -797,11 +804,26 @@ def _matches(m, pid, env=None):
                 file=sys.stderr,
             )
         return False
-    if "exe" in m and inspect.exe(pid) != m["exe"]:
+    return unit_matches(m, pid)
+
+
+def unit_matches(match, pid, *, exe=None, comm=None, cmdline=None):
+    """Pure [match] evaluation. Overrides stand in for live process reads."""
+    if not isinstance(match, dict) or not any(k in match for k in _MATCH_KEYS):
         return False
-    if "comm" in m and not fnmatch.fnmatchcase(inspect.comm(pid), m["comm"]):
+    if (
+        "exe" in match
+        and (exe if exe is not None else inspect.exe(pid)) != match["exe"]
+    ):
         return False
-    if "cmdline_contains" in m and m["cmdline_contains"] not in inspect.cmdline(pid):
+    if "comm" in match and not fnmatch.fnmatchcase(
+        comm if comm is not None else inspect.comm(pid), match["comm"]
+    ):
+        return False
+    needle = match.get("cmdline_contains")
+    if needle is not None and needle not in (
+        cmdline if cmdline is not None else inspect.cmdline(pid)
+    ):
         return False
     return True
 
@@ -1377,7 +1399,11 @@ def _leftover_verdict(
 
 def remove_empty(path):
     """rmdir an empty leaf tree. False when a process is (or became) present or rmdir fails."""
-    if os.path.basename(path) == "manager" or cgroup.tree_procs(path):
+    if (
+        os.path.basename(path) == "manager"
+        or policy.is_agent_scope(cgroup.rel(path))
+        or cgroup.tree_procs(path)
+    ):
         return False
     try:
         cgroup.rmdir_tree(path)

@@ -11,6 +11,7 @@ import fnmatch
 import math
 import os
 import re
+import time as _time
 import tomllib
 import glob
 
@@ -18,7 +19,17 @@ SYSTEM_CONFIG = os.environ.get("TAEMA_SYSTEM_CONFIG", "/etc/taema/taema.toml")
 SYSTEM_UNITS = "/etc/taema/units"
 USERS_DIR = os.environ.get("TAEMA_USERSDIR", "/run/systemd/users")
 HELPER = "/usr/libexec/taema/taema-attach"
+AGENT_LEAF = "agent"
 MODES = ("observe", "adopt", "enforce", "auto")
+
+
+def is_agent_scope(rel):
+    """True for the protected session-agent leaf and anything below it."""
+    return rel == AGENT_LEAF or (
+        isinstance(rel, str) and rel.startswith(AGENT_LEAF + "/")
+    )
+
+
 LEARN_AUTHORITIES = ("answered", "learned", "aggressive")
 PROTECTED_LISTS = ("comm", "cgroup_prefix")
 
@@ -586,6 +597,480 @@ def _validate_config(cfg, sources):
         raise ValueError(
             "%s:1:1: profile.runtime_mode must be one of %s" % (source, MODES)
         )
+    auto = profiles.get("auto", {})
+    auto_source = sources.get("profile.auto", profile_source)
+    if not isinstance(auto, dict):
+        raise ValueError("%s:1:1: profile.auto must be a table" % auto_source)
+    if "on_battery" in auto:
+        battery = auto["on_battery"]
+        if not isinstance(battery, str) or not isinstance(profiles.get(battery), dict):
+            raise ValueError(
+                "%s:1:1: profile.auto.on_battery must name a profile" % auto_source
+            )
+    running = auto.get("when_running", {})
+    if not isinstance(running, dict) or any(
+        not isinstance(comm, str) or not isinstance(profiles.get(name), dict)
+        for comm, name in running.items()
+    ):
+        raise ValueError(
+            "%s:1:1: profile.auto.when_running must map commands to profiles"
+            % auto_source
+        )
+    windows = auto.get("time", [])
+    if not isinstance(windows, list) or any(
+        not isinstance(window, dict)
+        or not isinstance(profiles.get(window.get("profile")), dict)
+        or _parse_day_time(window.get("start")) is None
+        or _parse_day_time(window.get("end")) is None
+        or (
+            window.get("days") is not None
+            and (
+                not isinstance(window.get("days"), list)
+                or not window["days"]
+                or any(
+                    not isinstance(day, str)
+                    or day.strip().lower()
+                    not in ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+                    for day in window["days"]
+                )
+            )
+        )
+        for window in windows
+    ):
+        raise ValueError(
+            "%s:1:1: profile.auto.time must list profile/start/end windows"
+            % auto_source
+        )
+
+
+def read_power_supply(power_dir):
+    """True when the machine runs on battery. Missing facts mean False."""
+    try:
+        entries = sorted(os.listdir(power_dir))
+    except OSError:
+        return False
+    seen_ac = False
+    for entry in entries:
+        kind_path = os.path.join(power_dir, entry, "type")
+        try:
+            with open(kind_path, encoding="utf-8") as stream:
+                kind = stream.read().strip()
+        except OSError:
+            continue
+        if kind == "Mains":
+            seen_ac = True
+            try:
+                with open(
+                    os.path.join(power_dir, entry, "online"), encoding="utf-8"
+                ) as stream:
+                    if stream.read().strip() == "1":
+                        return False
+            except OSError:
+                continue
+    if seen_ac:
+        return True
+    for entry in entries:
+        status_path = os.path.join(power_dir, entry, "status")
+        try:
+            with open(status_path, encoding="utf-8") as stream:
+                if stream.read().strip() == "Discharging":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _parse_day_time(value):
+    match = re.fullmatch(r"(\d{2}):(\d{2})", str(value or ""))
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _window_matches(window, now):
+    local = _time.localtime(now)
+    days = window.get("days")
+    if days is not None:
+        names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        wanted = {str(day).strip().lower() for day in days if isinstance(day, str)}
+        if names[local.tm_wday] not in wanted:
+            return False
+    start = _parse_day_time(window.get("start"))
+    end = _parse_day_time(window.get("end"))
+    if start is None or end is None:
+        return False
+    current = local.tm_hour * 60 + local.tm_min
+    if start <= end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def select_auto_profile(cfg, *, on_battery, comms, now):
+    """Pick the automatic profile, or None when a manual profile is active.
+
+    Precedence: a running match, then a time window, then battery, then the
+    default profile. Returns (name, reason).
+    """
+    profiles = cfg.get("profile", {})
+    if profiles.get("active", "auto") != "auto":
+        return None
+    auto = profiles.get("auto", {})
+    if not isinstance(auto, dict):
+        auto = {}
+    for comm, name in sorted((auto.get("when_running") or {}).items()):
+        if comm in (comms or set()) and isinstance(profiles.get(name), dict):
+            return name, "process %s is running" % comm
+    for window in auto.get("time") or []:
+        if not isinstance(window, dict):
+            continue
+        name = window.get("profile")
+        if isinstance(profiles.get(name), dict) and _window_matches(window, now):
+            return name, "time window %s-%s" % (window.get("start"), window.get("end"))
+    if on_battery:
+        name = auto.get("on_battery")
+        if isinstance(name, str) and isinstance(profiles.get(name), dict):
+            return name, "running on battery power"
+    if isinstance(profiles.get("default"), dict):
+        return "default", "no automatic rule matched"
+    return None
+
+
+def with_profile(cfg, name, reason):
+    """Return cfg with the named profile overlay applied. The input is unchanged."""
+    overlay = cfg["profile"][name]
+    merged = merge(copy.deepcopy(cfg), copy.deepcopy(overlay))
+    source_map = merged.setdefault("_source_map", {})
+    source_map.update(_flatten_sources(overlay, "profile %s" % name))
+    runtime_mode = merged.get("profile", {}).get("runtime_mode", "")
+    if runtime_mode:
+        merged["mode"] = runtime_mode
+        source_map["mode"] = source_map.get(
+            "profile.runtime_mode", "runtime mode override"
+        )
+    merged["_profile_name"] = name
+    merged["_profile_reason"] = reason
+    merged["_profile_suppress_stops"] = name == "quiet"
+    merged["_source_map"] = source_map
+    return merged
+
+
+_UNIT_TABLES = {
+    "unit": {
+        "name",
+        "kind",
+        "stop_when_unneeded",
+        "group_by_env",
+        "group_by_qmp",
+    },
+    "match": {"exe", "comm", "cmdline_contains", "env_exclude"},
+    "window": {"backend", "requires_window"},
+    "desktop": {"app_id", "on_last_window"},
+    "mem": {"class", "background", "save_state", "pause", "swap_max", "max"},
+    "kill": {"graceful", "keep", "hook", "never_stop", "survive_logout"},
+    "source": {"learned"},
+    "gc": {
+        "keep_while_children",
+        "no_attach_grace",
+        "env_dir_missing",
+        "socket_path",
+        "socket_glob",
+        "socket_env",
+        "quit_process_missing",
+        "qmp_socket",
+    },
+}
+_CHILDREN_KEYS = {"name", "comm", "ancestor_comm", "binds_to", "same_env"}
+
+
+#: Interpreter and shell comms that match far more than one app when used alone.
+_GENERIC_COMMS = frozenset(
+    {
+        "node",
+        "nodejs",
+        "python",
+        "python2",
+        "python3",
+        "java",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "dash",
+        "electron",
+        "ruby",
+        "perl",
+        "php",
+        "deno",
+        "bun",
+    }
+)
+
+
+def validate_unit(unit, peaks=None):
+    """Lint one parsed unit file. Returns a list of error strings.
+
+    peaks optionally maps a unit name to its observed peak memory in
+    bytes, letting the lint flag a [mem] max below what the app has
+    already used.
+    """
+    errors = []
+    if not isinstance(unit, dict):
+        return ["unit must be a table"]
+    for table in sorted(unit):
+        if table in ("_file", "children"):
+            continue
+        if table not in _UNIT_TABLES:
+            errors.append("unknown table [%s]" % table)
+    for table, allowed in _UNIT_TABLES.items():
+        section = unit.get(table)
+        if section is None:
+            continue
+        if not isinstance(section, dict):
+            errors.append("[%s] must be a table" % table)
+            continue
+        for key in sorted(section):
+            if key not in allowed:
+                errors.append("unknown key [%s] %s" % (table, key))
+    source = unit.get("source", {})
+    if not isinstance(source, dict):
+        errors.append("[source] must be a table")
+    elif "learned" in source and not isinstance(source["learned"], bool):
+        errors.append("[source] learned must be true or false")
+    head = unit.get("unit")
+    if not isinstance(head, dict):
+        errors.append("[unit] table is required")
+        return errors
+    name = head.get("name")
+    if not isinstance(name, str) or not name:
+        errors.append("[unit] name must be a non-empty string")
+    kind = head.get("kind")
+    if kind not in ("app", "scope"):
+        errors.append('[unit] kind must be "app" or "scope"')
+    for key in ("stop_when_unneeded", "group_by_qmp"):
+        if key in head and not isinstance(head[key], bool):
+            errors.append("[unit] %s must be true or false" % key)
+    if "group_by_env" in head and not isinstance(head["group_by_env"], str):
+        errors.append("[unit] group_by_env must be a string")
+    match = unit.get("match", {})
+    if kind == "app" and not any(
+        key in match for key in ("exe", "comm", "cmdline_contains")
+    ):
+        errors.append("[match] needs one of exe, comm, cmdline_contains")
+    for key in ("exe", "comm", "cmdline_contains"):
+        if key in match and not isinstance(match[key], str):
+            errors.append("[match] %s must be a string" % key)
+    if "env_exclude" in match and not isinstance(match["env_exclude"], dict):
+        errors.append("[match] env_exclude must be a table")
+    if set(match) == {"comm"} and isinstance(match.get("comm"), str):
+        comm = match["comm"].strip("*?[]").lower()
+        if comm in _GENERIC_COMMS:
+            errors.append(
+                "[match] over-broad: comm %r alone matches every %s process; "
+                "add exe or cmdline_contains" % (match["comm"], comm)
+            )
+    window = unit.get("window", {})
+    if "backend" in window and (
+        not isinstance(window["backend"], str) or not window["backend"]
+    ):
+        errors.append("[window] backend must be a non-empty string")
+    if "requires_window" in window and not isinstance(window["requires_window"], bool):
+        errors.append("[window] requires_window must be true or false")
+    desk = unit.get("desktop", {})
+    if not isinstance(desk, dict):
+        errors.append("[desktop] must be a table")
+        desk = {}
+    if "app_id" in desk and not isinstance(desk["app_id"], str):
+        errors.append("[desktop] app_id must be a string")
+    if "on_last_window" in desk and desk["on_last_window"] not in (
+        "ask",
+        "quit",
+        "keep",
+    ):
+        errors.append("[desktop] on_last_window must be ask, quit, or keep")
+    kill = unit.get("kill", {})
+    graceful = kill.get("graceful")
+    if graceful is not None and (
+        not isinstance(graceful, (int, float))
+        or isinstance(graceful, bool)
+        or graceful < 0
+    ):
+        errors.append("[kill] graceful must be a non-negative number of seconds")
+    if "keep" in kill and (
+        not isinstance(kill["keep"], list)
+        or any(not isinstance(item, str) for item in kill["keep"])
+    ):
+        errors.append("[kill] keep must be a list of strings")
+    if "hook" in kill and not isinstance(kill["hook"], str):
+        errors.append("[kill] hook must be a string")
+    hook = kill.get("hook")
+    if isinstance(hook, str) and "/" in hook:
+        hook_path = os.path.expanduser(hook)
+        if not (os.path.isfile(hook_path) and os.access(hook_path, os.X_OK)):
+            errors.append("[kill] hook %s is not executable" % hook)
+    for key in ("never_stop", "survive_logout"):
+        if key in kill and not isinstance(kill[key], bool):
+            errors.append("[kill] %s must be true or false" % key)
+    if kill.get("never_stop") is True and head.get("stop_when_unneeded") is True:
+        errors.append(
+            "[kill] never_stop contradicts [unit] stop_when_unneeded; "
+            "the unit can never be stopped"
+        )
+    if (
+        kill.get("survive_logout") is True
+        and head.get("stop_when_unneeded") is not True
+    ):
+        errors.append(
+            "[kill] survive_logout without stop_when_unneeded never stops; "
+            "set [unit] stop_when_unneeded"
+        )
+    mem = unit.get("mem", {})
+    if "background" in mem and not isinstance(mem["background"], bool):
+        errors.append("[mem] background must be true or false")
+    if "class" in mem and (not isinstance(mem["class"], str) or not mem["class"]):
+        errors.append("[mem] class must be a non-empty string")
+    if "swap_max" in mem and (
+        not isinstance(mem["swap_max"], int)
+        or isinstance(mem["swap_max"], bool)
+        or mem["swap_max"] < 0
+    ):
+        errors.append("[mem] swap_max must be a non-negative integer")
+    if "max" in mem and (
+        not isinstance(mem["max"], int)
+        or isinstance(mem["max"], bool)
+        or mem["max"] < 0
+    ):
+        errors.append("[mem] max must be a non-negative integer")
+    if peaks and isinstance(mem.get("max"), int) and not isinstance(mem["max"], bool):
+        peak = peaks.get(name)
+        if isinstance(peak, (int, float)) and mem["max"] < peak:
+            errors.append(
+                "[mem] max %d is below the observed peak %d for %s"
+                % (mem["max"], int(peak), name)
+            )
+    for key in ("save_state", "pause"):
+        if key in mem and not isinstance(mem[key], str):
+            errors.append("[mem] %s must be a string" % key)
+    gc = unit.get("gc", {})
+    grace = gc.get("no_attach_grace")
+    if grace is not None and (
+        not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace < 0
+    ):
+        errors.append("[gc] no_attach_grace must be a non-negative number of seconds")
+    for key in ("keep_while_children", "quit_process_missing", "qmp_socket"):
+        if key in gc and not isinstance(gc[key], bool):
+            errors.append("[gc] %s must be true or false" % key)
+    for key in ("env_dir_missing", "socket_path", "socket_glob", "socket_env"):
+        if key in gc and not isinstance(gc[key], str):
+            errors.append("[gc] %s must be a string" % key)
+    children = unit.get("children", [])
+    if not isinstance(children, list) or any(
+        not isinstance(child, dict) for child in children
+    ):
+        errors.append("[[children]] must be a list of tables")
+    else:
+        for child in children:
+            for key in sorted(child):
+                if key not in _CHILDREN_KEYS:
+                    errors.append("unknown key [[children]] %s" % key)
+            if not isinstance(child.get("name"), str) or not child.get("name"):
+                errors.append("[[children]] name must be a non-empty string")
+            if "comm" not in child and "ancestor_comm" not in child:
+                errors.append("[[children]] needs comm or ancestor_comm")
+    return errors
+
+
+def draft_unit(
+    name, *, comm, exe, cmdline, cgroup, children=(), peak_bytes=None, app_id=None
+):
+    """Generate a unit file body from one running process's identity.
+
+    children lists observed child comms, peak_bytes the scope's observed
+    memory peak, and app_id the window app id when known; each becomes a
+    suggestion in the drafted sections.
+    """
+    import json as _json
+
+    lines = [
+        "# Drafted from pid identity; adjust [match] before installing.",
+        "# cmdline: %s" % " ".join(str(cmdline).split()),
+        "# cgroup: %s" % cgroup,
+        "[unit]",
+        "name = %s" % _json.dumps(name),
+        'kind = "app"',
+        "",
+        "[match]",
+    ]
+    if comm:
+        lines.append("comm = %s" % _json.dumps(comm))
+    if exe and os.path.isabs(exe):
+        lines.append("exe = %s" % _json.dumps(exe))
+    backend = "niri" if os.environ.get("NIRI_SOCKET") else "auto"
+    lines.extend(
+        [
+            "",
+            "[window]",
+            "backend = %s" % _json.dumps(backend),
+            "requires_window = true",
+        ]
+    )
+    if app_id:
+        lines.append("# window app id: %s" % app_id)
+    kids = sorted({str(kid) for kid in children if kid})
+    if kids:
+        lines.append("")
+        for kid in kids:
+            lines.extend(
+                [
+                    "[[children]]",
+                    "name = %s" % _json.dumps(kid),
+                    "comm = %s" % _json.dumps(kid),
+                    "",
+                ]
+            )
+    else:
+        lines.extend(
+            [
+                "",
+                "# [[children]]",
+                '# name = "helper"',
+                '# comm = "helper"',
+            ]
+        )
+    lines.extend(
+        ["", "[gc]", "keep_while_children = %s" % ("true" if kids else "false")]
+    )
+    lines.extend(["", "[mem]", 'class = "app"'])
+    if peak_bytes:
+        lines.append("# observed peak %d bytes; set max above it" % int(peak_bytes))
+        lines.append("max = %d" % int(peak_bytes * 1.25))
+    lines.extend(
+        [
+            "",
+            "# [qos] is profile-level; set the app's profile for QoS classes.",
+            "",
+            "[kill]",
+            "graceful = 10",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def read_unit_file(path):
+    """Parse one unit file. Returns (unit, error)."""
+    try:
+        with open(path, "rb") as stream:
+            unit = tomllib.load(stream)
+    except FileNotFoundError:
+        return None, "no such unit file: %s" % path
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        return None, "could not parse %s: %s" % (path, error)
+    if not isinstance(unit, dict):
+        return None, "could not parse %s: not a table" % path
+    return unit, None
 
 
 def effective_authority(cfg):
@@ -621,23 +1106,19 @@ def _load_files(files, required=()):
     _validate_config(cfg, source_map)
     active_profile = cfg["profile"].get("active", "auto")
     if active_profile != "auto":
-        overlay = cfg["profile"][active_profile]
-        cfg = merge(copy.deepcopy(cfg), copy.deepcopy(overlay))
-        source_map.update(_flatten_sources(overlay, "profile %s" % active_profile))
-    runtime_mode = cfg.get("profile", {}).get("runtime_mode", "")
-    if runtime_mode:
-        cfg["mode"] = runtime_mode
-        source_map["mode"] = source_map.get(
-            "profile.runtime_mode", "runtime mode override"
-        )
-    cfg["_profile_name"] = active_profile
-    cfg["_profile_reason"] = (
-        "automatic profile selection"
-        if active_profile == "auto"
-        else "manual profile selection"
-    )
-    cfg["_profile_suppress_stops"] = active_profile == "quiet"
-    cfg["_source_map"] = source_map
+        cfg = with_profile(cfg, active_profile, "manual profile selection")
+        source_map = cfg["_source_map"]
+    else:
+        runtime_mode = cfg.get("profile", {}).get("runtime_mode", "")
+        if runtime_mode:
+            cfg["mode"] = runtime_mode
+            source_map["mode"] = source_map.get(
+                "profile.runtime_mode", "runtime mode override"
+            )
+        cfg["_profile_name"] = active_profile
+        cfg["_profile_reason"] = "automatic profile selection"
+        cfg["_profile_suppress_stops"] = False
+        cfg["_source_map"] = source_map
     _validate_config(cfg, source_map)
     p = cfg["paths"]
     p.setdefault("session_cgroup", "auto")
@@ -646,6 +1127,7 @@ def _load_files(files, required=()):
     p.setdefault("socket_fallback", os.path.join(expand(p["state_dir"]), "taema.sock"))
     p.setdefault("helper", HELPER)
     p.setdefault("hooks_dir", os.path.join(user_config_dir(), "hooks"))
+    p.setdefault("power_supply", "/sys/class/power_supply")
     source_map = cfg["_source_map"]
     for key in (
         "session_cgroup",
@@ -654,6 +1136,7 @@ def _load_files(files, required=()):
         "socket_fallback",
         "helper",
         "hooks_dir",
+        "power_supply",
     ):
         source_map.setdefault("paths." + key, "built-in defaults")
     return cfg
@@ -715,14 +1198,36 @@ def file_fingerprint(paths):
     return tuple(result)
 
 
+def _mask_name(filename):
+    if filename.endswith(".toml.disabled"):
+        return filename[: -len(".disabled")]
+    return None
+
+
+def masked_units(cfg):
+    """Unit filenames disabled by a tombstone in the same or a later directory."""
+    masks = {}
+    for index, directory in enumerate(units_dirs(cfg)):
+        if not os.path.isdir(directory):
+            continue
+        for filename in sorted(os.listdir(directory)):
+            masked = _mask_name(filename)
+            if masked is not None:
+                masks.setdefault(masked, index)
+    return masks
+
+
 def load_units(cfg):
     by_name = {}
     errors = []
-    for d in units_dirs(cfg):
+    masks = masked_units(cfg)
+    for index, d in enumerate(units_dirs(cfg)):
         if not os.path.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
             if fn.endswith(".toml"):
+                if fn in masks and masks[fn] >= index:
+                    continue
                 path = os.path.join(d, fn)
                 try:
                     with open(path, "rb") as f:
@@ -746,6 +1251,123 @@ def load_units(cfg):
                 by_name[fn] = u
     cfg["_unit_errors"] = errors
     return [by_name[k] for k in sorted(by_name)]
+
+
+def pack_dirs():
+    """Candidate directories holding curated unit packs, installed first."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        "/usr/share/examples/taema/packs",
+        os.path.join(here, "..", "..", "..", "examples", "packs"),
+    ]
+
+
+def pack_source(name):
+    """The pack file for NAME, or None when no curated pack has that name."""
+    if not isinstance(name, str) or not name or "/" in name or name.startswith("."):
+        return None
+    filename = name + ".toml"
+    for directory in pack_dirs():
+        candidate = os.path.join(directory, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def available_packs():
+    """Sorted names of the curated unit packs."""
+    for directory in pack_dirs():
+        if os.path.isdir(directory):
+            return sorted(
+                path[: -len(".toml")]
+                for path in os.listdir(directory)
+                if path.endswith(".toml")
+            )
+    return []
+
+
+def install_pack_file(source, units_dir, name, force=False):
+    """Lint a pack and copy it into a units directory.
+
+    Returns (ok, message, target). Refuses to overwrite unless forced.
+    """
+    unit, error = read_unit_file(source)
+    if error is not None:
+        return False, error, ""
+    problems = validate_unit(unit)
+    if problems:
+        return False, "; ".join(problems), ""
+    os.makedirs(units_dir, exist_ok=True)
+    target = os.path.join(units_dir, name + ".toml")
+    if os.path.exists(target) and not force:
+        return False, "unit file exists: %s (use --force to overwrite)" % target, target
+    with open(source, "rb") as origin, open(target, "wb") as destination:
+        destination.write(origin.read())
+    os.chmod(target, 0o600)
+    return True, target, target
+
+
+def _unit_dir_source(path):
+    system = os.path.abspath(SYSTEM_UNITS)
+    user = os.path.abspath(os.path.join(user_config_dir(), "units"))
+    absolute = os.path.abspath(path)
+    if absolute == system or absolute.startswith(system + os.sep):
+        return "system"
+    if absolute == user or absolute.startswith(user + os.sep):
+        return "user"
+    return "custom"
+
+
+def describe_units(cfg):
+    """One entry per unit for `unit list`: name, source, active, file.
+
+    Source is system, user, or learned (a user file the learner wrote,
+    marked with `[source] learned = true`). Masked units still appear,
+    with active False.
+    """
+    loaded = {unit.get("unit", {}).get("name"): unit for unit in load_units(cfg)}
+    entries = {}
+    for name, unit in loaded.items():
+        if not name:
+            continue
+        source = "learned" if unit.get("source", {}).get("learned") is True else None
+        if source is None:
+            source = _unit_dir_source(unit.get("_file", ""))
+        entries[name] = {
+            "name": name,
+            "source": source,
+            "active": True,
+            "file": unit.get("_file", ""),
+        }
+    for filename in sorted(masked_units(cfg)):
+        name = os.path.basename(filename)[: -len(".toml")]
+        for directory in units_dirs(cfg):
+            candidate = os.path.join(directory, filename)
+            if os.path.isfile(candidate):
+                break
+        else:
+            candidate = ""
+        if name in entries and entries[name]["active"]:
+            continue
+        if name not in entries:
+            source = "learned"
+            if candidate:
+                unit, error = read_unit_file(candidate)
+                if error is None:
+                    name = unit.get("unit", {}).get("name", name)
+                    if unit.get("source", {}).get("learned") is not True:
+                        source = _unit_dir_source(candidate)
+                else:
+                    source = _unit_dir_source(candidate)
+            entries[name] = {
+                "name": name,
+                "source": source,
+                "active": False,
+                "file": candidate,
+            }
+        else:
+            entries[name]["active"] = False
+    return [entries[key] for key in sorted(entries)]
 
 
 def unit_for_scope(units, leaf_name):
@@ -825,6 +1447,9 @@ def protected_reason(pid, cfg, pp=None):
         return "protected comm %s" % c
     cg = cgroup.proc_cgroup(pid) or ""
     full = cgroup.CG + cg
+    leaf = cgroup.base() + "/" + AGENT_LEAF
+    if full == leaf or full.startswith(leaf + "/"):
+        return "agent leaf"
     for pre in prot.get("cgroup_prefix", []):
         if full == pre or full.startswith(pre.rstrip("/") + "/"):
             return "protected cgroup %s" % pre

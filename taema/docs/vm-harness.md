@@ -105,6 +105,11 @@ Built-in scenarios:
   is contained in an `app-*` scope → wait for the matching `adopt` audit event
   → close the root → assert both survivors are members of the same
   `leftover/*` scope → capture daemon logs.
+- **eventd** — the 0.8.0 forwarder gate (issue #74): with the stock
+  config the forwarder stays off and the daemon stays healthy; with
+  `TAEMA_EVENTD=1` and `[experimental] eventd = true` a 0.3 s probe lands in
+  the instance ledger with a sub-second born-to-exit span, on a per-uid
+  `0600` socket. Service and user config are restored afterwards.
 - **m0** — exercise GUI survivor containment and review in `adopt`, manual-stop
   vetoes, `taema run --bind` owner exit, runtime-directory GC in `auto`, and
   observe-mode no-mutation plus deduplicated would-stop audit records. It waits
@@ -129,6 +134,28 @@ Built-in scenarios:
   earlyoom floor. Verify a leftover has `oom_score_adj=500`, record earlyoom's selected
   process when it fires, then measure daemon RSS, CPU, sampling, and pressure triggers for
   610 seconds. The two-libc run therefore takes at least 20 minutes plus guest setup.
+  earlyoom is installed only inside the disposable guest.
+- **graphical** — start a disposable headless graphical session (private
+  dbus-daemon, `weston --backend=headless` as the outer root, niri nested
+  inside it) under a test-owned `XDG_RUNTIME_DIR`, run a scripted
+  `org.freedesktop.Notifications` server (`tools/vm/notify_server.py`) that
+  records notifications and closes them or invokes actions on cue, open and
+  close test windows and move focus through `niri msg`, read the window
+  list back, and capture the headless output with `grim`, verifying the PNG
+  decodes with the stdlib-only `read_png` (no new dependencies). The
+  capture lands in the artifacts directory as `graphical.png`;
+  `image_diff_fraction` compares two captures.
+- **m5** — the 0.7.0 desktop and session gate (issue #67) inside the
+  graphical session with the session agent up: default batching and grace
+  delays verified first with batching and grace at stock values, then with
+  fast test delays a last-window close with a surviving child reviews
+  within 3 seconds and Stop applies it, `on_last_window = quit` stops past
+  the grace while a reopen inside the grace cancels the stop, a wrapped
+  desktop entry launches in its scope with `launched_by=launch` and the
+  desktop id in `why`, killing the agent degrades to process-only mode and
+  a restart re-registers within 30 seconds, a scripted storm of 50 closes
+  stays within `max_per_hour` with a widget-feed screenshot, and the
+  `taema-agent(1)` page plus the niri autostart snippet are installed.
 
 ## Artifacts
 
@@ -172,6 +199,23 @@ Populate the root image cache with the explicit network option when needed.
 M3's pressure probe runs only inside QEMU and confines its memory hogs, cgroups, and temporary
 configuration to the disposable guest. It needs a low-memory guest and at least 610 seconds
 per libc to complete the idle-footprint gate.
+
+## M5 release acceptance
+
+Run the m5 scenario on both libcs before the 0.7.0 tag:
+
+```sh
+make -C taema vm-test VMFLAGS="--allow-network --scenarios m5"
+```
+
+It starts the disposable graphical session (weston headless plus nested
+niri under a test-owned `XDG_RUNTIME_DIR`), writes a fast test drop-in
+(`batch_seconds = 0`, `windowless_grace = 3`, fast adopt, `launch_wrap`
+enabled) only after proving the stock 60-second batching delay and the
+30-second grace hold, then checks every M5 criterion from issue #67 with
+the session agent up. The drop-in and the `m5quit` unit are removed and
+the daemon restarted during teardown. Captures land next to the
+per-scenario results as `m5.png` and `m5-notify.jsonl`.
 
 ## CI
 

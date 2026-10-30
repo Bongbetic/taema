@@ -13,6 +13,50 @@ _COMMANDS = {
     "subscribe": ({"topics": "array", "since_seq": "integer"}, ("topics", "since_seq")),
     "register": ({"scope": "string", "owner": "integer"}, ("scope", "owner")),
     "attach": ({"scope": "string", "pids": "array"}, ("scope", "pids")),
+    "register_agent": (
+        {
+            "session": "string",
+            "pid": "integer",
+            "capabilities": "array",
+            "compositor": "string",
+        },
+        ("session", "pid"),
+    ),
+    "agent_beat": (
+        {"session": "string", "pid": "integer", "facts": "object"},
+        ("session", "pid"),
+    ),
+    "notify_poll": (
+        {"session": "string", "pid": "integer", "since_seq": "integer"},
+        ("session", "pid"),
+    ),
+    "notify_result": (
+        {
+            "session": "string",
+            "pid": "integer",
+            "kind": "string",
+            "nonce": "string",
+            "choice": "string",
+            "decision_id": "integer",
+        },
+        ("session", "pid", "kind"),
+    ),
+    "window_event": (
+        {
+            "session": "string",
+            "pid": "integer",
+            "kind": "string",
+            "window_id": "integer",
+            "app_id": "string",
+            "window_pid": "integer",
+            "focus": "boolean",
+            "title": "string",
+            "windows": "array",
+            "time": "integer",
+            "backend": "string",
+        },
+        ("session", "pid", "kind"),
+    ),
     "job_done": (
         {
             "shell_pid": "integer",
@@ -36,6 +80,21 @@ _COMMANDS = {
     "freeze": ({"scope": "string"}, ("scope",)),
     "thaw": ({"scope": "string", "all": "boolean"}, ()),
     "feedback": ({}, ()),
+    "launch_prepare": (
+        {
+            "app": "string",
+            "pid": "integer",
+            "session": "string",
+            "unit": "string",
+            "owner": "integer",
+        },
+        ("app", "pid"),
+    ),
+    "launch_claim": (
+        {"scope": "string", "pid": "integer", "app": "string"},
+        ("scope", "pid", "app"),
+    ),
+    "launch_release": ({"scope": "string"}, ("scope",)),
 }
 
 
@@ -84,6 +143,8 @@ def _is_type(value, kind):
         return isinstance(value, int) and not isinstance(value, bool)
     if kind == "array":
         return isinstance(value, list)
+    if kind == "object":
+        return isinstance(value, dict)
     if kind == "boolean":
         return isinstance(value, bool)
     if kind == "string":
@@ -177,6 +238,12 @@ def _validate_feedback(args):
         "until",
         "reason",
         "expires",
+        "mode",
+        "document",
+        "scope",
+        "staging",
+        "unit",
+        "pids",
     }
     if "v" not in args:
         if set(args) != legacy_fields:
@@ -221,6 +288,10 @@ def _validate_feedback(args):
             "mute": common | {"app", "muted"},
             "hold": common | {"scope", "held", "reason"},
             "snooze": common | {"until", "reason"},
+            "import_learning": common | {"mode", "document"},
+            "reset_scope": common | {"scope"},
+            "restore_backup": common | {"staging"},
+            "unit_test": common | {"unit", "pids"},
         }
     )
     if op not in operation_fields:
@@ -249,6 +320,31 @@ def _validate_feedback(args):
             _fail("feedback key must be a non-empty string")
     if op == "forget" and "all" in args and not _is_type(args["all"], "boolean"):
         _fail("forget all must be a boolean")
+    if op == "import_learning":
+        if args.get("mode") not in ("merge", "replace"):
+            _fail("import mode must be merge or replace")
+        if not isinstance(args.get("document"), dict):
+            _fail("import document must be an object")
+    if op == "reset_scope":
+        if args.get("scope") not in ("learning", "vetoes", "history", "all"):
+            _fail("reset scope must be learning, vetoes, history, or all")
+    if op == "restore_backup":
+        staging = args.get("staging")
+        if not _is_type(staging, "string") or not staging or len(staging) > 4096:
+            _fail("restore staging must be a path string")
+    if op == "unit_test":
+        if not isinstance(args.get("unit"), dict):
+            _fail("unit test needs a unit object")
+        pids = args.get("pids")
+        if (
+            not isinstance(pids, list)
+            or len(pids) > 4096
+            or any(
+                not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                for pid in pids
+            )
+        ):
+            _fail("unit test pids must be a list of at most 4096 positive pids")
     if op in ("answer", "teach"):
         owner, leftovers, choice = (
             args.get("owner"),
@@ -364,6 +460,40 @@ def _validate_args(command, args):
         pid = args.get("owner") if command == "register" else args.get("shell_pid")
         if pid is not None and pid <= 1:
             _fail("process id must be greater than one")
+    if command in (
+        "register_agent",
+        "agent_beat",
+        "notify_poll",
+        "notify_result",
+        "window_event",
+    ):
+        if not args["session"] or len(args["session"]) > 64:
+            _fail("agent session is empty or too long")
+        if args["pid"] <= 1:
+            _fail("process id must be greater than one")
+    if command == "register_agent":
+        capabilities = args.get("capabilities", [])
+        if len(capabilities) > 16 or any(
+            not _is_type(cap, "string") or not cap or len(cap) > 32
+            for cap in capabilities
+        ):
+            _fail("agent capabilities must be up to 16 short names")
+        if len(args.get("compositor", "")) > 256:
+            _fail("agent compositor path is too long")
+    if command == "agent_beat" and "facts" in args:
+        import json as _json
+
+        if len(_json.dumps(args["facts"], sort_keys=True, default=str)) > 8192:
+            _fail("agent facts are too large")
+    if command == "window_event":
+        if args["kind"] not in ("snapshot", "opened", "changed", "closed", "focus"):
+            _fail("window event kind is unknown")
+        if "window_id" in args and args["window_id"] < 0:
+            _fail("window id must be non-negative")
+        if "window_pid" in args and args["window_pid"] <= 1:
+            _fail("process id must be greater than one")
+        if "windows" in args and len(args["windows"]) > 512:
+            _fail("window snapshot holds at most 512 windows")
     if command == "attach":
         if not 0 < len(args["pids"]) <= 64 or any(
             not _is_type(pid, "integer") or pid <= 1 for pid in args["pids"]

@@ -1,10 +1,13 @@
 """Read-only checks that explain whether tæma can run safely on this machine."""
 
+import json
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import subprocess
+import time
 from urllib.parse import quote
 
 from .config import policy
@@ -28,6 +31,7 @@ _PATH_KEYS = {
     "helper",
     "hooks_dir",
     "units_dir",
+    "power_supply",
 }
 _TIMER_KEYS = {
     "adopt_interval",
@@ -64,6 +68,94 @@ def fallback_config():
 
 def _check(name, status, message, fix="No action required."):
     return {"name": name, "status": status, "message": str(message), "fix": str(fix)}
+
+
+def _agent_check(agents):
+    """Session-agent liveness from the daemon's live report."""
+    if not agents:
+        return _check(
+            "session agent",
+            "warn",
+            "no session agent is registered; desktop facts are unavailable",
+            "Start taema agent from the graphical session autostart.",
+        )
+    down = sorted(
+        session for session, info in agents.items() if info.get("state") != "up"
+    )
+    if down:
+        return _check(
+            "session agent",
+            "warn",
+            "session agent down for %s; the daemon decides on process data only"
+            % ", ".join(down),
+            "Restart taema agent in the affected session.",
+        )
+    return _check(
+        "session agent",
+        "ok",
+        "session agent up for %s" % ", ".join(sorted(agents)),
+    )
+
+
+def _notify_check(cfg, notify):
+    """Active notification backend and the server's capabilities."""
+    if notify is None:
+        from . import notify as notify_mod
+
+        try:
+            configured = (cfg.get("notify") or {}).get("backend", "auto")
+            backend = notify_mod.select_backend(configured)
+            notify = {
+                "backend": backend.name,
+                "capabilities": backend.server_capabilities(),
+            }
+        except Exception:
+            notify = {"backend": "unknown", "capabilities": []}
+    backend = notify.get("backend", "unknown")
+    if backend in ("null", "unknown"):
+        return _check(
+            "notifications",
+            "warn",
+            "no notification backend is available; reviews wait for the shell",
+            "Install libnotify (notify-send) for desktop notifications.",
+        )
+    caps = ", ".join(notify.get("capabilities", ())) or "capabilities unknown"
+    return _check(
+        "notifications",
+        "ok",
+        "backend %s; server capabilities: %s" % (backend, caps),
+    )
+
+
+def _desktop_check(cfg):
+    """Wrapped launcher entries, and whether their sources drifted behind them."""
+    from . import desktop as desktop_mod
+
+    try:
+        items = desktop_mod.list_wraps()
+    except Exception:
+        return _check(
+            "desktop entries",
+            "warn",
+            "wrapped launcher entries could not be listed",
+            "Check %s for overrides taema cannot read." % desktop_mod.user_dir(),
+        )
+    drifted = [item for item in items if item["drifted"]]
+    if drifted:
+        names = ", ".join(sorted(os.path.basename(item["file"]) for item in drifted))
+        return _check(
+            "desktop entries",
+            "warn",
+            "package update changed the source behind: %s" % names,
+            "Run taema desktop wrap NAME.desktop again to rewrap.",
+        )
+    if not items:
+        return _check("desktop entries", "ok", "no wrapped launcher entries")
+    return _check(
+        "desktop entries",
+        "ok",
+        "%d wrapped launcher entries match their sources" % len(items),
+    )
 
 
 def _rooted(root, path):
@@ -130,7 +222,7 @@ def _unknown_config(cfg):
                         unknown.extend(
                             path + "." + item
                             for item in child
-                            if item not in {"on_battery", "when_running"}
+                            if item not in {"on_battery", "when_running", "time"}
                         )
                         if "when_running" in child and not isinstance(
                             child["when_running"], dict
@@ -545,6 +637,84 @@ def _memory_oom_group_check(base, controllers):
     )
 
 
+def _guard_psi_trigger_check(cfg, base, system_root):
+    """Probe writable guard triggers in delegated cgroup and host PSI, in that order."""
+    guard_cfg = cfg.get("guard", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(guard_cfg, dict):
+        guard_cfg = {}
+    settings = {
+        "some": guard_cfg.get(
+            "psi_some", policy._DEFAULTS["guard"]["psi_some"]
+        ),
+        "full": guard_cfg.get(
+            "psi_full", policy._DEFAULTS["guard"]["psi_full"]
+        ),
+    }
+    sources = pressure_guard.psi_trigger_sources(
+        os.path.join(base, "memory.pressure"),
+        proc_root=_rooted(system_root, "/proc"),
+    )
+    attempts = []
+    for source, path in sources:
+        monitor = pressure_guard.PsiTriggerMonitor()
+        try:
+            failures = monitor.open_triggers(path, settings)
+            metrics = tuple(monitor.metrics)
+        except Exception as error:  # diagnostics should keep reporting other features
+            failures = ["%s: %s" % (type(error).__name__, error)]
+            metrics = ()
+        finally:
+            try:
+                monitor.close()
+            except OSError:
+                pass
+        attempts.append(
+            {
+                "source": source,
+                "path": path,
+                "metrics": list(metrics),
+                "failures": list(failures),
+            }
+        )
+        if metrics:
+            required = set(settings)
+            writable = required.issubset(metrics)
+            failed_sources = attempts[:-1]
+            message = (
+                "writable PSI trigger source=%s path=%s metrics=%s"
+                % (source, path, ",".join(metrics))
+            )
+            if failed_sources:
+                message += "; delegated trigger unavailable, using host PSI fallback"
+            if failures:
+                message += "; unavailable metrics: %s" % ", ".join(failures)
+            return _check(
+                "guard PSI triggers",
+                "ok" if writable else "warn",
+                message,
+                "No action required; host-wide PSI is a labeled fallback."
+                if source == "host-proc"
+                else "A writable trigger is active for each configured PSI metric."
+                if writable
+                else "The daemon will monitor only metrics with writable PSI triggers.",
+            )
+    summary = "; ".join(
+        "%s %s: %s"
+        % (
+            attempt["source"],
+            attempt["path"],
+            ", ".join(attempt["failures"]) or "no configured metric is writable",
+        )
+        for attempt in attempts
+    )
+    return _check(
+        "guard PSI triggers",
+        "warn",
+        "no writable PSI trigger source: %s" % summary,
+        "Guard floor sampling remains available; enable writable PSI triggers for earlier pressure actions.",
+    )
+
+
 def _kernel_checks(base, controllers, system_root, cfg=None):
     proc_swaps_path = _rooted(system_root, "/proc/swaps")
     proc_swaps = _read(proc_swaps_path)
@@ -609,16 +779,22 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
     checks.append(_process_oom_score_check(system_root))
     memory_features = {
         "memory accounting": "memory.current and memory.stat",
+        "memory.stat breakdown": "memory.stat anon, file, inactive_file, shmem, and slab fields",
         "memory peak usage": "memory.peak",
         "memory pressure": "memory.pressure or /proc/pressure/memory",
+        "guard PSI triggers": "writable memory PSI trigger on cgroup or host source",
         "memory reclaim": "memory.reclaim or memory.high fallback",
         "memory low reservation": "memory.low",
         "memory OOM group kill": "memory.oom.group",
         "memory soft cap": "memory.high",
+        "memory low protection": "memory.low",
         "memory hard cap": "memory.max",
+        "memory OOM group": "memory.oom.group",
         "swap accounting": "memory.swap.current and memory.swap.max",
         "zswap accounting": "memory.zswap.current",
         "memory OOM events": "memory.events or memory.events.local",
+        "memory high events": "memory.events high counter",
+        "memory max events": "memory.events max counter",
     }
     if not memory.enabled(cfg):
         checks.extend(
@@ -661,6 +837,30 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 )
             )
 
+        stat_path = os.path.join(base, "memory.stat")
+        stat_text = _read(stat_path)
+        stat_fields = {
+            fields[0]
+            for line in (stat_text or "").splitlines()
+            if len(fields := line.split()) >= 2
+        }
+        required_stat = {"anon", "file", "inactive_file", "shmem", "slab"}
+        missing_stat = sorted(required_stat - stat_fields)
+        checks.append(
+            _check(
+                "memory.stat breakdown",
+                "ok",
+                "memory.stat reports anon, file, inactive_file, shmem, and slab",
+            )
+            if not missing_stat
+            else _check(
+                "memory.stat breakdown",
+                "warn",
+                "memory.stat is missing fields: %s" % ", ".join(missing_stat),
+                "Kernel memory.stat fields vary; missing breakdowns remain unknown.",
+            )
+        )
+
         peak_path = os.path.join(base, "memory.peak")
         checks.append(
             _check("memory peak usage", "ok", "memory.peak is available")
@@ -689,6 +889,7 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 else "Enable PSI in the kernel to report pressure.",
             )
         )
+        checks.append(_guard_psi_trigger_check(cfg, base, system_root))
 
         reclaim_path = os.path.join(base, "memory.reclaim")
         high_path = os.path.join(base, "memory.high")
@@ -712,6 +913,22 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 ("memory low reservation", "memory.low"),
                 ("memory soft cap", "memory.high"),
                 ("memory hard cap", "memory.max"),
+            )
+        )
+        checks.append(
+            _feature_check(
+                "memory low protection",
+                os.path.join(base, "memory.low"),
+                controllers,
+                "memory",
+            )
+        )
+        checks.append(
+            _feature_check(
+                "memory OOM group",
+                os.path.join(base, "memory.oom.group"),
+                controllers,
+                "memory",
             )
         )
         checks.append(
@@ -742,21 +959,56 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "Cgroup swap accounting remains the fallback for compressed swap.",
             )
         )
+        event_fields = set()
+        for filename in ("memory.events.local", "memory.events"):
+            event_text = _read(os.path.join(base, filename))
+            if event_text is None:
+                continue
+            event_fields.update(
+                fields[0]
+                for line in event_text.splitlines()
+                if len(fields := line.split()) >= 2
+            )
         checks.append(
             _check(
                 "memory OOM events",
                 "ok",
-                "memory.events or memory.events.local is available",
+                "memory.events reports oom and oom_kill counters",
             )
-            if any(
-                os.path.isfile(os.path.join(base, filename))
-                for filename in ("memory.events.local", "memory.events")
-            )
+            if {"oom", "oom_kill"} <= event_fields
             else _check(
                 "memory OOM events",
                 "warn",
-                "cgroup OOM event files are unsupported; process exits remain observable",
-                "No action required; event counters are optional.",
+                "memory.events oom or oom_kill counters are unavailable",
+                "No action required; process exits remain observable.",
+            )
+        )
+        checks.append(
+            _check(
+                "memory high events",
+                "ok",
+                "memory.events reports the high counter",
+            )
+            if "high" in event_fields
+            else _check(
+                "memory high events",
+                "warn",
+                "memory.events high counter is unavailable",
+                "Kernel high-event accounting is optional; pressure reporting remains available.",
+            )
+        )
+        checks.append(
+            _check(
+                "memory max events",
+                "ok",
+                "memory.events reports the max counter",
+            )
+            if "max" in event_fields
+            else _check(
+                "memory max events",
+                "warn",
+                "memory.events max counter is unavailable",
+                "Kernel limit-event accounting is optional; process exits remain observable.",
             )
         )
         checks.append(_memory_oom_group_check(base, controllers))
@@ -779,6 +1031,55 @@ def _kernel_checks(base, controllers, system_root, cfg=None):
                 "io.weight", os.path.join(base, "io.weight"), controllers, "io"
             ),
         ]
+    )
+    oom_score_path = _rooted(system_root, "/proc/self/oom_score_adj")
+    oom_score = _read(oom_score_path)
+    try:
+        score_value = int((oom_score or "").strip())
+        score_supported = -1000 <= score_value <= 1000
+    except ValueError:
+        score_supported = False
+    checks.append(
+        _check(
+            "OOM score adjustment",
+            "ok",
+            "the current process exposes a readable oom_score_adj value",
+        )
+        if score_supported
+        else _check(
+            "OOM score adjustment",
+            "warn",
+            "/proc/self/oom_score_adj is unavailable or unreadable",
+            "OOM priority adjustment is skipped when the procfs control is unavailable.",
+        )
+    )
+
+    paths = cfg.get("paths", {})
+    helper_value = paths.get("helper", policy.HELPER) if isinstance(paths, dict) else None
+    helper_path = (
+        _rooted(system_root, policy.expand(helper_value))
+        if isinstance(helper_value, str)
+        else None
+    )
+    helper_text = _read(helper_path) if helper_path else None
+    helper_has_restore = (
+        helper_text is not None
+        and "oom-restore" in helper_text
+        and "oom-record" in helper_text
+    )
+    checks.append(
+        _check(
+            "OOM restore helper",
+            "ok",
+            "taema-attach provides oom-record and oom-restore operations",
+        )
+        if helper_has_restore
+        else _check(
+            "OOM restore helper",
+            "warn",
+            "taema-attach oom-record or oom-restore is unavailable",
+            "Reinstall the taema helper to record and restore managed OOM adjustments.",
+        )
     )
     zswap_paths = (
         "/sys/module/zswap/parameters/enabled",
@@ -1160,6 +1461,8 @@ def diagnose(
     system_root="/",
     uid=None,
     group_ids=None,
+    agents=None,
+    notify=None,
 ):
     """Build a stable, read-only diagnostic result shared by the CLI and daemon."""
     uid = os.getuid() if uid is None else uid
@@ -1247,6 +1550,10 @@ def diagnose(
             "taema 0.3.0 adopts eligible apps and reviews unknown leftovers before stopping them",
         )
     )
+    if agents is not None:
+        checks.append(_agent_check(agents))
+    checks.append(_notify_check(cfg, notify))
+    checks.append(_desktop_check(cfg))
     statuses = {item["status"] for item in checks}
     overall = "fail" if "fail" in statuses else "warn" if "warn" in statuses else "ok"
     return {"schema": "taema.doctor.v1", "status": overall, "checks": checks}
@@ -1260,4 +1567,394 @@ def render(report):
             "[%s] %s: %s — fix: %s"
             % (item["status"], item["name"], item["message"], item["fix"])
         )
+    return "\n".join(lines) + "\n"
+
+
+def _repair_dirs(cfg, fixes):
+    """Create missing state/config/hooks directories and enforce their modes."""
+    paths = cfg.get("paths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+    targets = []
+    state_dir = paths.get("state_dir")
+    if isinstance(state_dir, str) and state_dir:
+        targets.append((policy.expand(state_dir), 0o700, "state dir"))
+    config_dir = policy.user_config_dir()
+    targets.append((config_dir, 0o700, "config dir"))
+    hooks_dir = paths.get("hooks_dir")
+    if isinstance(hooks_dir, str) and hooks_dir:
+        targets.append((policy.expand(hooks_dir), 0o755, "hooks dir"))
+    for path, mode, name in targets:
+        try:
+            if not os.path.isdir(path):
+                os.makedirs(path, mode=mode, exist_ok=True)
+                os.chmod(path, mode)
+                fixes.append(
+                    {"name": name, "status": "fixed", "message": "created %s" % path}
+                )
+            elif stat.S_IMODE(os.stat(path).st_mode) != mode:
+                os.chmod(path, mode)
+                fixes.append(
+                    {
+                        "name": name,
+                        "status": "fixed",
+                        "message": "set mode %04o on %s" % (mode, path),
+                    }
+                )
+            else:
+                fixes.append(
+                    {
+                        "name": name,
+                        "status": "skipped",
+                        "message": "%s already present with mode %04o" % (path, mode),
+                    }
+                )
+        except OSError as error:
+            fixes.append(
+                {"name": name, "status": "fail", "message": str(error)}
+            )
+
+
+_DESIRED_CONTROLLERS = ("cpu", "io", "memory", "pids")
+
+
+def _legacy_marker_present(dbpath):
+    try:
+        uri = "file:%s?mode=ro" % quote(os.path.abspath(dbpath))
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            row = connection.execute(
+                "SELECT value FROM meta WHERE key = 'migration.legacy_import'"
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is not None
+    except (OSError, sqlite3.Error, TypeError, IndexError):
+        return False
+
+
+def _schema_version(dbpath):
+    try:
+        uri = "file:%s?mode=ro" % quote(os.path.abspath(dbpath))
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            row = connection.execute("PRAGMA user_version").fetchone()
+        finally:
+            connection.close()
+        return row[0] if row else None
+    except (OSError, sqlite3.Error, TypeError, IndexError):
+        return None
+
+
+def _repair_store(cfg, fixes):
+    from .store import db as db_mod
+    from .store import knowledge as knowledge_mod
+
+    paths = cfg.get("paths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+    state_dir_value = paths.get("state_dir")
+    if not isinstance(state_dir_value, str) or not state_dir_value:
+        fixes.append(
+            {
+                "name": "store migration",
+                "status": "skipped",
+                "message": "no state dir configured; nothing to migrate",
+            }
+        )
+        return None
+    state_dir = policy.expand(state_dir_value)
+    legacy = os.path.join(state_dir, "knowledge.json")
+    dbpath = os.path.join(state_dir, "state.db")
+    if _legacy_marker_present(dbpath):
+        fixes.append(
+            {
+                "name": "store migration",
+                "status": "skipped",
+                "message": "legacy store already imported",
+            }
+        )
+        return state_dir
+    version = _schema_version(dbpath) if os.path.isfile(dbpath) else None
+    if (
+        not os.path.isfile(legacy)
+        and version is not None
+        and version >= db_mod.SCHEMA_VERSION
+    ):
+        fixes.append(
+            {
+                "name": "store migration",
+                "status": "skipped",
+                "message": "store schema is current; nothing to migrate",
+            }
+        )
+        return state_dir
+    try:
+        knowledge_mod.Store(state_dir, cfg.get("seeds") or {})
+    except Exception as error:
+        fixes.append(
+            {"name": "store migration", "status": "fail", "message": str(error)}
+        )
+        return None
+    fixes.append(
+        {
+            "name": "store migration",
+            "status": "fixed",
+            "message": "opened the store so pending migrations apply",
+        }
+    )
+    return state_dir
+
+
+def _runtime_hold_marker():
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(runtime, "taema", "HOLD")
+
+
+def _repair_stale_flags(state_dir, store, fixes):
+    removed = []
+    failed = []
+    if state_dir is not None:
+        try:
+            exports = sorted(
+                name
+                for name in os.listdir(state_dir)
+                if name.startswith("state-export-") and name.endswith(".json")
+            )
+        except OSError:
+            exports = []
+        for name in exports[:-3]:
+            path = os.path.join(state_dir, name)
+            try:
+                os.unlink(path)
+                removed.append(name)
+            except OSError as error:
+                failed.append("%s: %s" % (name, error))
+    marker = _runtime_hold_marker()
+    marker_handled = False
+    try:
+        with open(marker, encoding="utf-8") as stream:
+            marker_value = stream.read()
+    except FileNotFoundError:
+        marker_value = None
+    except OSError:
+        marker_value = "unreadable"
+    if marker_value is None:
+        pass
+    elif marker_value == "unreadable":
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "skipped",
+                "message": "hold marker is unreadable; left in place",
+            }
+        )
+        marker_handled = True
+    else:
+        try:
+            claimed = json.loads(marker_value) if marker_value else {}
+        except ValueError:
+            claimed = {}
+        active_claim = claimed.get("held") is True if isinstance(claimed, dict) else True
+        if isinstance(claimed, dict):
+            snooze = claimed.get("snooze_until")
+            if (
+                isinstance(snooze, (int, float))
+                and not isinstance(snooze, bool)
+                and snooze > time.time()
+            ):
+                active_claim = True
+        hold_active = False
+        if active_claim:
+            if store is not None:
+                try:
+                    hold_active = bool(store.hold_reason())
+                except Exception:
+                    hold_active = True
+            else:
+                hold_active = True
+        if hold_active:
+            fixes.append(
+                {
+                    "name": "stale flags",
+                    "status": "skipped",
+                    "message": "hold marker reflects an active hold; left in place",
+                }
+            )
+            marker_handled = True
+        else:
+            try:
+                os.unlink(marker)
+                removed.append("hold marker")
+            except OSError as error:
+                failed.append("hold marker: %s" % error)
+    if failed:
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "fail",
+                "message": "; ".join(failed),
+            }
+        )
+    elif removed:
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "fixed",
+                "message": "removed %s" % ", ".join(sorted(removed)),
+            }
+        )
+    elif not marker_handled:
+        fixes.append(
+            {
+                "name": "stale flags",
+                "status": "skipped",
+                "message": "no stale exports or hold markers",
+            }
+        )
+
+
+def _repair_autostart(fixes, system_root):
+    from . import desktop as desktop_mod
+
+    config_home = policy.xdg("XDG_CONFIG_HOME", "~/.config")
+    status, message = desktop_mod.ensure_agent_autostart(
+        system_root=system_root, config_home=config_home
+    )
+    if status == "skipped" and message == "packaged autostart snippet not found":
+        message = "packaged autostart snippet not found; install the taema package"
+    fixes.append({"name": "agent autostart", "status": status, "message": message})
+
+
+def _default_runner(argv):
+    return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+
+
+def _repair_controllers(uid, fixes, sudo, runner):
+    from .core import cgroup as cgroup_mod
+
+    resolved = os.getuid() if uid is None else uid
+    control = os.path.join(cgroup_mod.base(resolved), "cgroup.subtree_control")
+    try:
+        with open(control, encoding="utf-8") as stream:
+            enabled = {
+                token.lstrip("+") for token in stream.read().split() if token
+            }
+    except OSError:
+        fixes.append(
+            {
+                "name": "controllers",
+                "status": "skipped",
+                "message": "user subtree has no subtree_control; start the service first",
+            }
+        )
+        return
+    missing = [name for name in _DESIRED_CONTROLLERS if name not in enabled]
+    if not missing:
+        fixes.append(
+            {
+                "name": "controllers",
+                "status": "skipped",
+                "message": "delegated controllers already include %s"
+                % " ".join(_DESIRED_CONTROLLERS),
+            }
+        )
+        return
+    fragment = " ".join("+" + name for name in missing)
+    command = ["sudo", "sh", "-c", "echo '%s' > %s" % (fragment, control)]
+    try:
+        with open(control, "w", encoding="utf-8") as stream:
+            stream.write(
+                " ".join(
+                    "+" + name
+                    for name in sorted(enabled | set(missing), key=str.lower)
+                )
+                + "\n"
+            )
+    except OSError:
+        if sudo:
+            run = runner or _default_runner
+            try:
+                result = run(command)
+            except (OSError, subprocess.SubprocessError) as error:
+                fixes.append(
+                    {"name": "controllers", "status": "fail", "message": str(error)}
+                )
+                return
+            if getattr(result, "returncode", 1) == 0:
+                fixes.append(
+                    {
+                        "name": "controllers",
+                        "status": "fixed",
+                        "message": "enabled %s via %s"
+                        % (" ".join(missing), shlex.join(command)),
+                    }
+                )
+            else:
+                fixes.append(
+                    {
+                        "name": "controllers",
+                        "status": "fail",
+                        "message": "root command exited %s"
+                        % getattr(result, "returncode", "?"),
+                        "command": command,
+                    }
+                )
+        else:
+            fixes.append(
+                {
+                    "name": "controllers",
+                    "status": "needs-root",
+                    "message": "subtree_control is not writable; enable %s"
+                    % " ".join(missing),
+                    "command": command,
+                }
+            )
+        return
+    fixes.append(
+        {
+            "name": "controllers",
+            "status": "fixed",
+            "message": "enabled %s on the delegated subtree" % " ".join(missing),
+        }
+    )
+
+
+def repair(cfg, store=None, *, system_root="/", uid=None, sudo=False, runner=None):
+    """Apply the safe subset of doctor fixes and report each one.
+
+    Read-only checks stay untouched: this only creates missing directories,
+    repairs ownership-safe permissions, enables delegated controllers where
+    writable, installs the session-agent autostart entry, opens the store so
+    pending migrations apply, and prunes stale state exports and hold
+    markers. Anything needing root is reported with its command and runs
+    only when ``sudo`` is true. Every entry is ``{"name", "status",
+    "message"[, "command"]}`` with status one of ``fixed``, ``skipped``,
+    ``needs-root``, or ``fail``. Running repair twice changes nothing the
+    second time.
+    """
+    fixes = []
+    _repair_dirs(cfg, fixes)
+    _repair_controllers(uid, fixes, sudo, runner)
+    _repair_autostart(fixes, system_root)
+    state_dir = _repair_store(cfg, fixes)
+    _repair_stale_flags(state_dir, store, fixes)
+    return fixes
+
+
+def render_repair(fixes):
+    """Render one line per applied or pending fix."""
+    lines = ["doctor --fix: %d action(s)" % len(fixes)]
+    for item in fixes:
+        line = "[%s] %s: %s" % (
+            item["status"],
+            item["name"],
+            item["message"],
+        )
+        if item["status"] == "needs-root" and item.get("command"):
+            command = item["command"]
+            if not isinstance(command, str):
+                command = shlex.join(command)
+            line += " — run: %s" % command
+        lines.append(line)
     return "\n".join(lines) + "\n"

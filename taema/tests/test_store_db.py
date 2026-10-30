@@ -68,6 +68,23 @@ class StoreDatabaseTests(unittest.TestCase):
             reopened.data["frozen_scopes"]["leftover/browser"]["source"], "auto"
         )
 
+    def test_launch_apps_metadata_roundtrips(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(temporary, {})
+            launch_apps = store.data.setdefault("launch_apps", {})
+            launch_apps["app-m5wrap"] = {
+                "app": "m5wrap",
+                "unit": None,
+                "launched_by": "launch",
+            }
+            store.save()
+            reopened = Store(temporary, {}, read_only=True)
+
+        self.assertEqual(
+            reopened.data["launch_apps"]["app-m5wrap"]["launched_by"],
+            "launch",
+        )
+
     def test_managed_freeze_listener_metadata_roundtrips(self):
         listeners = [{"transport": "tcp", "inode": 12345}]
         with tempfile.TemporaryDirectory() as temporary:
@@ -767,6 +784,10 @@ class StoreDatabaseTests(unittest.TestCase):
                 "daily_export",
             )
             self.assertTrue(status_daemon.store.export_daily_if_due())
+            # the store changed outside the daemon command stream; move the
+            # generation the way any state-changing command would so the
+            # cached status reply is rebuilt (the 1s TTL would also refresh)
+            status_daemon._state_gen += 1
             self.assertIsNone(status_daemon.handle({"cmd": "status"})["recovery"])
 
     def test_missing_daily_export_recovers_from_legacy_backup(self):

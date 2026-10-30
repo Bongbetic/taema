@@ -24,6 +24,36 @@ nobody:x:65534:65534::/:/bin/bash
 """
 
 
+class VendoredCargoTest(unittest.TestCase):
+    def test_offline_build_resolves_vendored_crates_from_package_root(self):
+        # The Makefile and release build invoke cargo from the package root
+        # with --manifest-path; with an empty CARGO_HOME that only resolves
+        # when the vendored-sources config is discoverable from there.
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust build")
+        cargo = shutil.which("cargo")
+        if cargo is None:
+            raise unittest.SkipTest("cargo not available")
+        with tempfile.TemporaryDirectory() as home:
+            env = dict(os.environ, CARGO_HOME=home)
+            built = subprocess.run(
+                [
+                    cargo,
+                    "build",
+                    "--locked",
+                    "--offline",
+                    "--manifest-path",
+                    os.path.join(ROOT, "rust", "Cargo.toml"),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=600,
+            )
+        self.assertEqual(built.returncode, 0, built.stderr)
+
+
 class SyntaxTest(unittest.TestCase):
     def test_sh_n(self):
         for rel in (
@@ -31,9 +61,12 @@ class SyntaxTest(unittest.TestCase):
             "srcpkgs/taema/REMOVE",
             "sv/taema/run",
             "sv/taema/finish",
+            "libexec/taema-attach",
             "libexec/taemad-user",
             "bin/taemad",
+            "bin/taema-eventd",
             "tools/build-xbps.sh",
+            "tools/vendor-dist.sh",
         ):
             with self.subTest(script=rel):
                 r = subprocess.run(
@@ -54,8 +87,176 @@ class SyntaxTest(unittest.TestCase):
         self.assertIn('TAEMA_HOLD="${TAEMA_HOLD:-0}"', user_run)
 
 
+class TemplateLayoutTest(unittest.TestCase):
+    def read_template(self):
+        with open(os.path.join(ROOT, "srcpkgs", "taema", "template")) as f:
+            fields = {}
+            for raw in f:
+                if raw[:1] in (" ", "\t"):
+                    continue
+                line = raw.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    fields[key] = value.strip('"')
+            return fields
+
+    def test_native_package_targets_x86_64_glibc_and_musl(self):
+        fields = self.read_template()
+        self.assertEqual(fields["archs"], "x86_64*")
+        self.assertIn("cargo", fields["hostmakedepends"].split())
+        self.assertIn("scdoc", fields["hostmakedepends"].split())
+        self.assertEqual(
+            fields["depends"],
+            "python3>=3.11 iproute2 util-linux sudo runit shadow tzdata",
+        )
+
+    def test_vendor_distfile_is_listed_with_its_checksum(self):
+        fields = self.read_template()
+        distfiles = fields["distfiles"].split()
+        checksums = fields["checksum"].split()
+        self.assertEqual(len(distfiles), 2)
+        self.assertEqual(len(checksums), 2)
+        self.assertTrue(distfiles[0].endswith(".tar.gz"))
+        self.assertIn("taema-vendor-", distfiles[1])
+        self.assertTrue(all(len(s) == 64 for s in checksums))
+
+    def test_template_vendor_checksum_matches_the_script(self):
+        fields = self.read_template()
+        with tempfile.TemporaryDirectory() as out:
+            r = subprocess.run(
+                ["sh", os.path.join(ROOT, "tools", "vendor-dist.sh"), out],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            recorded = r.stdout.split()
+            self.assertEqual(len(recorded), 2)
+        self.assertEqual(fields["checksum"].split()[1], recorded[0])
+
+
+class VendorDistTest(unittest.TestCase):
+    def test_distfile_is_deterministic_with_repo_prefix(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as first:
+            with tempfile.TemporaryDirectory() as second:
+                sums = []
+                for out in (first, second):
+                    r = subprocess.run(
+                        ["sh", os.path.join(ROOT, "tools", "vendor-dist.sh"), out],
+                        capture_output=True,
+                        text=True,
+                        cwd=ROOT,
+                    )
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    sums.append(r.stdout.split()[0])
+                    names = os.listdir(out)
+                    self.assertEqual(len(names), 1)
+                    self.assertTrue(names[0].startswith("taema-vendor-"))
+                self.assertEqual(sums[0], sums[1])
+                path = os.path.join(first, names[0])
+                with tarfile.open(path) as tar:
+                    members = tar.getnames()
+                self.assertTrue(
+                    all(n.startswith("taema/rust/vendor/") for n in members),
+                    members[:3],
+                )
+                self.assertIn("taema/rust/vendor/libc/Cargo.toml", members)
+
+
+class ArchDetectTest(unittest.TestCase):
+    def detect(self, uname_out, ldd_out, env=None):
+        script = os.path.join(ROOT, "tools", "build-xbps.sh")
+        with open(script) as f:
+            body = f.read()
+        start = body.index("default_arch() {")
+        end = body.index("}", body.index("printf", start)) + 1
+        func = body[start:end]
+        probe = (
+            "uname() { printf '%s'; };\n"
+            "ldd() { printf '%s'; };\n"
+            "%s\narch=${XBPS_ARCH:-$(default_arch)}; printf '%%s' \"$arch\""
+            % (uname_out, ldd_out, func)
+        )
+        if env is None:
+            # Scrub ambient overrides: the probe tests detection, not inheritance.
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key != "XBPS_ARCH"
+            }
+        r = subprocess.run(
+            ["sh", "-c", probe], capture_output=True, text=True, env=env
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip()
+
+    def test_musl_host_gets_musl_arch(self):
+        self.assertEqual(
+            self.detect("x86_64", "musl libc (x86_64)"), "x86_64-musl"
+        )
+
+    def test_glibc_host_keeps_uname_arch(self):
+        self.assertEqual(
+            self.detect("x86_64", "ldd (GNU libc) 2.40"), "x86_64"
+        )
+
+    def test_explicit_arch_wins_over_detection(self):
+        env = dict(os.environ, XBPS_ARCH="x86_64-musl")
+        self.assertEqual(
+            self.detect("aarch64", "ldd (GNU libc) 2.40", env), "x86_64-musl"
+        )
+
+
+class FuzzExclusionTest(unittest.TestCase):
+    def test_fuzz_crate_stays_out_of_the_locked_workspace(self):
+        with open(os.path.join(ROOT, "rust", "Cargo.toml"), encoding="utf-8") as f:
+            workspace = f.read()
+        self.assertRegex(workspace, r'exclude\s*=\s*\[[^\]]*"fuzz"')
+
+    def test_install_ships_no_fuzz_sources(self):
+        r = subprocess.run(
+            ["make", "-n", "install"],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("fuzz", r.stdout)
+
+
+class MakefileNativeTest(unittest.TestCase):
+    def dry_run(self, *args):
+        r = subprocess.run(
+            ["make", "-n", *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_release_build_is_offline(self):
+        out = self.dry_run("rust-helper-release", "XBPS_ARCH=")
+        self.assertIn("cargo build --locked --offline --release", out)
+        self.assertNotIn("--target", out)
+
+    def test_musl_arch_selects_the_static_target(self):
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust build")
+        out = self.dry_run("rust-helper-release", "XBPS_ARCH=x86_64-musl")
+        self.assertIn("--target x86_64-unknown-linux-musl", out)
+        install = self.dry_run("install", "XBPS_ARCH=x86_64-musl", "DESTDIR=/tmp/nope")
+        self.assertIn(
+            "rust/target/x86_64-unknown-linux-musl/release/taema-fast", install
+        )
+
+
 class InstalledDocumentationTest(unittest.TestCase):
     def test_install_publishes_learning_manual_and_state_docs(self):
+        if os.environ.get("WITHOUT_RUST"):
+            raise unittest.SkipTest("WITHOUT_RUST=1 skips the rust install")
         with tempfile.TemporaryDirectory() as staged:
             result = subprocess.run(
                 ["make", "DESTDIR=" + staged, "install"],
@@ -67,10 +268,13 @@ class InstalledDocumentationTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             for path in (
                 "usr/share/man/man7/taema-learning.7",
+                "usr/share/man/man1/taema.1",
+                "usr/share/man/man5/taema.toml.5",
                 "usr/share/doc/taema/state-schema.md",
                 "usr/share/doc/taema/legacy-state-migration.md",
                 "usr/bin/taemad",
                 "usr/libexec/taema/taemad-user",
+                "usr/libexec/taema/taema-fast",
             ):
                 with self.subTest(path=path):
                     self.assertTrue(os.path.isfile(os.path.join(staged, path)), path)
@@ -151,6 +355,23 @@ class ServiceDelegationTest(unittest.TestCase):
         self.assertIn("-m taema.daemon_entrypoint", daemon_wrapper)
         self.assertNotIn("PYTHONMALLOC=malloc", daemon_wrapper)
         self.assertIn("bin/taemad", makefile)
+
+    def test_user_service_primes_agent_leaf_before_privilege_drop(self):
+        with open(
+            os.path.join(ROOT, "libexec/taemad-user"), encoding="utf-8"
+        ) as source:
+            user_run = source.read()
+        manager_prime = user_run.index('"$cg/manager/cgroup.procs"')
+        agent_prime = user_run.index('"$cg/agent/cgroup.procs"')
+        privilege_drop = user_run.index("exec setpriv")
+        self.assertLess(manager_prime, agent_prime)
+        self.assertLess(agent_prime, privilege_drop)
+        agent_block = user_run[manager_prime:privilege_drop]
+        self.assertIn('mkdir -p "$cg/agent"', agent_block)
+        self.assertIn(
+            'chown "$uid:$gid" "$cg/agent" "$cg/agent/cgroup.procs"',
+            agent_block,
+        )
 
     def test_root_service_primes_readable_bytecode_before_privilege_drop(self):
         with open(os.path.join(ROOT, "bin/taemad"), encoding="utf-8") as source:

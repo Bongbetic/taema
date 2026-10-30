@@ -846,6 +846,90 @@ class DaemonReclaimTests(unittest.TestCase):
         reclaim.assert_called_once()
         self.assertEqual(results[0]["status"], "reclaimed")
 
+    def test_page_cache_becomes_eligible_before_freeze_sample_completes(self):
+        self.daemon.cfg["mem"].update(
+            reclaim_cooldown=0,
+            idle_reclaim_grace=0,
+            pressure_gate=100,
+        )
+        self.daemon.cfg["freeze"] = {
+            "enabled": True,
+            "after": 0,
+            "max_frozen": 4,
+            "cpu_idle_max": 0.5,
+            "wake_on_connect": False,
+        }
+        self.daemon.cfg["experimental"] = {"freeze": True, "guard": True}
+        self.daemon.reclaim_usage[self.scope] = (100, 1000.0)
+        self.daemon.reclaim_idle_since[self.scope] = 1000.0
+        self.daemon.freeze_usage[self.scope] = (100, 1000.0, (4242,))
+
+        with (
+            mock.patch.object(service.engine, "_cpu_usage", return_value=100),
+            mock.patch.object(self.daemon, "_reclaim_safety_reason", return_value=""),
+            mock.patch.object(self.daemon, "_freeze_safety_reason", return_value=""),
+            mock.patch.object(
+                service.memory,
+                "reclaim_page_cache",
+                side_effect=self.reclaim_and_apply,
+            ),
+        ):
+            for now in (1002.0, 1004.0):
+                idle, reason = self.daemon._reclaim_idle(
+                    self.scope, self.path, now, warm=False, grace=0
+                )
+                self.assertFalse(idle)
+                self.assertEqual(reason, "waiting for a stable CPU sample")
+                self.assertEqual(self.daemon.reclaim_usage[self.scope], (100, 1000.0))
+
+            self.assertEqual(self.daemon.freeze_pass(now=1005.0, guard=True), [])
+            result = self.daemon._reclaim_one(
+                self.scope,
+                self.path,
+                1005.0,
+                {"some_avg10": 20.0, "full_avg10": 0.0},
+                resource_class="leftover",
+                guard=True,
+                stage="page_cache",
+            )
+
+        self.assertEqual(result["status"], "reclaimed")
+        self.assertEqual(self.daemon.reclaim_usage[self.scope], (100, 1005.0))
+
+    def test_reclaim_idle_refreshes_long_baseline_before_recent_burst(self):
+        self.daemon.reclaim_usage[self.scope] = (100, 1000.0)
+        self.daemon.reclaim_idle_since[self.scope] = 1000.0
+        usage = iter((100, 100100, 100100))
+
+        with mock.patch.object(
+            service.engine, "_cpu_usage", side_effect=lambda _path: next(usage)
+        ):
+            idle, reason = self.daemon._reclaim_idle(
+                self.scope, self.path, 4600.0, warm=False, grace=3000
+            )
+            self.assertTrue(idle)
+            self.assertIn("idle for 3600s", reason)
+            self.assertEqual(self.daemon.reclaim_usage[self.scope], (100, 4600.0))
+            self.assertEqual(self.daemon.reclaim_idle_since[self.scope], 1000.0)
+
+            idle, reason = self.daemon._reclaim_idle(
+                self.scope, self.path, 4606.0, warm=False, grace=3000
+            )
+            self.assertFalse(idle)
+            self.assertIn("scope is active", reason)
+            self.assertEqual(self.daemon.reclaim_usage[self.scope], (100100, 4606.0))
+            self.assertEqual(self.daemon.reclaim_idle_since[self.scope], 4606.0)
+
+            idle, reason = self.daemon._reclaim_idle(
+                self.scope, self.path, 4612.0, warm=False, grace=3000
+            )
+
+        self.assertFalse(idle)
+        self.assertIn("idle for 6s", reason)
+        self.assertIn("needs 3000s", reason)
+        self.assertEqual(self.daemon.reclaim_usage[self.scope], (100100, 4612.0))
+        self.assertEqual(self.daemon.reclaim_idle_since[self.scope], 4606.0)
+
     def test_observe_automatic_pass_reports_would_without_reclaiming(self):
         self.daemon.cfg["mode"] = "observe"
         with (

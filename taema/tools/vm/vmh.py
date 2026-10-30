@@ -48,7 +48,19 @@ LEARNING_REPLAY_FIXTURE = os.path.join(
 GUEST_TMP = "/tmp/taema-vm"
 
 LIBCS = ("glibc", "musl")
-SCENARIOS = ("smoke", "m0", "m1", "m2", "m3", "upgrade", "remove")
+SCENARIOS = (
+    "smoke",
+    "eventd",
+    "m0",
+    "m1",
+    "m2",
+    "m3",
+    "m4",
+    "m5",
+    "upgrade",
+    "remove",
+    "graphical",
+)
 ACCELS = ("auto", "kvm", "tcg")
 IMAGE_KEYS = ("dir", "tarball", "rootfs", "base", "kernel", "initrd")
 
@@ -109,6 +121,11 @@ def _validate(raw, path="<config>"):
     if raw.get("accel", "auto") not in ACCELS:
         raise HarnessError("%s: unknown accel %r" % (path, raw.get("accel")))
     need("memory_mb", int, 512)
+    if "m3" in scenarios:
+        if "m3_memory_mb" not in raw:
+            raw = dict(raw)
+            raw["m3_memory_mb"] = 768
+        need("m3_memory_mb", int, 512)
     need("cpus", int, 1)
     need("boot_timeout_s", int, 1)
     need("scenario_timeout_s", int, 1)
@@ -177,6 +194,9 @@ def with_overrides(
         new["accel"] = accel
     if memory_mb is not None:
         new["memory_mb"] = memory_mb
+        # An explicit guest size also sizes the M3 low-memory allocation;
+        # otherwise M3 pins qemu to m3_memory_mb (768 MiB default).
+        new["m3_memory_mb"] = memory_mb
     return _validate(new, "<cli>")
 
 
@@ -251,15 +271,24 @@ def package_repo_dir(cfg):
     return repo
 
 
-def package_path(cfg):
+# D20: packages are built only for x86_64 glibc and x86_64 musl.
+LIBC_ARCH = {"glibc": "x86_64", "musl": "x86_64-musl"}
+
+
+def package_arches(libcs):
+    """XBPS architectures needed to cover the selected libcs, in order."""
+    return [LIBC_ARCH[c] for c in dict.fromkeys(libcs) if c in LIBC_ARCH]
+
+
+def package_path(cfg, arch="x86_64"):
     return os.path.join(
-        package_repo_dir(cfg), "taema-%s_1.noarch.xbps" % read_version()
+        package_repo_dir(cfg), "taema-%s_1.%s.xbps" % (read_version(), arch)
     )
 
 
 def previous_version(cfg):
     m = re.match(
-        r"taema-(.+?)(?:_\d+)?\.noarch\.xbps$",
+        r"taema-(.+?)(?:_\d+)?\.(?:noarch|x86_64(?:-musl)?)\.xbps$",
         os.path.basename(cfg["images"]["previous_url"]),
     )
     if not m:
@@ -274,11 +303,21 @@ def needs_previous_package(scenarios):
     return any(name in scenarios for name in ("m1", "upgrade"))
 
 
+def validate_network_opt_in(scenarios, allow_network):
+    """Refuse M3 before boot unless its guest-only earlyoom install is authorized."""
+    if "m3" in scenarios and not allow_network:
+        raise HarnessError(
+            "scenario m3 installs earlyoom inside the disposable guest; "
+            "re-run with --allow-network"
+        )
+
+
 def bootstrap_sources(pub, package_repo, previous, scenarios):
     """Files copied to a guest before provisioning and scenario execution."""
     sources = [
         os.path.join(VM_DIR, "provision.sh"),
         os.path.join(VM_DIR, "scenario.py"),
+        os.path.join(VM_DIR, "notify_server.py"),
         pub,
         package_repo,
     ]
@@ -302,6 +341,8 @@ def scenario_command(name, cfg, repo_name, previous):
         name,
         GUEST_TMP,
     )
+    if name == "m3":
+        remote += " --expected-memory-mb %s" % cfg.get("m3_memory_mb", 768)
     if name in ("upgrade", "m1"):
         remote += (
             " --package-dir %s/%s --previous %s/%s"
@@ -504,6 +545,15 @@ def mkimage_argv(cfg, rootfs, pub):
 # ---- plan ------------------------------------------------------------------
 
 
+def qemu_config_for_scenarios(cfg, scenarios):
+    """Apply the low-memory M3 allocation without changing the shared run config."""
+    if "m3" not in scenarios:
+        return cfg
+    qemu_cfg = dict(cfg)
+    qemu_cfg["memory_mb"] = cfg.get("m3_memory_mb", 768)
+    return qemu_cfg
+
+
 def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     """A machine-readable description of everything `run` would do."""
     libcs = list(libcs or cfg["libcs"])
@@ -517,7 +567,16 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
     key, pub = ssh_key_paths(cfg)
     vmadmin = "vmadmin"
     repo_name = os.path.basename(cfg["paths"]["package_repo"].rstrip("/"))
-    pkg = package_path(cfg)
+    repo = package_repo_dir(cfg)
+    packages = [
+        {
+            "arch": arch,
+            "path": package_path(cfg, arch),
+            "argv": ["sh", BUILD_XBPS, repo],
+            "env": {"XBPS_ARCH": arch},
+        }
+        for arch in package_arches(libcs)
+    ]
     prev = previous_pkg_path(cfg)
     network_urls = [image_spec(cfg, c)["url"] for c in libcs]
     if (
@@ -534,7 +593,8 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
         run_dir = os.path.join(state_dir(cfg), "runs", "RUN-" + libc)
         port = free_port()
         known = os.path.join(run_dir, "known_hosts")
-        qemu = qemu_argv(cfg, libc, kvm=kvm, port=port, run_dir=run_dir)
+        qemu_cfg = qemu_config_for_scenarios(cfg, scenarios)
+        qemu = qemu_argv(qemu_cfg, libc, kvm=kvm, port=port, run_dir=run_dir)
         steps = [
             {"name": "wait-ssh", "user": vmadmin},
             {
@@ -619,15 +679,22 @@ def build_plan(cfg, *, libcs=None, scenarios=None, kvm=None):
         "kvm": kvm,
         "scenarios": scenarios,
         "libcs": libcs,
-        "package": {"path": pkg, "argv": ["sh", BUILD_XBPS, package_repo_dir(cfg)]},
+        "packages": packages,
         "network": {"urls": network_urls},
         "vms": vms,
     }
 
 
 def print_plan(plan, out):
-    out.write("package: %s\n" % plan["package"]["path"])
-    out.write("build: %s\n" % " ".join(plan["package"]["argv"]))
+    for package in plan["packages"]:
+        out.write("package: %s\n" % package["path"])
+        out.write(
+            "build: %s\n"
+            % " ".join(
+                ["%s=%s" % item for item in sorted(package["env"].items())]
+                + package["argv"]
+            )
+        )
     for url in plan["network"]["urls"]:
         out.write("network: %s\n" % url)
     for vm in plan["vms"]:
@@ -900,21 +967,31 @@ def build_image(cfg, libc, log=None):
 # ---- package build ---------------------------------------------------------
 
 
-def build_package(cfg):
-    r = subprocess.run(
-        ["sh", BUILD_XBPS, package_repo_dir(cfg)],
-        cwd=TAEMA_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if r.returncode != 0:
-        raise RunError(
-            "package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:])
+def build_package(cfg, libcs=None):
+    """Build one package per needed arch; the suite runs once, on the first."""
+    arches = package_arches(libcs or cfg["libcs"])
+    built = []
+    for index, arch in enumerate(arches):
+        env = dict(os.environ, XBPS_ARCH=arch)
+        if index > 0:
+            # tests already ran with the first arch; only (re)build binaries.
+            env["SKIP_TESTS"] = "1"
+        r = subprocess.run(
+            ["sh", BUILD_XBPS, package_repo_dir(cfg)],
+            cwd=TAEMA_ROOT,
+            capture_output=True,
+            text=True,
+            env=env,
         )
-    pkg = package_path(cfg)
-    if not os.path.isfile(pkg):
-        raise RunError("package build produced no %s" % pkg)
-    return pkg
+        if r.returncode != 0:
+            raise RunError(
+                "package build failed:\n%s\n%s" % (r.stdout[-1200:], r.stderr[-1200:])
+            )
+        pkg = package_path(cfg, arch)
+        if not os.path.isfile(pkg):
+            raise RunError("package build produced no %s" % pkg)
+        built.append(pkg)
+    return built
 
 
 # ---- run pipeline ----------------------------------------------------------
@@ -923,6 +1000,10 @@ def build_package(cfg):
 def ensure_ssh_key(cfg):
     key, pub = ssh_key_paths(cfg)
     if os.path.isfile(key) and os.path.isfile(pub):
+        # ssh ignores a private key readable by anyone else; enforce 0600
+        # on every run, not just at creation (a loose key fails closed as
+        # "ssh not ready" with no hint).
+        os.chmod(key, 0o600)
         return key, pub
     os.makedirs(os.path.dirname(key), exist_ok=True)
     r = subprocess.run(
@@ -1027,7 +1108,10 @@ def run_vm(cfg, plan_vm, plan, scenarios, run_dir, out, err):
     port = free_port()  # plan port is a preview; pick again for the real run
     known = os.path.join(run_dir, "known_hosts")
     run_dir_abs = run_dir
-    qemu = qemu_argv(cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs)
+    qemu_cfg = qemu_config_for_scenarios(cfg, scenarios)
+    qemu = qemu_argv(
+        qemu_cfg, libc, kvm=plan["kvm"], port=port, run_dir=run_dir_abs
+    )
     overlay = os.path.join(run_dir, "disk.qcow2")
     ovr = overlay_argv(
         cache_paths(cfg, libc)["base"], overlay, qemu_img=cfg["tools"]["qemu_img"]
@@ -1159,6 +1243,8 @@ def cmd_run(cfg, args, out, err):
         out.write("prerequisites: ok\n")
         return 0
 
+    validate_network_opt_in(scenarios, args.allow_network)
+
     # Network opt-in gate happens before anything is created or executed.
     need_net = []
     for libc in libcs:
@@ -1189,13 +1275,19 @@ def cmd_run(cfg, args, out, err):
                 raise HarnessError("base image for %s missing" % libc)
 
     if args.no_build:
-        if not os.path.isfile(package_path(cfg)):
+        missing = [
+            package_path(cfg, arch)
+            for arch in package_arches(libcs)
+            if not os.path.isfile(package_path(cfg, arch))
+        ]
+        if missing:
             raise HarnessError(
-                "package not built: %s (run without --no-build)" % package_path(cfg)
+                "package not built: %s (run without --no-build)"
+                % ", ".join(missing)
             )
     else:
         err.write("vmh: building package from the working tree\n")
-        build_package(cfg)
+        build_package(cfg, libcs)
 
     summary = {"accel": plan["accel"], "scenarios": scenarios, "vms": {}}
     failed = False
@@ -1272,7 +1364,7 @@ def main(argv, out=None, err=None):
     net.add_argument(
         "--allow-network",
         action="store_true",
-        help="permit downloads (base images, previous release)",
+        help="permit downloads (base images, previous release, M3 guest earlyoom)",
     )
     runp = argparse.ArgumentParser(add_help=False)
     runp.add_argument(
@@ -1280,7 +1372,7 @@ def main(argv, out=None, err=None):
     )
     runp.add_argument(
         "--scenarios",
-        help="comma-separated: smoke,m0,m1,m2,m3,upgrade,remove or all",
+        help="comma-separated: smoke,m0,m1,m2,m3,m4,upgrade,remove or all",
     )
     runp.add_argument("--memory-mb", type=int, help="guest RAM in MiB (minimum 512)")
     runp.add_argument("--tcg", action="store_true", help="force TCG emulation")

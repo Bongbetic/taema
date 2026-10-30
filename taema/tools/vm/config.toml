@@ -5,9 +5,10 @@
 # --allow-network; runs with a populated cache work offline.
 
 libcs = ["glibc", "musl"]          # libcs to boot for `run`
-scenarios = ["smoke", "m0"]        # M1/M2 acceptance: smoke,m1,m2,upgrade
+scenarios = ["smoke", "m0"]        # M1/M2/M3 acceptance stays opt-in
 accel = "auto"                     # auto | kvm | tcg; auto uses KVM when /dev/kvm is usable
 memory_mb = 1536
+m3_memory_mb = 768                  # isolated M3 pressure run only
 cpus = 2
 boot_timeout_s = 300               # ssh readiness after qemu starts
 scenario_timeout_s = 4500          # M0 includes a real one-hour idle GC window

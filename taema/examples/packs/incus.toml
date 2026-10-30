@@ -1,0 +1,5 @@
+[unit]
+name = "incus"
+kind = "app"
+[match]
+comm = "incusd"

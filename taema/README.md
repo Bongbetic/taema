@@ -141,12 +141,13 @@ The first sync asks whether to import the repository key. The fingerprint is
 
 ### From a release file
 
-Download `taema-<version>_1.noarch.xbps` from the
+Download `taema-<version>_1.x86_64.xbps` (glibc) or
+`taema-<version>_1.x86_64-musl.xbps` (musl) from the
 [releases page](https://github.com/Bongbetic/taema/releases) into an empty
 directory, index it, and install it:
 
 ```sh
-xbps-rindex -a taema-*.noarch.xbps
+xbps-rindex -a taema-*_1.x86_64*.xbps
 sudo xbps-install --repository="$PWD" taema
 ```
 
@@ -337,6 +338,14 @@ Soft limits are protection and pressure signals; they do not transfer or pre-all
 memory. High controls change only when the requested value differs materially, and tæma restores
 the original value when a scope becomes active or leaves the managed set.
 
+`taema memory` reports `memory.current`, peak use, `memory.stat` anon/file/inactive-file/shmem/slab
+breakdowns, swap and zswap use, PSI, and `memory.events` high/max/OOM counters when the kernel
+exposes them. If `memory.peak` is missing, the daemon samples `memory.current` and keeps the
+sampled maximum. `taema doctor` names missing accounting fields, `memory.low`, `memory.oom.group`,
+reclaim controls and their fallback, swap/zswap support, event counters, cgroup controllers and
+freezer, OOM-score adjustment, and the helper operations used to restore OOM scores. Unsupported
+kernel features are reported as portability warnings; doctor does not write these controls.
+
 The default `[mem] manage = "soft"` does not apply unit `memory.max` caps. Hard caps require
 `[mem] manage = "hard"` in the user config and an explicit `[mem] max` in that unit's file,
 for example:
@@ -398,10 +407,13 @@ available.
 
 ### Pressure guard
 
-The experimental pressure guard reacts to user-cgroup PSI triggers (`some = 150ms/2s` and
-`full = 50ms/2s`) and to host `MemAvailable` dropping below `guard.available_floor`. The `auto`
-floor is earlyoom's configured `-m` threshold plus four percentage points, or 12% of installed
-memory when earlyoom is not running. It is gated by `[experimental] guard` and `[guard] enabled`.
+The experimental pressure guard reacts to PSI triggers (`some = 150ms/2s` and `full = 50ms/2s`)
+and to host `MemAvailable` dropping below `guard.available_floor`. It uses the delegated user-cgroup
+PSI trigger when writable, falling back to `/proc/pressure/memory` when the delegated trigger is
+unavailable. `taema doctor` reports the selected trigger source and whether it can register the
+configured triggers. The `auto` floor is earlyoom's configured `-m` threshold plus four percentage
+points, or 12% of installed memory when earlyoom is not running. It is gated by
+`[experimental] guard` and `[guard] enabled`.
 
 During pressure, tæma tries page-cache reclaim from idle scopes first, freezes eligible leftovers,
 reclaims anonymous memory only from scopes it froze, then stops one authorized scope at a time,
@@ -409,6 +421,11 @@ largest first. Each ladder step has a 10-second cooldown by default. The guard e
 soon as PSI and the available-memory floor clear. It never stops an unlearned scope; `observe` only
 records would-actions. In `adopt`, freezing also requires `guard.freeze_in_adopt = true`. Set
 `freeze.enabled = false` to prevent guard-triggered freezing.
+
+The opt-in `m3` disposable-VM release gate records `MemAvailable` and PSI at cache-reclaim and
+freeze events, and checks both actions precede the configured floor. It also compares live kernel
+OOM scores for an adjusted leftover and an equal-sized app peer while earlyoom runs in the guest.
+See [the VM harness instructions](docs/vm-harness.md) for its network opt-in and invocation.
 
 ```toml
 [experimental]
@@ -470,6 +487,8 @@ Useful options:
 taema run --bind NAME CMD...      # stop the scope when CMD itself exits
 taema run --owner PID NAME CMD... # stop the scope when PID exits
 taema run --join NAME CMD...      # add a process to an existing scope
+taema launch --app NAME CMD...    # start CMD inside its own reserved app scope
+taema launch --bind -- CMD...     # stop the app scope when CMD itself exits
 taema kill --dry-run NAME         # show the decisions, change nothing
 taema kill -t 3 NAME              # 3 s between SIGTERM and SIGKILL
 taema kill --keep adb NAME        # move adb aside instead of killing it
@@ -507,6 +526,11 @@ taema events --json --follow
 taema watch
 taema prompt
 ```
+
+The shell hooks report through the native `taema-fast` client when it is installed
+(`usr/libexec/taema/taema-fast`), falling back to the Python `taema-hook`; set
+`TAEMA_HOOK` to override both. `taema-fast prompt` reads the same cached segment
+as `taema prompt` without starting Python, for use in a shell prompt.
 
 A review shows its owner, surviving apps, close count, memory, age, provenance, and survivor
 signature. Answer it with `taema answer ID stop|keep|standalone|never`, or use the interactive
@@ -565,6 +589,10 @@ graceful = 10                 # seconds between SIGTERM and SIGKILL
 
 [gc]
 keep_while_children = true    # needed while it has child processes
+
+[window]
+backend = "niri"              # auto, or the backend that must feed evidence
+requires_window = true        # stop the scope once windowless past grace
 ```
 
 App units can carve child scopes out of an adopted tree. Each child is bound to its own
@@ -580,6 +608,13 @@ binds_to = "root"
 Project scopes (`kind = "scope"`) are created with `taema run NAME`. Their unit may list
 `keep = ["adb"]` and a stop `hook`. An executable `~/.config/taema/hooks/NAME.stop` runs
 before `scope-NAME` is signalled, for example to let an emulator save its state.
+
+Author new units with `taema unit draft NAME --from PID`, which writes
+`~/.config/taema/units/NAME.toml` from the process's comm, exe, cmdline, and cgroup.
+`taema unit lint FILE` checks keys, durations, and dangerous combinations such as
+`survive_logout` without `stop_when_unneeded`. `taema unit dry-run FILE` shows which
+running processes would match, changing nothing. The daemon picks up new and changed
+unit files without a restart; `taema reload` applies them immediately.
 
 ## Configuration
 

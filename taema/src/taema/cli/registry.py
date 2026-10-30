@@ -1,7 +1,5 @@
 """Single source for public command names, aliases, help, and arguments."""
 
-from typing import Any
-
 GLOBAL_OPTIONS = (
     (("--plain",), {"action": "store_true", "help": "use plain, accessible output"}),
     (("--wide",), {"action": "store_true", "help": "do not truncate terminal output"}),
@@ -14,7 +12,9 @@ GLOBAL_OPTIONS = (
     (("--verbose",), {"action": "store_true", "help": "show additional details"}),
 )
 
-COMMANDS: tuple[dict[str, Any], ...] = (
+# String annotation: keeps the type visible to checkers without importing typing
+# on the latency-sensitive CLI path.
+COMMANDS: "tuple[dict[str, object], ...]" = (
     {
         "name": "run",
         "aliases": (),
@@ -33,6 +33,80 @@ COMMANDS: tuple[dict[str, Any], ...] = (
             ),
             (("name",), {}),
             (("cmd",), {"remainder": True}),
+        ),
+    },
+    {
+        "name": "launch",
+        "aliases": (),
+        "help": "launch CMD inside its own reserved app scope",
+        "handler": "cmd_launch",
+        "arguments": (
+            (("--app",), {"metavar": "NAME", "help": "app name for the scope"}),
+            (("--unit",), {"metavar": "UNIT", "help": "unit to record on the app"}),
+            (
+                ("--bind",),
+                {
+                    "action": "store_true",
+                    "help": "stop the scope when CMD itself exits",
+                },
+            ),
+            (("--dry-run",), {"action": "store_true"}),
+            (("cmd",), {"remainder": True}),
+        ),
+    },
+    {
+        "name": "desktop",
+        "aliases": (),
+        "help": "wrap launcher entries with taema launch",
+        "handler": "cmd_desktop",
+        "children": (
+            {
+                "name": "wrap",
+                "help": "wrap NAME.desktop with taema launch",
+                "handler": "cmd_desktop_wrap",
+                "arguments": ((("name",), {}),),
+            },
+            {
+                "name": "unwrap",
+                "help": "remove the wrapper for NAME",
+                "handler": "cmd_desktop_unwrap",
+                "arguments": (
+                    (("name",), {"nargs": "?"}),
+                    (("--all",), {"action": "store_true"}),
+                ),
+            },
+            {
+                "name": "list",
+                "help": "list wrapped launcher entries",
+                "handler": "cmd_desktop_list",
+                "read": True,
+                "arguments": (),
+            },
+        ),
+    },
+    {
+        "name": "bar",
+        "aliases": (),
+        "help": "stream bar state in waybar, i3bar, json, or plain",
+        "handler": "cmd_bar",
+        "read": True,
+        "arguments": (
+            (
+                ("--format",),
+                {
+                    "metavar": "FORMAT",
+                    "default": "plain",
+                    "choices": ("waybar", "i3bar", "json", "plain"),
+                    "help": "output format",
+                },
+            ),
+            (
+                ("--follow",),
+                {
+                    "action": "store_true",
+                    "help": "stream one line per state change",
+                },
+            ),
         ),
     },
     {
@@ -159,6 +233,20 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "name": "mute",
+        "aliases": (),
+        "help": "mute an app's notifications, or list muted apps",
+        "handler": "cmd_mute",
+        "arguments": ((("app",), {"nargs": "?", "metavar": "APP"}),),
+    },
+    {
+        "name": "unmute",
+        "aliases": (),
+        "help": "unmute an app's notifications",
+        "handler": "cmd_unmute",
+        "arguments": ((("app",), {"metavar": "APP"}),),
+    },
+    {
         "name": "undo",
         "aliases": (),
         "help": "undo the latest automatic action or a decision by id",
@@ -185,6 +273,22 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "help": "check system support and report setup problems",
         "handler": "cmd_doctor",
         "read": True,
+        "arguments": (
+            (
+                ("--fix",),
+                {
+                    "action": "store_true",
+                    "help": "repair safe items; print root commands unless --sudo",
+                },
+            ),
+            (
+                ("--sudo",),
+                {
+                    "action": "store_true",
+                    "help": "run the printed root commands for doctor --fix",
+                },
+            ),
+        ),
     },
     {
         "name": "config",
@@ -357,6 +461,25 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_watch",
     },
     {
+        "name": "agent",
+        "aliases": (),
+        "help": "relay this session's desktop facts to the daemon",
+        "handler": "cmd_agent",
+    },
+    {
+        "name": "dash",
+        "aliases": (),
+        "help": "show scopes, learning, memory, and events in one screen",
+        "handler": "cmd_dash",
+        "read": True,
+        "arguments": (
+            (
+                ("--once",),
+                {"action": "store_true", "help": "print one snapshot and exit"},
+            ),
+        ),
+    },
+    {
         "name": "events",
         "aliases": (),
         "help": "query or follow the event log",
@@ -452,16 +575,300 @@ COMMANDS: tuple[dict[str, Any], ...] = (
             },
             {
                 "name": "export",
-                "help": "export state for a 0.2 downgrade",
+                "help": "export learned answers",
                 "handler": "cmd_learn_export",
                 "arguments": (
-                    (("--format",), {"choices": ("v2",), "required": True}),
+                    (
+                        ("--format",),
+                        {
+                            "choices": ("learn-v1", "v2"),
+                            "default": "learn-v1",
+                            "help": "learn-v1 (default) or v2 for a 0.2 downgrade",
+                        },
+                    ),
                     (
                         ("--output",),
                         {"help": "write atomically to PATH instead of stdout"},
                     ),
+                    (
+                        ("--redact",),
+                        {
+                            "action": "store_true",
+                            "help": "strip argv, cwd, titles, and environment values",
+                        },
+                    ),
                 ),
             },
+            {
+                "name": "import",
+                "help": "import learned answers from an export file",
+                "handler": "cmd_learn_import",
+                "arguments": (
+                    (("file",), {}),
+                    (("--merge",), {"action": "store_true"}),
+                    (("--replace",), {"action": "store_true"}),
+                ),
+            },
+        ),
+    },
+    {
+        "name": "report",
+        "aliases": (),
+        "help": "summarize a day, week, or month of cleanup activity",
+        "handler": "cmd_report",
+        "read": True,
+        "arguments": (
+            (("--day",), {"action": "store_true"}),
+            (("--week",), {"action": "store_true"}),
+            (("--month",), {"action": "store_true"}),
+        ),
+    },
+    {
+        "name": "top",
+        "aliases": (),
+        "help": "live process table sorted by CPU, memory, then PID",
+        "handler": "cmd_top",
+        "read": True,
+        "arguments": (
+            (
+                ("count",),
+                {"nargs": "?", "help": "snapshots to show, then exit"},
+            ),
+            (
+                ("--interval",),
+                {"help": "seconds between snapshots (default 1)"},
+            ),
+            (
+                ("--once",),
+                {
+                    "action": "store_true",
+                    "help": "print one snapshot and exit",
+                },
+            ),
+            (
+                ("--sort",),
+                {
+                    "metavar": "COLUMN",
+                    "help": "sort by cpu, mem, delta, psi, scope, or pid",
+                },
+            ),
+        ),
+    },
+    {
+        "name": "tree",
+        "aliases": (),
+        "help": "process trees grouped under scope headers",
+        "handler": "cmd_tree",
+        "read": True,
+        "arguments": (
+            (
+                ("target",),
+                {"nargs": "?", "help": "only scopes whose name contains TARGET"},
+            ),
+        ),
+    },
+    {
+        "name": "unit",
+        "aliases": (),
+        "help": "unit authoring tools",
+        "handler": "cmd_unit",
+        "children": (
+            {
+                "name": "new",
+                "help": "draft a unit from a running process, scope, or app",
+                "handler": "cmd_unit_new",
+                "arguments": (
+                    (
+                        ("--from",),
+                        {
+                            "dest": "from_target",
+                            "required": True,
+                            "help": "PID, scope:REL, or app comm",
+                        },
+                    ),
+                    (
+                        ("--name",),
+                        {"help": "unit name (default: from the process)"},
+                    ),
+                    (
+                        ("--force",),
+                        {"action": "store_true", "help": "overwrite an existing file"},
+                    ),
+                ),
+            },
+            {
+                "name": "test",
+                "help": "dry-run a unit file or name through the ladder",
+                "handler": "cmd_unit_test",
+                "read": True,
+                "arguments": ((("target",), {}),),
+            },
+            {
+                "name": "draft",
+                "help": "generate a unit file from a running process",
+                "handler": "cmd_unit_draft",
+                "arguments": (
+                    (("name",), {}),
+                    (
+                        ("--from",),
+                        {
+                            "dest": "from_pid",
+                            "required": True,
+                            "help": "draft from PID",
+                        },
+                    ),
+                    (
+                        ("--force",),
+                        {"action": "store_true", "help": "overwrite an existing file"},
+                    ),
+                ),
+            },
+            {
+                "name": "dry-run",
+                "help": "show what a unit file would match, changing nothing",
+                "handler": "cmd_unit_dry_run",
+                "read": True,
+                "arguments": ((("file",), {}),),
+            },
+            {
+                "name": "lint",
+                "help": "lint one unit file",
+                "handler": "cmd_unit_lint",
+                "read": True,
+                "arguments": ((("file",), {}),),
+            },
+            {
+                "name": "list",
+                "help": "list units with source and active state",
+                "handler": "cmd_unit_list",
+                "read": True,
+            },
+            {
+                "name": "enable",
+                "help": "unmask a unit so it loads again",
+                "handler": "cmd_unit_enable",
+                "arguments": ((("name",), {}),),
+            },
+            {
+                "name": "disable",
+                "help": "mask a unit with a user tombstone",
+                "handler": "cmd_unit_disable",
+                "arguments": ((("name",), {}),),
+            },
+            {
+                "name": "install",
+                "help": "install a curated pack to the user units",
+                "handler": "cmd_unit_install",
+                "arguments": (
+                    (
+                        ("name",),
+                        {},
+                    ),
+                    (
+                        ("--force",),
+                        {
+                            "action": "store_true",
+                            "help": "overwrite an existing unit file",
+                        },
+                    ),
+                ),
+            },
+        ),
+    },
+    {
+        "name": "recent",
+        "aliases": (),
+        "help": "list the latest automatic actions",
+        "handler": "cmd_recent",
+        "read": True,
+        "arguments": (),
+    },
+    {
+        "name": "history",
+        "aliases": (),
+        "help": "show the timeline of one app or scope",
+        "handler": "cmd_history",
+        "read": True,
+        "arguments": (
+            (("target",), {"help": "APP, SCOPE, app:APP, or scope:SCOPE"}),
+            (
+                ("--since",),
+                {"help": "epoch timestamp or relative Ns/Nm/Nh/Nd"},
+            ),
+        ),
+    },
+    {
+        "name": "suggest",
+        "aliases": (),
+        "help": "list ranked improvements, or apply one by id",
+        "handler": "cmd_suggest",
+        "read": True,
+        "optional_children": True,
+        "children": (
+            {
+                "name": "apply",
+                "help": "apply one suggestion by id after confirmation",
+                "handler": "cmd_suggest_apply",
+                "arguments": (
+                    (
+                        ("identifier",),
+                        {},
+                    ),
+                    (
+                        ("--choice",),
+                        {
+                            "choices": ("stop", "keep", "standalone", "never"),
+                            "help": "answer for a stale-review suggestion",
+                        },
+                    ),
+                    (
+                        ("--force",),
+                        {
+                            "action": "store_true",
+                            "help": "overwrite an existing unit file",
+                        },
+                    ),
+                ),
+            },
+        ),
+    },
+    {
+        "name": "setup",
+        "aliases": (),
+        "help": "walk from install to a working setup",
+        "handler": "cmd_setup",
+        "read": True,
+    },
+    {
+        "name": "restore-backup",
+        "aliases": (),
+        "help": "restore state, config, and units from a backup tarball",
+        "handler": "cmd_restore_backup",
+        "arguments": ((("file",), {}),),
+    },
+    {
+        "name": "reset",
+        "aliases": (),
+        "help": "clear learning, vetoes, history, or all state after a backup",
+        "handler": "cmd_reset",
+        "arguments": (
+            (("--learning",), {"action": "store_true"}),
+            (("--vetoes",), {"action": "store_true"}),
+            (("--history",), {"action": "store_true"}),
+            (("--all",), {"action": "store_true"}),
+        ),
+    },
+    {
+        "name": "backup",
+        "aliases": (),
+        "help": "write a tarball with the database, user config, and user units",
+        "handler": "cmd_backup",
+        "read": True,
+        "arguments": (
+            (
+                ("--to",),
+                {"help": "write to PATH instead of the state backups directory"},
+            ),
         ),
     },
     {
@@ -510,6 +917,25 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         "handler": "cmd_daemon",
     },
     {
+        "name": "help",
+        "aliases": (),
+        "help": "show a topic: modes, learning, veto, ladder, memory, units, agent, profiles, privacy, safety",
+        "handler": "cmd_help",
+        "arguments": (
+            (("topic",), {"nargs": "?", "metavar": "TOPIC"}),
+        ),
+    },
+    {
+        "name": "bug-report",
+        "aliases": (),
+        "help": "write a sanitized support bundle (versions, doctor, redacted config, units, metrics, events)",
+        "handler": "cmd_bug_report",
+        "read": True,
+        "arguments": (
+            (("--to",), {"metavar": "PATH", "help": "write to PATH instead of the state directory"}),
+        ),
+    },
+    {
         "name": "__complete",
         "aliases": (),
         "help": "internal shell completion interface",
@@ -523,3 +949,61 @@ COMMANDS: tuple[dict[str, Any], ...] = (
         ),
     },
 )
+
+# Two real examples per command (issue #83). Keys are the
+# `_command` value ("learn export" for children); missing keys fall back
+# to the generic pair below.
+EXAMPLES = {
+    "run": ("taema run editor -- code .", "taema run --owner 4242 shell -- bash"),
+    "launch": ("taema launch --app firefox -- firefox", "taema launch --bind -- ./app --serve"),
+    "desktop": ("taema desktop wrap firefox.desktop", "taema desktop list"),
+    "bar": ("taema bar --format waybar", "taema bar --format plain --follow"),
+    "kill": ("taema kill scope-editor", "taema kill scope-editor --dry-run"),
+    "ls": ("taema ls", "taema ls --json"),
+    "explain": ("taema why scope-firefox", "taema explain app:firefox"),
+    "keep": ("taema keep firefox", "taema keep --pair npm vite"),
+    "forget": ("taema forget firefox", "taema forget --veto scope-x"),
+    "do-not-kill": ("taema do-not-kill scope-x", "taema do-not-kill app:firefox --for 2h"),
+    "mute": ("taema mute firefox", "taema mute"),
+    "unmute": ("taema unmute firefox", "taema mute"),
+    "undo": ("taema undo", "taema undo --restore"),
+    "restore": ("taema restore 123", "taema recent"),
+    "doctor": ("taema doctor", "taema doctor --fix"),
+    "config": ("taema config show", "taema config get mode"),
+    "reload": ("taema reload", "taema config show"),
+    "mode": ("taema mode adopt", "taema status"),
+    "profile": ("taema profile focus", "taema profile auto"),
+    "hold": ("taema hold --reason lunch", "taema hold scope-x"),
+    "resume": ("taema resume", "taema resume scope-x"),
+    "snooze": ("taema snooze 2h", "taema snooze until 18:00"),
+    "status": ("taema status", "taema status --json"),
+    "memory": ("taema memory", "taema memory top"),
+    "watch": ("taema watch", "taema events --follow"),
+    "agent": ("taema agent", "taema status"),
+    "dash": ("taema dash --once", "taema dash"),
+    "events": ("taema events --since 0", "taema events --follow"),
+    "prompt": ("taema prompt", "taema status"),
+    "review": ("taema review", "taema review --interactive"),
+    "answer": ("taema answer 12 keep", "taema review"),
+    "teach": ("taema teach npm vite keep", "taema learn pairs"),
+    "learn": ("taema learn show", "taema learn export --redact"),
+    "report": ("taema report --day", "taema report --week"),
+    "top": ("taema top --once", "taema top --sort mem"),
+    "tree": ("taema tree", "taema tree firefox"),
+    "unit": ("taema unit list", "taema unit lint file.toml"),
+    "recent": ("taema recent", "taema history app:firefox"),
+    "history": ("taema history app:firefox", "taema recent"),
+    "suggest": ("taema suggest", "taema suggest apply 3"),
+    "setup": ("taema setup", "taema doctor"),
+    "restore-backup": ("taema restore-backup file.tar.gz", "taema backup"),
+    "reset": ("taema reset --learning", "taema backup"),
+    "backup": ("taema backup", "taema backup --to /tmp/taema-backup.tar.gz"),
+    "freeze": ("taema freeze scope-x", "taema thaw scope-x"),
+    "thaw": ("taema thaw scope-x", "taema thaw --all"),
+    "gc": ("taema gc --dry-run", "taema gc --memory"),
+    "adopt": ("taema adopt --dry-run", "taema adopt --all"),
+    "daemon": ("taema daemon", "taema status"),
+    "help": ("taema help modes", "taema help units"),
+    "bug-report": ("taema bug-report", "taema bug-report --to /tmp/taema-bug.tar.gz"),
+}
+GENERIC_EXAMPLES = ("taema status", "taema doctor")

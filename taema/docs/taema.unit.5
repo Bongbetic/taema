@@ -1,0 +1,104 @@
+.TH TAEMA.UNIT 5 "2026-10-30" "taema 0.8.0" "Tæma Manual"
+.SH NAME
+taema.unit \- tæma unit file format
+.SH DESCRIPTION
+Units match apps and scopes and say how to stop them. Files live in
+.IR /etc/taema/units
+(system) and
+.IR ~/.config/taema/units
+(user); later directories win unless a user tombstone masks the name
+.RB ( taema\ unit\ disable ).
+Lint with
+.BR "taema unit lint" ,
+dry-run matches with
+.BR "taema unit dry-run" ,
+test the ladder with
+.BR "taema unit test" .
+.SH UNIT
+.TP
+.B [unit] name
+Unit name. App units match processes; scope units match explicit scopes.
+.TP
+.B [unit] kind
+\fBapp\fR or \fBscope\fR.
+.TP
+.B [unit] stop_when_unneeded
+Stop the scope when nothing uses it (GC). Detached servers that should
+survive logout combine this with
+.B [kill] survive_logout.
+.TP
+.B [unit] group_by_qmp, group_by_env
+Optional grouping keys for VM-backed apps.
+.SH MATCH
+.TP
+.B [match] exe, comm, cmdline_contains
+How to recognize the app. App units need at least one. Prefer \fBexe\fR;
+a bare \fBcomm\fR that matches every process of that name is rejected as
+over-broad unless \fBcmdline_contains\fR narrows it.
+.TP
+.B [match] env_exclude
+Table of environment values that disqualify a match.
+.SH KILL
+.TP
+.B [kill] graceful
+Seconds to wait after SIGTERM before SIGKILL. Default follows the daemon.
+.TP
+.B [kill] keep
+List of exe basenames moved to shared/ instead of killed, even without a
+detected edge (for example shared adb servers).
+.TP
+.B [kill] hook
+Path to an executable stop hook.
+.TP
+.B [kill] never_stop, survive_logout
+Never stop this unit; survive logout (requires \fBstop_when_unneeded\fR).
+.SH GC
+.TP
+.B [gc] keep_while_children
+Keep the scope while it has children (for tmux-like servers).
+.SH MEM
+.TP
+.B [mem] class, background
+Memory class (\fBapp\fR, \fBvm\fR) and whether the workload is background
+work for reclaim priority.
+.SH WINDOW
+.TP
+.B [window] backend, requires_window
+Compositor backend and whether the app needs a window to stay alive.
+.TP
+.B [desktop] app_id, on_last_window
+Desktop identity and what happens on the last window close:
+\fBask\fR, \fBquit\fR, or \fBkeep\fR.
+.SH CHILDREN
+.TP
+.B [[children]] name, ancestor_comm|comm, binds_to
+Carve sub-scopes out of an adopted tree. Each child binds to its own root
+process: when that process exits, the child scope stops. Names become
+\fIname\fR-\fIpid\fR leaves (for example \fBsession-4242\fR).
+.SH SOURCE
+.TP
+.B [source] learned
+True when the learner wrote the file. Masks and packs never touch it.
+.SH EXAMPLE
+.PP
+.nf
+[unit]
+name = "app-herdr"
+kind = "app"
+stop_when_unneeded = true
+
+[match]
+comm = "herdr"
+cmdline_contains = "server"
+
+[kill]
+survive_logout = true
+graceful = 10
+
+[gc]
+keep_while_children = true
+.fi
+.SH SEE ALSO
+.BR taema (1),
+.BR taema.toml (5),
+.BR taema-learning (7)

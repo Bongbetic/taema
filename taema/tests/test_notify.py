@@ -7,7 +7,10 @@ fake connection, including forged signals.
 
 import io
 import subprocess
+import sys
+import types
 import unittest
+from unittest import mock
 
 from taema import notify
 
@@ -301,6 +304,128 @@ class DBusNotifierTest(unittest.TestCase):
         backend = notify.DBusNotifier()
         with self.assertRaises(notify.NotifyError):
             backend.send("s", "b")
+
+
+class FakeJeepneyMessage:
+    def __init__(self, address, method, signature, args, fields=None, body=()):
+        self.address = address
+        self.method = method
+        self.signature = signature
+        self.args = args
+        self.header = types.SimpleNamespace(fields=fields or {})
+        self.body = body
+
+
+class FakeJeepneyBus:
+    """In-process stand-in for jeepney's blocking connection."""
+
+    def __init__(self, signals=()):
+        self.calls = []
+        self.closed_notifications = []
+        self._signals = list(signals)
+        self.closed = False
+
+    def send_and_get_reply(self, msg, timeout=None):
+        self.calls.append(msg.method)
+        replies = {
+            "Notify": (42,),
+            "GetCapabilities": ["actions", "body"],
+            "GetNameOwner": (":1.5",),
+            "AddMatch": (),
+            "CloseNotification": (),
+        }
+        if msg.method == "CloseNotification":
+            self.closed_notifications.append(msg.args[0])
+        return types.SimpleNamespace(body=replies[msg.method])
+
+    def filter(self, rule):
+        class _Filter:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Filter()
+
+    def recv_until_filtered(self, matches, timeout=None):
+        if not self._signals:
+            raise TimeoutError
+        return self._signals.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def fake_jeepney_modules(connection):
+    """Build a fake jeepney package whose bus connection is `connection`."""
+    jeepney = types.ModuleType("jeepney")
+    jeepney.DBusAddress = lambda path, bus_name=None, interface=None: (
+        path,
+        bus_name,
+        interface,
+    )
+    jeepney.HeaderFields = types.SimpleNamespace(member=3, sender=7)
+    jeepney.MatchRule = lambda **kwargs: kwargs
+    jeepney.new_method_call = FakeJeepneyMessage
+    bus_messages = types.ModuleType("jeepney.bus_messages")
+    bus_messages.message_bus = object()
+    io_module = types.ModuleType("jeepney.io")
+    blocking = types.ModuleType("jeepney.io.blocking")
+    blocking.open_dbus_connection = lambda bus=None: connection
+    jeepney.bus_messages = bus_messages
+    io_module.blocking = blocking
+    return {
+        "jeepney": jeepney,
+        "jeepney.bus_messages": bus_messages,
+        "jeepney.io": io_module,
+        "jeepney.io.blocking": blocking,
+    }
+
+
+class JeepneyConnectionTest(unittest.TestCase):
+    def test_default_backend_round_trip_over_fake_jeepney(self):
+        signal = FakeJeepneyMessage(
+            None,
+            None,
+            None,
+            None,
+            fields={3: "ActionInvoked", 7: ":1.5"},
+            body=(42, "stop"),
+        )
+        bus = FakeJeepneyBus(signals=[signal])
+        with mock.patch.dict(sys.modules, fake_jeepney_modules(bus)):
+            backend = notify.DBusNotifier()
+            receipt = backend.send("s", "b", actions=[("stop", "Stop")])
+            self.assertEqual(receipt["id"], 42)
+            self.assertEqual(backend.server_capabilities(), ["actions", "body"])
+            self.assertEqual(
+                backend.wait_for_action(receipt, timeout=5), ("action", "stop")
+            )
+            backend.close(42)
+        self.assertEqual(bus.closed_notifications, [42])
+        self.assertIn("AddMatch", bus.calls)
+
+    def test_signal_timeout_is_a_timeout_result(self):
+        bus = FakeJeepneyBus()
+        with mock.patch.dict(sys.modules, fake_jeepney_modules(bus)):
+            backend = notify.DBusNotifier()
+            receipt = backend.send("s", "b")
+            self.assertEqual(
+                backend.wait_for_action(receipt, timeout=5), ("timeout", None)
+            )
+
+    def test_bus_open_failure_refuses_cleanly(self):
+        modules = fake_jeepney_modules(FakeJeepneyBus())
+
+        def fail(bus=None):
+            raise OSError("no session bus")
+
+        modules["jeepney.io.blocking"].open_dbus_connection = fail
+        with mock.patch.dict(sys.modules, modules):
+            backend = notify.DBusNotifier()
+            with self.assertRaises(notify.NotifyError):
+                backend.send("s", "b")
 
 
 class SelectBackendTest(unittest.TestCase):
